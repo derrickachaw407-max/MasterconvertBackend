@@ -18,7 +18,7 @@ MIME_TYPES = {
 
 # CORS: allow the frontend (any origin, since this is a public conversion API).
 # Tighten this to your real domain once it's live, e.g. "https://masterconvert.app"
-ALLOWED_ORIGIN = "*"
+ALLOWED_ORIGIN = "https://masterconvert-tau.vercel.app"
 
 # AI features (Smart Summarize / drafting) call Claude directly.
 # Set ANTHROPIC_API_KEY as an environment variable on Render — never hardcode it here.
