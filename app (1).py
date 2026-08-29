@@ -193,16 +193,21 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
     }
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=payload,
-        timeout=90 if use_search else 45,
-    )
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=140 if use_search else 45,
+        )
+    except requests.exceptions.Timeout:
+        raise ConversionError("AI request timed out — try again, or try a narrower topic")
+    except requests.exceptions.RequestException as e:
+        raise ConversionError(f"AI request failed: {e}")
     if resp.status_code != 200:
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
     data = resp.json()
@@ -756,19 +761,29 @@ def write_endpoint():
                 "journal, or citation, even a plausible-sounding one. If you cannot find a "
                 "genuine source for a specific claim, either drop that claim or mark it with "
                 "the literal placeholder [cite a source here] instead of guessing a citation. "
+                "Do not spend more than 2-3 searches on this — search enough to ground the "
+                "claims, then write. Your final response must contain ONLY the finished "
+                "paragraph followed by the SOURCES line below — never any narration, planning, "
+                "or commentary about your search process itself (e.g. do not write things like "
+                "'let me search for more detail' or 'I found some sources, now I will write'). "
                 "After the paragraph, on its own line write exactly 'SOURCES:' followed by "
                 "each real source you cited, one per line, as: Title — URL. List only sources "
                 "you actually found via search; if none were found, write 'SOURCES:' with "
                 "nothing after it."
             ),
             user_message=topic,
-            max_tokens=900,
+            max_tokens=4000,
             use_search=True,
         )
 
         text, _, sources_block = result.rpartition("SOURCES:")
         if not _:
             text = result
+        text = text.strip()
+        if len(text) < 40:
+            raise ConversionError(
+                "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
+            )
         sources = []
         for line in sources_block.strip().split("\n"):
             line = line.strip()
@@ -778,7 +793,7 @@ def write_endpoint():
             if sep and url.strip().startswith("http"):
                 sources.append({"title": title.strip(), "url": url.strip()})
 
-        return jsonify({"text": text.strip(), "sources": sources})
+        return jsonify({"text": text, "sources": sources})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
