@@ -182,9 +182,17 @@ def auth_required(fn):
     return wrapper
 
 
-def call_claude(system_prompt, user_message, max_tokens=600):
+def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
     if not ANTHROPIC_API_KEY:
         raise ConversionError("AI features need ANTHROPIC_API_KEY set on the server")
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if use_search:
+        payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -192,13 +200,8 @@ def call_claude(system_prompt, user_message, max_tokens=600):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
-        json={
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}],
-        },
-        timeout=45,
+        json=payload,
+        timeout=90 if use_search else 45,
     )
     if resp.status_code != 200:
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
@@ -745,16 +748,37 @@ def write_endpoint():
     try:
         result = call_claude(
             system_prompt=(
-                "Write a clear explanatory paragraph, 120-180 words, on the given academic topic "
-                "for a student. Do not invent citations, author names, journal names, or source "
-                "titles under any circumstance — you cannot verify real sources exist, and a "
-                "fabricated citation in a student's work is a serious problem. Write in plain "
-                "prose with no citations or references at all."
+                "Use web search to find real, credible sources (academic papers, reputable "
+                "educational or scientific publications) relevant to the given topic. Then "
+                "write a clear explanatory paragraph, 150-220 words, for a student, with "
+                "brief in-text citations like (Author, Year). Only cite a source you actually "
+                "retrieved via search in this conversation — never invent an author, year, "
+                "journal, or citation, even a plausible-sounding one. If you cannot find a "
+                "genuine source for a specific claim, either drop that claim or mark it with "
+                "the literal placeholder [cite a source here] instead of guessing a citation. "
+                "After the paragraph, on its own line write exactly 'SOURCES:' followed by "
+                "each real source you cited, one per line, as: Title — URL. List only sources "
+                "you actually found via search; if none were found, write 'SOURCES:' with "
+                "nothing after it."
             ),
             user_message=topic,
-            max_tokens=450,
+            max_tokens=900,
+            use_search=True,
         )
-        return jsonify({"text": result.strip()})
+
+        text, _, sources_block = result.rpartition("SOURCES:")
+        if not _:
+            text = result
+        sources = []
+        for line in sources_block.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            title, sep, url = line.partition(" — ")
+            if sep and url.strip().startswith("http"):
+                sources.append({"title": title.strip(), "url": url.strip()})
+
+        return jsonify({"text": text.strip(), "sources": sources})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
