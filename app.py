@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import secrets
@@ -5,6 +6,7 @@ import string
 import tempfile
 import shutil
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -180,9 +182,17 @@ def auth_required(fn):
     return wrapper
 
 
-def call_claude(system_prompt, user_message, max_tokens=600):
+def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
     if not ANTHROPIC_API_KEY:
         raise ConversionError("AI features need ANTHROPIC_API_KEY set on the server")
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if use_search:
+        payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -190,13 +200,8 @@ def call_claude(system_prompt, user_message, max_tokens=600):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
-        json={
-            "model": ANTHROPIC_MODEL,
-            "max_tokens": max_tokens,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": user_message}],
-        },
-        timeout=45,
+        json=payload,
+        timeout=90 if use_search else 45,
     )
     if resp.status_code != 200:
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
@@ -209,6 +214,7 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary"
     return resp
 
 
@@ -576,6 +582,82 @@ def convert_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@app.route("/api/convert-batch", methods=["POST", "OPTIONS"])
+@auth_required
+def convert_batch_endpoint():
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No files uploaded"}), 400
+    if len(files) > 20:
+        return jsonify({"error": "Maximum 20 files per batch"}), 400
+
+    from_fmt = (request.form.get("from") or "").lower().strip()
+    to_fmt = (request.form.get("to") or "").lower().strip()
+    style = (request.form.get("style") or "").lower().strip() or None
+    if not from_fmt or not to_fmt:
+        return jsonify({"error": "Missing 'from' or 'to' format"}), 400
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_batch_{uuid.uuid4().hex[:8]}_")
+    details = []
+    converted = []  # (result_path, download_name)
+    try:
+        for file in files:
+            filename = file.filename or "unnamed"
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if ext != from_fmt:
+                details.append({"filename": filename, "success": False, "error": f"Not a .{from_fmt} file"})
+                continue
+
+            try:
+                _log_conversion_and_consume(request.current_user, from_fmt, to_fmt)
+            except ConversionError as e:
+                details.append({"filename": filename, "success": False, "error": str(e)})
+                continue
+
+            src_path = os.path.join(work_dir, filename)
+            file.save(src_path)
+            try:
+                result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style)
+                base_name = filename.rsplit(".", 1)[0]
+                converted.append((result_path, f"{base_name}.{to_fmt}"))
+                details.append({"filename": filename, "success": True})
+            except ConversionError as e:
+                details.append({"filename": filename, "success": False, "error": str(e)})
+            except Exception:
+                details.append({"filename": filename, "success": False, "error": "Conversion failed"})
+
+        if not converted:
+            return jsonify({"error": "No files could be converted", "details": details}), 422
+
+        zip_path = os.path.join(work_dir, "converted_files.zip")
+        used_names = set()
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for result_path, download_name in converted:
+                name, n = download_name, 1
+                while name in used_names:
+                    base, _, extn = download_name.rpartition(".")
+                    name = f"{base} ({n}).{extn}"
+                    n += 1
+                used_names.add(name)
+                zf.write(result_path, arcname=name)
+
+        summary = {
+            "total": len(files),
+            "succeeded": len(converted),
+            "failed": len(files) - len(converted),
+            "details": details,
+        }
+        response = send_file(
+            zip_path, mimetype="application/zip", as_attachment=True, download_name="converted_files.zip"
+        )
+        response.headers["X-Batch-Summary"] = json.dumps(summary)
+        return response
+    except Exception as e:
+        return jsonify({"error": f"Batch conversion failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @app.route("/api/text-to-pptx", methods=["POST", "OPTIONS"])
 @auth_required
 def text_to_pptx_endpoint():
@@ -666,16 +748,37 @@ def write_endpoint():
     try:
         result = call_claude(
             system_prompt=(
-                "Write a clear explanatory paragraph, 120-180 words, on the given academic topic "
-                "for a student. Do not invent citations, author names, journal names, or source "
-                "titles under any circumstance — you cannot verify real sources exist, and a "
-                "fabricated citation in a student's work is a serious problem. Write in plain "
-                "prose with no citations or references at all."
+                "Use web search to find real, credible sources (academic papers, reputable "
+                "educational or scientific publications) relevant to the given topic. Then "
+                "write a clear explanatory paragraph, 150-220 words, for a student, with "
+                "brief in-text citations like (Author, Year). Only cite a source you actually "
+                "retrieved via search in this conversation — never invent an author, year, "
+                "journal, or citation, even a plausible-sounding one. If you cannot find a "
+                "genuine source for a specific claim, either drop that claim or mark it with "
+                "the literal placeholder [cite a source here] instead of guessing a citation. "
+                "After the paragraph, on its own line write exactly 'SOURCES:' followed by "
+                "each real source you cited, one per line, as: Title — URL. List only sources "
+                "you actually found via search; if none were found, write 'SOURCES:' with "
+                "nothing after it."
             ),
             user_message=topic,
-            max_tokens=450,
+            max_tokens=900,
+            use_search=True,
         )
-        return jsonify({"text": result.strip()})
+
+        text, _, sources_block = result.rpartition("SOURCES:")
+        if not _:
+            text = result
+        sources = []
+        for line in sources_block.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            title, sep, url = line.partition(" — ")
+            if sep and url.strip().startswith("http"):
+                sources.append({"title": title.strip(), "url": url.strip()})
+
+        return jsonify({"text": text.strip(), "sources": sources})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
