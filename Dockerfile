@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY converters.py app.py ./
 
 EXPOSE 8000
-CMD gunicorn --bind 0.0.0.0:${PORT:-8000} --timeout 120 --workers 2 app:app
+CMD gunicorn --bind 0.0.0.0:${PORT:-8000} --timeout 240 --workers 2 app:app

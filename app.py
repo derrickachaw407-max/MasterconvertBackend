@@ -214,6 +214,77 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
 
+OUTLINE_LINE_RE = re.compile(r'^\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$')
+
+
+def parse_outline(text):
+    """Recognizes lines like '5.1 Discussion' or '5.1.1 Knowledge of Dietary
+    Sources' as a heading with a nesting level equal to how many dot-separated
+    numbers it has (5 -> level 1, 5.1 -> level 2, 5.1.1 -> level 3). Plain
+    topic text with no such lines simply parses to an empty list."""
+    sections = []
+    for line in text.strip().split("\n"):
+        m = OUTLINE_LINE_RE.match(line)
+        if m:
+            number = m.group(1)
+            heading = m.group(2).strip()
+            if heading:
+                sections.append({"number": number, "heading": heading, "level": number.count(".") + 1})
+    return sections
+
+
+def search_for_sources(topic, max_results=4):
+    """Runs a search-only Claude call and reads real title/url pairs straight out of
+    Anthropic's own web_search_tool_result blocks — never from the model's text output,
+    so a source can never be fabricated: it either came from a real search hit or it
+    isn't in the list at all."""
+    if not ANTHROPIC_API_KEY:
+        return []
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 200,
+        "system": (
+            "Search the web for 3-4 real, credible sources (academic papers, reputable "
+            "educational or scientific publications) relevant to the given topic. Once you've "
+            "searched, just reply with the word Done — no summary needed."
+        ),
+        "messages": [{"role": "user", "content": topic}],
+        "tools": [{"type": "web_search_20260318", "name": "web_search", "max_uses": 3}],
+    }
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+    except requests.exceptions.RequestException:
+        return []
+    if resp.status_code != 200:
+        return []
+    data = resp.json()
+    sources, seen = [], set()
+    for block in data.get("content", []):
+        if block.get("type") != "web_search_tool_result":
+            continue
+        content = block.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if item.get("type") != "web_search_result":
+                continue
+            url = (item.get("url") or "").strip()
+            title = (item.get("title") or "").strip()
+            if url and title and url not in seen:
+                seen.add(url)
+                sources.append({"title": title, "url": url})
+    return sources[:max_results]
+
+
 @app.after_request
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
@@ -748,50 +819,103 @@ def write_endpoint():
     topic = (data.get("topic") or "").strip()
     if not topic:
         return jsonify({"error": "No topic provided"}), 400
-    if len(topic) > 2000:
-        return jsonify({"error": "Topic too long (2,000 character limit)"}), 400
-    try:
-        result = call_claude(
-            system_prompt=(
-                "Use web search to find real, credible sources (academic papers, reputable "
-                "educational or scientific publications) relevant to the given topic. Then "
-                "write a clear explanatory paragraph, 150-220 words, for a student, with "
-                "brief in-text citations like (Author, Year). Only cite a source you actually "
-                "retrieved via search in this conversation — never invent an author, year, "
-                "journal, or citation, even a plausible-sounding one. If you cannot find a "
-                "genuine source for a specific claim, either drop that claim or mark it with "
-                "the literal placeholder [cite a source here] instead of guessing a citation. "
-                "Do not spend more than 2-3 searches on this — search enough to ground the "
-                "claims, then write. Your final response must contain ONLY the finished "
-                "paragraph followed by the SOURCES line below — never any narration, planning, "
-                "or commentary about your search process itself (e.g. do not write things like "
-                "'let me search for more detail' or 'I found some sources, now I will write'). "
-                "After the paragraph, on its own line write exactly 'SOURCES:' followed by "
-                "each real source you cited, one per line, as: Title — URL. List only sources "
-                "you actually found via search; if none were found, write 'SOURCES:' with "
-                "nothing after it."
-            ),
-            user_message=topic,
-            max_tokens=4000,
-            use_search=True,
-        )
+    if len(topic) > 4000:
+        return jsonify({"error": "Topic too long (4,000 character limit)"}), 400
 
-        text, _, sources_block = result.rpartition("SOURCES:")
-        if not _:
-            text = result
-        text = text.strip()
+    outline = parse_outline(topic)
+
+    try:
+        if len(outline) >= 2:
+            # Outline mode: e.g. "5.1 Discussion / 5.1.1 General Awareness / 5.1.2 ..."
+            # Cap section count so one request can't run unbounded.
+            outline = outline[:14]
+            combined_headings = "; ".join(s["heading"] for s in outline)
+
+            # One shared search across the whole outline — a bigger, single pool
+            # of real sources every section draws from, instead of one search per
+            # section (slower and more likely to fragment/duplicate sources).
+            sources = search_for_sources(combined_headings, max_results=8)
+
+            if sources:
+                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                base_prompt = (
+                    "You are writing one subsection of a longer academic piece on "
+                    f"\"{combined_headings}\". Write ONLY the subsection given below as the "
+                    "user message — 100-160 words, plain prose. Below is a numbered list of "
+                    "real sources relevant to the overall piece — cite them naturally with "
+                    "their bracketed number, e.g. [1], [2], where genuinely relevant to this "
+                    "particular subsection; leave sources unused if they don't fit here. Do "
+                    "not invent any author names or additional sources beyond this list. No "
+                    f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                sources = []
+                base_prompt = (
+                    "You are writing one subsection of a longer academic piece on "
+                    f"\"{combined_headings}\". Write ONLY the subsection given below as the "
+                    "user message — 100-160 words, plain prose. No verified sources were "
+                    "found for this topic, so do not invent any citations, authors, or "
+                    "sources. No heading, no reference list — just the paragraph."
+                )
+
+            for sec in outline:
+                sec_text = call_claude(
+                    system_prompt=base_prompt,
+                    user_message=f"{sec['number']} {sec['heading']}",
+                    max_tokens=400,
+                    use_search=False,
+                ).strip()
+                sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
+
+            return jsonify({
+                "sections": [
+                    {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
+                    for s in outline
+                ],
+                "sources": sources,
+            })
+
+        # Simple mode: a single flat topic, unchanged from before.
+        # Step 1: search only. Sources come straight from Anthropic's own structured
+        # search-result blocks, not from anything the model writes — so every title/url
+        # here is guaranteed to be something that was actually found, never invented.
+        sources = search_for_sources(topic)
+
+        # Step 2: a plain, tool-free writing call. No search loop to hang, run long,
+        # or narrate about — just a single bounded completion, grounded in exactly the
+        # real sources from step 1 (or told plainly that none were found).
+        if sources:
+            sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+            system_prompt = (
+                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
+                "given topic. Below is a numbered list of real sources found for this exact "
+                "topic — refer to them naturally in the text using their bracketed number, "
+                "e.g. [1], [2], at points where that source's subject matter is genuinely "
+                "relevant. Do not invent any author names, years, or additional sources beyond "
+                "this list — the numbers are the only citation format to use. Not every "
+                "sentence needs one, and it's fine to leave a source unused if it doesn't fit. "
+                "Write plain prose only, no reference list at the end — the sources are shown "
+                f"separately.\n\nSOURCES:\n{sources_block}"
+            )
+        else:
+            system_prompt = (
+                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
+                "given topic. No verified sources were found for this specific topic, so do "
+                "not invent any citations, authors, or sources — write in plain, well-informed "
+                "prose instead, with no citation markers at all."
+            )
+
+        text = call_claude(
+            system_prompt=system_prompt,
+            user_message=topic,
+            max_tokens=500,
+            use_search=False,
+        ).strip()
+
         if len(text) < 40:
             raise ConversionError(
                 "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
             )
-        sources = []
-        for line in sources_block.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            title, sep, url = line.partition(" — ")
-            if sep and url.strip().startswith("http"):
-                sources.append({"title": title.strip(), "url": url.strip()})
 
         return jsonify({"text": text, "sources": sources})
     except ConversionError as e:
