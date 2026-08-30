@@ -2,11 +2,13 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import string
 import tempfile
 import shutil
 import uuid
 import zipfile
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -31,6 +33,7 @@ MIME_TYPES = {
 
 # CORS: locked to the live frontend.
 ALLOWED_ORIGIN = "https://masterconvert-tau.vercel.app"
+FRONTEND_URL = ALLOWED_ORIGIN
 
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -41,7 +44,13 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# Password-reset emails, sent via Gmail SMTP with an app password —
+# console.google.com -> Security -> 2-Step Verification -> App passwords.
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
 FREE_CONVERSIONS_LIMIT = 2
 FREE_WINDOW_DAYS = 30
 
@@ -135,6 +144,32 @@ def verify_token(token):
         return data.get("user_id")
     except (BadSignature, SignatureExpired):
         return None
+
+
+def make_reset_token(user_id):
+    return _serializer.dumps({"reset_user_id": user_id}, salt="password-reset")
+
+
+def verify_reset_token(token):
+    if not _serializer:
+        return None
+    try:
+        data = _serializer.loads(token, max_age=RESET_TOKEN_MAX_AGE, salt="password-reset")
+        return data.get("reset_user_id")
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def send_email(to_email, subject, body):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        raise ConversionError("Email sending isn't configured on the server yet")
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
 
 
 def user_row_to_dict(row):
@@ -367,6 +402,81 @@ def login():
         return jsonify({"error": "Incorrect email or password"}), 401
 
     return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
+
+
+@app.route("/api/auth/forgot-password", methods=["POST", "OPTIONS"])
+def forgot_password():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not DATABASE_URL or not SECRET_KEY:
+        return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        return jsonify({"error": "Password reset emails aren't configured on the server yet"}), 500
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    # Always the same response whether or not the email has an account —
+    # never confirm or deny that in the response itself.
+    if row:
+        token = make_reset_token(row["id"])
+        reset_link = f"{FRONTEND_URL}/?reset_token={token}"
+        try:
+            send_email(
+                email,
+                "Reset your MasterConvert password",
+                f"Hi {row['name'] or ''},\n\n"
+                "We received a request to reset your MasterConvert password. "
+                "This link expires in 1 hour:\n\n"
+                f"{reset_link}\n\n"
+                "If you didn't request this, you can safely ignore this email — "
+                "your password won't change unless you click the link above.",
+            )
+        except ConversionError:
+            pass  # already validated config above; a transient send failure shouldn't leak state
+
+    return jsonify({"message": "If that email has an account, a reset link has been sent."})
+
+
+@app.route("/api/auth/reset-password", methods=["POST", "OPTIONS"])
+def reset_password():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not DATABASE_URL or not SECRET_KEY:
+        return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token = data.get("token") or ""
+    new_password = data.get("password") or ""
+
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    user_id = verify_reset_token(token)
+    if not user_id:
+        return jsonify({"error": "This reset link is invalid or has expired — request a new one"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (generate_password_hash(new_password), user_id),
+            )
+    finally:
+        conn.close()
+
+    return jsonify({"message": "Password updated — you can log in with your new password now"})
 
 
 @app.route("/api/auth/google", methods=["POST", "OPTIONS"])
