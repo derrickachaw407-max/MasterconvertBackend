@@ -268,7 +268,7 @@ def parse_outline(text):
     return sections
 
 
-def search_for_sources(topic, max_results=4):
+def search_web_sources(topic, max_results=4):
     """Runs a search-only Claude call and reads real title/url pairs straight out of
     Anthropic's own web_search_tool_result blocks — never from the model's text output,
     so a source can never be fabricated: it either came from a real search hit or it
@@ -318,6 +318,82 @@ def search_for_sources(topic, max_results=4):
                 seen.add(url)
                 sources.append({"title": title, "url": url})
     return sources[:max_results]
+
+
+def search_semantic_scholar(query, max_results=4):
+    """Searches Semantic Scholar's free public API for real peer-reviewed papers —
+    no API key required. Only keeps hits with a real abstract, since a bare title
+    with no abstract can't ground a claim in what the paper actually found. Returns
+    [] on any failure (timeout, rate limit, bad response) so callers fall back
+    cleanly to general web search."""
+    try:
+        resp = requests.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": query[:300], "limit": max_results, "fields": "title,url,year,authors,abstract"},
+            timeout=12,
+        )
+    except requests.exceptions.RequestException:
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    sources = []
+    for paper in data.get("data", []):
+        title = (paper.get("title") or "").strip()
+        url = (paper.get("url") or "").strip()
+        abstract = (paper.get("abstract") or "").strip()
+        if not (title and url and abstract):
+            continue
+        authors = paper.get("authors") or []
+        author_names = ", ".join(a.get("name", "") for a in authors[:3] if a.get("name"))
+        if len(authors) > 3:
+            author_names += " et al."
+        year = paper.get("year")
+        meta = ", ".join(x for x in (author_names, str(year) if year else "") if x)
+        label = f"{title} ({meta})" if meta else title
+        sources.append({"title": label, "url": url, "abstract": abstract})
+    return sources
+
+
+def search_for_sources(topic, max_results=4):
+    """Combines two source lookups: Semantic Scholar for real peer-reviewed papers
+    (with abstracts, so the writer can ground claims in actual findings rather than
+    a title alone) plus general web search to fill any remaining slots. Semantic
+    Scholar hits come first when both find matches for the same topic; deduplicated
+    by URL."""
+    sources, seen = [], set()
+    for s in search_semantic_scholar(topic, max_results=max_results):
+        if s["url"] not in seen:
+            seen.add(s["url"])
+            sources.append(s)
+    if len(sources) < max_results:
+        for s in search_web_sources(topic, max_results=max_results - len(sources)):
+            if s["url"] not in seen:
+                seen.add(s["url"])
+                sources.append(s)
+    return sources[:max_results]
+
+
+def build_sources_block(sources):
+    """Numbered source list for the writing prompt. Sources with an abstract
+    (from Semantic Scholar) include a short excerpt, so the model can cite what
+    the paper actually found instead of guessing from the title alone."""
+    lines = []
+    for i, s in enumerate(sources):
+        line = f"[{i + 1}] {s['title']}"
+        if s.get("abstract"):
+            line += f"\n    Abstract: {s['abstract'][:400]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def public_sources(sources):
+    """Strips internal-only fields (like the full abstract) before sending
+    sources to the client — it only ever needs title + url to render links."""
+    return [{"title": s["title"], "url": s["url"]} for s in sources]
 
 
 @app.after_request
@@ -434,9 +510,9 @@ def forgot_password():
         try:
             send_email(
                 email,
-                "Reset your MasterConvert password",
+                "Reset your Docently password",
                 f"Hi {row['name'] or ''},\n\n"
-                "We received a request to reset your MasterConvert password. "
+                "We received a request to reset your Docently password. "
                 "This link expires in 1 hour:\n\n"
                 f"{reset_link}\n\n"
                 "If you didn't request this, you can safely ignore this email — "
@@ -932,6 +1008,19 @@ def write_endpoint():
     if len(topic) > 4000:
         return jsonify({"error": "Topic too long (4,000 character limit)"}), 400
 
+    # Optional conversation history for the chat UI — absent/empty means the
+    # existing one-shot topic/outline behavior below, unchanged.
+    raw_history = data.get("history") or []
+    history = []
+    if isinstance(raw_history, list):
+        for turn in raw_history[-8:]:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role")
+            content = (turn.get("content") or "").strip()[:2000]
+            if role in ("user", "assistant") and content:
+                history.append({"role": role, "content": content})
+
     outline = parse_outline(topic)
 
     try:
@@ -947,7 +1036,7 @@ def write_endpoint():
             sources = search_for_sources(combined_headings, max_results=8)
 
             if sources:
-                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                sources_block = build_sources_block(sources)
                 base_prompt = (
                     "You are writing one subsection of a longer academic piece on "
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
@@ -982,8 +1071,58 @@ def write_endpoint():
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
                     for s in outline
                 ],
-                "sources": sources,
+                "sources": public_sources(sources),
             })
+
+        # Chat mode: prior turns are present — reply to the latest message as one
+        # turn in an ongoing conversation instead of a standalone one-shot draft.
+        if history:
+            history_block = "\n".join(
+                ("Student: " if t["role"] == "user" else "You: ") + t["content"]
+                for t in history
+            )
+            search_query = topic
+            if len(topic) < 15:
+                prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
+                if prior_user:
+                    search_query = f"{prior_user} {topic}"
+
+            sources = search_for_sources(search_query)
+
+            if sources:
+                sources_block = build_sources_block(sources)
+                system_prompt = (
+                    "You are an evidence-based writing assistant in an ongoing conversation "
+                    "with a student. Below is the conversation so far, then a numbered list of "
+                    "real sources found for the student's latest message. Reply to the latest "
+                    "message directly, continuing the same thread naturally — as a direct reply, "
+                    "not restating the question. Cite sources with their bracketed number, e.g. "
+                    "[1], [2], only where genuinely relevant — not every sentence needs one, and "
+                    "it's fine to leave a source unused if it doesn't fit. Do not invent any "
+                    "author names, years, or additional sources beyond this list. Keep the reply "
+                    "focused — a few short paragraphs at most, no reference list at the end.\n\n"
+                    f"CONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                system_prompt = (
+                    "You are an evidence-based writing assistant in an ongoing conversation "
+                    "with a student. Below is the conversation so far. No verified sources were "
+                    "found for the student's latest message, so respond helpfully in plain "
+                    "prose with no citation markers or invented sources.\n\n"
+                    f"CONVERSATION SO FAR:\n{history_block}"
+                )
+
+            text = call_claude(
+                system_prompt=system_prompt,
+                user_message=topic,
+                max_tokens=500,
+                use_search=False,
+            ).strip()
+
+            if len(text) < 15:
+                raise ConversionError("Couldn't generate a reply — try rephrasing")
+
+            return jsonify({"text": text, "sources": public_sources(sources)})
 
         # Simple mode: a single flat topic, unchanged from before.
         # Step 1: search only. Sources come straight from Anthropic's own structured
@@ -995,7 +1134,7 @@ def write_endpoint():
         # or narrate about — just a single bounded completion, grounded in exactly the
         # real sources from step 1 (or told plainly that none were found).
         if sources:
-            sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+            sources_block = build_sources_block(sources)
             system_prompt = (
                 "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
                 "given topic. Below is a numbered list of real sources found for this exact "
@@ -1027,7 +1166,7 @@ def write_endpoint():
                 "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
             )
 
-        return jsonify({"text": text, "sources": sources})
+        return jsonify({"text": text, "sources": public_sources(sources)})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
