@@ -2,11 +2,13 @@ import json
 import os
 import re
 import secrets
+import smtplib
 import string
 import tempfile
 import shutil
 import uuid
 import zipfile
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -31,6 +33,7 @@ MIME_TYPES = {
 
 # CORS: locked to the live frontend.
 ALLOWED_ORIGIN = "https://masterconvert-tau.vercel.app"
+FRONTEND_URL = ALLOWED_ORIGIN
 
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -41,7 +44,13 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 
+# Password-reset emails, sent via Gmail SMTP with an app password —
+# console.google.com -> Security -> 2-Step Verification -> App passwords.
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
 FREE_CONVERSIONS_LIMIT = 2
 FREE_WINDOW_DAYS = 30
 
@@ -137,6 +146,32 @@ def verify_token(token):
         return None
 
 
+def make_reset_token(user_id):
+    return _serializer.dumps({"reset_user_id": user_id}, salt="password-reset")
+
+
+def verify_reset_token(token):
+    if not _serializer:
+        return None
+    try:
+        data = _serializer.loads(token, max_age=RESET_TOKEN_MAX_AGE, salt="password-reset")
+        return data.get("reset_user_id")
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def send_email(to_email, subject, body):
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        raise ConversionError("Email sending isn't configured on the server yet")
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = to_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+
+
 def user_row_to_dict(row):
     now = datetime.now(timezone.utc)
     used = row["conversions_used"]
@@ -212,6 +247,77 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
     data = resp.json()
     return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+
+
+OUTLINE_LINE_RE = re.compile(r'^\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$')
+
+
+def parse_outline(text):
+    """Recognizes lines like '5.1 Discussion' or '5.1.1 Knowledge of Dietary
+    Sources' as a heading with a nesting level equal to how many dot-separated
+    numbers it has (5 -> level 1, 5.1 -> level 2, 5.1.1 -> level 3). Plain
+    topic text with no such lines simply parses to an empty list."""
+    sections = []
+    for line in text.strip().split("\n"):
+        m = OUTLINE_LINE_RE.match(line)
+        if m:
+            number = m.group(1)
+            heading = m.group(2).strip()
+            if heading:
+                sections.append({"number": number, "heading": heading, "level": number.count(".") + 1})
+    return sections
+
+
+def search_for_sources(topic, max_results=4):
+    """Runs a search-only Claude call and reads real title/url pairs straight out of
+    Anthropic's own web_search_tool_result blocks — never from the model's text output,
+    so a source can never be fabricated: it either came from a real search hit or it
+    isn't in the list at all."""
+    if not ANTHROPIC_API_KEY:
+        return []
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 200,
+        "system": (
+            "Search the web for 3-4 real, credible sources (academic papers, reputable "
+            "educational or scientific publications) relevant to the given topic. Once you've "
+            "searched, just reply with the word Done — no summary needed."
+        ),
+        "messages": [{"role": "user", "content": topic}],
+        "tools": [{"type": "web_search_20260318", "name": "web_search", "max_uses": 3}],
+    }
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+    except requests.exceptions.RequestException:
+        return []
+    if resp.status_code != 200:
+        return []
+    data = resp.json()
+    sources, seen = [], set()
+    for block in data.get("content", []):
+        if block.get("type") != "web_search_tool_result":
+            continue
+        content = block.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if item.get("type") != "web_search_result":
+                continue
+            url = (item.get("url") or "").strip()
+            title = (item.get("title") or "").strip()
+            if url and title and url not in seen:
+                seen.add(url)
+                sources.append({"title": title, "url": url})
+    return sources[:max_results]
 
 
 @app.after_request
@@ -296,6 +402,81 @@ def login():
         return jsonify({"error": "Incorrect email or password"}), 401
 
     return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
+
+
+@app.route("/api/auth/forgot-password", methods=["POST", "OPTIONS"])
+def forgot_password():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not DATABASE_URL or not SECRET_KEY:
+        return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        return jsonify({"error": "Password reset emails aren't configured on the server yet"}), 500
+
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    # Always the same response whether or not the email has an account —
+    # never confirm or deny that in the response itself.
+    if row:
+        token = make_reset_token(row["id"])
+        reset_link = f"{FRONTEND_URL}/?reset_token={token}"
+        try:
+            send_email(
+                email,
+                "Reset your Docently password",
+                f"Hi {row['name'] or ''},\n\n"
+                "We received a request to reset your Docently password. "
+                "This link expires in 1 hour:\n\n"
+                f"{reset_link}\n\n"
+                "If you didn't request this, you can safely ignore this email — "
+                "your password won't change unless you click the link above.",
+            )
+        except ConversionError:
+            pass  # already validated config above; a transient send failure shouldn't leak state
+
+    return jsonify({"message": "If that email has an account, a reset link has been sent."})
+
+
+@app.route("/api/auth/reset-password", methods=["POST", "OPTIONS"])
+def reset_password():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not DATABASE_URL or not SECRET_KEY:
+        return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token = data.get("token") or ""
+    new_password = data.get("password") or ""
+
+    if len(new_password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+
+    user_id = verify_reset_token(token)
+    if not user_id:
+        return jsonify({"error": "This reset link is invalid or has expired — request a new one"}), 400
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (generate_password_hash(new_password), user_id),
+            )
+    finally:
+        conn.close()
+
+    return jsonify({"message": "Password updated — you can log in with your new password now"})
 
 
 @app.route("/api/auth/google", methods=["POST", "OPTIONS"])
@@ -748,50 +929,166 @@ def write_endpoint():
     topic = (data.get("topic") or "").strip()
     if not topic:
         return jsonify({"error": "No topic provided"}), 400
-    if len(topic) > 2000:
-        return jsonify({"error": "Topic too long (2,000 character limit)"}), 400
-    try:
-        result = call_claude(
-            system_prompt=(
-                "Use web search to find real, credible sources (academic papers, reputable "
-                "educational or scientific publications) relevant to the given topic. Then "
-                "write a clear explanatory paragraph, 150-220 words, for a student, with "
-                "brief in-text citations like (Author, Year). Only cite a source you actually "
-                "retrieved via search in this conversation — never invent an author, year, "
-                "journal, or citation, even a plausible-sounding one. If you cannot find a "
-                "genuine source for a specific claim, either drop that claim or mark it with "
-                "the literal placeholder [cite a source here] instead of guessing a citation. "
-                "Do not spend more than 2-3 searches on this — search enough to ground the "
-                "claims, then write. Your final response must contain ONLY the finished "
-                "paragraph followed by the SOURCES line below — never any narration, planning, "
-                "or commentary about your search process itself (e.g. do not write things like "
-                "'let me search for more detail' or 'I found some sources, now I will write'). "
-                "After the paragraph, on its own line write exactly 'SOURCES:' followed by "
-                "each real source you cited, one per line, as: Title — URL. List only sources "
-                "you actually found via search; if none were found, write 'SOURCES:' with "
-                "nothing after it."
-            ),
-            user_message=topic,
-            max_tokens=4000,
-            use_search=True,
-        )
+    if len(topic) > 4000:
+        return jsonify({"error": "Topic too long (4,000 character limit)"}), 400
 
-        text, _, sources_block = result.rpartition("SOURCES:")
-        if not _:
-            text = result
-        text = text.strip()
+    # Optional conversation history for the chat UI — absent/empty means the
+    # existing one-shot topic/outline behavior below, unchanged.
+    raw_history = data.get("history") or []
+    history = []
+    if isinstance(raw_history, list):
+        for turn in raw_history[-8:]:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role")
+            content = (turn.get("content") or "").strip()[:2000]
+            if role in ("user", "assistant") and content:
+                history.append({"role": role, "content": content})
+
+    outline = parse_outline(topic)
+
+    try:
+        if len(outline) >= 2:
+            # Outline mode: e.g. "5.1 Discussion / 5.1.1 General Awareness / 5.1.2 ..."
+            # Cap section count so one request can't run unbounded.
+            outline = outline[:14]
+            combined_headings = "; ".join(s["heading"] for s in outline)
+
+            # One shared search across the whole outline — a bigger, single pool
+            # of real sources every section draws from, instead of one search per
+            # section (slower and more likely to fragment/duplicate sources).
+            sources = search_for_sources(combined_headings, max_results=8)
+
+            if sources:
+                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                base_prompt = (
+                    "You are writing one subsection of a longer academic piece on "
+                    f"\"{combined_headings}\". Write ONLY the subsection given below as the "
+                    "user message — 100-160 words, plain prose. Below is a numbered list of "
+                    "real sources relevant to the overall piece — cite them naturally with "
+                    "their bracketed number, e.g. [1], [2], where genuinely relevant to this "
+                    "particular subsection; leave sources unused if they don't fit here. Do "
+                    "not invent any author names or additional sources beyond this list. No "
+                    f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                sources = []
+                base_prompt = (
+                    "You are writing one subsection of a longer academic piece on "
+                    f"\"{combined_headings}\". Write ONLY the subsection given below as the "
+                    "user message — 100-160 words, plain prose. No verified sources were "
+                    "found for this topic, so do not invent any citations, authors, or "
+                    "sources. No heading, no reference list — just the paragraph."
+                )
+
+            for sec in outline:
+                sec_text = call_claude(
+                    system_prompt=base_prompt,
+                    user_message=f"{sec['number']} {sec['heading']}",
+                    max_tokens=400,
+                    use_search=False,
+                ).strip()
+                sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
+
+            return jsonify({
+                "sections": [
+                    {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
+                    for s in outline
+                ],
+                "sources": sources,
+            })
+
+        # Chat mode: prior turns are present — reply to the latest message as one
+        # turn in an ongoing conversation instead of a standalone one-shot draft.
+        if history:
+            history_block = "\n".join(
+                ("Student: " if t["role"] == "user" else "You: ") + t["content"]
+                for t in history
+            )
+            search_query = topic
+            if len(topic) < 15:
+                prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
+                if prior_user:
+                    search_query = f"{prior_user} {topic}"
+
+            sources = search_for_sources(search_query)
+
+            if sources:
+                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                system_prompt = (
+                    "You are an evidence-based writing assistant in an ongoing conversation "
+                    "with a student. Below is the conversation so far, then a numbered list of "
+                    "real sources found for the student's latest message. Reply to the latest "
+                    "message directly, continuing the same thread naturally — as a direct reply, "
+                    "not restating the question. Cite sources with their bracketed number, e.g. "
+                    "[1], [2], only where genuinely relevant — not every sentence needs one, and "
+                    "it's fine to leave a source unused if it doesn't fit. Do not invent any "
+                    "author names, years, or additional sources beyond this list. Keep the reply "
+                    "focused — a few short paragraphs at most, no reference list at the end.\n\n"
+                    f"CONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                system_prompt = (
+                    "You are an evidence-based writing assistant in an ongoing conversation "
+                    "with a student. Below is the conversation so far. No verified sources were "
+                    "found for the student's latest message, so respond helpfully in plain "
+                    "prose with no citation markers or invented sources.\n\n"
+                    f"CONVERSATION SO FAR:\n{history_block}"
+                )
+
+            text = call_claude(
+                system_prompt=system_prompt,
+                user_message=topic,
+                max_tokens=500,
+                use_search=False,
+            ).strip()
+
+            if len(text) < 15:
+                raise ConversionError("Couldn't generate a reply — try rephrasing")
+
+            return jsonify({"text": text, "sources": sources})
+
+        # Simple mode: a single flat topic, unchanged from before.
+        # Step 1: search only. Sources come straight from Anthropic's own structured
+        # search-result blocks, not from anything the model writes — so every title/url
+        # here is guaranteed to be something that was actually found, never invented.
+        sources = search_for_sources(topic)
+
+        # Step 2: a plain, tool-free writing call. No search loop to hang, run long,
+        # or narrate about — just a single bounded completion, grounded in exactly the
+        # real sources from step 1 (or told plainly that none were found).
+        if sources:
+            sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+            system_prompt = (
+                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
+                "given topic. Below is a numbered list of real sources found for this exact "
+                "topic — refer to them naturally in the text using their bracketed number, "
+                "e.g. [1], [2], at points where that source's subject matter is genuinely "
+                "relevant. Do not invent any author names, years, or additional sources beyond "
+                "this list — the numbers are the only citation format to use. Not every "
+                "sentence needs one, and it's fine to leave a source unused if it doesn't fit. "
+                "Write plain prose only, no reference list at the end — the sources are shown "
+                f"separately.\n\nSOURCES:\n{sources_block}"
+            )
+        else:
+            system_prompt = (
+                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
+                "given topic. No verified sources were found for this specific topic, so do "
+                "not invent any citations, authors, or sources — write in plain, well-informed "
+                "prose instead, with no citation markers at all."
+            )
+
+        text = call_claude(
+            system_prompt=system_prompt,
+            user_message=topic,
+            max_tokens=500,
+            use_search=False,
+        ).strip()
+
         if len(text) < 40:
             raise ConversionError(
                 "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
             )
-        sources = []
-        for line in sources_block.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            title, sep, url = line.partition(" — ")
-            if sep and url.strip().startswith("http"):
-                sources.append({"title": title.strip(), "url": url.strip()})
 
         return jsonify({"text": text, "sources": sources})
     except ConversionError as e:
