@@ -439,6 +439,84 @@ def text_to_pptx(raw_text, out_dir):
     return out_path
 
 
+def _set_run_font(run, bold=False):
+    run.font.name = "Times New Roman"
+    run.font.size = DocxPt(12)
+    run.font.color.rgb = DocxRGBColor(0, 0, 0)
+    run.bold = bold
+    # Word can silently fall back to a different font for East-Asian text
+    # runs unless this is set explicitly alongside the Latin font name above.
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:eastAsia"), "Times New Roman")
+
+
+def academic_essay_to_docx(payload, out_dir):
+    """Builds a strictly-formatted academic Word document from AI-generated
+    evidence-based writing: Times New Roman, 12pt, black, double-spaced
+    (2.0), justified body paragraphs, and a hanging-indent APA References
+    list at the end. No AI involved — pure deterministic formatting of
+    content the caller already generated."""
+    doc = Document()
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Times New Roman"
+    normal.font.size = DocxPt(12)
+    normal.font.color.rgb = DocxRGBColor(0, 0, 0)
+    normal.paragraph_format.line_spacing = 2.0
+
+    title = (payload.get("title") or "Academic Response").strip()[:200]
+    title_p = doc.add_paragraph()
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_p.paragraph_format.line_spacing = 2.0
+    _set_run_font(title_p.add_run(title), bold=True)
+
+    def add_body_paragraph(text, bold_heading=False):
+        p = doc.add_paragraph()
+        p.paragraph_format.line_spacing = 2.0
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT if bold_heading else WD_ALIGN_PARAGRAPH.JUSTIFY
+        _set_run_font(p.add_run(text), bold=bold_heading)
+        return p
+
+    sections = payload.get("sections")
+    if sections:
+        for sec in sections:
+            add_body_paragraph(f"{sec['number']} {sec['heading']}", bold_heading=True)
+            add_body_paragraph(sec["text"])
+    else:
+        text = (payload.get("text") or "").strip()
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        for para in paragraphs or [text]:
+            add_body_paragraph(para)
+
+    references = payload.get("references") or []
+    if references:
+        doc.add_paragraph()
+        ref_heading = doc.add_paragraph()
+        ref_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        ref_heading.paragraph_format.line_spacing = 2.0
+        _set_run_font(ref_heading.add_run("References"), bold=True)
+
+        for ref in references:
+            p = doc.add_paragraph()
+            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.left_indent = DocxInches(0.5)
+            p.paragraph_format.first_line_indent = DocxInches(-0.5)
+            ref_text = (ref.get("text") or "").strip()
+            url = (ref.get("url") or "").strip()
+            if ref_text:
+                _set_run_font(p.add_run(ref_text + (" " if url else "")))
+            if url:
+                _set_run_font(p.add_run(url))
+
+    out_path = os.path.join(out_dir, "Academic_Response.docx")
+    doc.save(out_path)
+    return out_path
+
+
 # --------------------------------------------------------- extract raw text
 def extract_text(src_path, ext):
     """Pull plain text out of an uploaded file for use in the AI tools.

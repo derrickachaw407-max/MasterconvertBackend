@@ -8,6 +8,8 @@ import tempfile
 import shutil
 import uuid
 import zipfile
+from collections import Counter
+from urllib.parse import urlparse
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -19,7 +21,7 @@ from flask import Flask, request, send_file, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from converters import convert, text_to_pptx, extract_text, ConversionError
+from converters import convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
@@ -316,7 +318,7 @@ def search_web_sources(topic, max_results=4):
             title = (item.get("title") or "").strip()
             if url and title and url not in seen:
                 seen.add(url)
-                sources.append({"title": title, "url": url})
+                sources.append({"title": title, "url": url, "authors": None, "year": None, "venue": None, "abstract": None})
     return sources[:max_results]
 
 
@@ -329,7 +331,7 @@ def search_semantic_scholar(query, max_results=4):
     try:
         resp = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query[:300], "limit": max_results, "fields": "title,url,year,authors,abstract"},
+            params={"query": query[:300], "limit": max_results, "fields": "title,url,year,authors,abstract,venue"},
             timeout=12,
         )
     except requests.exceptions.RequestException:
@@ -347,14 +349,15 @@ def search_semantic_scholar(query, max_results=4):
         abstract = (paper.get("abstract") or "").strip()
         if not (title and url and abstract):
             continue
-        authors = paper.get("authors") or []
-        author_names = ", ".join(a.get("name", "") for a in authors[:3] if a.get("name"))
-        if len(authors) > 3:
-            author_names += " et al."
-        year = paper.get("year")
-        meta = ", ".join(x for x in (author_names, str(year) if year else "") if x)
-        label = f"{title} ({meta})" if meta else title
-        sources.append({"title": label, "url": url, "abstract": abstract})
+        author_names = [a.get("name", "").strip() for a in (paper.get("authors") or []) if a.get("name")]
+        sources.append({
+            "title": title,
+            "url": url,
+            "abstract": abstract,
+            "authors": author_names or None,
+            "year": paper.get("year"),
+            "venue": (paper.get("venue") or "").strip() or None,
+        })
     return sources
 
 
@@ -377,23 +380,103 @@ def search_for_sources(topic, max_results=4):
     return sources[:max_results]
 
 
+def _format_author_apa(full_name):
+    """'John Smith' -> 'Smith, J.' for a References-list author entry."""
+    parts = full_name.strip().split()
+    if not parts:
+        return full_name
+    surname = parts[-1]
+    initials = " ".join(p[0].upper() + "." for p in parts[:-1] if p)
+    return f"{surname}, {initials}" if initials else surname
+
+
+def _domain_org_name(url):
+    """Falls back to a readable site name (e.g. 'Healthline') when a web
+    source has no identifiable author — standard APA practice for websites."""
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        base = host.split(".")[0] if host else "Source"
+        return base.replace("-", " ").title() or "Source"
+    except Exception:
+        return "Source"
+
+
+def enrich_sources_for_apa(sources):
+    """Computes a real APA in-text citation key and a full References-list
+    entry for each source, from actual metadata only — nothing here is
+    invented. Sources with no known individual author fall back to the
+    organization/site name (standard APA practice); sources with no known
+    year use 'n.d.'. Duplicate (author, year) pairs get a/b/c suffixes, as
+    APA requires, applied consistently to both the in-text key and the
+    reference entry."""
+    enriched = []
+    for s in sources:
+        authors = s.get("authors")
+        if authors:
+            surnames = [a.split()[-1] for a in authors if a.split()]
+            if len(surnames) == 1:
+                author_intext = surnames[0]
+            elif len(surnames) == 2:
+                author_intext = f"{surnames[0]} & {surnames[1]}"
+            else:
+                author_intext = f"{surnames[0]} et al."
+            author_refs_list = [_format_author_apa(a) for a in authors[:20]]
+            if len(author_refs_list) == 1:
+                author_refs = author_refs_list[0]
+            else:
+                author_refs = ", ".join(author_refs_list[:-1]) + ", & " + author_refs_list[-1]
+        else:
+            org = _domain_org_name(s["url"])
+            author_intext = org
+            author_refs = org
+
+        year = s.get("year")
+        year_display = str(year) if year else "n.d."
+        enriched.append({**s, "author_intext": author_intext, "author_refs": author_refs,
+                          "year_display": year_display, "base_key": f"{author_intext}|{year_display}"})
+
+    key_counts = Counter(e["base_key"] for e in enriched)
+    running = {}
+    for e in enriched:
+        if key_counts[e["base_key"]] > 1:
+            idx = running.get(e["base_key"], 0)
+            running[e["base_key"]] = idx + 1
+            e["year_display"] += "abcdefghij"[idx] if idx < 10 else str(idx)
+        e["citation_key"] = f"({e['author_intext']}, {e['year_display']})"
+
+    for e in enriched:
+        pieces = [f"{e['author_refs']} ({e['year_display']})."]
+        title = e["title"].rstrip(".")
+        pieces.append(f"{title}.")
+        if e.get("venue"):
+            pieces.append(f"{e['venue']}.")
+        e["ref_text"] = " ".join(pieces)
+
+    return enriched
+
+
 def build_sources_block(sources):
-    """Numbered source list for the writing prompt. Sources with an abstract
-    (from Semantic Scholar) include a short excerpt, so the model can cite what
-    the paper actually found instead of guessing from the title alone."""
+    """Source list for the writing prompt, keyed by the exact APA citation
+    the model must copy verbatim. Sources with an abstract (from Semantic
+    Scholar) include a short excerpt, so the model can cite what the paper
+    actually found instead of guessing from the title alone."""
     lines = []
-    for i, s in enumerate(sources):
-        line = f"[{i + 1}] {s['title']}"
+    for s in sources:
+        line = f"{s['citation_key']} {s['title']}"
         if s.get("abstract"):
             line += f"\n    Abstract: {s['abstract'][:400]}"
         lines.append(line)
     return "\n".join(lines)
 
 
-def public_sources(sources):
-    """Strips internal-only fields (like the full abstract) before sending
-    sources to the client — it only ever needs title + url to render links."""
-    return [{"title": s["title"], "url": s["url"]} for s in sources]
+def build_references_list(sources):
+    """The client-facing References section: plain reference text plus its
+    URL as a separate field (so the frontend can render the URL as a live
+    link), alphabetized by author/organization the way APA requires."""
+    ordered = sorted(sources, key=lambda s: s["author_intext"].lower())
+    return [{"text": s["ref_text"], "url": s["url"]} for s in ordered]
 
 
 @app.after_request
@@ -998,6 +1081,26 @@ def summarize_endpoint():
         return jsonify({"error": str(e)}), 502
 
 
+CLARIFY_MARKER = "[CLARIFY]"
+CLARIFY_INSTRUCTION = (
+    "Only write on exactly what was asked — do not broaden, reinterpret, or add scope beyond "
+    "the literal request. If the request is too vague, or is missing something you genuinely "
+    "need to write specifically on that exact topic, do not write the full piece — instead "
+    f"reply with ONLY a short clarifying question or suggestion, starting your entire reply "
+    f"with the exact marker {CLARIFY_MARKER} and nothing before it."
+)
+
+
+def split_clarify(text):
+    """Detects the model's clarify marker at the very start of its reply and strips
+    it, so a genuinely ambiguous request surfaces as a short question instead of a
+    full piece of writing being generated from a guess."""
+    stripped = text.strip()
+    if stripped.startswith(CLARIFY_MARKER):
+        return True, stripped[len(CLARIFY_MARKER):].strip()
+    return False, stripped
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @auth_required
 def write_endpoint():
@@ -1033,27 +1136,27 @@ def write_endpoint():
             # One shared search across the whole outline — a bigger, single pool
             # of real sources every section draws from, instead of one search per
             # section (slower and more likely to fragment/duplicate sources).
-            sources = search_for_sources(combined_headings, max_results=8)
+            sources = enrich_sources_for_apa(search_for_sources(combined_headings, max_results=8))
 
             if sources:
                 sources_block = build_sources_block(sources)
                 base_prompt = (
                     "You are writing one subsection of a longer academic piece on "
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
-                    "user message — 100-160 words, plain prose. Below is a numbered list of "
-                    "real sources relevant to the overall piece — cite them naturally with "
-                    "their bracketed number, e.g. [1], [2], where genuinely relevant to this "
-                    "particular subsection; leave sources unused if they don't fit here. Do "
-                    "not invent any author names or additional sources beyond this list. No "
+                    "user message — 100-160 words, formal academic prose. Below is a list of "
+                    "real sources relevant to the overall piece, each labeled with its exact "
+                    "APA in-text citation, e.g. (Smith, 2023) — cite them using that EXACT "
+                    "key, copied exactly, where genuinely relevant to this particular "
+                    "subsection; leave sources unused if they don't fit here. Never alter an "
+                    "author name or year, and never invent a citation not in this list. No "
                     f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
                 )
             else:
-                sources = []
                 base_prompt = (
                     "You are writing one subsection of a longer academic piece on "
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
-                    "user message — 100-160 words, plain prose. No verified sources were "
-                    "found for this topic, so do not invent any citations, authors, or "
+                    "user message — 100-160 words, formal academic prose. No verified sources "
+                    "were found for this topic, so do not invent any citations, authors, or "
                     "sources. No heading, no reference list — just the paragraph."
                 )
 
@@ -1067,15 +1170,17 @@ def write_endpoint():
                 sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
 
             return jsonify({
+                "type": "result",
                 "sections": [
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
                     for s in outline
                 ],
-                "sources": public_sources(sources),
+                "references": build_references_list(sources),
             })
 
-        # Chat mode: prior turns are present — reply to the latest message as one
-        # turn in an ongoing conversation instead of a standalone one-shot draft.
+        # Chat mode (history present) and simple mode (first message, no history
+        # yet) share the same citation and clarify-guardrail logic below — they
+        # differ only in whether prior turns are folded into the prompt.
         if history:
             history_block = "\n".join(
                 ("Student: " if t["role"] == "user" else "You: ") + t["content"]
@@ -1086,89 +1191,106 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-
-            sources = search_for_sources(search_query)
+            sources = enrich_sources_for_apa(search_for_sources(search_query))
 
             if sources:
                 sources_block = build_sources_block(sources)
                 system_prompt = (
-                    "You are an evidence-based writing assistant in an ongoing conversation "
-                    "with a student. Below is the conversation so far, then a numbered list of "
-                    "real sources found for the student's latest message. Reply to the latest "
-                    "message directly, continuing the same thread naturally — as a direct reply, "
-                    "not restating the question. Cite sources with their bracketed number, e.g. "
-                    "[1], [2], only where genuinely relevant — not every sentence needs one, and "
-                    "it's fine to leave a source unused if it doesn't fit. Do not invent any "
-                    "author names, years, or additional sources beyond this list. Keep the reply "
-                    "focused — a few short paragraphs at most, no reference list at the end.\n\n"
-                    f"CONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
+                    "You are an evidence-based academic writing assistant in an ongoing "
+                    f"conversation with a student. {CLARIFY_INSTRUCTION} Below is the "
+                    "conversation so far, then a list of real sources found for the "
+                    "student's latest message, each labeled with its exact APA in-text "
+                    "citation, e.g. (Smith, 2023). When you do write, cite sources using "
+                    "that EXACT citation key, copied exactly — never alter an author name "
+                    "or year, and never invent a citation not in this list. Not every "
+                    "sentence needs one, and it's fine to leave a source unused if it "
+                    "doesn't fit. Write in formal academic prose, a few short paragraphs "
+                    "at most. Do not write a references list yourself — it is generated "
+                    f"separately.\n\nCONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
-                    "You are an evidence-based writing assistant in an ongoing conversation "
-                    "with a student. Below is the conversation so far. No verified sources were "
-                    "found for the student's latest message, so respond helpfully in plain "
-                    "prose with no citation markers or invented sources.\n\n"
-                    f"CONVERSATION SO FAR:\n{history_block}"
+                    "You are an evidence-based academic writing assistant in an ongoing "
+                    f"conversation with a student. {CLARIFY_INSTRUCTION} No verified sources "
+                    "were found for the student's latest message, so if you do write, "
+                    "respond in formal academic prose with no citation markers or invented "
+                    f"sources.\n\nCONVERSATION SO FAR:\n{history_block}"
+                )
+        else:
+            sources = enrich_sources_for_apa(search_for_sources(topic))
+
+            if sources:
+                sources_block = build_sources_block(sources)
+                system_prompt = (
+                    f"You are an evidence-based academic writing assistant. {CLARIFY_INSTRUCTION} "
+                    "Below is a list of real sources found for this exact topic, each labeled "
+                    "with its exact APA in-text citation, e.g. (Smith, 2023). When you do "
+                    "write, produce a clear, well-informed academic paragraph, 150-220 words, "
+                    "citing sources using that EXACT citation key, copied exactly — never "
+                    "alter an author name or year, and never invent a citation not in this "
+                    "list. Not every sentence needs one, and it's fine to leave a source "
+                    "unused if it doesn't fit. Write in formal academic prose. Do not write a "
+                    f"references list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                system_prompt = (
+                    f"You are an evidence-based academic writing assistant. {CLARIFY_INSTRUCTION} "
+                    "No verified sources were found for this specific topic, so if you do "
+                    "write, write a clear, well-informed academic paragraph, 150-220 words, "
+                    "in formal prose with no citation markers or invented sources."
                 )
 
-            text = call_claude(
-                system_prompt=system_prompt,
-                user_message=topic,
-                max_tokens=500,
-                use_search=False,
-            ).strip()
-
-            if len(text) < 15:
-                raise ConversionError("Couldn't generate a reply — try rephrasing")
-
-            return jsonify({"text": text, "sources": public_sources(sources)})
-
-        # Simple mode: a single flat topic, unchanged from before.
-        # Step 1: search only. Sources come straight from Anthropic's own structured
-        # search-result blocks, not from anything the model writes — so every title/url
-        # here is guaranteed to be something that was actually found, never invented.
-        sources = search_for_sources(topic)
-
-        # Step 2: a plain, tool-free writing call. No search loop to hang, run long,
-        # or narrate about — just a single bounded completion, grounded in exactly the
-        # real sources from step 1 (or told plainly that none were found).
-        if sources:
-            sources_block = build_sources_block(sources)
-            system_prompt = (
-                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
-                "given topic. Below is a numbered list of real sources found for this exact "
-                "topic — refer to them naturally in the text using their bracketed number, "
-                "e.g. [1], [2], at points where that source's subject matter is genuinely "
-                "relevant. Do not invent any author names, years, or additional sources beyond "
-                "this list — the numbers are the only citation format to use. Not every "
-                "sentence needs one, and it's fine to leave a source unused if it doesn't fit. "
-                "Write plain prose only, no reference list at the end — the sources are shown "
-                f"separately.\n\nSOURCES:\n{sources_block}"
-            )
-        else:
-            system_prompt = (
-                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
-                "given topic. No verified sources were found for this specific topic, so do "
-                "not invent any citations, authors, or sources — write in plain, well-informed "
-                "prose instead, with no citation markers at all."
-            )
-
-        text = call_claude(
+        raw_text = call_claude(
             system_prompt=system_prompt,
             user_message=topic,
             max_tokens=500,
             use_search=False,
         ).strip()
 
-        if len(text) < 40:
-            raise ConversionError(
-                "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
-            )
+        is_clarify, text = split_clarify(raw_text)
 
-        return jsonify({"text": text, "sources": public_sources(sources)})
+        if not text:
+            raise ConversionError("Couldn't generate a reply — try rephrasing")
+        if not is_clarify and len(text) < 15:
+            raise ConversionError("Couldn't generate a reply — try rephrasing")
+
+        if is_clarify:
+            return jsonify({"type": "clarify", "text": text})
+
+        return jsonify({"type": "result", "text": text, "references": build_references_list(sources)})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/write/export-docx", methods=["POST", "OPTIONS"])
+@auth_required
+def write_export_docx_endpoint():
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "Academic Response").strip()
+    text = data.get("text")
+    sections = data.get("sections")
+    references = data.get("references") or []
+    if not text and not sections:
+        return jsonify({"error": "No content to export"}), 400
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_docx_{uuid.uuid4().hex[:8]}_")
+    try:
+        result_path = academic_essay_to_docx(
+            {"title": title, "text": text, "sections": sections, "references": references},
+            work_dir,
+        )
+        return send_file(
+            result_path,
+            mimetype=MIME_TYPES["docx"],
+            as_attachment=True,
+            download_name="Academic_Response.docx",
+        )
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        return jsonify({"error": f"Export failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 init_db()
