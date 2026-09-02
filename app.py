@@ -1083,11 +1083,17 @@ def summarize_endpoint():
 
 CLARIFY_MARKER = "[CLARIFY]"
 CLARIFY_INSTRUCTION = (
-    "Only write on exactly what was asked — do not broaden, reinterpret, or add scope beyond "
-    "the literal request. If the request is too vague, or is missing something you genuinely "
-    "need to write specifically on that exact topic, do not write the full piece — instead "
-    f"reply with ONLY a short clarifying question or suggestion, starting your entire reply "
-    f"with the exact marker {CLARIFY_MARKER} and nothing before it."
+    "Interpret the request generously and do your best with it even if it is unclear, "
+    "incomplete, oddly phrased, or missing details a student would ideally have given — use "
+    "your own general knowledge and judgment to fill reasonable gaps rather than requiring a "
+    "perfectly-worded request. If a specific missing detail would meaningfully change what "
+    "you write, briefly state the assumption you're making in one sentence at the very start "
+    "of your reply, then continue immediately with the full piece written on that assumption "
+    "— never stop at just the assumption. Reserve asking a clarifying question INSTEAD of "
+    "writing for the rare case where the request is so minimal, contentless, or contradictory "
+    "that no reasonable topic can be identified at all — not merely because it's broad, "
+    f"informal, or underspecified. In that rare case only, start your entire reply with the "
+    f"exact marker {CLARIFY_MARKER} and nothing else before it."
 )
 
 
@@ -1148,7 +1154,9 @@ def write_endpoint():
                     "APA in-text citation, e.g. (Smith, 2023) — cite them using that EXACT "
                     "key, copied exactly, where genuinely relevant to this particular "
                     "subsection; leave sources unused if they don't fit here. Never alter an "
-                    "author name or year, and never invent a citation not in this list. No "
+                    "author name or year, and never invent a citation not in this list — if "
+                    "the sources don't fully cover this subsection, draw on your own general "
+                    "knowledge to complete it, just without a citation on that part. No "
                     f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
                 )
             else:
@@ -1202,7 +1210,9 @@ def write_endpoint():
                     "student's latest message, each labeled with its exact APA in-text "
                     "citation, e.g. (Smith, 2023). When you do write, cite sources using "
                     "that EXACT citation key, copied exactly — never alter an author name "
-                    "or year, and never invent a citation not in this list. Not every "
+                    "or year, and never invent a citation not in this list — if the sources "
+                    "don't fully cover a point, draw on your own general knowledge to "
+                    "complete the answer, just without a citation on that part. Not every "
                     "sentence needs one, and it's fine to leave a source unused if it "
                     "doesn't fit. Write in formal academic prose, a few short paragraphs "
                     "at most. Do not write a references list yourself — it is generated "
@@ -1212,9 +1222,9 @@ def write_endpoint():
                 system_prompt = (
                     "You are an evidence-based academic writing assistant in an ongoing "
                     f"conversation with a student. {CLARIFY_INSTRUCTION} No verified sources "
-                    "were found for the student's latest message, so if you do write, "
-                    "respond in formal academic prose with no citation markers or invented "
-                    f"sources.\n\nCONVERSATION SO FAR:\n{history_block}"
+                    "were found for the student's latest message, so write from your own "
+                    "well-informed general knowledge in formal academic prose, with no "
+                    f"citation markers or invented sources.\n\nCONVERSATION SO FAR:\n{history_block}"
                 )
         else:
             sources = enrich_sources_for_apa(search_for_sources(topic))
@@ -1228,16 +1238,19 @@ def write_endpoint():
                     "write, produce a clear, well-informed academic paragraph, 150-220 words, "
                     "citing sources using that EXACT citation key, copied exactly — never "
                     "alter an author name or year, and never invent a citation not in this "
-                    "list. Not every sentence needs one, and it's fine to leave a source "
-                    "unused if it doesn't fit. Write in formal academic prose. Do not write a "
-                    f"references list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
+                    "list — if the sources don't fully cover a point, draw on your own general "
+                    "knowledge to complete the answer, just without a citation on that part. "
+                    "Not every sentence needs one, and it's fine to leave a source unused if "
+                    "it doesn't fit. Write in formal academic prose. Do not write a references "
+                    f"list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
                     f"You are an evidence-based academic writing assistant. {CLARIFY_INSTRUCTION} "
-                    "No verified sources were found for this specific topic, so if you do "
-                    "write, write a clear, well-informed academic paragraph, 150-220 words, "
-                    "in formal prose with no citation markers or invented sources."
+                    "No verified sources were found for this specific topic, so write a "
+                    "clear, well-informed academic paragraph, 150-220 words, from your own "
+                    "general knowledge, in formal prose with no citation markers or "
+                    "invented sources."
                 )
 
         raw_text = call_claude(
