@@ -454,13 +454,44 @@ def _set_run_font(run, bold=False):
     rfonts.set(qn("w:eastAsia"), "Times New Roman")
 
 
+def _add_page_number_footer(doc):
+    """Adds a centered auto-updating page number to the footer — standard
+    for academic documents."""
+    footer = doc.sections[0].footer
+    p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.line_spacing = 1.0
+    run = p.add_run()
+    run.font.name = "Times New Roman"
+    run.font.size = DocxPt(12)
+    run.font.color.rgb = DocxRGBColor(0, 0, 0)
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = "PAGE"
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_end)
+
+
 def academic_essay_to_docx(payload, out_dir):
     """Builds a strictly-formatted academic Word document from AI-generated
-    evidence-based writing: Times New Roman, 12pt, black, double-spaced
-    (2.0), justified body paragraphs, and a hanging-indent APA References
-    list at the end. No AI involved — pure deterministic formatting of
-    content the caller already generated."""
+    academic writing: Times New Roman, 12pt, black, double-spaced (2.0),
+    1-inch margins, justified body paragraphs with a standard first-line
+    indent, a centered page number in the footer, and a hanging-indent APA
+    References list at the end. No AI involved — pure deterministic
+    formatting of content the caller already generated."""
     doc = Document()
+
+    section = doc.sections[0]
+    section.left_margin = DocxInches(1)
+    section.right_margin = DocxInches(1)
+    section.top_margin = DocxInches(1)
+    section.bottom_margin = DocxInches(1)
+    _add_page_number_footer(doc)
 
     normal = doc.styles["Normal"]
     normal.font.name = "Times New Roman"
@@ -477,7 +508,11 @@ def academic_essay_to_docx(payload, out_dir):
     def add_body_paragraph(text, bold_heading=False):
         p = doc.add_paragraph()
         p.paragraph_format.line_spacing = 2.0
-        p.alignment = WD_ALIGN_PARAGRAPH.LEFT if bold_heading else WD_ALIGN_PARAGRAPH.JUSTIFY
+        if bold_heading:
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.first_line_indent = DocxInches(0.5)
         _set_run_font(p.add_run(text), bold=bold_heading)
         return p
 

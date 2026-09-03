@@ -239,7 +239,7 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
                 "content-type": "application/json",
             },
             json=payload,
-            timeout=140 if use_search else 45,
+            timeout=140 if use_search else 110,
         )
     except requests.exceptions.Timeout:
         raise ConversionError("AI request timed out — try again, or try a narrower topic")
@@ -1081,6 +1081,31 @@ def summarize_endpoint():
         return jsonify({"error": str(e)}), 502
 
 
+ROLE_DESCRIPTION = (
+    "You are Docently's academic and research writing assistant, supporting a student or "
+    "researcher across the full range of academic work: drafting and structuring research "
+    "proposals, literature reviews, abstracts, and full papers; improving clarity, grammar, "
+    "tense consistency, and academic tone in a draft they've pasted in; formatting in-text "
+    "citations and references in APA; interpreting findings and discussion sections; spotting "
+    "gaps in an argument or methodology; helping frame research questions and objectives; "
+    "summarizing concepts from the literature and explaining complex theories or mechanisms "
+    "in plain language; advising on study designs, sampling techniques, statistical tools, "
+    "and ethical considerations; interpreting descriptive statistics and results tables; "
+    "correcting grammar, tense, and awkward phrasing; smoothing over stiff or unnatural "
+    "AI-sounding language so writing reads naturally; and building practical tools like "
+    "questionnaires, data-collection instruments, tables, summaries, and structured outlines. "
+    "Match your response's shape to what was actually asked — flowing prose for a draft or "
+    "explanation, a numbered list for a questionnaire, a clear structure for comparing or "
+    "summarizing data, a short bulleted critique for gaps in an argument — rather than "
+    "forcing every reply into the same paragraph shape. Talk to the student in a warm, "
+    "friendly, genuinely conversational voice — like a supportive, knowledgeable mentor "
+    "talking things through with them — for your own commentary, feedback, and guidance. But "
+    "when you're drafting the actual academic content itself (a lit review paragraph, an "
+    "abstract, a proposal section), write that content in standard formal academic register, "
+    "not a casual one — the warmth lives in how you talk to the student around the work, not "
+    "inside the academic writing you hand them."
+)
+
 CLARIFY_MARKER = "[CLARIFY]"
 CLARIFY_INSTRUCTION = (
     "Interpret the request generously and do your best with it even if it is unclear, "
@@ -1114,8 +1139,8 @@ def write_endpoint():
     topic = (data.get("topic") or "").strip()
     if not topic:
         return jsonify({"error": "No topic provided"}), 400
-    if len(topic) > 4000:
-        return jsonify({"error": "Topic too long (4,000 character limit)"}), 400
+    if len(topic) > 20000:
+        return jsonify({"error": "That's too long for one message (20,000 character limit) — try splitting it into sections"}), 400
 
     # Optional conversation history for the chat UI — absent/empty means the
     # existing one-shot topic/outline behavior below, unchanged.
@@ -1204,27 +1229,29 @@ def write_endpoint():
             if sources:
                 sources_block = build_sources_block(sources)
                 system_prompt = (
-                    "You are an evidence-based academic writing assistant in an ongoing "
-                    f"conversation with a student. {CLARIFY_INSTRUCTION} Below is the "
-                    "conversation so far, then a list of real sources found for the "
-                    "student's latest message, each labeled with its exact APA in-text "
-                    "citation, e.g. (Smith, 2023). When you do write, cite sources using "
-                    "that EXACT citation key, copied exactly — never alter an author name "
-                    "or year, and never invent a citation not in this list — if the sources "
-                    "don't fully cover a point, draw on your own general knowledge to "
-                    "complete the answer, just without a citation on that part. Not every "
-                    "sentence needs one, and it's fine to leave a source unused if it "
-                    "doesn't fit. Write in formal academic prose, a few short paragraphs "
-                    "at most. Do not write a references list yourself — it is generated "
+                    f"{ROLE_DESCRIPTION} {CLARIFY_INSTRUCTION} You're in an ongoing "
+                    "conversation with the student — below is the conversation so far, then "
+                    "a list of real sources found for their latest message, each labeled "
+                    "with its exact APA in-text citation, e.g. (Smith, 2023). When your "
+                    "response makes evidence-based claims, cite sources using that EXACT "
+                    "citation key, copied exactly — never alter an author name or year, and "
+                    "never invent a citation not in this list; if the sources don't fully "
+                    "cover a point, draw on your own general knowledge to complete it, just "
+                    "without a citation on that part. Citations only belong where the task "
+                    "calls for them — skip them entirely for tasks like grammar editing, "
+                    "building a questionnaire, or interpreting a table the student pasted "
+                    "in. Write as much as the task genuinely needs — a quick fix might be a "
+                    "sentence or two, a literature review draft might run several "
+                    "paragraphs. Do not write a references list yourself — it is generated "
                     f"separately.\n\nCONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
-                    "You are an evidence-based academic writing assistant in an ongoing "
-                    f"conversation with a student. {CLARIFY_INSTRUCTION} No verified sources "
-                    "were found for the student's latest message, so write from your own "
-                    "well-informed general knowledge in formal academic prose, with no "
-                    f"citation markers or invented sources.\n\nCONVERSATION SO FAR:\n{history_block}"
+                    f"{ROLE_DESCRIPTION} {CLARIFY_INSTRUCTION} No verified sources were "
+                    "found for the student's latest message, so respond from your own "
+                    "well-informed general knowledge, with no citation markers or invented "
+                    "sources. Write as much as the task genuinely needs.\n\n"
+                    f"CONVERSATION SO FAR:\n{history_block}"
                 )
         else:
             sources = enrich_sources_for_apa(search_for_sources(topic))
@@ -1232,31 +1259,31 @@ def write_endpoint():
             if sources:
                 sources_block = build_sources_block(sources)
                 system_prompt = (
-                    f"You are an evidence-based academic writing assistant. {CLARIFY_INSTRUCTION} "
-                    "Below is a list of real sources found for this exact topic, each labeled "
-                    "with its exact APA in-text citation, e.g. (Smith, 2023). When you do "
-                    "write, produce a clear, well-informed academic paragraph, 150-220 words, "
-                    "citing sources using that EXACT citation key, copied exactly — never "
-                    "alter an author name or year, and never invent a citation not in this "
-                    "list — if the sources don't fully cover a point, draw on your own general "
-                    "knowledge to complete the answer, just without a citation on that part. "
-                    "Not every sentence needs one, and it's fine to leave a source unused if "
-                    "it doesn't fit. Write in formal academic prose. Do not write a references "
-                    f"list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
+                    f"{ROLE_DESCRIPTION} {CLARIFY_INSTRUCTION} Below is a list of real "
+                    "sources found for this exact topic, each labeled with its exact APA "
+                    "in-text citation, e.g. (Smith, 2023). When your response makes "
+                    "evidence-based claims, cite sources using that EXACT citation key, "
+                    "copied exactly — never alter an author name or year, and never invent "
+                    "a citation not in this list; if the sources don't fully cover a point, "
+                    "draw on your own general knowledge to complete it, just without a "
+                    "citation on that part. Citations only belong where the task calls for "
+                    "them — skip them entirely for tasks like grammar editing, building a "
+                    "questionnaire, or interpreting a table the student pasted in. Write as "
+                    "much as the task genuinely needs. Do not write a references list "
+                    f"yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
-                    f"You are an evidence-based academic writing assistant. {CLARIFY_INSTRUCTION} "
-                    "No verified sources were found for this specific topic, so write a "
-                    "clear, well-informed academic paragraph, 150-220 words, from your own "
-                    "general knowledge, in formal prose with no citation markers or "
-                    "invented sources."
+                    f"{ROLE_DESCRIPTION} {CLARIFY_INSTRUCTION} No verified sources were "
+                    "found for this specific topic, so respond from your own well-informed "
+                    "general knowledge, with no citation markers or invented sources. Write "
+                    "as much as the task genuinely needs."
                 )
 
         raw_text = call_claude(
             system_prompt=system_prompt,
             user_message=topic,
-            max_tokens=500,
+            max_tokens=4000,
             use_search=False,
         ).strip()
 
