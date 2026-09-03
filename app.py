@@ -1142,6 +1142,13 @@ def write_endpoint():
     if len(topic) > 20000:
         return jsonify({"error": "That's too long for one message (20,000 character limit) — try splitting it into sections"}), 400
 
+    # An uploaded document's text, if any — kept separate from the typed
+    # command so it never pollutes the search query, and so the frontend can
+    # display just the command in the chat transcript.
+    attachment = (data.get("attachment") or "").strip()
+    if len(attachment) > 20000:
+        return jsonify({"error": "That attached document is too long (20,000 character limit)"}), 400
+
     # Optional conversation history for the chat UI — absent/empty means the
     # existing one-shot topic/outline behavior below, unchanged.
     raw_history = data.get("history") or []
@@ -1176,13 +1183,14 @@ def write_endpoint():
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
                     "user message — 100-160 words, formal academic prose. Below is a list of "
                     "real sources relevant to the overall piece, each labeled with its exact "
-                    "APA in-text citation, e.g. (Smith, 2023) — cite them using that EXACT "
-                    "key, copied exactly, where genuinely relevant to this particular "
-                    "subsection; leave sources unused if they don't fit here. Never alter an "
-                    "author name or year, and never invent a citation not in this list — if "
-                    "the sources don't fully cover this subsection, draw on your own general "
-                    "knowledge to complete it, just without a citation on that part. No "
-                    f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
+                    "APA in-text citation, e.g. (Smith, 2023). Cite EVERY sentence that makes "
+                    "a claim, using the EXACT key next to its supporting source, copied "
+                    "exactly — never alter an author name or year, and never invent a "
+                    "citation not in this list. If a sentence can't be tied to one of the "
+                    "given sources, leave that claim out entirely rather than writing it "
+                    "uncited or attaching a fabricated citation — keep the subsection only "
+                    "as long as what the sources genuinely support. No heading, no "
+                    f"reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 base_prompt = (
@@ -1233,12 +1241,16 @@ def write_endpoint():
                     "conversation with the student — below is the conversation so far, then "
                     "a list of real sources found for their latest message, each labeled "
                     "with its exact APA in-text citation, e.g. (Smith, 2023). When your "
-                    "response makes evidence-based claims, cite sources using that EXACT "
-                    "citation key, copied exactly — never alter an author name or year, and "
-                    "never invent a citation not in this list; if the sources don't fully "
-                    "cover a point, draw on your own general knowledge to complete it, just "
-                    "without a citation on that part. Citations only belong where the task "
-                    "calls for them — skip them entirely for tasks like grammar editing, "
+                    "response is generating written academic content (a draft, an "
+                    "explanation, a literature summary, an argument), cite EVERY sentence "
+                    "that makes a claim, using the EXACT citation key next to its "
+                    "supporting source — copied exactly, never altering an author name or "
+                    "year, and never inventing a citation not in this list. If a sentence "
+                    "can't be tied to one of the given sources, leave that claim out "
+                    "entirely rather than writing it uncited or attaching a fabricated "
+                    "citation — keep the response only as long as what the sources "
+                    "genuinely support. Citations don't apply to tasks that aren't "
+                    "generating cited content — skip them entirely for grammar editing, "
                     "building a questionnaire, or interpreting a table the student pasted "
                     "in. Write as much as the task genuinely needs — a quick fix might be a "
                     "sentence or two, a literature review draft might run several "
@@ -1261,16 +1273,19 @@ def write_endpoint():
                 system_prompt = (
                     f"{ROLE_DESCRIPTION} {CLARIFY_INSTRUCTION} Below is a list of real "
                     "sources found for this exact topic, each labeled with its exact APA "
-                    "in-text citation, e.g. (Smith, 2023). When your response makes "
-                    "evidence-based claims, cite sources using that EXACT citation key, "
-                    "copied exactly — never alter an author name or year, and never invent "
-                    "a citation not in this list; if the sources don't fully cover a point, "
-                    "draw on your own general knowledge to complete it, just without a "
-                    "citation on that part. Citations only belong where the task calls for "
-                    "them — skip them entirely for tasks like grammar editing, building a "
-                    "questionnaire, or interpreting a table the student pasted in. Write as "
-                    "much as the task genuinely needs. Do not write a references list "
-                    f"yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
+                    "in-text citation, e.g. (Smith, 2023). When your response is generating "
+                    "written academic content (a draft, an explanation, a literature "
+                    "summary, an argument), cite EVERY sentence that makes a claim, using "
+                    "the EXACT citation key next to its supporting source — copied exactly, "
+                    "never altering an author name or year, and never inventing a citation "
+                    "not in this list. If a sentence can't be tied to one of the given "
+                    "sources, leave that claim out entirely rather than writing it uncited "
+                    "or attaching a fabricated citation — keep the response only as long as "
+                    "what the sources genuinely support. Citations don't apply to tasks "
+                    "that aren't generating cited content — skip them entirely for grammar "
+                    "editing, building a questionnaire, or interpreting a table the student "
+                    "pasted in. Write as much as the task genuinely needs. Do not write a "
+                    f"references list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
@@ -1280,9 +1295,14 @@ def write_endpoint():
                     "as much as the task genuinely needs."
                 )
 
+        user_message = (
+            f"[Attached document]\n{attachment}\n[End of attached document]\n\nStudent's message: {topic}"
+            if attachment else topic
+        )
+
         raw_text = call_claude(
             system_prompt=system_prompt,
-            user_message=topic,
+            user_message=user_message,
             max_tokens=4000,
             use_search=False,
         ).strip()
