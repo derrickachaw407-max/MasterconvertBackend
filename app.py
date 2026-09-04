@@ -343,10 +343,12 @@ def search_web_sources(topic, max_results=4):
     """Runs a search-only Claude call and reads real title/url pairs straight out of
     Anthropic's own web_search_tool_result blocks — never from the model's text output,
     so a source can never be fabricated: it either came from a real search hit or it
-    isn't in the list at all."""
+    isn't in the list at all. Returns (sources, diagnostic) — diagnostic explains
+    exactly why the list is empty, if it is, so that reason can reach the student
+    instead of getting lost in server logs no one can see."""
     if not ANTHROPIC_API_KEY:
         logger.warning("search_web_sources: no ANTHROPIC_API_KEY set, skipping")
-        return []
+        return [], "web search skipped (no API key configured on the server)"
     payload = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 200,
@@ -371,13 +373,13 @@ def search_web_sources(topic, max_results=4):
         )
     except requests.exceptions.RequestException as e:
         logger.warning("search_web_sources: request failed for %r: %s", topic[:80], e)
-        return []
+        return [], f"web search request failed: {e}"
     if resp.status_code != 200:
         logger.warning(
             "search_web_sources: non-200 (%s) for %r — body: %s",
             resp.status_code, topic[:80], resp.text[:500],
         )
-        return []
+        return [], f"web search returned HTTP {resp.status_code}: {resp.text[:200]}"
     data = resp.json()
     sources, seen = [], set()
     for block in data.get("content", []):
@@ -395,7 +397,8 @@ def search_web_sources(topic, max_results=4):
                 seen.add(url)
                 sources.append({"title": title, "url": url, "authors": None, "year": None, "venue": None, "abstract": None})
     logger.info("search_web_sources: %r -> %d source(s)", topic[:80], len(sources))
-    return sources[:max_results]
+    diag = None if sources else "web search ran but found no usable results for this topic"
+    return sources[:max_results], diag
 
 
 def search_semantic_scholar(query, max_results=4):
@@ -407,8 +410,8 @@ def search_semantic_scholar(query, max_results=4):
     niche topics. Fetches a larger relevance-matched pool than max_results, then
     sorts by publication year descending so the most recent matching papers are
     preferred — falls back to older ones only when too few recent matches exist
-    for the topic. Returns [] on any failure (timeout, rate limit, bad response)
-    so callers fall back cleanly to general web search."""
+    for the topic. Returns (sources, diagnostic) — sources is [] on any failure
+    (timeout, rate limit, bad response), with diagnostic explaining why."""
     try:
         resp = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -417,18 +420,19 @@ def search_semantic_scholar(query, max_results=4):
         )
     except requests.exceptions.RequestException as e:
         logger.warning("search_semantic_scholar: request failed for %r: %s", query[:80], e)
-        return []
+        return [], f"Semantic Scholar request failed: {e}"
     if resp.status_code != 200:
         logger.warning(
             "search_semantic_scholar: non-200 (%s) for %r — body: %s",
             resp.status_code, query[:80], resp.text[:500],
         )
-        return []
+        reason = "rate-limited (too many requests)" if resp.status_code == 429 else f"HTTP {resp.status_code}"
+        return [], f"Semantic Scholar {reason}: {resp.text[:200]}"
     try:
         data = resp.json()
     except ValueError:
         logger.warning("search_semantic_scholar: non-JSON response for %r", query[:80])
-        return []
+        return [], "Semantic Scholar returned a non-JSON response"
     sources = []
     for paper in data.get("data", []):
         title = (paper.get("title") or "").strip()
@@ -446,8 +450,13 @@ def search_semantic_scholar(query, max_results=4):
             "venue": (paper.get("venue") or "").strip() or None,
         })
     sources.sort(key=lambda s: s["year"] or 0, reverse=True)
-    logger.info("search_semantic_scholar: %r -> %d source(s) (raw hits: %d)", query[:80], len(sources), len(data.get("data", [])))
-    return sources[:max_results]
+    raw_count = len(data.get("data", []))
+    logger.info("search_semantic_scholar: %r -> %d source(s) (raw hits: %d)", query[:80], len(sources), raw_count)
+    diag = None if sources else (
+        f"Semantic Scholar ran but returned {raw_count} raw hits, none usable" if raw_count
+        else "Semantic Scholar found zero matching papers for this topic"
+    )
+    return sources[:max_results], diag
 
 
 def search_for_sources(topic, max_results=8):
@@ -456,22 +465,28 @@ def search_for_sources(topic, max_results=8):
     web search to fill any remaining slots only when Semantic Scholar can't cover
     the topic on its own — general web sources carry no verifiable author or
     publication date, so they're a last resort, not the default. Semantic Scholar
-    hits come first when both find matches for the same topic; deduplicated by URL."""
+    hits come first when both find matches for the same topic; deduplicated by URL.
+    Returns (sources, diagnostic) — diagnostic is only set when sources ends up
+    empty, combining both underlying reasons so the failure is never silent."""
     sources, seen = [], set()
-    for s in search_semantic_scholar(topic, max_results=max_results):
+    ss_sources, ss_diag = search_semantic_scholar(topic, max_results=max_results)
+    for s in ss_sources:
         if s["url"] not in seen:
             seen.add(s["url"])
             sources.append(s)
+    web_diag = None
     if len(sources) < max_results:
-        for s in search_web_sources(topic, max_results=max_results - len(sources)):
+        web_sources, web_diag = search_web_sources(topic, max_results=max_results - len(sources))
+        for s in web_sources:
             if s["url"] not in seen:
                 seen.add(s["url"])
                 sources.append(s)
     if not sources:
-        logger.warning("search_for_sources: ZERO total sources found for %r", topic[:120])
-    else:
-        logger.info("search_for_sources: %r -> %d total source(s)", topic[:80], len(sources))
-    return sources[:max_results]
+        combined_diag = "; ".join(d for d in (ss_diag, web_diag) if d) or "no sources found (unknown reason)"
+        logger.warning("search_for_sources: ZERO total sources found for %r — %s", topic[:120], combined_diag)
+        return [], combined_diag
+    logger.info("search_for_sources: %r -> %d total source(s)", topic[:80], len(sources))
+    return sources[:max_results], None
 
 
 def _format_author_apa(full_name):
@@ -1309,7 +1324,8 @@ def write_endpoint():
         if not previous_text:
             return jsonify({"error": "Nothing to continue"}), 400
         try:
-            cont_sources = enrich_sources_for_apa(search_for_sources(topic))
+            cont_sources, cont_diag = search_for_sources(topic)
+            cont_sources = enrich_sources_for_apa(cont_sources)
             if cont_sources:
                 cont_sources_block = build_sources_block(cont_sources)
                 cont_system_prompt = (
@@ -1365,7 +1381,8 @@ def write_endpoint():
             # One shared search across the whole outline — a bigger, single pool
             # of real sources every section draws from, instead of one search per
             # section (slower and more likely to fragment/duplicate sources).
-            sources = enrich_sources_for_apa(search_for_sources(combined_headings, max_results=8))
+            sources, sources_diag = search_for_sources(combined_headings, max_results=8)
+            sources = enrich_sources_for_apa(sources)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -1438,7 +1455,8 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-            sources = enrich_sources_for_apa(search_for_sources(search_query))
+            raw_sources, search_diag = search_for_sources(search_query)
+            sources = enrich_sources_for_apa(raw_sources)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -1471,19 +1489,23 @@ def write_endpoint():
                 )
             else:
                 system_prompt = (
-                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
-                    "found for the student's latest message. Write from your own "
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Source search ran for "
+                    "the student's latest message and came back with nothing usable — here's "
+                    f"exactly why, verbatim: \"{search_diag}\". Write from your own "
                     "well-informed general knowledge instead — but do NOT insert any "
                     "placeholder in place of a citation, in any form: no [Author, Year], no "
                     "[Citation needed], no [source], no blank brackets, nothing standing in "
                     "for a reference that isn't there. If the topic genuinely calls for "
                     "citation-backed evidence you don't have, say so plainly to the student in "
-                    "a sentence or two instead of writing the piece with fake-looking markers "
-                    "sprinkled through it. Write as much as the task genuinely needs.\n\n"
+                    "a sentence or two — and include the verbatim search-failure reason above "
+                    "so they know exactly what to check next, rather than a vague 'no sources "
+                    "found'. Write as much as the task genuinely needs.\n\n"
                     f"CONVERSATION SO FAR:\n{history_block}"
+
                 )
         else:
-            sources = enrich_sources_for_apa(search_for_sources(topic))
+            raw_sources2, search_diag2 = search_for_sources(topic)
+            sources = enrich_sources_for_apa(raw_sources2)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -1512,15 +1534,17 @@ def write_endpoint():
                 )
             else:
                 system_prompt = (
-                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
-                    "found for this specific topic. Write from your own well-informed general "
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Source search ran for "
+                    "this exact topic and came back with nothing usable — here's exactly why, "
+                    f"verbatim: \"{search_diag2}\". Write from your own well-informed general "
                     "knowledge instead — but do NOT insert any placeholder in place of a "
                     "citation, in any form: no [Author, Year], no [Citation needed], no "
                     "[source], no blank brackets, nothing standing in for a reference that "
                     "isn't there. If the topic genuinely calls for citation-backed evidence "
-                    "you don't have, say so plainly to the student in a sentence or two "
-                    "instead of writing the piece with fake-looking markers sprinkled through "
-                    "it. Write as much as the task genuinely needs."
+                    "you don't have, say so plainly to the student in a sentence or two — and "
+                    "include the verbatim search-failure reason above so they know exactly "
+                    "what to check next, rather than a vague 'no sources found'. Write as "
+                    "much as the task genuinely needs."
                 )
 
         user_message = (
