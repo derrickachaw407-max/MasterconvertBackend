@@ -8,6 +8,8 @@ import tempfile
 import shutil
 import uuid
 import zipfile
+from collections import Counter
+from urllib.parse import urlparse
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -19,7 +21,7 @@ from flask import Flask, request, send_file, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from converters import convert, text_to_pptx, extract_text, ConversionError
+from converters import convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
@@ -111,8 +113,59 @@ def init_db():
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_memory (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    note TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
     finally:
         conn.close()
+
+
+def add_user_memory(user_id, note):
+    """Appends one durable note the AI has picked up about a student's ongoing
+    work — additive only, existing notes are never edited or removed."""
+    note = (note or "").strip()[:400]
+    if not (DATABASE_URL and user_id and note):
+        return
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO user_memory (user_id, note) VALUES (%s, %s)",
+                    (user_id, note),
+                )
+        finally:
+            conn.close()
+    except Exception:
+        pass  # memory is a nice-to-have — never let it break the actual response
+
+
+def get_user_memory(user_id, limit=12):
+    """Returns this student's most recent accumulated notes, oldest first, so
+    later context reads as a running history rather than a jumbled list."""
+    if not (DATABASE_URL and user_id):
+        return []
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT note FROM user_memory WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+                    (user_id, limit),
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        return [r["note"] for r in reversed(rows)]
+    except Exception:
+        return []
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -217,7 +270,7 @@ def auth_required(fn):
     return wrapper
 
 
-def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
+def call_claude(system_prompt, user_message, max_tokens=600, use_search=False, return_meta=False):
     if not ANTHROPIC_API_KEY:
         raise ConversionError("AI features need ANTHROPIC_API_KEY set on the server")
     payload = {
@@ -237,7 +290,7 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
                 "content-type": "application/json",
             },
             json=payload,
-            timeout=140 if use_search else 45,
+            timeout=140 if use_search else 110,
         )
     except requests.exceptions.Timeout:
         raise ConversionError("AI request timed out — try again, or try a narrower topic")
@@ -246,7 +299,10 @@ def call_claude(system_prompt, user_message, max_tokens=600, use_search=False):
     if resp.status_code != 200:
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
     data = resp.json()
-    return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    if return_meta:
+        return {"text": text, "stop_reason": data.get("stop_reason")}
+    return text
 
 
 OUTLINE_LINE_RE = re.compile(r'^\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$')
@@ -268,7 +324,7 @@ def parse_outline(text):
     return sections
 
 
-def search_for_sources(topic, max_results=4):
+def search_web_sources(topic, max_results=4):
     """Runs a search-only Claude call and reads real title/url pairs straight out of
     Anthropic's own web_search_tool_result blocks — never from the model's text output,
     so a source can never be fabricated: it either came from a real search hit or it
@@ -316,8 +372,170 @@ def search_for_sources(topic, max_results=4):
             title = (item.get("title") or "").strip()
             if url and title and url not in seen:
                 seen.add(url)
-                sources.append({"title": title, "url": url})
+                sources.append({"title": title, "url": url, "authors": None, "year": None, "venue": None, "abstract": None})
     return sources[:max_results]
+
+
+def search_semantic_scholar(query, max_results=4):
+    """Searches Semantic Scholar's free public API for real peer-reviewed papers —
+    no API key required. Only keeps hits with a real abstract, since a bare title
+    with no abstract can't ground a claim in what the paper actually found. Fetches
+    a larger relevance-matched pool than max_results, then sorts by publication
+    year descending so the most recent matching papers are preferred — falls back
+    to older ones only when too few recent matches exist for the topic. Returns
+    [] on any failure (timeout, rate limit, bad response) so callers fall back
+    cleanly to general web search."""
+    try:
+        resp = requests.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": query[:300], "limit": max(max_results * 3, 15), "fields": "title,url,year,authors,abstract,venue"},
+            timeout=12,
+        )
+    except requests.exceptions.RequestException:
+        return []
+    if resp.status_code != 200:
+        return []
+    try:
+        data = resp.json()
+    except ValueError:
+        return []
+    sources = []
+    for paper in data.get("data", []):
+        title = (paper.get("title") or "").strip()
+        url = (paper.get("url") or "").strip()
+        abstract = (paper.get("abstract") or "").strip()
+        if not (title and url and abstract):
+            continue
+        author_names = [a.get("name", "").strip() for a in (paper.get("authors") or []) if a.get("name")]
+        sources.append({
+            "title": title,
+            "url": url,
+            "abstract": abstract,
+            "authors": author_names or None,
+            "year": paper.get("year"),
+            "venue": (paper.get("venue") or "").strip() or None,
+        })
+    sources.sort(key=lambda s: s["year"] or 0, reverse=True)
+    return sources[:max_results]
+
+
+def search_for_sources(topic, max_results=8):
+    """Combines two source lookups: Semantic Scholar for real peer-reviewed papers
+    (with abstracts and real author/year, sorted most-recent-first) plus general
+    web search to fill any remaining slots only when Semantic Scholar can't cover
+    the topic on its own — general web sources carry no verifiable author or
+    publication date, so they're a last resort, not the default. Semantic Scholar
+    hits come first when both find matches for the same topic; deduplicated by URL."""
+    sources, seen = [], set()
+    for s in search_semantic_scholar(topic, max_results=max_results):
+        if s["url"] not in seen:
+            seen.add(s["url"])
+            sources.append(s)
+    if len(sources) < max_results:
+        for s in search_web_sources(topic, max_results=max_results - len(sources)):
+            if s["url"] not in seen:
+                seen.add(s["url"])
+                sources.append(s)
+    return sources[:max_results]
+
+
+def _format_author_apa(full_name):
+    """'John Smith' -> 'Smith, J.' for a References-list author entry."""
+    parts = full_name.strip().split()
+    if not parts:
+        return full_name
+    surname = parts[-1]
+    initials = " ".join(p[0].upper() + "." for p in parts[:-1] if p)
+    return f"{surname}, {initials}" if initials else surname
+
+
+def _domain_org_name(url):
+    """Falls back to a readable site name (e.g. 'Healthline') when a web
+    source has no identifiable author — standard APA practice for websites."""
+    try:
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        base = host.split(".")[0] if host else "Source"
+        return base.replace("-", " ").title() or "Source"
+    except Exception:
+        return "Source"
+
+
+def enrich_sources_for_apa(sources):
+    """Computes a real APA in-text citation key and a full References-list
+    entry for each source, from actual metadata only — nothing here is
+    invented. Sources with no known individual author fall back to the
+    organization/site name (standard APA practice); sources with no known
+    year use 'n.d.'. Duplicate (author, year) pairs get a/b/c suffixes, as
+    APA requires, applied consistently to both the in-text key and the
+    reference entry."""
+    enriched = []
+    for s in sources:
+        authors = s.get("authors")
+        if authors:
+            surnames = [a.split()[-1] for a in authors if a.split()]
+            if len(surnames) == 1:
+                author_intext = surnames[0]
+            elif len(surnames) == 2:
+                author_intext = f"{surnames[0]} & {surnames[1]}"
+            else:
+                author_intext = f"{surnames[0]} et al."
+            author_refs_list = [_format_author_apa(a) for a in authors[:20]]
+            if len(author_refs_list) == 1:
+                author_refs = author_refs_list[0]
+            else:
+                author_refs = ", ".join(author_refs_list[:-1]) + ", & " + author_refs_list[-1]
+        else:
+            org = _domain_org_name(s["url"])
+            author_intext = org
+            author_refs = org
+
+        year = s.get("year")
+        year_display = str(year) if year else "n.d."
+        enriched.append({**s, "author_intext": author_intext, "author_refs": author_refs,
+                          "year_display": year_display, "base_key": f"{author_intext}|{year_display}"})
+
+    key_counts = Counter(e["base_key"] for e in enriched)
+    running = {}
+    for e in enriched:
+        if key_counts[e["base_key"]] > 1:
+            idx = running.get(e["base_key"], 0)
+            running[e["base_key"]] = idx + 1
+            e["year_display"] += "abcdefghij"[idx] if idx < 10 else str(idx)
+        e["citation_key"] = f"({e['author_intext']}, {e['year_display']})"
+
+    for e in enriched:
+        pieces = [f"{e['author_refs']} ({e['year_display']})."]
+        title = e["title"].rstrip(".")
+        pieces.append(f"{title}.")
+        if e.get("venue"):
+            pieces.append(f"{e['venue']}.")
+        e["ref_text"] = " ".join(pieces)
+
+    return enriched
+
+
+def build_sources_block(sources):
+    """Source list for the writing prompt, keyed by the exact APA citation
+    the model must copy verbatim. Sources with an abstract (from Semantic
+    Scholar) include a short excerpt, so the model can cite what the paper
+    actually found instead of guessing from the title alone."""
+    lines = []
+    for s in sources:
+        line = f"{s['citation_key']} {s['title']}"
+        if s.get("abstract"):
+            line += f"\n    Abstract: {s['abstract'][:400]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def build_references_list(sources):
+    """The client-facing References section: plain reference text plus its
+    URL as a separate field (so the frontend can render the URL as a live
+    link), alphabetized by author/organization the way APA requires."""
+    ordered = sorted(sources, key=lambda s: s["author_intext"].lower())
+    return [{"text": s["ref_text"], "url": s["url"]} for s in ordered]
 
 
 @app.after_request
@@ -922,6 +1140,111 @@ def summarize_endpoint():
         return jsonify({"error": str(e)}), 502
 
 
+ROLE_DESCRIPTION = (
+    "You are Docently's academic and research writing assistant, supporting a student or "
+    "researcher across the full range of academic work: drafting and structuring research "
+    "proposals, literature reviews, abstracts, and full papers; improving clarity, grammar, "
+    "tense consistency, and academic tone in a draft they've pasted in; formatting in-text "
+    "citations and references in APA; interpreting findings and discussion sections; spotting "
+    "gaps in an argument or methodology; helping frame research questions and objectives; "
+    "summarizing concepts from the literature and explaining complex theories or mechanisms "
+    "in plain language; advising on study designs, sampling techniques, statistical tools, "
+    "and ethical considerations; interpreting descriptive statistics and results tables; "
+    "correcting grammar, tense, and awkward phrasing; smoothing over stiff or unnatural "
+    "AI-sounding language so writing reads naturally; and building practical tools like "
+    "questionnaires, data-collection instruments, tables, summaries, and structured outlines. "
+    "Match your response's shape to what was actually asked — flowing prose for a draft or "
+    "explanation, a numbered list for a questionnaire, a clear structure for comparing or "
+    "summarizing data, a short bulleted critique for gaps in an argument — rather than "
+    "forcing every reply into the same paragraph shape. Talk to the student in a warm, "
+    "friendly, genuinely conversational voice — like a supportive, knowledgeable mentor "
+    "talking things through with them — for your own commentary, feedback, and guidance. But "
+    "when you're drafting the actual academic content itself (a lit review paragraph, an "
+    "abstract, a proposal section), write that content in standard formal academic register, "
+    "not a casual one — the warmth lives in how you talk to the student around the work, not "
+    "inside the academic writing you hand them."
+)
+
+CLARIFY_MARKER = "[CLARIFY]"
+CLARIFY_INSTRUCTION = (
+    "Interpret the request generously and do your best with it even if it is unclear, "
+    "incomplete, oddly phrased, or missing details a student would ideally have given — use "
+    "your own general knowledge and judgment to fill reasonable gaps rather than requiring a "
+    "perfectly-worded request. If a specific missing detail would meaningfully change what "
+    "you write, briefly state the assumption you're making in one sentence at the very start "
+    "of your reply, then continue immediately with the full piece written on that assumption "
+    "— never stop at just the assumption. Reserve asking a clarifying question INSTEAD of "
+    "writing for the rare case where the request is so minimal, contentless, or contradictory "
+    "that no reasonable topic can be identified at all — not merely because it's broad, "
+    f"informal, or underspecified. In that rare case only, start your entire reply with the "
+    f"exact marker {CLARIFY_MARKER} and nothing else before it."
+)
+
+
+def split_clarify(text):
+    """Detects the model's clarify marker at the very start of its reply and strips
+    it, so a genuinely ambiguous request surfaces as a short question instead of a
+    full piece of writing being generated from a guess."""
+    stripped = text.strip()
+    if stripped.startswith(CLARIFY_MARKER):
+        return True, stripped[len(CLARIFY_MARKER):].strip()
+    return False, stripped
+
+
+THINK_START = "[THINKING]"
+THINK_END = "[/THINKING]"
+THINKING_INSTRUCTION = (
+    "Before your main reply, briefly think out loud about how you're approaching this "
+    "request — your read on what's being asked, which sources or angle you're leaning on, "
+    "and why. Keep it a few sentences, in your own natural voice. Wrap it in the exact "
+    f"markers {THINK_START} and {THINK_END} with nothing else on those lines, then "
+    "immediately after the closing marker write your actual answer in full — the thinking "
+    "is shown to the student separately and is never a substitute for the complete answer."
+)
+
+
+def split_thinking(text):
+    """Strips a leading [THINKING]...[/THINKING] block from the reply and returns
+    (thinking_text_or_None, remaining_text) — keeps the model's own reasoning
+    visually and functionally separate from the actual answer."""
+    stripped = text.strip()
+    if stripped.startswith(THINK_START):
+        end_idx = stripped.find(THINK_END)
+        if end_idx != -1:
+            thinking = stripped[len(THINK_START):end_idx].strip()
+            rest = stripped[end_idx + len(THINK_END):].strip()
+            return (thinking or None), rest
+    return None, text
+
+
+MEMORY_START = "[MEMORY]"
+MEMORY_END = "[/MEMORY]"
+MEMORY_INSTRUCTION = (
+    "If, from this exchange, you learn something durable and genuinely reusable about this "
+    "student's ongoing work — their field of study, a specific project or thesis they're on, "
+    "a recurring topic, a citation-style or formatting preference — add ONE short sentence "
+    "noting it, wrapped in the exact markers "
+    f"{MEMORY_START} and {MEMORY_END}, placed after your full answer and any references. "
+    "Only include this when you've learned something genuinely new and worth remembering for "
+    "next time — omit it entirely otherwise, and never repeat something you already noted "
+    "before. This is saved privately for future context and never shown to the student."
+)
+
+
+def split_memory_note(text):
+    """Strips a trailing [MEMORY]...[/MEMORY] note from the reply, wherever it
+    appears, and returns (note_text_or_None, remaining_text)."""
+    start = text.find(MEMORY_START)
+    if start == -1:
+        return None, text
+    end = text.find(MEMORY_END, start)
+    if end == -1:
+        return None, text
+    note = text[start + len(MEMORY_START):end].strip()
+    remaining = (text[:start] + text[end + len(MEMORY_END):]).strip()
+    return (note or None), remaining
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @auth_required
 def write_endpoint():
@@ -929,8 +1252,15 @@ def write_endpoint():
     topic = (data.get("topic") or "").strip()
     if not topic:
         return jsonify({"error": "No topic provided"}), 400
-    if len(topic) > 4000:
-        return jsonify({"error": "Topic too long (4,000 character limit)"}), 400
+    if len(topic) > 20000:
+        return jsonify({"error": "That's too long for one message (20,000 character limit) — try splitting it into sections"}), 400
+
+    # An uploaded document's text, if any — kept separate from the typed
+    # command so it never pollutes the search query, and so the frontend can
+    # display just the command in the chat transcript.
+    attachment = (data.get("attachment") or "").strip()
+    if len(attachment) > 20000:
+        return jsonify({"error": "That attached document is too long (20,000 character limit)"}), 400
 
     # Optional conversation history for the chat UI — absent/empty means the
     # existing one-shot topic/outline behavior below, unchanged.
@@ -947,6 +1277,60 @@ def write_endpoint():
 
     outline = parse_outline(topic)
 
+    # Continuation of a truncated previous answer — a distinct, simpler path:
+    # no clarify/thinking/outline logic, just pick the citation-bearing
+    # writing back up exactly where it stopped.
+    if data.get("continue_previous"):
+        previous_text = (data.get("previous_text") or "").strip()
+        if not previous_text:
+            return jsonify({"error": "Nothing to continue"}), 400
+        try:
+            cont_sources = enrich_sources_for_apa(search_for_sources(topic))
+            if cont_sources:
+                cont_sources_block = build_sources_block(cont_sources)
+                cont_system_prompt = (
+                    f"{ROLE_DESCRIPTION} You are continuing your own previous response, which "
+                    "was cut off partway through. Below is a list of real sources for this "
+                    "topic, each labeled with its exact APA in-text citation, e.g. "
+                    "(Smith, 2023), listed most-recent-first. Continue writing directly from "
+                    "where the previous text left off — do not repeat, restate, or summarize "
+                    "anything already written. Keep citing EVERY sentence that makes a claim "
+                    "using the EXACT citation key next to its supporting source, copied "
+                    "exactly, preferring the most recent source when more than one could "
+                    "support a claim; never invent a citation. If a sentence can't be tied to "
+                    "a source, leave that claim out rather than writing it uncited. Do not "
+                    "write a references list yourself — it is generated separately.\n\n"
+                    f"PREVIOUS TEXT (do not repeat any of this):\n{previous_text}\n\nSOURCES:\n{cont_sources_block}"
+                )
+            else:
+                cont_system_prompt = (
+                    f"{ROLE_DESCRIPTION} You are continuing your own previous response, which "
+                    "was cut off partway through. Continue writing directly from where the "
+                    "previous text left off — do not repeat, restate, or summarize anything "
+                    "already written. No verified sources are available for this topic, so "
+                    "continue from your own well-informed general knowledge, with no "
+                    "citation markers or invented sources.\n\n"
+                    f"PREVIOUS TEXT (do not repeat any of this):\n{previous_text}"
+                )
+            cont_result = call_claude(
+                system_prompt=cont_system_prompt,
+                user_message=topic,
+                max_tokens=4000,
+                use_search=False,
+                return_meta=True,
+            )
+            cont_text = cont_result["text"].strip()
+            if not cont_text:
+                raise ConversionError("Couldn't continue — try again")
+            return jsonify({
+                "type": "result",
+                "text": cont_text,
+                "references": build_references_list(cont_sources),
+                "truncated": cont_result["stop_reason"] == "max_tokens",
+            })
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 502
+
     try:
         if len(outline) >= 2:
             # Outline mode: e.g. "5.1 Discussion / 5.1.1 General Awareness / 5.1.2 ..."
@@ -957,27 +1341,31 @@ def write_endpoint():
             # One shared search across the whole outline — a bigger, single pool
             # of real sources every section draws from, instead of one search per
             # section (slower and more likely to fragment/duplicate sources).
-            sources = search_for_sources(combined_headings, max_results=8)
+            sources = enrich_sources_for_apa(search_for_sources(combined_headings, max_results=8))
 
             if sources:
-                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                sources_block = build_sources_block(sources)
                 base_prompt = (
                     "You are writing one subsection of a longer academic piece on "
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
-                    "user message — 100-160 words, plain prose. Below is a numbered list of "
-                    "real sources relevant to the overall piece — cite them naturally with "
-                    "their bracketed number, e.g. [1], [2], where genuinely relevant to this "
-                    "particular subsection; leave sources unused if they don't fit here. Do "
-                    "not invent any author names or additional sources beyond this list. No "
+                    "user message — 100-160 words, formal academic prose. Below is a list of "
+                    "real sources relevant to the overall piece, each labeled with its exact "
+                    "APA in-text citation, e.g. (Smith, 2023), listed most-recent-first. Cite EVERY sentence that makes "
+                    "a claim, using the EXACT key next to its supporting source, copied "
+                    "exactly — never alter an author name or year, and never invent a "
+                    "citation not in this list. When more than one source could support the "
+                    "same claim, prefer the most recent one. If a sentence can't be tied to "
+                    "one of the given sources, leave that claim out entirely rather than "
+                    "writing it uncited or attaching a fabricated citation — keep the "
+                    "subsection only as long as what the sources genuinely support. No "
                     f"heading, no reference list — just the paragraph.\n\nSOURCES:\n{sources_block}"
                 )
             else:
-                sources = []
                 base_prompt = (
                     "You are writing one subsection of a longer academic piece on "
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
-                    "user message — 100-160 words, plain prose. No verified sources were "
-                    "found for this topic, so do not invent any citations, authors, or "
+                    "user message — 100-160 words, formal academic prose. No verified sources "
+                    "were found for this topic, so do not invent any citations, authors, or "
                     "sources. No heading, no reference list — just the paragraph."
                 )
 
@@ -991,15 +1379,26 @@ def write_endpoint():
                 sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
 
             return jsonify({
+                "type": "result",
                 "sections": [
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
                     for s in outline
                 ],
-                "sources": sources,
+                "references": build_references_list(sources),
             })
 
-        # Chat mode: prior turns are present — reply to the latest message as one
-        # turn in an ongoing conversation instead of a standalone one-shot draft.
+        # Chat mode (history present) and simple mode (first message, no history
+        # yet) share the same citation and clarify-guardrail logic below — they
+        # differ only in whether prior turns are folded into the prompt.
+        user_id = request.current_user["id"] if getattr(request, "current_user", None) else None
+        memory_notes = get_user_memory(user_id)
+        role_with_memory = ROLE_DESCRIPTION + (
+            " Here's what you've picked up about this student from past work together — use "
+            "it naturally where it's actually relevant, don't just recite it back: "
+            + "; ".join(memory_notes)
+            if memory_notes else ""
+        )
+
         if history:
             history_block = "\n".join(
                 ("Student: " if t["role"] == "user" else "You: ") + t["content"]
@@ -1010,89 +1409,142 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-
-            sources = search_for_sources(search_query)
+            sources = enrich_sources_for_apa(search_for_sources(search_query))
 
             if sources:
-                sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
+                sources_block = build_sources_block(sources)
                 system_prompt = (
-                    "You are an evidence-based writing assistant in an ongoing conversation "
-                    "with a student. Below is the conversation so far, then a numbered list of "
-                    "real sources found for the student's latest message. Reply to the latest "
-                    "message directly, continuing the same thread naturally — as a direct reply, "
-                    "not restating the question. Cite sources with their bracketed number, e.g. "
-                    "[1], [2], only where genuinely relevant — not every sentence needs one, and "
-                    "it's fine to leave a source unused if it doesn't fit. Do not invent any "
-                    "author names, years, or additional sources beyond this list. Keep the reply "
-                    "focused — a few short paragraphs at most, no reference list at the end.\n\n"
-                    f"CONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} You're in an ongoing "
+                    "conversation with the student — below is the conversation so far, then "
+                    "a list of real sources found for their latest message, each labeled "
+                    "with its exact APA in-text citation, e.g. (Smith, 2023), listed "
+                    "most-recent-first. When your "
+                    "response is generating written academic content (a draft, an "
+                    "explanation, a literature summary, an argument), cite EVERY sentence "
+                    "that makes a claim, using the EXACT citation key next to its "
+                    "supporting source — copied exactly, never altering an author name or "
+                    "year, and never inventing a citation not in this list. When more than "
+                    "one source could support the same claim, prefer the most recent one. "
+                    "If a sentence can't be tied to one of the given sources, leave that "
+                    "claim out entirely rather than writing it uncited or attaching a "
+                    "fabricated citation — keep the response only as long as what the "
+                    "sources genuinely support. Citations don't apply to tasks that aren't "
+                    "generating cited content — skip them entirely for grammar editing, "
+                    "building a questionnaire, or interpreting a table the student pasted "
+                    "in. Write as much as the task genuinely needs — a quick fix might be a "
+                    "sentence or two, a literature review draft might run several "
+                    "paragraphs. Do not write a references list yourself — it is generated "
+                    f"separately.\n\nCONVERSATION SO FAR:\n{history_block}\n\nSOURCES:\n{sources_block}"
                 )
             else:
                 system_prompt = (
-                    "You are an evidence-based writing assistant in an ongoing conversation "
-                    "with a student. Below is the conversation so far. No verified sources were "
-                    "found for the student's latest message, so respond helpfully in plain "
-                    "prose with no citation markers or invented sources.\n\n"
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
+                    "found for the student's latest message, so respond from your own "
+                    "well-informed general knowledge, with no citation markers or invented "
+                    "sources. Write as much as the task genuinely needs.\n\n"
                     f"CONVERSATION SO FAR:\n{history_block}"
                 )
-
-            text = call_claude(
-                system_prompt=system_prompt,
-                user_message=topic,
-                max_tokens=500,
-                use_search=False,
-            ).strip()
-
-            if len(text) < 15:
-                raise ConversionError("Couldn't generate a reply — try rephrasing")
-
-            return jsonify({"text": text, "sources": sources})
-
-        # Simple mode: a single flat topic, unchanged from before.
-        # Step 1: search only. Sources come straight from Anthropic's own structured
-        # search-result blocks, not from anything the model writes — so every title/url
-        # here is guaranteed to be something that was actually found, never invented.
-        sources = search_for_sources(topic)
-
-        # Step 2: a plain, tool-free writing call. No search loop to hang, run long,
-        # or narrate about — just a single bounded completion, grounded in exactly the
-        # real sources from step 1 (or told plainly that none were found).
-        if sources:
-            sources_block = "\n".join(f"[{i + 1}] {s['title']}" for i, s in enumerate(sources))
-            system_prompt = (
-                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
-                "given topic. Below is a numbered list of real sources found for this exact "
-                "topic — refer to them naturally in the text using their bracketed number, "
-                "e.g. [1], [2], at points where that source's subject matter is genuinely "
-                "relevant. Do not invent any author names, years, or additional sources beyond "
-                "this list — the numbers are the only citation format to use. Not every "
-                "sentence needs one, and it's fine to leave a source unused if it doesn't fit. "
-                "Write plain prose only, no reference list at the end — the sources are shown "
-                f"separately.\n\nSOURCES:\n{sources_block}"
-            )
         else:
-            system_prompt = (
-                "Write a clear, well-informed paragraph, 150-220 words, for a student on the "
-                "given topic. No verified sources were found for this specific topic, so do "
-                "not invent any citations, authors, or sources — write in plain, well-informed "
-                "prose instead, with no citation markers at all."
-            )
+            sources = enrich_sources_for_apa(search_for_sources(topic))
 
-        text = call_claude(
+            if sources:
+                sources_block = build_sources_block(sources)
+                system_prompt = (
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Below is a list of real "
+                    "sources found for this exact topic, each labeled with its exact APA "
+                    "in-text citation, e.g. (Smith, 2023), listed most-recent-first. When your response is generating "
+                    "written academic content (a draft, an explanation, a literature "
+                    "summary, an argument), cite EVERY sentence that makes a claim, using "
+                    "the EXACT citation key next to its supporting source — copied exactly, "
+                    "never altering an author name or year, and never inventing a citation "
+                    "not in this list. When more than one source could support the same "
+                    "claim, prefer the most recent one. If a sentence can't be tied to one "
+                    "of the given sources, leave that claim out entirely rather than "
+                    "writing it uncited or attaching a fabricated citation — keep the "
+                    "response only as long as what the sources genuinely support. "
+                    "Citations don't apply to tasks "
+                    "that aren't generating cited content — skip them entirely for grammar "
+                    "editing, building a questionnaire, or interpreting a table the student "
+                    "pasted in. Write as much as the task genuinely needs. Do not write a "
+                    f"references list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
+                )
+            else:
+                system_prompt = (
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
+                    "found for this specific topic, so respond from your own well-informed "
+                    "general knowledge, with no citation markers or invented sources. Write "
+                    "as much as the task genuinely needs."
+                )
+
+        user_message = (
+            f"[Attached document]\n{attachment}\n[End of attached document]\n\nStudent's message: {topic}"
+            if attachment else topic
+        )
+
+        result = call_claude(
             system_prompt=system_prompt,
-            user_message=topic,
-            max_tokens=500,
+            user_message=user_message,
+            max_tokens=4000,
             use_search=False,
-        ).strip()
+            return_meta=True,
+        )
+        raw_text = result["text"].strip()
+        truncated = result["stop_reason"] == "max_tokens"
 
-        if len(text) < 40:
-            raise ConversionError(
-                "Couldn't finish a draft for this topic — try again, or make the topic a bit narrower"
-            )
+        thinking, after_thinking = split_thinking(raw_text)
+        is_clarify, text = split_clarify(after_thinking)
+        memory_note, text = split_memory_note(text)
+        if memory_note:
+            add_user_memory(user_id, memory_note)
 
-        return jsonify({"text": text, "sources": sources})
+        if not text:
+            raise ConversionError("Couldn't generate a reply — try rephrasing")
+        if not is_clarify and len(text) < 15:
+            raise ConversionError("Couldn't generate a reply — try rephrasing")
+
+        if is_clarify:
+            return jsonify({"type": "clarify", "text": text, "thinking": thinking})
+
+        return jsonify({
+            "type": "result",
+            "text": text,
+            "thinking": thinking,
+            "references": build_references_list(sources),
+            "truncated": truncated,
+        })
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/write/export-docx", methods=["POST", "OPTIONS"])
+@auth_required
+def write_export_docx_endpoint():
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "Academic Response").strip()
+    text = data.get("text")
+    sections = data.get("sections")
+    references = data.get("references") or []
+    if not text and not sections:
+        return jsonify({"error": "No content to export"}), 400
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_docx_{uuid.uuid4().hex[:8]}_")
+    try:
+        result_path = academic_essay_to_docx(
+            {"title": title, "text": text, "sections": sections, "references": references},
+            work_dir,
+        )
+        return send_file(
+            result_path,
+            mimetype=MIME_TYPES["docx"],
+            as_attachment=True,
+            download_name="Academic_Response.docx",
+        )
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        return jsonify({"error": f"Export failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 init_db()
