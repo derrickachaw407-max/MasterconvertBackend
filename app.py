@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,6 +26,9 @@ from converters import convert, text_to_pptx, academic_essay_to_docx, extract_te
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("docently")
 
 MIME_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -330,6 +334,7 @@ def search_web_sources(topic, max_results=4):
     so a source can never be fabricated: it either came from a real search hit or it
     isn't in the list at all."""
     if not ANTHROPIC_API_KEY:
+        logger.warning("search_web_sources: no ANTHROPIC_API_KEY set, skipping")
         return []
     payload = {
         "model": ANTHROPIC_MODEL,
@@ -353,9 +358,14 @@ def search_web_sources(topic, max_results=4):
             json=payload,
             timeout=60,
         )
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        logger.warning("search_web_sources: request failed for %r: %s", topic[:80], e)
         return []
     if resp.status_code != 200:
+        logger.warning(
+            "search_web_sources: non-200 (%s) for %r — body: %s",
+            resp.status_code, topic[:80], resp.text[:500],
+        )
         return []
     data = resp.json()
     sources, seen = [], set()
@@ -373,49 +383,59 @@ def search_web_sources(topic, max_results=4):
             if url and title and url not in seen:
                 seen.add(url)
                 sources.append({"title": title, "url": url, "authors": None, "year": None, "venue": None, "abstract": None})
+    logger.info("search_web_sources: %r -> %d source(s)", topic[:80], len(sources))
     return sources[:max_results]
 
 
 def search_semantic_scholar(query, max_results=4):
     """Searches Semantic Scholar's free public API for real peer-reviewed papers —
-    no API key required. Only keeps hits with a real abstract, since a bare title
-    with no abstract can't ground a claim in what the paper actually found. Fetches
-    a larger relevance-matched pool than max_results, then sorts by publication
-    year descending so the most recent matching papers are preferred — falls back
-    to older ones only when too few recent matches exist for the topic. Returns
-    [] on any failure (timeout, rate limit, bad response) so callers fall back
-    cleanly to general web search."""
+    no API key required. Keeps any hit with a real title and URL; an abstract is
+    used as a grounding excerpt when present but is not required — many real
+    papers, especially in regional/non-mainstream journals, have no abstract
+    indexed, and excluding them was emptying the candidate pool entirely for
+    niche topics. Fetches a larger relevance-matched pool than max_results, then
+    sorts by publication year descending so the most recent matching papers are
+    preferred — falls back to older ones only when too few recent matches exist
+    for the topic. Returns [] on any failure (timeout, rate limit, bad response)
+    so callers fall back cleanly to general web search."""
     try:
         resp = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
             params={"query": query[:300], "limit": max(max_results * 3, 15), "fields": "title,url,year,authors,abstract,venue"},
             timeout=12,
         )
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e:
+        logger.warning("search_semantic_scholar: request failed for %r: %s", query[:80], e)
         return []
     if resp.status_code != 200:
+        logger.warning(
+            "search_semantic_scholar: non-200 (%s) for %r — body: %s",
+            resp.status_code, query[:80], resp.text[:500],
+        )
         return []
     try:
         data = resp.json()
     except ValueError:
+        logger.warning("search_semantic_scholar: non-JSON response for %r", query[:80])
         return []
     sources = []
     for paper in data.get("data", []):
         title = (paper.get("title") or "").strip()
         url = (paper.get("url") or "").strip()
         abstract = (paper.get("abstract") or "").strip()
-        if not (title and url and abstract):
+        if not (title and url):
             continue
         author_names = [a.get("name", "").strip() for a in (paper.get("authors") or []) if a.get("name")]
         sources.append({
             "title": title,
             "url": url,
-            "abstract": abstract,
+            "abstract": abstract or None,
             "authors": author_names or None,
             "year": paper.get("year"),
             "venue": (paper.get("venue") or "").strip() or None,
         })
     sources.sort(key=lambda s: s["year"] or 0, reverse=True)
+    logger.info("search_semantic_scholar: %r -> %d source(s) (raw hits: %d)", query[:80], len(sources), len(data.get("data", [])))
     return sources[:max_results]
 
 
@@ -436,6 +456,10 @@ def search_for_sources(topic, max_results=8):
             if s["url"] not in seen:
                 seen.add(s["url"])
                 sources.append(s)
+    if not sources:
+        logger.warning("search_for_sources: ZERO total sources found for %r", topic[:120])
+    else:
+        logger.info("search_for_sources: %r -> %d total source(s)", topic[:80], len(sources))
     return sources[:max_results]
 
 
@@ -1349,7 +1373,9 @@ def write_endpoint():
                     "most recent one. If a claim can't be tied to one of the given sources, "
                     "leave it out rather than writing it uncited or attaching a fabricated "
                     "citation — keep the subsection only as long as what the sources genuinely "
-                    "support. No heading, no reference list — just the paragraph.\n\nSOURCES:\n"
+                    "support. Never write a placeholder in place of a missing citation ([Author, "
+                    "Year], [Citation needed], or similar) — if it's not covered, just leave the "
+                    "claim out. No heading, no reference list — just the paragraph.\n\nSOURCES:\n"
                     f"{sources_block}"
                 )
             else:
@@ -1421,7 +1447,10 @@ def write_endpoint():
                     "the same claim, prefer the most recent one. If a claim can't be tied to "
                     "one of the given sources, leave it out rather than writing it uncited or "
                     "attaching a fabricated citation — keep the response only as long as what "
-                    "the sources genuinely support. Citations don't apply to tasks that aren't "
+                    "the sources genuinely support. Never write a placeholder in place of a "
+                    "missing citation ([Author, Year], [Citation needed], or similar) — if "
+                    "it's not covered, just leave the claim out. Citations don't apply to "
+                    "tasks that aren't "
                     "generating cited content — skip them entirely for grammar editing, "
                     "building a questionnaire, or interpreting a table the student pasted "
                     "in. Write as much as the task genuinely needs — a quick fix might be a "
@@ -1432,9 +1461,14 @@ def write_endpoint():
             else:
                 system_prompt = (
                     f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
-                    "found for the student's latest message, so respond from your own "
-                    "well-informed general knowledge, with no citation markers or invented "
-                    "sources. Write as much as the task genuinely needs.\n\n"
+                    "found for the student's latest message. Write from your own "
+                    "well-informed general knowledge instead — but do NOT insert any "
+                    "placeholder in place of a citation, in any form: no [Author, Year], no "
+                    "[Citation needed], no [source], no blank brackets, nothing standing in "
+                    "for a reference that isn't there. If the topic genuinely calls for "
+                    "citation-backed evidence you don't have, say so plainly to the student in "
+                    "a sentence or two instead of writing the piece with fake-looking markers "
+                    "sprinkled through it. Write as much as the task genuinely needs.\n\n"
                     f"CONVERSATION SO FAR:\n{history_block}"
                 )
         else:
@@ -1457,8 +1491,10 @@ def write_endpoint():
                     "claim, prefer the most recent one. If a claim can't be tied to one of "
                     "the given sources, leave it out rather than writing it uncited or "
                     "attaching a fabricated citation — keep the response only as long as "
-                    "what the sources genuinely support. Citations don't apply to tasks "
-                    "that aren't generating cited content — skip them entirely for grammar "
+                    "what the sources genuinely support. Never write a placeholder in place "
+                    "of a missing citation ([Author, Year], [Citation needed], or similar) — "
+                    "if it's not covered, just leave the claim out. Citations don't apply to "
+                    "tasks that aren't generating cited content — skip them entirely for grammar "
                     "editing, building a questionnaire, or interpreting a table the student "
                     "pasted in. Write as much as the task genuinely needs. Do not write a "
                     f"references list yourself — it is generated separately.\n\nSOURCES:\n{sources_block}"
@@ -1466,9 +1502,14 @@ def write_endpoint():
             else:
                 system_prompt = (
                     f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} No verified sources were "
-                    "found for this specific topic, so respond from your own well-informed "
-                    "general knowledge, with no citation markers or invented sources. Write "
-                    "as much as the task genuinely needs."
+                    "found for this specific topic. Write from your own well-informed general "
+                    "knowledge instead — but do NOT insert any placeholder in place of a "
+                    "citation, in any form: no [Author, Year], no [Citation needed], no "
+                    "[source], no blank brackets, nothing standing in for a reference that "
+                    "isn't there. If the topic genuinely calls for citation-backed evidence "
+                    "you don't have, say so plainly to the student in a sentence or two "
+                    "instead of writing the piece with fake-looking markers sprinkled through "
+                    "it. Write as much as the task genuinely needs."
                 )
 
         user_message = (
