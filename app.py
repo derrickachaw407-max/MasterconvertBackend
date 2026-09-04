@@ -74,7 +74,16 @@ def get_db():
 def init_db():
     if not DATABASE_URL:
         return
-    conn = get_db()
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(
+            "init_db: could not connect to the database — the server will still "
+            "boot, but every DB-backed route (auth, conversions, promo codes, "
+            "memory) will fail until this is fixed. This is often an expired "
+            "Render free Postgres instance. Error: %s", e,
+        )
+        return
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -127,6 +136,8 @@ def init_db():
                 )
                 """
             )
+    except Exception as e:
+        logger.error("init_db: table setup failed: %s", e)
     finally:
         conn.close()
 
