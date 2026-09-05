@@ -5,24 +5,106 @@ structural rebuilding (python-docx/pptx/openpyxl) for formats that have
 no direct renderer path between them.
 """
 import os
+import re
 import subprocess
 import tempfile
 import shutil
 from docx import Document
 from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+from docx.table import Table as DocxTable
+from docx.text.paragraph import Paragraph as DocxParagraph
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
 from pptx.dml.color import RGBColor as PptxRGBColor
 import openpyxl
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font as XlsxFont
 import pypdf
 
 
 class ConversionError(Exception):
     pass
+
+
+def _iter_block_items(doc):
+    """Yields each paragraph and table in a python-docx Document in actual
+    document order. python-docx's own .paragraphs and .tables are separate
+    flat lists with no ordering between them — without this, a table
+    embedded between two paragraphs silently gets processed out of order
+    (or, in the old docx_to_pptx, not at all, since it only ever walked
+    .paragraphs). This is the standard recipe for this since python-docx
+    doesn't expose a unified iterator itself."""
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield DocxParagraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield DocxTable(child, doc)
+
+
+_BULLET_RE = re.compile(
+    r"^([\u2022\u25CF\u25AA\u25E6\uf0b7\uf0a7\uf076\uf0d8\-\*]|\d{1,3}[\.\)])\s+"
+)
+_SENTENCE_END_RE = re.compile(r"[.!?][\'\")\]]*$")
+_SHORT_LINE_LEN = 70  # a full wrapped line in a standard document usually runs
+                      # much longer than this; a short line ending a sentence
+                      # is the most reliable signal pypdf gives us that a
+                      # paragraph has actually finished, since it never
+                      # exposes real layout/whitespace metadata to check instead.
+
+
+def _reconstruct_paragraphs(raw_text):
+    """pypdf's extract_text() reflects the PDF's internal line-by-line visual
+    layout, not its semantic paragraph structure — a single paragraph comes
+    back as many short lines with no reliable blank-line separator, and two
+    genuinely distinct paragraphs can butt up against each other with no gap
+    at all. Dumping each raw line as its own Word paragraph (the old
+    behavior) produces a broken, hard-wrapped look with a line break after
+    every few words. This rejoins wrapped lines into real flowing
+    paragraphs: lines keep accumulating into the same paragraph until one
+    both ends a sentence AND is short (the two together are the closest
+    signal available that this was genuinely the last line of a paragraph,
+    rather than a mid-sentence wrap that happens to land near a period).
+    Bullet/numbered list items and short heading-like lines are kept on
+    their own line instead, since those usually aren't meant to be joined
+    with what follows. Returns a list of (text, kind) tuples, kind in
+    {"para", "bullet", "heading"}."""
+    lines = [l.strip() for l in raw_text.split("\n")]
+    items = []
+    current = []
+
+    def flush():
+        if current:
+            items.append((" ".join(current).strip(), "para"))
+            current.clear()
+
+    for line in lines:
+        if not line:
+            flush()
+            continue
+        if _BULLET_RE.match(line):
+            flush()
+            items.append((_BULLET_RE.sub("", line).strip(), "bullet"))
+            continue
+        ends_sentence = bool(_SENTENCE_END_RE.search(line))
+        if not current and not ends_sentence and len(line) < 80 and line[:1].isupper():
+            # A short line, sitting on its own, that doesn't end mid-sentence
+            # and starts capitalized reads as a heading far more often than
+            # not — e.g. "Section One", "PDF Test Document" — this no longer
+            # relies on line.istitle()-style checks, which break on any line
+            # containing an all-caps acronym.
+            items.append((line, "heading"))
+            continue
+        current.append(line)
+        if ends_sentence and len(line) < _SHORT_LINE_LEN:
+            flush()
+    flush()
+    return items
+
 
 
 # ---------------------------------------------------------- PPTX templates
@@ -186,9 +268,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
     title_layout = prs.slide_layouts[1]  # title + content
+    blank_layout = prs.slide_layouts[6]
 
-    slide = None
-    body_tf = None
+    MAX_BULLETS_PER_SLIDE = 8  # keep slides readable; overflow spills onto a "(cont.)" slide
+    state = {"slide": None, "body_tf": None, "bullet_count": 0}
 
     def new_slide(title_text):
         s = prs.slides.add_slide(title_layout)
@@ -196,27 +279,62 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         _style_pptx_slide(s, template_style)
         tf = s.placeholders[1].text_frame
         tf.clear()
+        state["slide"], state["body_tf"], state["bullet_count"] = s, tf, 0
         return s, tf
 
-    for para in doc.paragraphs:
+    def add_bullet(text, level=0):
+        if state["slide"] is None:
+            new_slide("Overview")
+        if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
+            current_title = state["slide"].shapes.title.text or "Overview"
+            new_slide(current_title + " (cont.)")
+        body_tf = state["body_tf"]
+        if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
+            p = body_tf.paragraphs[0]
+        else:
+            p = body_tf.add_paragraph()
+        p.text = text
+        p.level = min(level, 4)
+        _style_pptx_body_paragraph(p, template_style)
+        state["bullet_count"] += 1
+
+    def add_table_slide(table):
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        rows = [r for r in rows if any(r)]
+        if not rows:
+            return
+        n_rows, n_cols = len(rows), max(len(r) for r in rows)
+        s = prs.slides.add_slide(blank_layout)
+        left, top = PptxInches(0.6), PptxInches(0.6)
+        width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
+        gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
+        for r_idx, row in enumerate(rows):
+            for c_idx in range(n_cols):
+                gtable.cell(r_idx, c_idx).text = row[c_idx] if c_idx < len(row) else ""
+        # A loose paragraph appearing right after a table should land on a
+        # fresh slide rather than silently reusing the table slide.
+        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+
+    for block in _iter_block_items(doc):
+        if isinstance(block, DocxTable):
+            add_table_slide(block)
+            continue
+        para = block
         text = para.text.strip()
         if not text:
             continue
         para_style_name = (para.style.name or "").lower()
         if "heading" in para_style_name or para_style_name == "title":
-            slide, body_tf = new_slide(text)
+            new_slide(text)
         else:
-            if slide is None:
-                slide, body_tf = new_slide("Overview")
-            if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1:
-                p = body_tf.paragraphs[0]
-            else:
-                p = body_tf.add_paragraph()
-            p.text = text
-            p.level = 0
-            _style_pptx_body_paragraph(p, template_style)
+            level = 0
+            if "list" in para_style_name:
+                m = re.search(r"(\d+)", para_style_name)
+                if m:
+                    level = max(0, min(int(m.group(1)) - 1, 4))
+            add_bullet(text, level=level)
 
-    if slide is None:
+    if state["slide"] is None:
         new_slide("Untitled Document")
 
     out_path = os.path.join(out_dir, "converted.pptx")
@@ -229,26 +347,63 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     prs = Presentation(src_path)
     doc = Document()
     doc.add_heading("Slide Handout", 0)
+    BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
 
     for i, slide in enumerate(prs.slides, 1):
         title = None
-        body_texts = []
+        text_shapes = []
+        table_shapes = []
         for shape in slide.shapes:
-            if not shape.has_text_frame:
+            if shape.has_table:
+                table_shapes.append(shape)
                 continue
-            text = shape.text_frame.text.strip()
-            if not text:
+            if not shape.has_text_frame or not shape.text_frame.text.strip():
                 continue
             if shape == slide.shapes.title:
-                title = text
+                title = shape.text_frame.text.strip()
             else:
-                body_texts.append(text)
+                text_shapes.append(shape)
 
         doc.add_heading(title or f"Slide {i}", level=1)
-        for t in body_texts:
-            for line in t.split("\n"):
-                if line.strip():
-                    doc.add_paragraph(line.strip(), style="List Bullet")
+
+        for shape in text_shapes:
+            for para in shape.text_frame.paragraphs:
+                line = para.text.strip()
+                if not line:
+                    continue
+                level = min(para.level or 0, 2)
+                try:
+                    doc.add_paragraph(line, style=BULLET_STYLES[level])
+                except KeyError:
+                    p = doc.add_paragraph(line, style="List Bullet")
+                    p.paragraph_format.left_indent = DocxInches(0.25 * (level + 1))
+
+        for shape in table_shapes:
+            rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
+            rows = [r for r in rows if any(r)]
+            if not rows:
+                continue
+            n_rows, n_cols = len(rows), max(len(r) for r in rows)
+            word_table = doc.add_table(rows=n_rows, cols=n_cols)
+            word_table.style = "Light Grid Accent 1"
+            for r_idx, row in enumerate(rows):
+                for c_idx in range(n_cols):
+                    cell = word_table.cell(r_idx, c_idx)
+                    cell.text = row[c_idx] if c_idx < len(row) else ""
+                    if r_idx == 0:
+                        for p in cell.paragraphs:
+                            for run in p.runs:
+                                run.bold = True
+
+        if slide.has_notes_slide:
+            notes_text = slide.notes_slide.notes_text_frame.text.strip()
+            if notes_text:
+                note_p = doc.add_paragraph()
+                note_p.paragraph_format.space_before = DocxPt(8)
+                run = note_p.add_run(f"Speaker notes: {notes_text}")
+                run.italic = True
+                run.font.size = DocxPt(9)
+
         if i < len(prs.slides):
             doc.add_page_break()
 
@@ -265,15 +420,19 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     doc.add_heading("Converted from PDF", 0)
 
     for i, page in enumerate(reader.pages, 1):
-        text = page.extract_text() or ""
-        text = text.strip()
+        text = (page.extract_text() or "").strip()
         if len(reader.pages) > 1:
             doc.add_heading(f"Page {i}", level=2)
         if text:
-            for line in text.split("\n"):
-                line = line.strip()
-                if line:
-                    doc.add_paragraph(line)
+            for para_text, kind in _reconstruct_paragraphs(text):
+                if not para_text:
+                    continue
+                if kind == "bullet":
+                    doc.add_paragraph(para_text, style="List Bullet")
+                elif kind == "heading":
+                    doc.add_heading(para_text, level=3)
+                else:
+                    doc.add_paragraph(para_text)
         else:
             doc.add_paragraph("[No extractable text on this page — likely a scanned image.]")
 
@@ -286,10 +445,17 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
 # ---------------------------------------------------------------- PDF -> PPTX
 def pdf_to_pptx(src_path, out_dir, style=None):
     page_prefix = os.path.join(out_dir, "page")
-    subprocess.run(
-        ["pdftoppm", "-png", "-r", "150", src_path, page_prefix],
-        capture_output=True, text=True, timeout=60, check=True
-    )
+    try:
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", "150", src_path, page_prefix],
+            capture_output=True, text=True, timeout=60, check=True
+        )
+    except FileNotFoundError:
+        raise ConversionError("PDF rendering tool (poppler-utils) is not installed on the server")
+    except subprocess.TimeoutExpired:
+        raise ConversionError("PDF rendering timed out — the file may be too large or complex")
+    except subprocess.CalledProcessError as e:
+        raise ConversionError(f"Could not rasterize PDF: {(e.stderr or e.stdout or '').strip()[:300]}")
     page_images = sorted(
         f for f in os.listdir(out_dir) if f.startswith("page") and f.endswith(".png")
     )
@@ -328,14 +494,27 @@ def pdf_to_pptx(src_path, out_dir, style=None):
 # --------------------------------------------------------------- XLSX -> DOCX
 def xlsx_to_docx(src_path, out_dir, style="clean"):
     wb = openpyxl.load_workbook(src_path, data_only=True)
-    doc = Document()
-    doc.add_heading("Converted from Excel", 0)
 
+    sheet_rows = []
+    max_cols = 0
     for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        doc.add_heading(sheet_name, level=1)
-        rows = list(ws.iter_rows(values_only=True))
+        rows = list(wb[sheet_name].iter_rows(values_only=True))
         rows = [r for r in rows if any(c is not None and str(c).strip() for c in r)]
+        sheet_rows.append((sheet_name, rows))
+        if rows:
+            max_cols = max(max_cols, max(len(r) for r in rows))
+
+    doc = Document()
+    if max_cols > 6:
+        # A wide sheet squeezed into a portrait page becomes unreadable —
+        # landscape gives every column real room.
+        section = doc.sections[0]
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width, section.page_height = section.page_height, section.page_width
+
+    doc.add_heading("Converted from Excel", 0)
+    for sheet_name, rows in sheet_rows:
+        doc.add_heading(sheet_name, level=1)
         if not rows:
             doc.add_paragraph("(Empty sheet)")
             continue
@@ -345,7 +524,12 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
                 val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
-                table.cell(r_idx, c_idx).text = str(val)
+                cell = table.cell(r_idx, c_idx)
+                cell.text = str(val)
+                if r_idx == 0:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.bold = True
 
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
@@ -359,22 +543,38 @@ def docx_to_xlsx(src_path, out_dir):
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    if doc.tables:
-        for i, table in enumerate(doc.tables, 1):
-            ws = wb.create_sheet(title=f"Table {i}"[:31])
-            for r_idx, row in enumerate(table.rows, 1):
-                for c_idx, cell in enumerate(row.cells, 1):
-                    ws.cell(row=r_idx, column=c_idx, value=cell.text)
-            for col in range(1, len(table.columns) + 1):
-                ws.column_dimensions[get_column_letter(col)].width = 22
-    else:
+    def autosize_columns(ws, n_cols):
+        for col_idx in range(1, n_cols + 1):
+            letter = get_column_letter(col_idx)
+            longest = max(
+                (len(str(cell.value)) for cell in ws[letter] if cell.value is not None),
+                default=10,
+            )
+            ws.column_dimensions[letter].width = min(max(longest + 2, 10), 60)
+
+    for i, table in enumerate(doc.tables, 1):
+        ws = wb.create_sheet(title=f"Table {i}"[:31])
+        for r_idx, row in enumerate(table.rows, 1):
+            for c_idx, cell in enumerate(row.cells, 1):
+                ws.cell(row=r_idx, column=c_idx, value=cell.text)
+        for cell in ws[1]:
+            cell.font = XlsxFont(bold=True)
+        autosize_columns(ws, len(table.columns))
+
+    # Capture the document's own paragraph text too, in its own sheet —
+    # tables and surrounding prose commentary often coexist in a document,
+    # and the old behavior silently dropped all of it whenever any table
+    # was present.
+    text_rows = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    if text_rows:
         ws = wb.create_sheet(title="Document Text")
         ws.column_dimensions["A"].width = 100
-        r = 1
-        for para in doc.paragraphs:
-            if para.text.strip():
-                ws.cell(row=r, column=1, value=para.text.strip())
-                r += 1
+        for r, line in enumerate(text_rows, 1):
+            ws.cell(row=r, column=1, value=line)
+
+    if not wb.sheetnames:
+        ws = wb.create_sheet(title="Sheet1")
+        ws["A1"] = "(No content found in document)"
 
     out_path = os.path.join(out_dir, "converted.xlsx")
     wb.save(out_path)
@@ -415,21 +615,33 @@ def text_to_pptx(raw_text, out_dir):
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
     title_layout = prs.slide_layouts[1]
+    MAX_BULLETS_PER_SLIDE = 8
 
     for block in blocks:
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if not lines:
             continue
-        title, body_lines = lines[0], lines[1:]
+        title = _BULLET_RE.sub("", lines[0]).strip()
+        body_lines = [_BULLET_RE.sub("", l).strip() for l in lines[1:]]
 
-        slide = prs.slides.add_slide(title_layout)
-        slide.shapes.title.text = title[:120]
-        tf = slide.placeholders[1].text_frame
-        tf.clear()
-        if body_lines:
-            for i, line in enumerate(body_lines):
-                p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-                p.text = line
+        slide = None
+        tf = None
+        count = 0
+        for i, line in enumerate(body_lines):
+            if slide is None or count >= MAX_BULLETS_PER_SLIDE:
+                slide_title = title if slide is None else title + " (cont.)"
+                slide = prs.slides.add_slide(title_layout)
+                slide.shapes.title.text = slide_title[:120]
+                tf = slide.placeholders[1].text_frame
+                tf.clear()
+                count = 0
+            p = tf.paragraphs[0] if count == 0 else tf.add_paragraph()
+            p.text = line
+            count += 1
+        if slide is None:
+            slide = prs.slides.add_slide(title_layout)
+            slide.shapes.title.text = title[:120]
+            slide.placeholders[1].text_frame.clear()
 
     if not prs.slides:
         raise ConversionError("No usable text found")
@@ -505,21 +717,40 @@ def academic_essay_to_docx(payload, out_dir):
     title_p.paragraph_format.line_spacing = 2.0
     _set_run_font(title_p.add_run(title), bold=True)
 
-    def add_body_paragraph(text, bold_heading=False):
+    def add_body_paragraph(text):
         p = doc.add_paragraph()
         p.paragraph_format.line_spacing = 2.0
-        if bold_heading:
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        p.paragraph_format.first_line_indent = DocxInches(0.5)
+        _set_run_font(p.add_run(text))
+        return p
+
+    def add_section_heading(text, level=1):
+        p = doc.add_paragraph()
+        p.paragraph_format.line_spacing = 2.0
+        if level <= 1:
+            # APA Level 1: centered, bold
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _set_run_font(p.add_run(text), bold=True)
+        elif level == 2:
+            # APA Level 2: left-aligned, bold
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _set_run_font(p.add_run(text), bold=True)
         else:
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            p.paragraph_format.first_line_indent = DocxInches(0.5)
-        _set_run_font(p.add_run(text), bold=bold_heading)
+            # APA Level 3: left-aligned, bold italic
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            run = p.add_run(text)
+            run.font.name = "Times New Roman"
+            run.font.size = DocxPt(12)
+            run.font.color.rgb = DocxRGBColor(0, 0, 0)
+            run.bold = True
+            run.italic = True
         return p
 
     sections = payload.get("sections")
     if sections:
         for sec in sections:
-            add_body_paragraph(f"{sec['number']} {sec['heading']}", bold_heading=True)
+            add_section_heading(f"{sec['number']} {sec['heading']}", level=sec.get("level", 1))
             add_body_paragraph(sec["text"])
     else:
         text = (payload.get("text") or "").strip()
@@ -529,6 +760,9 @@ def academic_essay_to_docx(payload, out_dir):
 
     references = payload.get("references") or []
     if references:
+        # APA requires an alphabetical reference list — sort defensively here
+        # rather than trusting whatever order the source list arrived in.
+        references = sorted(references, key=lambda r: (r.get("text") or "").lower())
         doc.add_paragraph()
         ref_heading = doc.add_paragraph()
         ref_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
