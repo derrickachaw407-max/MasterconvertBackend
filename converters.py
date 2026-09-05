@@ -302,7 +302,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         state["slide"], state["body_tf"], state["bullet_count"] = s, tf, 0
         return s, tf
 
-    def add_bullet(text, level=0):
+    def add_bullet(para, level=0):
         if state["slide"] is None:
             new_slide("Overview")
         if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
@@ -313,9 +313,24 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             p = body_tf.paragraphs[0]
         else:
             p = body_tf.add_paragraph()
-        p.text = text
         p.level = min(level, 4)
+        runs = [r for r in para.runs if r.text]
+        if not runs:
+            p.text = para.text.strip()
+        for run in runs:
+            r = p.add_run()
+            r.text = run.text
+            r.font.bold = bool(run.bold)
+            r.font.italic = bool(run.italic)
+            r.font.underline = bool(run.underline)
         _style_pptx_body_paragraph(p, template_style)
+        # Re-apply bold/italic after the shared style pass, since that pass
+        # sets font attributes on every run and would otherwise stomp the
+        # per-run emphasis we just copied over.
+        for r, src in zip(p.runs, runs):
+            r.font.bold = bool(src.bold)
+            r.font.italic = bool(src.italic)
+            r.font.underline = bool(src.underline)
         state["bullet_count"] += 1
 
     def add_table_slide(table):
@@ -330,7 +345,12 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
-                gtable.cell(r_idx, c_idx).text = row[c_idx] if c_idx < len(row) else ""
+                cell = gtable.cell(r_idx, c_idx)
+                cell.text = row[c_idx] if c_idx < len(row) else ""
+                if r_idx == 0:
+                    for p in cell.text_frame.paragraphs:
+                        for run in p.runs:
+                            run.font.bold = True
         # A loose paragraph appearing right after a table should land on a
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
@@ -375,7 +395,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                 m = re.search(r"(\d+)", para_style_name)
                 if m:
                     level = max(0, min(int(m.group(1)) - 1, 4))
-            add_bullet(text, level=level)
+            add_bullet(para, level=level)
 
     if state["slide"] is None:
         new_slide("Untitled Document")
@@ -416,10 +436,18 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                     continue
                 level = min(para.level or 0, 2)
                 try:
-                    doc.add_paragraph(line, style=BULLET_STYLES[level])
+                    p = doc.add_paragraph(style=BULLET_STYLES[level])
                 except KeyError:
-                    p = doc.add_paragraph(line, style="List Bullet")
+                    p = doc.add_paragraph(style="List Bullet")
                     p.paragraph_format.left_indent = DocxInches(0.25 * (level + 1))
+                runs = [r for r in para.runs if r.text]
+                if not runs:
+                    p.add_run(line)
+                for run in runs:
+                    r = p.add_run(run.text)
+                    r.bold = bool(run.font.bold)
+                    r.italic = bool(run.font.italic)
+                    r.underline = bool(run.font.underline)
 
         for shape in table_shapes:
             rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
@@ -548,8 +576,26 @@ def pdf_to_pptx(src_path, out_dir, style=None):
     prs.slide_height = PptxInches(7.5)
     blank_layout = prs.slide_layouts[6]
 
+    from PIL import Image
+
     for img_name in page_images:
-        img_path = os.path.join(out_dir, img_name)
+        png_path = os.path.join(out_dir, img_name)
+        # Rendered PDF pages are usually flat text/line-art, which PNG often
+        # compresses better than JPEG's photo-oriented compression — but a
+        # photo-heavy page can go the other way. Keep whichever is smaller
+        # rather than assuming either format always wins.
+        img_path = png_path
+        try:
+            jpeg_path = png_path[:-4] + ".jpg"
+            with Image.open(png_path) as im:
+                im.convert("RGB").save(jpeg_path, "JPEG", quality=85)
+            if os.path.getsize(jpeg_path) < os.path.getsize(png_path):
+                img_path = jpeg_path
+            else:
+                os.remove(jpeg_path)
+        except Exception:
+            pass  # fall back to the original PNG if re-encoding fails for any reason
+
         slide = prs.slides.add_slide(blank_layout)
         slide.shapes.add_picture(img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
 
@@ -602,9 +648,12 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
     sheet_rows = []
     max_cols = 0
     for sheet_name in wb.sheetnames:
-        rows = list(wb[sheet_name].iter_rows())
-        rows = [r for r in rows if any(c.value is not None and str(c.value).strip() for c in r)]
-        sheet_rows.append((sheet_name, rows))
+        ws = wb[sheet_name]
+        merged_ranges = list(ws.merged_cells.ranges)
+        rows = list(ws.iter_rows())
+        if not merged_ranges:
+            rows = [r for r in rows if any(c.value is not None and str(c.value).strip() for c in r)]
+        sheet_rows.append((sheet_name, rows, merged_ranges))
         if rows:
             max_cols = max(max_cols, max(len(r) for r in rows))
 
@@ -617,7 +666,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         section.page_width, section.page_height = section.page_height, section.page_width
 
     doc.add_heading("Converted from Excel", 0)
-    for sheet_name, rows in sheet_rows:
+    for sheet_name, rows, merged_ranges in sheet_rows:
         doc.add_heading(sheet_name, level=1)
         if not rows:
             doc.add_paragraph("(Empty sheet)")
@@ -634,6 +683,11 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                     for p in cell.paragraphs:
                         for run in p.runs:
                             run.bold = True
+        for mr in merged_ranges:
+            try:
+                table.cell(mr.min_row - 1, mr.min_col - 1).merge(table.cell(mr.max_row - 1, mr.max_col - 1))
+            except IndexError:
+                continue  # merge range falls outside the table we built — skip rather than crash
 
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
