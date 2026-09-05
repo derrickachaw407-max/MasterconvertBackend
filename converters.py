@@ -23,9 +23,10 @@ from docx.text.paragraph import Paragraph as DocxParagraph
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
 from pptx.dml.color import RGBColor as PptxRGBColor
+from pptx.enum.dml import MSO_FILL_TYPE
 import openpyxl
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font as XlsxFont
+from openpyxl.styles import Font as XlsxFont, PatternFill as XlsxPatternFill
 import pypdf
 
 
@@ -264,6 +265,42 @@ def docx_to_pdf(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- DOCX -> PPTX
+def _xlsx_cell_fill_hex(cell):
+    """Returns an openpyxl cell's solid fill color as a 6-char hex string,
+    or None if it has no solid fill. openpyxl reports colors as 8-char ARGB
+    (alpha + RGB), while docx/pptx RGBColor expects plain 6-char RGB."""
+    fill = cell.fill
+    if fill.patternType != "solid" or not fill.fgColor or fill.fgColor.type != "rgb":
+        return None
+    rgb = fill.fgColor.rgb
+    return rgb[2:] if rgb and len(rgb) == 8 else None
+
+
+def _get_docx_cell_shading(cell):
+    """Returns a docx table cell's background shading as a hex string, or
+    None if it has none. python-docx has no high-level API for cell
+    shading — this reads the raw <w:shd w:fill="..."/> element directly."""
+    tcPr = cell._tc.find(qn("w:tcPr"))
+    if tcPr is None:
+        return None
+    shd = tcPr.find(qn("w:shd"))
+    if shd is None:
+        return None
+    fill = shd.get(qn("w:fill"))
+    return fill if fill and fill.upper() != "AUTO" else None
+
+
+def _set_docx_cell_shading(cell, hex_color):
+    """Sets a docx table cell's background shading. No high-level API for
+    this in python-docx — building the <w:shd> element by hand is the
+    standard recipe."""
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:fill"), hex_color)
+    tcPr.append(shd)
+
+
 def _safe_hex_color(color):
     """Returns a run's color as a hex string ('FF0000'), or None if it's
     unset or a theme color rather than an explicit RGB value. Accessing
@@ -403,10 +440,13 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         state["bullet_count"] += 1
 
     def add_table_slide(table):
-        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
-        rows = [r for r in rows if any(r)]
-        if not rows:
+        src_rows = [list(row.cells) for row in table.rows]
+        rows = [[cell.text.strip() for cell in row] for row in src_rows]
+        keep = [i for i, r in enumerate(rows) if any(r)]
+        if not keep:
             return
+        rows = [rows[i] for i in keep]
+        src_rows = [src_rows[i] for i in keep]
         n_rows, n_cols = len(rows), max(len(r) for r in rows)
         s = prs.slides.add_slide(blank_layout)
         left, top = PptxInches(0.6), PptxInches(0.6)
@@ -420,6 +460,14 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     for p in cell.text_frame.paragraphs:
                         for run in p.runs:
                             run.font.bold = True
+                if c_idx < len(src_rows[r_idx]):
+                    shade = _get_docx_cell_shading(src_rows[r_idx][c_idx])
+                    if shade:
+                        try:
+                            cell.fill.solid()
+                            cell.fill.fore_color.rgb = PptxRGBColor.from_string(shade)
+                        except Exception:
+                            pass
         # A loose paragraph appearing right after a table should land on a
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
@@ -579,10 +627,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                                 pass
 
         for shape in table_shapes:
-            rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
-            rows = [r for r in rows if any(r)]
-            if not rows:
+            src_rows = [list(row.cells) for row in shape.table.rows]
+            rows = [[cell.text.strip() for cell in row] for row in src_rows]
+            keep = [i for i, r in enumerate(rows) if any(r)]
+            if not keep:
                 continue
+            rows = [rows[i] for i in keep]
+            src_rows = [src_rows[i] for i in keep]
             n_rows, n_cols = len(rows), max(len(r) for r in rows)
             word_table = doc.add_table(rows=n_rows, cols=n_cols)
             word_table.style = "Light Grid Accent 1"
@@ -594,6 +645,15 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                         for p in cell.paragraphs:
                             for run in p.runs:
                                 run.bold = True
+                    if c_idx < len(src_rows[r_idx]):
+                        src_cell = src_rows[r_idx][c_idx]
+                        try:
+                            if src_cell.fill.type == MSO_FILL_TYPE.SOLID:
+                                hex_color = _safe_hex_color(src_cell.fill.fore_color)
+                                if hex_color:
+                                    _set_docx_cell_shading(cell, hex_color)
+                        except Exception:
+                            pass
 
         if slide.has_notes_slide:
             notes_text = slide.notes_slide.notes_text_frame.text.strip()
@@ -805,13 +865,18 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         table.style = "Light Grid Accent 1"
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
-                val = row[c_idx].value if c_idx < len(row) else None
+                src_cell = row[c_idx] if c_idx < len(row) else None
+                val = src_cell.value if src_cell is not None else None
                 cell = table.cell(r_idx, c_idx)
                 cell.text = _format_cell_value(val)
                 if r_idx == 0:
                     for p in cell.paragraphs:
                         for run in p.runs:
                             run.bold = True
+                if src_cell is not None:
+                    fill_hex = _xlsx_cell_fill_hex(src_cell)
+                    if fill_hex:
+                        _set_docx_cell_shading(cell, fill_hex)
         for mr in merged_ranges:
             try:
                 table.cell(mr.min_row - 1, mr.min_col - 1).merge(table.cell(mr.max_row - 1, mr.max_col - 1))
@@ -858,7 +923,10 @@ def docx_to_xlsx(src_path, out_dir):
             for c_idx, cell in enumerate(row.cells, 1):
                 text = cell.text.strip()
                 value = text if r_idx == 1 else coerce_numeric(text)
-                ws.cell(row=r_idx, column=c_idx, value=value)
+                xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                shade = _get_docx_cell_shading(cell)
+                if shade:
+                    xlsx_cell.fill = XlsxPatternFill(start_color=shade, end_color=shade, fill_type="solid")
         for cell in ws[1]:
             cell.font = XlsxFont(bold=True)
         autosize_columns(ws, len(table.columns))
