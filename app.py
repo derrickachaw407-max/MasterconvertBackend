@@ -7,6 +7,7 @@ import smtplib
 import string
 import tempfile
 import shutil
+import time
 import uuid
 import zipfile
 from collections import Counter
@@ -44,6 +45,13 @@ FRONTEND_URL = ALLOWED_ORIGIN
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-5"
+
+# Optional — without this, Semantic Scholar's public API shares a very tight
+# anonymous rate limit across every caller on Render's IP range, which is what
+# was causing 429 Too Many Requests. Get a free key at
+# https://www.semanticscholar.org/product/api#api-key-form and set it as this
+# env var on Render to raise the limit substantially.
+SEMANTIC_SCHOLAR_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")
 
 # ---------- accounts / auth ----------
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -351,7 +359,7 @@ def search_web_sources(topic, max_results=4):
         return [], "web search skipped (no API key configured on the server)"
     payload = {
         "model": ANTHROPIC_MODEL,
-        "max_tokens": 200,
+        "max_tokens": 800,
         "system": (
             "Search the web for 3-4 real, credible sources (academic papers, reputable "
             "educational or scientific publications) relevant to the given topic. Once you've "
@@ -402,25 +410,39 @@ def search_web_sources(topic, max_results=4):
 
 
 def search_semantic_scholar(query, max_results=4):
-    """Searches Semantic Scholar's free public API for real peer-reviewed papers —
-    no API key required. Keeps any hit with a real title and URL; an abstract is
-    used as a grounding excerpt when present but is not required — many real
-    papers, especially in regional/non-mainstream journals, have no abstract
-    indexed, and excluding them was emptying the candidate pool entirely for
-    niche topics. Fetches a larger relevance-matched pool than max_results, then
-    sorts by publication year descending so the most recent matching papers are
-    preferred — falls back to older ones only when too few recent matches exist
-    for the topic. Returns (sources, diagnostic) — sources is [] on any failure
-    (timeout, rate limit, bad response), with diagnostic explaining why."""
-    try:
-        resp = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query[:300], "limit": max(max_results * 3, 15), "fields": "title,url,year,authors,abstract,venue"},
-            timeout=12,
-        )
-    except requests.exceptions.RequestException as e:
-        logger.warning("search_semantic_scholar: request failed for %r: %s", query[:80], e)
-        return [], f"Semantic Scholar request failed: {e}"
+    """Searches Semantic Scholar's free public API for real peer-reviewed papers.
+    Sends SEMANTIC_SCHOLAR_API_KEY when configured — without one, the anonymous
+    rate limit is shared across every caller on Render's IP range and gets
+    exhausted easily. On a 429, retries once after a short backoff before
+    giving up, since these limits are usually per-minute and often clear fast.
+    Keeps any hit with a real title and URL; an abstract is used as a grounding
+    excerpt when present but is not required — many real papers, especially in
+    regional/non-mainstream journals, have no abstract indexed, and excluding
+    them was emptying the candidate pool entirely for niche topics. Fetches a
+    larger relevance-matched pool than max_results, then sorts by publication
+    year descending so the most recent matching papers are preferred — falls
+    back to older ones only when too few recent matches exist for the topic.
+    Returns (sources, diagnostic) — sources is [] on any failure (timeout,
+    rate limit, bad response), with diagnostic explaining why."""
+    headers = {"x-api-key": SEMANTIC_SCHOLAR_API_KEY} if SEMANTIC_SCHOLAR_API_KEY else {}
+    params = {"query": query[:300], "limit": max(max_results * 3, 15), "fields": "title,url,year,authors,abstract,venue"}
+    resp = None
+    for attempt in range(2):
+        try:
+            resp = requests.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params=params,
+                headers=headers,
+                timeout=12,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.warning("search_semantic_scholar: request failed for %r: %s", query[:80], e)
+            return [], f"Semantic Scholar request failed: {e}"
+        if resp.status_code == 429 and attempt == 0:
+            logger.warning("search_semantic_scholar: 429 on first attempt for %r, retrying after backoff", query[:80])
+            time.sleep(2.5)
+            continue
+        break
     if resp.status_code != 200:
         logger.warning(
             "search_semantic_scholar: non-200 (%s) for %r — body: %s",
