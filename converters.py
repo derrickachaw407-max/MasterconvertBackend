@@ -304,7 +304,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         state["slide"], state["body_tf"], state["bullet_count"] = s, tf, 0
         return s, tf
 
-    def add_bullet(para, level=0):
+    def add_bullet(para, level=0, numbered=False):
         if state["slide"] is None:
             new_slide("Overview")
         if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
@@ -316,6 +316,9 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         else:
             p = body_tf.add_paragraph()
         p.level = min(level, 4)
+        if numbered:
+            pPr = p._p.get_or_add_pPr()
+            pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
 
         # para.runs deliberately excludes hyperlink-wrapped runs in
         # python-docx — using it here was silently dropping any hyperlinked
@@ -354,6 +357,30 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
                 except Exception:
                     pass
+        state["bullet_count"] += 1
+
+    def add_subheading(text):
+        """Heading 2/3 in the source document reads as a subsection within
+        the current topic, not a brand new topic — giving it a whole new
+        slide (the old behavior for every heading level) fragmented what's
+        usually meant to be one cohesive slide into several thin ones. This
+        keeps it on the current slide as a bolded standalone line instead."""
+        if state["slide"] is None:
+            new_slide(text)
+            return
+        if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
+            current_title = state["slide"].shapes.title.text or "Overview"
+            new_slide(current_title + " (cont.)")
+        body_tf = state["body_tf"]
+        if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
+            p = body_tf.paragraphs[0]
+        else:
+            p = body_tf.add_paragraph()
+        p.level = 0
+        p.text = text
+        _style_pptx_body_paragraph(p, template_style)
+        for r in p.runs:
+            r.font.bold = True
         state["bullet_count"] += 1
 
     def add_table_slide(table):
@@ -410,15 +437,20 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         if not text:
             continue
         para_style_name = (para.style.name or "").lower()
-        if "heading" in para_style_name or para_style_name == "title":
+        heading_match = re.match(r"heading (\d+)", para_style_name)
+        if para_style_name == "title" or (heading_match and int(heading_match.group(1)) <= 1):
             new_slide(text)
+        elif heading_match:
+            add_subheading(text)
         else:
             level = 0
+            numbered = False
             if "list" in para_style_name:
                 m = re.search(r"(\d+)", para_style_name)
                 if m:
                     level = max(0, min(int(m.group(1)) - 1, 4))
-            add_bullet(para, level=level)
+                numbered = "number" in para_style_name
+            add_bullet(para, level=level, numbered=numbered)
 
     if state["slide"] is None:
         new_slide("Untitled Document")
@@ -468,6 +500,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     doc = Document()
     doc.add_heading("Slide Handout", 0)
     BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
+    NUMBER_STYLES = ["List Number", "List Number 2", "List Number 3"]
 
     for i, slide in enumerate(prs.slides, 1):
         title = None
@@ -492,10 +525,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 if not line:
                     continue
                 level = min(para.level or 0, 2)
+                pPr = para._p.find(qn("a:pPr"))
+                is_numbered = pPr is not None and pPr.find(qn("a:buAutoNum")) is not None
+                style_list = NUMBER_STYLES if is_numbered else BULLET_STYLES
                 try:
-                    p = doc.add_paragraph(style=BULLET_STYLES[level])
+                    p = doc.add_paragraph(style=style_list[level])
                 except KeyError:
-                    p = doc.add_paragraph(style="List Bullet")
+                    p = doc.add_paragraph(style="List Number" if is_numbered else "List Bullet")
                     p.paragraph_format.left_indent = DocxInches(0.25 * (level + 1))
                 runs = [r for r in para.runs if r.text]
                 if not runs:
