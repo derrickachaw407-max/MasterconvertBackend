@@ -264,6 +264,19 @@ def docx_to_pdf(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- DOCX -> PPTX
+def _safe_hex_color(color):
+    """Returns a run's color as a hex string ('FF0000'), or None if it's
+    unset or a theme color rather than an explicit RGB value. Accessing
+    .rgb directly raises AttributeError in both python-docx and python-pptx
+    for those cases, so this is what makes copying colors between formats
+    safe instead of crashing on the first themed or default-colored run."""
+    try:
+        rgb = color.rgb
+    except AttributeError:
+        return None
+    return str(rgb) if rgb is not None else None
+
+
 def _iter_inline_images(paragraph, doc):
     """Yields raw image bytes for each inline picture embedded in this
     paragraph, in document order — including images inside a hyperlink.
@@ -324,7 +337,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # python-docx — using it here was silently dropping any hyperlinked
         # text in the paragraph entirely. iter_inner_content() walks both
         # plain runs and hyperlinks in real document order.
-        captured = []  # (pptx_run, bold, italic, underline, is_link)
+        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color)
         for item in para.iter_inner_content():
             is_link = type(item).__name__ == "Hyperlink"
             text = item.text
@@ -336,25 +349,31 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             bold = bool(src_run.bold) if src_run else False
             italic = bool(src_run.italic) if src_run else False
             underline = True if is_link else bool(src_run.underline if src_run else False)
+            hex_color = None if (is_link or src_run is None) else _safe_hex_color(src_run.font.color)
             if is_link:
                 try:
                     r.hyperlink.address = item.address
                 except Exception:
                     pass
-            captured.append((r, bold, italic, underline, is_link))
+            captured.append((r, bold, italic, underline, is_link, hex_color))
         if not captured:
             p.text = para.text.strip()
         _style_pptx_body_paragraph(p, template_style)
         # Re-apply emphasis after the shared style pass, since that pass
         # sets font attributes on every run and would otherwise stomp the
         # per-run formatting (and hyperlink coloring) just captured above.
-        for r, bold, italic, underline, is_link in captured:
+        for r, bold, italic, underline, is_link, hex_color in captured:
             r.font.bold = bold
             r.font.italic = italic
             r.font.underline = underline
             if is_link:
                 try:
                     r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
+                except Exception:
+                    pass
+            elif hex_color:
+                try:
+                    r.font.color.rgb = PptxRGBColor.from_string(hex_color)
                 except Exception:
                     pass
         state["bullet_count"] += 1
@@ -552,6 +571,12 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                         r.bold = bool(run.font.bold)
                         r.italic = bool(run.font.italic)
                         r.underline = bool(run.font.underline)
+                        hex_color = _safe_hex_color(run.font.color)
+                        if hex_color:
+                            try:
+                                r.font.color.rgb = DocxRGBColor.from_string(hex_color)
+                            except Exception:
+                                pass
 
         for shape in table_shapes:
             rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
