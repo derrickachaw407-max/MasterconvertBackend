@@ -4,11 +4,14 @@ Real conversions using LibreOffice (rendering-accurate formats) and
 structural rebuilding (python-docx/pptx/openpyxl) for formats that have
 no direct renderer path between them.
 """
+import datetime
+import io
 import os
 import re
 import subprocess
 import tempfile
 import shutil
+from collections import Counter
 from docx import Document
 from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -261,6 +264,23 @@ def docx_to_pdf(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- DOCX -> PPTX
+def _iter_inline_images(paragraph, doc):
+    """Yields raw image bytes for each inline picture embedded in this
+    paragraph's runs, in order. python-docx's own API doesn't expose
+    embedded pictures directly off a paragraph — this reaches into the
+    run's XML for the relationship id of each <a:blip> drawing and resolves
+    it against the document's image parts."""
+    for run in paragraph.runs:
+        for blip in run._element.findall(".//" + qn("a:blip")):
+            r_id = blip.get(qn("r:embed"))
+            if not r_id:
+                continue
+            try:
+                yield doc.part.related_parts[r_id].blob
+            except KeyError:
+                continue
+
+
 def docx_to_pptx(src_path, out_dir, style="minimal"):
     template_style = PPTX_TEMPLATES.get(style, PPTX_TEMPLATES["minimal"])
     doc = Document(src_path)
@@ -315,11 +335,34 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
 
+    def add_image_slide(image_bytes):
+        s = prs.slides.add_slide(blank_layout)
+        try:
+            pic = s.shapes.add_picture(io.BytesIO(image_bytes), 0, 0)
+        except Exception:
+            return  # a malformed/unsupported embedded image shouldn't sink the whole conversion
+        scale = min(prs.slide_width / pic.width, prs.slide_height / pic.height, 1) if pic.width and pic.height else 1
+        pic.width, pic.height = int(pic.width * scale), int(pic.height * scale)
+        pic.left = int((prs.slide_width - pic.width) / 2)
+        pic.top = int((prs.slide_height - pic.height) / 2)
+        # A loose paragraph appearing right after an image should land on a
+        # fresh slide rather than silently reusing the image slide.
+        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+
+    MAX_IMAGES = 30
+    image_count = 0
+
     for block in _iter_block_items(doc):
         if isinstance(block, DocxTable):
             add_table_slide(block)
             continue
         para = block
+        if image_count < MAX_IMAGES:
+            for img_bytes in _iter_inline_images(para, doc):
+                if image_count >= MAX_IMAGES:
+                    break
+                add_image_slide(img_bytes)
+                image_count += 1
         text = para.text.strip()
         if not text:
             continue
@@ -416,15 +459,37 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
 # ---------------------------------------------------------------- PDF -> DOCX
 def pdf_to_docx(src_path, out_dir, style="clean"):
     reader = pypdf.PdfReader(src_path)
+    n_pages = len(reader.pages)
+
+    page_items = []
+    for page in reader.pages:
+        text = (page.extract_text() or "").strip()
+        page_items.append(_reconstruct_paragraphs(text) if text else [])
+
+    # A short line that repeats verbatim across most pages is a running
+    # header/footer (page title, "Confidential", a date stamp, etc.), not
+    # real content — repeating it once per page in the reconstructed
+    # document just adds clutter. Only applies to documents long enough
+    # that a real repeat pattern is meaningful, not a 2-page coincidence.
+    line_counts = Counter()
+    for items in page_items:
+        seen_this_page = {t for t, _k in items if len(t) < 100}
+        for t in seen_this_page:
+            line_counts[t] += 1
+    repeat_threshold = max(3, int(n_pages * 0.6))
+    noisy_lines = {t for t, count in line_counts.items() if n_pages > 2 and count >= repeat_threshold}
+
     doc = Document()
     doc.add_heading("Converted from PDF", 0)
+    MAX_IMAGES = 30
+    image_count = 0
 
-    for i, page in enumerate(reader.pages, 1):
-        text = (page.extract_text() or "").strip()
-        if len(reader.pages) > 1:
+    for i, (page, items) in enumerate(zip(reader.pages, page_items), 1):
+        if n_pages > 1:
             doc.add_heading(f"Page {i}", level=2)
-        if text:
-            for para_text, kind in _reconstruct_paragraphs(text):
+        content_items = [(t, k) for t, k in items if t not in noisy_lines]
+        if content_items:
+            for para_text, kind in content_items:
                 if not para_text:
                     continue
                 if kind == "bullet":
@@ -433,8 +498,24 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                     doc.add_heading(para_text, level=3)
                 else:
                     doc.add_paragraph(para_text)
-        else:
+        elif not items:
             doc.add_paragraph("[No extractable text on this page — likely a scanned image.]")
+        # else: the page had only repeated header/footer noise and nothing
+        # else — nothing worth showing, so leave it at just the page heading.
+
+        if image_count < MAX_IMAGES:
+            try:
+                page_images = list(page.images)
+            except Exception:
+                page_images = []
+            for img in page_images:
+                if image_count >= MAX_IMAGES:
+                    break
+                try:
+                    doc.add_picture(io.BytesIO(img.data), width=DocxInches(6))
+                    image_count += 1
+                except Exception:
+                    continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
 
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
@@ -492,14 +573,37 @@ def pdf_to_pptx(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- XLSX -> DOCX
+def _format_cell_value(val):
+    """openpyxl hands back raw Python values — a date becomes a datetime
+    object, and floating-point arithmetic in the sheet often leaves noise
+    like 3.140000000000001. str()'ing these directly is what the old code
+    did, and it looked exactly as raw as that implies. This renders them the
+    way a person actually reads a spreadsheet."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, datetime.datetime):
+        if val.hour or val.minute or val.second:
+            return val.strftime("%Y-%m-%d %H:%M")
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, datetime.date):
+        return val.strftime("%Y-%m-%d")
+    if isinstance(val, float):
+        if val == int(val):
+            return str(int(val))
+        return f"{val:.6f}".rstrip("0").rstrip(".")
+    return str(val)
+
+
 def xlsx_to_docx(src_path, out_dir, style="clean"):
     wb = openpyxl.load_workbook(src_path, data_only=True)
 
     sheet_rows = []
     max_cols = 0
     for sheet_name in wb.sheetnames:
-        rows = list(wb[sheet_name].iter_rows(values_only=True))
-        rows = [r for r in rows if any(c is not None and str(c).strip() for c in r)]
+        rows = list(wb[sheet_name].iter_rows())
+        rows = [r for r in rows if any(c.value is not None and str(c.value).strip() for c in r)]
         sheet_rows.append((sheet_name, rows))
         if rows:
             max_cols = max(max_cols, max(len(r) for r in rows))
@@ -523,9 +627,9 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         table.style = "Light Grid Accent 1"
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
-                val = row[c_idx] if c_idx < len(row) and row[c_idx] is not None else ""
+                val = row[c_idx].value if c_idx < len(row) else None
                 cell = table.cell(r_idx, c_idx)
-                cell.text = str(val)
+                cell.text = _format_cell_value(val)
                 if r_idx == 0:
                     for p in cell.paragraphs:
                         for run in p.runs:
@@ -552,11 +656,26 @@ def docx_to_xlsx(src_path, out_dir):
             )
             ws.column_dimensions[letter].width = min(max(longest + 2, 10), 60)
 
+    def coerce_numeric(text):
+        """A table cell that reads '42' or '3.5' should become an actual
+        number in the spreadsheet, not a text string that looks like one —
+        otherwise SUM/sort/filter in Excel silently don't work on it. Only
+        coerces values that are unambiguously numeric; anything else is
+        left as text exactly as written."""
+        cleaned = text.strip().replace(",", "")
+        if re.fullmatch(r"-?\d+", cleaned):
+            return int(cleaned)
+        if re.fullmatch(r"-?\d+\.\d+", cleaned):
+            return float(cleaned)
+        return text
+
     for i, table in enumerate(doc.tables, 1):
         ws = wb.create_sheet(title=f"Table {i}"[:31])
         for r_idx, row in enumerate(table.rows, 1):
             for c_idx, cell in enumerate(row.cells, 1):
-                ws.cell(row=r_idx, column=c_idx, value=cell.text)
+                text = cell.text.strip()
+                value = text if r_idx == 1 else coerce_numeric(text)
+                ws.cell(row=r_idx, column=c_idx, value=value)
         for cell in ws[1]:
             cell.font = XlsxFont(bold=True)
         autosize_columns(ws, len(table.columns))
