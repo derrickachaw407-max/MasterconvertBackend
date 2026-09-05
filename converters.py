@@ -266,19 +266,21 @@ def docx_to_pdf(src_path, out_dir, style=None):
 # --------------------------------------------------------------- DOCX -> PPTX
 def _iter_inline_images(paragraph, doc):
     """Yields raw image bytes for each inline picture embedded in this
-    paragraph's runs, in order. python-docx's own API doesn't expose
-    embedded pictures directly off a paragraph — this reaches into the
-    run's XML for the relationship id of each <a:blip> drawing and resolves
-    it against the document's image parts."""
-    for run in paragraph.runs:
-        for blip in run._element.findall(".//" + qn("a:blip")):
-            r_id = blip.get(qn("r:embed"))
-            if not r_id:
-                continue
-            try:
-                yield doc.part.related_parts[r_id].blob
-            except KeyError:
-                continue
+    paragraph, in document order — including images inside a hyperlink.
+    python-docx's own paragraph.runs deliberately excludes hyperlink-wrapped
+    runs, so walking iter_inner_content() (which covers both) is required
+    here, not just runs, or a clickable image would be silently skipped."""
+    for item in paragraph.iter_inner_content():
+        runs = item.runs if type(item).__name__ == "Hyperlink" else [item]
+        for run in runs:
+            for blip in run._element.findall(".//" + qn("a:blip")):
+                r_id = blip.get(qn("r:embed"))
+                if not r_id:
+                    continue
+                try:
+                    yield doc.part.related_parts[r_id].blob
+                except KeyError:
+                    continue
 
 
 def docx_to_pptx(src_path, out_dir, style="minimal"):
@@ -314,23 +316,44 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         else:
             p = body_tf.add_paragraph()
         p.level = min(level, 4)
-        runs = [r for r in para.runs if r.text]
-        if not runs:
-            p.text = para.text.strip()
-        for run in runs:
+
+        # para.runs deliberately excludes hyperlink-wrapped runs in
+        # python-docx — using it here was silently dropping any hyperlinked
+        # text in the paragraph entirely. iter_inner_content() walks both
+        # plain runs and hyperlinks in real document order.
+        captured = []  # (pptx_run, bold, italic, underline, is_link)
+        for item in para.iter_inner_content():
+            is_link = type(item).__name__ == "Hyperlink"
+            text = item.text
+            if not text:
+                continue
+            src_run = (item.runs[0] if item.runs else None) if is_link else item
             r = p.add_run()
-            r.text = run.text
-            r.font.bold = bool(run.bold)
-            r.font.italic = bool(run.italic)
-            r.font.underline = bool(run.underline)
+            r.text = text
+            bold = bool(src_run.bold) if src_run else False
+            italic = bool(src_run.italic) if src_run else False
+            underline = True if is_link else bool(src_run.underline if src_run else False)
+            if is_link:
+                try:
+                    r.hyperlink.address = item.address
+                except Exception:
+                    pass
+            captured.append((r, bold, italic, underline, is_link))
+        if not captured:
+            p.text = para.text.strip()
         _style_pptx_body_paragraph(p, template_style)
-        # Re-apply bold/italic after the shared style pass, since that pass
+        # Re-apply emphasis after the shared style pass, since that pass
         # sets font attributes on every run and would otherwise stomp the
-        # per-run emphasis we just copied over.
-        for r, src in zip(p.runs, runs):
-            r.font.bold = bool(src.bold)
-            r.font.italic = bool(src.italic)
-            r.font.underline = bool(src.underline)
+        # per-run formatting (and hyperlink coloring) just captured above.
+        for r, bold, italic, underline, is_link in captured:
+            r.font.bold = bold
+            r.font.italic = italic
+            r.font.underline = underline
+            if is_link:
+                try:
+                    r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
+                except Exception:
+                    pass
         state["bullet_count"] += 1
 
     def add_table_slide(table):
@@ -406,6 +429,40 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
 
 
 # --------------------------------------------------------------- PPTX -> DOCX
+def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underline=True):
+    """python-docx has no high-level API for creating a hyperlink — this is
+    the standard recipe: register the external relationship, then build the
+    <w:hyperlink> element by hand with a run inside it styled to look like a
+    normal link (blue, underlined) unless told otherwise."""
+    part = paragraph.part
+    r_id = part.relate_to(
+        url, "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
+        is_external=True,
+    )
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+    run_el = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    if bold:
+        rpr.append(OxmlElement("w:b"))
+    if italic:
+        rpr.append(OxmlElement("w:i"))
+    if underline:
+        u = OxmlElement("w:u")
+        u.set(qn("w:val"), "single")
+        rpr.append(u)
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    rpr.append(color)
+    run_el.append(rpr)
+    t = OxmlElement("w:t")
+    t.set(qn("xml:space"), "preserve")
+    t.text = text
+    run_el.append(t)
+    hyperlink.append(run_el)
+    paragraph._p.append(hyperlink)
+
+
 def pptx_to_docx(src_path, out_dir, style="clean"):
     prs = Presentation(src_path)
     doc = Document()
@@ -444,10 +501,21 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 if not runs:
                     p.add_run(line)
                 for run in runs:
-                    r = p.add_run(run.text)
-                    r.bold = bool(run.font.bold)
-                    r.italic = bool(run.font.italic)
-                    r.underline = bool(run.font.underline)
+                    address = None
+                    try:
+                        address = run.hyperlink.address
+                    except Exception:
+                        pass
+                    if address:
+                        _add_docx_hyperlink(
+                            p, address, run.text,
+                            bold=bool(run.font.bold), italic=bool(run.font.italic),
+                        )
+                    else:
+                        r = p.add_run(run.text)
+                        r.bold = bool(run.font.bold)
+                        r.italic = bool(run.font.italic)
+                        r.underline = bool(run.font.underline)
 
         for shape in table_shapes:
             rows = [[cell.text.strip() for cell in row.cells] for row in shape.table.rows]
