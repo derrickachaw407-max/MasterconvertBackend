@@ -468,17 +468,19 @@ def _effective_paragraph_alignment(paragraph):
 
 
 def _effective_run_format(run):
-    """Returns (bold, italic, underline) for a run, falling back to its
-    referenced character style when the run has no direct formatting of
-    its own. Word's built-in 'Strong'/'Emphasis' styles — and most custom
-    character styles — carry bold/italic in the STYLE definition rather
-    than as direct run formatting, so run.bold alone returns None for
-    these even though the text visibly renders bold, silently losing the
-    formatting on conversion. Direct run formatting always wins when
-    present; the style is only consulted for whichever of the three is
-    still unset."""
+    """Returns (bold, italic, underline, hex_color, size_pt) for a run,
+    falling back to its referenced character style when the run has no
+    direct formatting of its own. Word's built-in 'Strong'/'Emphasis'
+    styles — and most custom character styles — carry formatting in the
+    STYLE definition rather than as direct run formatting, so reading
+    run.bold/font.color/font.size directly returns None for all five of
+    these even though the text visibly renders styled, silently losing
+    the formatting on conversion. Direct run formatting always wins when
+    present; the style is only consulted for whichever is still unset."""
     bold, italic, underline = run.bold, run.italic, run.underline
-    if bold is None or italic is None or underline is None:
+    hex_color = _safe_hex_color(run.font.color)
+    size_pt = run.font.size.pt if run.font.size is not None else None
+    if bold is None or italic is None or underline is None or hex_color is None or size_pt is None:
         try:
             style_font = run.style.font
             if bold is None:
@@ -487,9 +489,13 @@ def _effective_run_format(run):
                 italic = style_font.italic
             if underline is None:
                 underline = style_font.underline
+            if hex_color is None:
+                hex_color = _safe_hex_color(style_font.color)
+            if size_pt is None and style_font.size is not None:
+                size_pt = style_font.size.pt
         except Exception:
             pass
-    return bold, italic, underline
+    return bold, italic, underline, hex_color, size_pt
 
 
 def _iter_all_runs(paragraph):
@@ -698,12 +704,12 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         for src_run, text, is_link, address, is_deleted in _iter_all_runs(para):
             r = p.add_run()
             r.text = text
-            style_bold, style_italic, style_underline = _effective_run_format(src_run)
+            style_bold, style_italic, style_underline, style_color, style_size = _effective_run_format(src_run)
             bold = bool(style_bold)
             italic = bool(style_italic)
             underline = True if is_link else bool(style_underline)
-            hex_color = None if is_link else _safe_hex_color(src_run.font.color)
-            size_pt = None if src_run.font.size is None else src_run.font.size.pt
+            hex_color = None if is_link else style_color
+            size_pt = style_size
             if is_link and address:
                 try:
                     r.hyperlink.address = address
