@@ -452,6 +452,31 @@ def _get_docx_endnotes(doc):
 
 
 
+def _effective_run_format(run):
+    """Returns (bold, italic, underline) for a run, falling back to its
+    referenced character style when the run has no direct formatting of
+    its own. Word's built-in 'Strong'/'Emphasis' styles — and most custom
+    character styles — carry bold/italic in the STYLE definition rather
+    than as direct run formatting, so run.bold alone returns None for
+    these even though the text visibly renders bold, silently losing the
+    formatting on conversion. Direct run formatting always wins when
+    present; the style is only consulted for whichever of the three is
+    still unset."""
+    bold, italic, underline = run.bold, run.italic, run.underline
+    if bold is None or italic is None or underline is None:
+        try:
+            style_font = run.style.font
+            if bold is None:
+                bold = style_font.bold
+            if italic is None:
+                italic = style_font.italic
+            if underline is None:
+                underline = style_font.underline
+        except Exception:
+            pass
+    return bold, italic, underline
+
+
 def _iter_all_runs(paragraph):
     """Yields (Run, text, is_hyperlink, hyperlink_address, is_deletion) for
     every actual text-bearing run in a paragraph, in document order —
@@ -658,9 +683,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         for src_run, text, is_link, address, is_deleted in _iter_all_runs(para):
             r = p.add_run()
             r.text = text
-            bold = bool(src_run.bold)
-            italic = bool(src_run.italic)
-            underline = True if is_link else bool(src_run.underline)
+            style_bold, style_italic, style_underline = _effective_run_format(src_run)
+            bold = bool(style_bold)
+            italic = bool(style_italic)
+            underline = True if is_link else bool(style_underline)
             hex_color = None if is_link else _safe_hex_color(src_run.font.color)
             size_pt = None if src_run.font.size is None else src_run.font.size.pt
             if is_link and address:
