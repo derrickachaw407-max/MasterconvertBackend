@@ -22,6 +22,7 @@ from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
+from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -213,7 +214,8 @@ def _style_docx_body(doc, style):
             continue
         for run in para.runs:
             run.font.name = style["body_font"]
-            run.font.size = style["body_size"]
+            if run.font.size is None:
+                run.font.size = style["body_size"]
         if style.get("tight_spacing"):
             para.paragraph_format.space_before = DocxPt(0)
             para.paragraph_format.space_after = DocxPt(2)
@@ -324,6 +326,23 @@ def _set_docx_cell_shading(cell, hex_color):
     tcPr.append(shd)
 
 
+_ALIGN_NAMES = {"LEFT", "CENTER", "RIGHT", "JUSTIFY"}
+
+
+def _docx_align_to_pptx(align):
+    """Word and PowerPoint's paragraph-alignment enums share the same names
+    for the alignments that matter (LEFT/CENTER/RIGHT/JUSTIFY) despite being
+    two unrelated classes — translating by name is simpler and more robust
+    than a hand-maintained value-to-value mapping."""
+    name = getattr(align, "name", None)
+    return getattr(PP_ALIGN, name) if name in _ALIGN_NAMES else None
+
+
+def _pptx_align_to_docx(align):
+    name = getattr(align, "name", None)
+    return getattr(WD_ALIGN_PARAGRAPH, name) if name in _ALIGN_NAMES else None
+
+
 def _safe_hex_color(color):
     """Returns a run's color as a hex string ('FF0000'), or None if it's
     unset or a theme color rather than an explicit RGB value. Accessing
@@ -389,6 +408,9 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         else:
             p = body_tf.add_paragraph()
         p.level = min(level, 4)
+        pptx_align = _docx_align_to_pptx(para.alignment)
+        if pptx_align is not None:
+            p.alignment = pptx_align
         if numbered:
             pPr = p._p.get_or_add_pPr()
             pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
@@ -397,7 +419,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # python-docx — using it here was silently dropping any hyperlinked
         # text in the paragraph entirely. iter_inner_content() walks both
         # plain runs and hyperlinks in real document order.
-        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color)
+        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt)
         for item in para.iter_inner_content():
             is_link = type(item).__name__ == "Hyperlink"
             text = item.text
@@ -410,22 +432,25 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             italic = bool(src_run.italic) if src_run else False
             underline = True if is_link else bool(src_run.underline if src_run else False)
             hex_color = None if (is_link or src_run is None) else _safe_hex_color(src_run.font.color)
+            size_pt = None if (is_link or src_run is None or src_run.font.size is None) else src_run.font.size.pt
             if is_link:
                 try:
                     r.hyperlink.address = item.address
                 except Exception:
                     pass
-            captured.append((r, bold, italic, underline, is_link, hex_color))
+            captured.append((r, bold, italic, underline, is_link, hex_color, size_pt))
         if not captured:
             p.text = para.text.strip()
         _style_pptx_body_paragraph(p, template_style)
         # Re-apply emphasis after the shared style pass, since that pass
         # sets font attributes on every run and would otherwise stomp the
         # per-run formatting (and hyperlink coloring) just captured above.
-        for r, bold, italic, underline, is_link, hex_color in captured:
+        for r, bold, italic, underline, is_link, hex_color, size_pt in captured:
             r.font.bold = bold
             r.font.italic = italic
             r.font.underline = underline
+            if size_pt is not None:
+                r.font.size = Pt(size_pt)
             if is_link:
                 try:
                     r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
@@ -657,6 +682,9 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 except KeyError:
                     p = doc.add_paragraph(style="List Number" if is_numbered else "List Bullet")
                     p.paragraph_format.left_indent = DocxInches(0.25 * (level + 1))
+                docx_align = _pptx_align_to_docx(para.alignment)
+                if docx_align is not None:
+                    p.alignment = docx_align
                 runs = [r for r in para.runs if r.text]
                 if not runs:
                     p.add_run(line)
@@ -682,6 +710,8 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                                 r.font.color.rgb = DocxRGBColor.from_string(hex_color)
                             except Exception:
                                 pass
+                        if run.font.size is not None:
+                            r.font.size = DocxPt(run.font.size.pt)
 
         for shape in table_shapes:
             src_rows = [list(row.cells) for row in shape.table.rows]
