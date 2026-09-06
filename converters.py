@@ -20,6 +20,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
+from docx.text.run import Run as DocxRun
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
 from pptx.enum.text import PP_ALIGN
@@ -440,6 +441,63 @@ def _get_docx_endnotes(doc):
 
 
 
+def _iter_all_runs(paragraph):
+    """Yields (Run, text, is_hyperlink, hyperlink_address, is_deletion) for
+    every actual text-bearing run in a paragraph, in document order —
+    including content python-docx's own .text, .runs, AND
+    iter_inner_content() all silently miss entirely: text wrapped in a
+    tracked-change insertion (<w:ins>) or deletion (<w:del>). This isn't a
+    narrow edge case — a paragraph.text call on a paragraph with tracked
+    changes present drops ALL of that text, and tracked-changes markup is
+    extremely common in real reviewed academic and business documents
+    (exactly the kind an academic tutoring tool would see uploaded).
+    Deletions are included rather than skipped, because that matches what
+    a reader actually sees in the source with changes displayed — a
+    struck-through but still-visible deletion, not truly gone until
+    someone accepts the change."""
+    def run_text(r_el, deleted):
+        tag = qn("w:delText") if deleted else qn("w:t")
+        return "".join(t.text or "" for t in r_el.findall(tag))
+
+    def walk(container_el, deleted, link_address):
+        for child in container_el:
+            if child.tag == qn("w:r"):
+                text = run_text(child, deleted)
+                if text:
+                    yield DocxRun(child, paragraph), text, link_address is not None, link_address, deleted
+            elif child.tag == qn("w:hyperlink"):
+                r_id = child.get(qn("r:id"))
+                address = None
+                if r_id:
+                    try:
+                        address = paragraph.part.rels[r_id].target_ref
+                    except Exception:
+                        pass
+                yield from walk(child, deleted, address)
+            elif child.tag == qn("w:ins"):
+                yield from walk(child, deleted, link_address)
+            elif child.tag == qn("w:del"):
+                yield from walk(child, True, link_address)
+
+    yield from walk(paragraph._p, False, None)
+
+
+def _full_paragraph_text(paragraph):
+    """The tracked-changes-aware equivalent of paragraph.text — includes
+    insertions and (still-visible, unaccepted) deletions that python-docx's
+    own .text silently drops entirely. Use this instead of .text anywhere
+    the actual content matters, which is everywhere in this file."""
+    return "".join(text for _run, text, _link, _addr, _del in _iter_all_runs(paragraph))
+
+
+def _full_cell_text(cell):
+    """The tracked-changes-aware equivalent of a docx table cell's .text —
+    joins _full_paragraph_text() across the cell's paragraphs instead of
+    using the cell's own .text, which has the same silent-drop problem on
+    insertions/deletions as paragraph.text does."""
+    return "\n".join(_full_paragraph_text(p) for p in cell.paragraphs)
+
+
 def _iter_textbox_paragraphs(paragraph):
     """Yields each paragraph nested inside a floating text box embedded in
     this paragraph's runs. A text box's own paragraphs live inside a nested
@@ -512,37 +570,35 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             pPr = p._p.get_or_add_pPr()
             pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
 
-        # para.runs deliberately excludes hyperlink-wrapped runs in
-        # python-docx — using it here was silently dropping any hyperlinked
-        # text in the paragraph entirely. iter_inner_content() walks both
-        # plain runs and hyperlinks in real document order.
-        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt)
-        for item in para.iter_inner_content():
-            is_link = type(item).__name__ == "Hyperlink"
-            text = item.text
-            if not text:
-                continue
-            src_run = (item.runs[0] if item.runs else None) if is_link else item
+        # iter_inner_content() (like .text and .runs) silently drops any
+        # text wrapped in a tracked-change insertion or deletion —
+        # _iter_all_runs() is the tracked-changes-aware replacement, and
+        # since every item it yields is already a real Run, the hyperlink
+        # special-casing this used to need is gone too.
+        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt, is_deleted)
+        for src_run, text, is_link, address, is_deleted in _iter_all_runs(para):
             r = p.add_run()
             r.text = text
-            bold = bool(src_run.bold) if src_run else False
-            italic = bool(src_run.italic) if src_run else False
-            underline = True if is_link else bool(src_run.underline if src_run else False)
-            hex_color = None if (is_link or src_run is None) else _safe_hex_color(src_run.font.color)
-            size_pt = None if (is_link or src_run is None or src_run.font.size is None) else src_run.font.size.pt
-            if is_link:
+            bold = bool(src_run.bold)
+            italic = bool(src_run.italic)
+            underline = True if is_link else bool(src_run.underline)
+            hex_color = None if is_link else _safe_hex_color(src_run.font.color)
+            size_pt = None if src_run.font.size is None else src_run.font.size.pt
+            if is_link and address:
                 try:
-                    r.hyperlink.address = item.address
+                    r.hyperlink.address = address
                 except Exception:
                     pass
-            captured.append((r, bold, italic, underline, is_link, hex_color, size_pt))
+            if is_deleted:
+                r._r.get_or_add_rPr().set("strike", "sngStrike")
+            captured.append((r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted))
         if not captured:
-            p.text = para.text.strip()
+            p.text = _full_paragraph_text(para).strip()
         _style_pptx_body_paragraph(p, template_style)
         # Re-apply emphasis after the shared style pass, since that pass
         # sets font attributes on every run and would otherwise stomp the
         # per-run formatting (and hyperlink coloring) just captured above.
-        for r, bold, italic, underline, is_link, hex_color, size_pt in captured:
+        for r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted in captured:
             r.font.bold = bold
             r.font.italic = italic
             r.font.underline = underline
@@ -586,7 +642,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
 
     def add_table_slide(table):
         src_rows = [list(row.cells) for row in table.rows]
-        rows = [[cell.text.strip() for cell in row] for row in src_rows]
+        rows = [[_full_cell_text(cell).strip() for cell in row] for row in src_rows]
         keep = [i for i, r in enumerate(rows) if any(r)]
         if not keep:
             return
@@ -663,10 +719,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                 add_image_slide(img_bytes)
                 image_count += 1
         for tb_para in _iter_textbox_paragraphs(para):
-            tb_text = tb_para.text.strip()
+            tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
                 add_bullet(tb_para, level=0)
-        text = para.text.strip()
+        text = _full_paragraph_text(para).strip()
         if not text:
             continue
         para_style_name = (para.style.name or "").lower()
@@ -1187,7 +1243,7 @@ def docx_to_xlsx(src_path, out_dir):
         ws = wb.create_sheet(title=f"Table {i}"[:31])
         for r_idx, row in enumerate(table.rows, 1):
             for c_idx, cell in enumerate(row.cells, 1):
-                text = cell.text.strip()
+                text = _full_cell_text(cell).strip()
                 value = text if r_idx == 1 else coerce_numeric(text)
                 xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
                 shade = _get_docx_cell_shading(cell)
@@ -1203,11 +1259,13 @@ def docx_to_xlsx(src_path, out_dir):
     # was present.
     text_rows = []
     for p in doc.paragraphs:
-        if p.text.strip():
-            text_rows.append(p.text.strip())
+        full_text = _full_paragraph_text(p).strip()
+        if full_text:
+            text_rows.append(full_text)
         for tb_para in _iter_textbox_paragraphs(p):
-            if tb_para.text.strip():
-                text_rows.append(tb_para.text.strip())
+            tb_text = _full_paragraph_text(tb_para).strip()
+            if tb_text:
+                text_rows.append(tb_text)
     if text_rows:
         ws = wb.create_sheet(title="Document Text")
         ws.column_dimensions["A"].width = 100
@@ -1472,14 +1530,16 @@ def extract_text(src_path, ext):
         doc = Document(src_path)
         parts = []
         for p in doc.paragraphs:
-            if p.text.strip():
-                parts.append(p.text)
+            full_text = _full_paragraph_text(p).strip()
+            if full_text:
+                parts.append(full_text)
             for tb_para in _iter_textbox_paragraphs(p):
-                if tb_para.text.strip():
-                    parts.append(tb_para.text)
+                tb_text = _full_paragraph_text(tb_para).strip()
+                if tb_text:
+                    parts.append(tb_text)
         for table in doc.tables:
             for row in table.rows:
-                parts.append(" | ".join(c.text for c in row.cells))
+                parts.append(" | ".join(_full_cell_text(c) for c in row.cells))
         footnotes = _get_docx_footnotes(doc)
         if footnotes:
             parts.append("Footnotes:")
