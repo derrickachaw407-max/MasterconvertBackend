@@ -937,6 +937,84 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
 
 
 # --------------------------------------------------------------- PPTX -> DOCX
+def _extract_pdf_page_links(page):
+    """Returns a list of (exact_text, url) for each real hyperlink on a PDF
+    page. pypdf's link annotations give a URL and an on-page rectangle but
+    no text of their own — this uses extract_text()'s visitor_text
+    callback to get the actual position of every rendered text fragment,
+    then matches each link's rectangle against fragments that fall inside
+    it, so the resulting text is the real clickable words rather than a
+    guess made after the text has been reflowed into paragraphs."""
+    fragments = []
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        if text.strip():
+            fragments.append((text, tm[4], tm[5]))
+
+    try:
+        page.extract_text(visitor_text=visitor)
+    except Exception:
+        return []
+
+    try:
+        annotations = page.get("/Annots") or []
+    except Exception:
+        return []
+
+    links = []
+    for a in annotations:
+        try:
+            obj = a.get_object()
+            if obj.get("/Subtype") != "/Link":
+                continue
+            action = obj.get("/A")
+            url = action.get("/URI") if action else None
+            rect = obj.get("/Rect")
+            if not url or not rect:
+                continue
+            x0, y0, x1, y1 = (float(v) for v in rect)
+            matched = [t for t, x, y in fragments if x0 <= x <= x1 and y0 - 1 <= y <= y1 + 1]
+            text = "".join(matched).strip()
+            if text:
+                links.append((text, url))
+        except Exception:
+            continue
+    return links
+
+
+def _add_docx_paragraph_with_links(doc, text, page_links, style=None):
+    """Adds a paragraph, converting any substring that exactly matches a
+    known link's real text into an actual hyperlink instead of plain text.
+    Falls back to a plain paragraph when no link text is found in it —
+    the caller is expected to separately list any link that never matched
+    anywhere, so a link is never silently dropped even when the exact-text
+    match fails."""
+    matches = []
+    for link_text, url in page_links:
+        idx = text.find(link_text)
+        if idx != -1:
+            matches.append((idx, idx + len(link_text), url))
+    if not matches:
+        return doc.add_paragraph(text, style=style) if style else doc.add_paragraph(text)
+    matches.sort(key=lambda m: m[0])
+    accepted = []
+    last_end = -1
+    for start, end, url in matches:
+        if start >= last_end:  # drop any overlap defensively, keep the leftmost match
+            accepted.append((start, end, url))
+            last_end = end
+    p = doc.add_paragraph(style=style) if style else doc.add_paragraph()
+    pos = 0
+    for start, end, url in accepted:
+        if start > pos:
+            p.add_run(text[pos:start])
+        _add_docx_hyperlink(p, url, text[start:end])
+        pos = end
+    if pos < len(text):
+        p.add_run(text[pos:])
+    return p
+
+
 def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underline=True):
     """python-docx has no high-level API for creating a hyperlink — this is
     the standard recipe: register the external relationship, then build the
@@ -1196,17 +1274,23 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     for i, (page, items) in enumerate(zip(reader.pages, page_items), 1):
         if n_pages > 1:
             doc.add_heading(f"Page {i}", level=2)
+        page_links = _extract_pdf_page_links(page)
+        unmatched_links = list(page_links)
         content_items = [(t, k) for t, k in items if t not in noisy_lines]
         if content_items:
             for para_text, kind in content_items:
                 if not para_text:
                     continue
+                matched_here = [(lt, url) for lt, url in page_links if lt in para_text]
+                for m in matched_here:
+                    if m in unmatched_links:
+                        unmatched_links.remove(m)
                 if kind == "bullet":
-                    doc.add_paragraph(para_text, style="List Bullet")
+                    _add_docx_paragraph_with_links(doc, para_text, matched_here, style="List Bullet")
                 elif kind == "heading":
                     doc.add_heading(para_text, level=3)
                 else:
-                    doc.add_paragraph(para_text)
+                    _add_docx_paragraph_with_links(doc, para_text, matched_here)
         elif not items:
             doc.add_paragraph("[No extractable text on this page — likely a scanned image.]")
         # else: the page had only repeated header/footer noise and nothing
@@ -1226,32 +1310,17 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                 except Exception:
                     continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
 
-        try:
-            annotations = page.get("/Annots") or []
-            page_links = []
-            seen_urls = set()
-            for a in annotations:
-                obj = a.get_object()
-                if obj.get("/Subtype") != "/Link":
-                    continue
-                action = obj.get("/A")
-                url = action.get("/URI") if action else None
-                if url and url not in seen_urls:
-                    seen_urls.add(url)
-                    page_links.append(url)
-        except Exception:
-            page_links = []
-        if page_links:
-            # Correlating a link's on-page rectangle to the exact word inside
-            # reflowed, reconstructed paragraph text is fragile — this lists
-            # the real destination URLs instead of guessing at (and risking
-            # getting wrong) which specific word should become clickable.
+        if unmatched_links:
+            # A link that never matched any reconstructed paragraph text
+            # (an image-only link, or a reflow edge case) still shouldn't
+            # be silently dropped — list its real URL instead of guessing
+            # where it belongs.
             link_p = doc.add_paragraph()
             link_p.paragraph_format.space_before = DocxPt(8)
-            label_run = link_p.add_run("Links on this page: ")
+            label_run = link_p.add_run("Other links on this page: ")
             label_run.italic = True
             label_run.bold = True
-            for j, url in enumerate(page_links):
+            for j, (_text, url) in enumerate(unmatched_links):
                 if j > 0:
                     link_p.add_run(", ")
                 _add_docx_hyperlink(link_p, url, url)
