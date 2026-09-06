@@ -356,6 +356,19 @@ def _safe_hex_color(color):
     return str(rgb) if rgb is not None else None
 
 
+def _iter_textbox_paragraphs(paragraph):
+    """Yields each paragraph nested inside a floating text box embedded in
+    this paragraph's runs. A text box's own paragraphs live inside a nested
+    <w:txbxContent> deep within the run's drawing XML — a completely
+    separate tree from the main document body — so normal paragraph
+    iteration (doc.paragraphs, iter_block_items) never sees them at all,
+    silently dropping the text box's entire content."""
+    for run in paragraph.runs:
+        for txbx_content in run._element.findall(".//" + qn("w:txbxContent")):
+            for p_el in txbx_content.findall(qn("w:p")):
+                yield DocxParagraph(p_el, paragraph)
+
+
 def _iter_inline_images(paragraph, doc):
     """Yields raw image bytes for each inline picture embedded in this
     paragraph, in document order — including images inside a hyperlink.
@@ -565,6 +578,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     break
                 add_image_slide(img_bytes)
                 image_count += 1
+        for tb_para in _iter_textbox_paragraphs(para):
+            tb_text = tb_para.text.strip()
+            if tb_text:
+                add_bullet(tb_para, level=0)
         text = para.text.strip()
         if not text:
             continue
@@ -1290,7 +1307,13 @@ def extract_text(src_path, ext):
             return f.read()
     if ext == "docx":
         doc = Document(src_path)
-        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        parts = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+            for tb_para in _iter_textbox_paragraphs(p):
+                if tb_para.text.strip():
+                    parts.append(tb_para.text)
         for table in doc.tables:
             for row in table.rows:
                 parts.append(" | ".join(c.text for c in row.cells))
