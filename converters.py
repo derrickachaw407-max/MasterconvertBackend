@@ -1566,14 +1566,20 @@ def _format_cell_value(val, number_format=None):
 
         decimals = _count_format_decimals(fmt)
         result = None
-        if "%" in fmt:
+        if "0" not in fmt and "#" not in fmt:
+            # A section with no numeric placeholder at all is pure literal
+            # text — commonly used to hide zeros (a zero-section of just
+            # '"-"' is a standard Excel convention) — so the format's own
+            # literal text is the correct output, not a formatted number.
+            result = fmt.strip('"')
+        elif "%" in fmt:
             result = f"{work_val * 100:.{decimals}f}%"
         else:
             for symbol in ("$", "£", "€", "¥"):
                 if symbol in fmt:
                     result = f"{symbol}{work_val:,.{decimals}f}"
                     break
-            if result is None and ("0" in fmt or "#" in fmt):
+            if result is None:
                 result = f"{work_val:,.{decimals}f}" if "," in fmt else f"{work_val:.{decimals}f}"
         if result is not None:
             return f"({result})" if use_parens else result
