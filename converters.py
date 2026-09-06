@@ -985,17 +985,29 @@ def _extract_pdf_page_links(page):
 def _add_docx_paragraph_with_links(doc, text, page_links, style=None):
     """Adds a paragraph, converting any substring that exactly matches a
     known link's real text into an actual hyperlink instead of plain text.
-    Falls back to a plain paragraph when no link text is found in it —
-    the caller is expected to separately list any link that never matched
-    anywhere, so a link is never silently dropped even when the exact-text
-    match fails."""
+    Returns (paragraph, used_links) — used_links is the subset of
+    page_links actually placed inline, so the caller can tell exactly
+    which links still need to fall back to a plain URL list.
+
+    A link's text that appears more than once in the paragraph is
+    deliberately skipped rather than guessed at: with only a single exact
+    string match to go on, there's no reliable way to tell which
+    occurrence is the real link and which is a coincidentally identical
+    word — e.g. a paragraph that says '...here appears first as plain
+    text, but the second here is a real link' would otherwise confidently
+    hyperlink the *wrong* word. Falling back to listing the link's URL
+    separately is honest; guessing the first occurrence is not."""
     matches = []
+    used_links = []
     for link_text, url in page_links:
+        if text.count(link_text) != 1:
+            continue  # ambiguous or absent — leave for the caller's fallback list
         idx = text.find(link_text)
-        if idx != -1:
-            matches.append((idx, idx + len(link_text), url))
+        matches.append((idx, idx + len(link_text), url))
+        used_links.append((link_text, url))
     if not matches:
-        return doc.add_paragraph(text, style=style) if style else doc.add_paragraph(text)
+        p = doc.add_paragraph(text, style=style) if style else doc.add_paragraph(text)
+        return p, used_links
     matches.sort(key=lambda m: m[0])
     accepted = []
     last_end = -1
@@ -1012,7 +1024,7 @@ def _add_docx_paragraph_with_links(doc, text, page_links, style=None):
         pos = end
     if pos < len(text):
         p.add_run(text[pos:])
-    return p
+    return p, used_links
 
 
 def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underline=True):
@@ -1281,16 +1293,17 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
             for para_text, kind in content_items:
                 if not para_text:
                     continue
-                matched_here = [(lt, url) for lt, url in page_links if lt in para_text]
-                for m in matched_here:
-                    if m in unmatched_links:
-                        unmatched_links.remove(m)
+                candidates = [(lt, url) for lt, url in page_links if lt in para_text]
                 if kind == "bullet":
-                    _add_docx_paragraph_with_links(doc, para_text, matched_here, style="List Bullet")
+                    _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates, style="List Bullet")
                 elif kind == "heading":
                     doc.add_heading(para_text, level=3)
+                    used = []
                 else:
-                    _add_docx_paragraph_with_links(doc, para_text, matched_here)
+                    _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates)
+                for m in used:
+                    if m in unmatched_links:
+                        unmatched_links.remove(m)
         elif not items:
             doc.add_paragraph("[No extractable text on this page — likely a scanned image.]")
         # else: the page had only repeated header/footer noise and nothing
