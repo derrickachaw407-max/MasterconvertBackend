@@ -357,6 +357,33 @@ def _safe_hex_color(color):
     return str(rgb) if rgb is not None else None
 
 
+def _get_docx_comments(doc):
+    """Returns an ordered list of (author, text) for each real reviewer
+    comment in the document. python-docx has no API for comments at all —
+    same story as footnotes/endnotes — so this reads the raw comments.xml
+    part directly. Comments are genuinely relevant content for a tutoring
+    tool specifically: this is often where a teacher's actual feedback on
+    a draft lives, not just document metadata to discard."""
+    try:
+        pkg = doc.part.package
+    except Exception:
+        return []
+    for part in pkg.iter_parts():
+        if part.partname == "/word/comments.xml":
+            try:
+                root = etree.fromstring(part.blob)
+            except Exception:
+                return []
+            comments = []
+            for c in root.findall(qn("w:comment")):
+                text = "".join(t.text or "" for t in c.findall(".//" + qn("w:t"))).strip()
+                if text:
+                    author = (c.get(qn("w:author")) or "").strip() or "Comment"
+                    comments.append((author, text))
+            return comments
+    return []
+
+
 def _get_docx_header_footer_text(doc):
     """Returns distinct, non-empty header/footer paragraph text across all
     sections. A header/footer holding only a page-number field returns
@@ -679,6 +706,16 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             body_tf = state["body_tf"]
             p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
             p.text = f"{i}. {note}"
+            _style_pptx_body_paragraph(p, template_style)
+            state["bullet_count"] += 1
+
+    comments = _get_docx_comments(doc)
+    if comments:
+        new_slide("Comments")
+        for author, comment_text in comments:
+            body_tf = state["body_tf"]
+            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
+            p.text = f"{author}: {comment_text}"
             _style_pptx_body_paragraph(p, template_style)
             state["bullet_count"] += 1
 
@@ -1191,6 +1228,17 @@ def docx_to_xlsx(src_path, out_dir):
         for r, note in enumerate(endnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
+    comments = _get_docx_comments(doc)
+    if comments:
+        ws = wb.create_sheet(title="Comments")
+        ws.column_dimensions["A"].width = 25
+        ws.column_dimensions["B"].width = 90
+        ws.cell(row=1, column=1, value="Author").font = XlsxFont(bold=True)
+        ws.cell(row=1, column=2, value="Comment").font = XlsxFont(bold=True)
+        for r, (author, comment_text) in enumerate(comments, 2):
+            ws.cell(row=r, column=1, value=author)
+            ws.cell(row=r, column=2, value=comment_text)
+
     header_footer = _get_docx_header_footer_text(doc)
     if header_footer:
         ws = wb.create_sheet(title="Header-Footer")
@@ -1440,6 +1488,10 @@ def extract_text(src_path, ext):
         if endnotes:
             parts.append("Endnotes:")
             parts.extend(f"{i}. {note}" for i, note in enumerate(endnotes, 1))
+        comments = _get_docx_comments(doc)
+        if comments:
+            parts.append("Comments:")
+            parts.extend(f"{author}: {comment_text}" for author, comment_text in comments)
         header_footer = _get_docx_header_footer_text(doc)
         if header_footer:
             parts.append("Header/Footer:")
