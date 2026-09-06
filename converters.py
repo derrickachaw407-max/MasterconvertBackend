@@ -24,6 +24,7 @@ from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font as XlsxFont, PatternFill as XlsxPatternFill
@@ -276,6 +277,28 @@ def _xlsx_cell_fill_hex(cell):
     return rgb[2:] if rgb and len(rgb) == 8 else None
 
 
+def _find_docx_merges(src_rows, n_cols):
+    """Detects merged cell spans in a docx table. python-docx represents a
+    merge as the *same* underlying cell object repeated across the whole
+    span rather than exposing merge info directly — comparing cell identity
+    across the grid is how you recover the actual rectangle. Returns a list
+    of (min_row, min_col, max_row, max_col) tuples, one per real merge
+    (spans of exactly 1x1 are skipped, they're just an ordinary cell)."""
+    seen = {}
+    for r_idx, row in enumerate(src_rows):
+        for c_idx in range(min(len(row), n_cols)):
+            key = id(row[c_idx]._tc)
+            if key not in seen:
+                seen[key] = [r_idx, c_idx, r_idx, c_idx]
+            else:
+                span = seen[key]
+                span[0] = min(span[0], r_idx)
+                span[1] = min(span[1], c_idx)
+                span[2] = max(span[2], r_idx)
+                span[3] = max(span[3], c_idx)
+    return [tuple(s) for s in seen.values() if s[0] != s[2] or s[1] != s[3]]
+
+
 def _get_docx_cell_shading(cell):
     """Returns a docx table cell's background shading as a hex string, or
     None if it has none. python-docx has no high-level API for cell
@@ -452,8 +475,20 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         left, top = PptxInches(0.6), PptxInches(0.6)
         width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
         gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
+
+        merges = _find_docx_merges(src_rows, n_cols)
+        # A merged span's duplicated cells would otherwise each get the same
+        # text written before merging, concatenating it multiple times into
+        # the final merged cell — only the top-left origin of each span
+        # should actually receive the text.
+        skip_cells = {(r, c) for (min_r, min_c, max_r, max_c) in merges
+                      for r in range(min_r, max_r + 1) for c in range(min_c, max_c + 1)
+                      if (r, c) != (min_r, min_c)}
+
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
+                if (r_idx, c_idx) in skip_cells:
+                    continue
                 cell = gtable.cell(r_idx, c_idx)
                 cell.text = row[c_idx] if c_idx < len(row) else ""
                 if r_idx == 0:
@@ -468,6 +503,11 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                             cell.fill.fore_color.rgb = PptxRGBColor.from_string(shade)
                         except Exception:
                             pass
+        for min_r, min_c, max_r, max_c in merges:
+            try:
+                gtable.cell(min_r, min_c).merge(gtable.cell(max_r, max_c))
+            except Exception:
+                pass
         # A loose paragraph appearing right after a table should land on a
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
@@ -562,6 +602,19 @@ def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underlin
     paragraph._p.append(hyperlink)
 
 
+def _iter_flat_shapes(shapes):
+    """Yields every shape in a slide's shape collection, recursing into any
+    GROUP shape's own .shapes. A grouped shape (very common — logos paired
+    with captions, multi-element diagrams) is otherwise a single opaque
+    'GROUP' entry with no text frame, table, or chart of its own, so a plain
+    top-level loop silently sees nothing inside it at all."""
+    for shape in shapes:
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from _iter_flat_shapes(shape.shapes)
+        else:
+            yield shape
+
+
 def pptx_to_docx(src_path, out_dir, style="clean"):
     prs = Presentation(src_path)
     doc = Document()
@@ -573,9 +626,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         title = None
         text_shapes = []
         table_shapes = []
-        for shape in slide.shapes:
+        chart_shapes = []
+        for shape in _iter_flat_shapes(slide.shapes):
             if shape.has_table:
                 table_shapes.append(shape)
+                continue
+            if getattr(shape, "has_chart", False):
+                chart_shapes.append(shape)
                 continue
             if not shape.has_text_frame or not shape.text_frame.text.strip():
                 continue
@@ -654,6 +711,43 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                                     _set_docx_cell_shading(cell, hex_color)
                         except Exception:
                             pass
+
+        for shape in chart_shapes:
+            try:
+                chart = shape.chart
+                plot = chart.plots[0]
+                categories = [str(cat) for cat in plot.categories]
+                series_list = list(plot.series)
+            except Exception:
+                continue
+            if not series_list:
+                continue
+            caption = doc.add_paragraph()
+            title_text = None
+            try:
+                if chart.has_title:
+                    title_text = chart.chart_title.text_frame.text.strip()
+            except Exception:
+                pass
+            run = caption.add_run(f"Chart: {title_text}" if title_text else "Chart data")
+            run.italic = True
+            n_rows = len(categories) + 1
+            n_cols = len(series_list) + 1
+            chart_table = doc.add_table(rows=n_rows, cols=n_cols)
+            chart_table.style = "Light Grid Accent 1"
+            chart_table.cell(0, 0).text = ""
+            for s_idx, series in enumerate(series_list, 1):
+                chart_table.cell(0, s_idx).text = series.name or f"Series {s_idx}"
+            for cat_idx, cat_name in enumerate(categories, 1):
+                chart_table.cell(cat_idx, 0).text = cat_name
+                for s_idx, series in enumerate(series_list, 1):
+                    values = list(series.values)
+                    val = values[cat_idx - 1] if cat_idx - 1 < len(values) else None
+                    chart_table.cell(cat_idx, s_idx).text = _format_cell_value(val)
+            for cell in chart_table.rows[0].cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.bold = True
 
         if slide.has_notes_slide:
             notes_text = slide.notes_slide.notes_text_frame.text.strip()
@@ -1178,7 +1272,7 @@ def extract_text(src_path, ext):
         prs = Presentation(src_path)
         parts = []
         for slide in prs.slides:
-            for shape in slide.shapes:
+            for shape in _iter_flat_shapes(slide.shapes):
                 if shape.has_text_frame and shape.text_frame.text.strip():
                     parts.append(shape.text_frame.text)
         return "\n".join(parts)
