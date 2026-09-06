@@ -1546,21 +1546,37 @@ def _format_cell_value(val, number_format=None):
     if isinstance(val, datetime.date):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, (int, float)) and number_format and number_format != "General":
-        decimals = _count_format_decimals(number_format)
-        if "%" in number_format:
-            return f"{val * 100:.{decimals}f}%"
-        for symbol in ("$", "£", "€", "¥"):
-            if symbol in number_format:
-                return f"{symbol}{val:,.{decimals}f}"
-        if "0" in number_format or "#" in number_format:
-            # Any explicit numeric format (with or without a thousands
-            # separator) means the format is dictating real precision —
-            # e.g. '0.00' forces two decimals even on a whole number like
-            # 3.0, which the generic float cleanup below would otherwise
-            # collapse to '3' and silently lose that explicit precision.
-            if "," in number_format:
-                return f"{val:,.{decimals}f}"
-            return f"{val:.{decimals}f}"
+        # Excel format strings can have up to 4 semicolon-separated
+        # sections: positive;negative;zero;text. When an explicit negative
+        # section exists (accounting-style '#,##0.00;(#,##0.00)' is the
+        # common case), Excel uses THAT section's own formatting for
+        # negative numbers — usually wrapping them in parentheses instead
+        # of a plain minus sign — rather than just prepending '-' to the
+        # positive format.
+        sections = number_format.split(";")
+        fmt = sections[0]
+        work_val = val
+        use_parens = False
+        if val < 0 and len(sections) > 1:
+            fmt = sections[1]
+            work_val = -val  # the section's own formatting conveys the sign
+            use_parens = "(" in fmt
+        elif val == 0 and len(sections) > 2:
+            fmt = sections[2]
+
+        decimals = _count_format_decimals(fmt)
+        result = None
+        if "%" in fmt:
+            result = f"{work_val * 100:.{decimals}f}%"
+        else:
+            for symbol in ("$", "£", "€", "¥"):
+                if symbol in fmt:
+                    result = f"{symbol}{work_val:,.{decimals}f}"
+                    break
+            if result is None and ("0" in fmt or "#" in fmt):
+                result = f"{work_val:,.{decimals}f}" if "," in fmt else f"{work_val:.{decimals}f}"
+        if result is not None:
+            return f"({result})" if use_parens else result
     if isinstance(val, float):
         if val == int(val):
             return str(int(val))
