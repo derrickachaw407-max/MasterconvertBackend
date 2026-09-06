@@ -998,26 +998,29 @@ def _add_docx_paragraph_with_links(doc, text, page_links, style=None):
     hyperlink the *wrong* word. Falling back to listing the link's URL
     separately is honest; guessing the first occurrence is not."""
     matches = []
-    used_links = []
     for link_text, url in page_links:
         if text.count(link_text) != 1:
             continue  # ambiguous or absent — leave for the caller's fallback list
         idx = text.find(link_text)
-        matches.append((idx, idx + len(link_text), url))
-        used_links.append((link_text, url))
+        matches.append((idx, idx + len(link_text), url, link_text))
     if not matches:
         p = doc.add_paragraph(text, style=style) if style else doc.add_paragraph(text)
-        return p, used_links
+        return p, []
     matches.sort(key=lambda m: m[0])
     accepted = []
     last_end = -1
-    for start, end, url in matches:
+    for start, end, url, link_text in matches:
         if start >= last_end:  # drop any overlap defensively, keep the leftmost match
-            accepted.append((start, end, url))
+            accepted.append((start, end, url, link_text))
             last_end = end
+    # used_links reflects what was actually accepted after overlap
+    # resolution — a match dropped here for overlapping an earlier one
+    # never actually appears in the paragraph, so it must stay eligible
+    # for the caller's fallback list rather than being marked as handled.
+    used_links = [(link_text, url) for start, end, url, link_text in accepted]
     p = doc.add_paragraph(style=style) if style else doc.add_paragraph()
     pos = 0
-    for start, end, url in accepted:
+    for start, end, url, link_text in accepted:
         if start > pos:
             p.add_run(text[pos:start])
         _add_docx_hyperlink(p, url, text[start:end])
