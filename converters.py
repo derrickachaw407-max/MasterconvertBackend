@@ -376,32 +376,41 @@ def _get_docx_header_footer_text(doc):
     return lines
 
 
-def _get_docx_footnotes(doc):
-    """Returns an ordered list of real footnote texts. python-docx has no
-    API for footnotes whatsoever — not even a way to detect they exist —
-    so this is the only way to reach them: find the raw footnotes.xml part
-    directly in the document's OPC package and parse it by hand. Skips the
+def _get_docx_notes(doc, part_name, note_tag):
+    """Returns an ordered list of real footnote/endnote texts. python-docx
+    has no API for either whatsoever — not even a way to detect they exist —
+    so this is the only way to reach them: find the raw XML part directly in
+    the document's OPC package and parse it by hand. Skips the
     separator/continuationSeparator placeholder entries every document with
-    footnotes has (visual dividers, not real content)."""
+    notes has (visual dividers, not real content)."""
     try:
         pkg = doc.part.package
     except Exception:
         return []
     for part in pkg.iter_parts():
-        if part.partname == "/word/footnotes.xml":
+        if part.partname == part_name:
             try:
                 root = etree.fromstring(part.blob)
             except Exception:
                 return []
-            footnotes = []
-            for fn in root.findall(qn("w:footnote")):
-                if fn.get(qn("w:type")) in ("separator", "continuationSeparator"):
+            notes = []
+            for note in root.findall(qn(note_tag)):
+                if note.get(qn("w:type")) in ("separator", "continuationSeparator"):
                     continue
-                text = "".join(t.text or "" for t in fn.findall(".//" + qn("w:t"))).strip()
+                text = "".join(t.text or "" for t in note.findall(".//" + qn("w:t"))).strip()
                 if text:
-                    footnotes.append(text)
-            return footnotes
+                    notes.append(text)
+            return notes
     return []
+
+
+def _get_docx_footnotes(doc):
+    return _get_docx_notes(doc, "/word/footnotes.xml", "w:footnote")
+
+
+def _get_docx_endnotes(doc):
+    return _get_docx_notes(doc, "/word/endnotes.xml", "w:endnote")
+
 
 
 def _iter_textbox_paragraphs(paragraph):
@@ -660,6 +669,16 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             body_tf = state["body_tf"]
             p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
             p.text = add_bullet_text
+            _style_pptx_body_paragraph(p, template_style)
+            state["bullet_count"] += 1
+
+    endnotes = _get_docx_endnotes(doc)
+    if endnotes:
+        new_slide("Endnotes")
+        for i, note in enumerate(endnotes, 1):
+            body_tf = state["body_tf"]
+            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
+            p.text = f"{i}. {note}"
             _style_pptx_body_paragraph(p, template_style)
             state["bullet_count"] += 1
 
@@ -1165,6 +1184,13 @@ def docx_to_xlsx(src_path, out_dir):
         for r, note in enumerate(footnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
+    endnotes = _get_docx_endnotes(doc)
+    if endnotes:
+        ws = wb.create_sheet(title="Endnotes")
+        ws.column_dimensions["A"].width = 100
+        for r, note in enumerate(endnotes, 1):
+            ws.cell(row=r, column=1, value=f"{r}. {note}")
+
     header_footer = _get_docx_header_footer_text(doc)
     if header_footer:
         ws = wb.create_sheet(title="Header-Footer")
@@ -1410,6 +1436,10 @@ def extract_text(src_path, ext):
         if footnotes:
             parts.append("Footnotes:")
             parts.extend(f"{i}. {note}" for i, note in enumerate(footnotes, 1))
+        endnotes = _get_docx_endnotes(doc)
+        if endnotes:
+            parts.append("Endnotes:")
+            parts.extend(f"{i}. {note}" for i, note in enumerate(endnotes, 1))
         header_footer = _get_docx_header_footer_text(doc)
         if header_footer:
             parts.append("Header/Footer:")
