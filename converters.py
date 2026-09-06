@@ -29,6 +29,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font as XlsxFont, PatternFill as XlsxPatternFill
+from lxml import etree
 import pypdf
 
 
@@ -356,6 +357,34 @@ def _safe_hex_color(color):
     return str(rgb) if rgb is not None else None
 
 
+def _get_docx_footnotes(doc):
+    """Returns an ordered list of real footnote texts. python-docx has no
+    API for footnotes whatsoever — not even a way to detect they exist —
+    so this is the only way to reach them: find the raw footnotes.xml part
+    directly in the document's OPC package and parse it by hand. Skips the
+    separator/continuationSeparator placeholder entries every document with
+    footnotes has (visual dividers, not real content)."""
+    try:
+        pkg = doc.part.package
+    except Exception:
+        return []
+    for part in pkg.iter_parts():
+        if part.partname == "/word/footnotes.xml":
+            try:
+                root = etree.fromstring(part.blob)
+            except Exception:
+                return []
+            footnotes = []
+            for fn in root.findall(qn("w:footnote")):
+                if fn.get(qn("w:type")) in ("separator", "continuationSeparator"):
+                    continue
+                text = "".join(t.text or "" for t in fn.findall(".//" + qn("w:t"))).strip()
+                if text:
+                    footnotes.append(text)
+            return footnotes
+    return []
+
+
 def _iter_textbox_paragraphs(paragraph):
     """Yields each paragraph nested inside a floating text box embedded in
     this paragraph's runs. A text box's own paragraphs live inside a nested
@@ -603,6 +632,17 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
 
     if state["slide"] is None:
         new_slide("Untitled Document")
+
+    footnotes = _get_docx_footnotes(doc)
+    if footnotes:
+        new_slide("Footnotes")
+        for i, note in enumerate(footnotes, 1):
+            add_bullet_text = f"{i}. {note}"
+            body_tf = state["body_tf"]
+            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
+            p.text = add_bullet_text
+            _style_pptx_body_paragraph(p, template_style)
+            state["bullet_count"] += 1
 
     out_path = os.path.join(out_dir, "converted.pptx")
     prs.save(out_path)
@@ -1076,12 +1116,25 @@ def docx_to_xlsx(src_path, out_dir):
     # tables and surrounding prose commentary often coexist in a document,
     # and the old behavior silently dropped all of it whenever any table
     # was present.
-    text_rows = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    text_rows = []
+    for p in doc.paragraphs:
+        if p.text.strip():
+            text_rows.append(p.text.strip())
+        for tb_para in _iter_textbox_paragraphs(p):
+            if tb_para.text.strip():
+                text_rows.append(tb_para.text.strip())
     if text_rows:
         ws = wb.create_sheet(title="Document Text")
         ws.column_dimensions["A"].width = 100
         for r, line in enumerate(text_rows, 1):
             ws.cell(row=r, column=1, value=line)
+
+    footnotes = _get_docx_footnotes(doc)
+    if footnotes:
+        ws = wb.create_sheet(title="Footnotes")
+        ws.column_dimensions["A"].width = 100
+        for r, note in enumerate(footnotes, 1):
+            ws.cell(row=r, column=1, value=f"{r}. {note}")
 
     if not wb.sheetnames:
         ws = wb.create_sheet(title="Sheet1")
@@ -1317,6 +1370,10 @@ def extract_text(src_path, ext):
         for table in doc.tables:
             for row in table.rows:
                 parts.append(" | ".join(c.text for c in row.cells))
+        footnotes = _get_docx_footnotes(doc)
+        if footnotes:
+            parts.append("Footnotes:")
+            parts.extend(f"{i}. {note}" for i, note in enumerate(footnotes, 1))
         return "\n".join(parts)
     if ext == "pdf":
         reader = pypdf.PdfReader(src_path)
