@@ -452,6 +452,21 @@ def _get_docx_endnotes(doc):
 
 
 
+def _effective_paragraph_alignment(paragraph):
+    """Returns a paragraph's alignment, falling back to its paragraph
+    style's own alignment when not set directly — the same style-carries-
+    the-real-formatting gap as run-level bold/italic, just for paragraph
+    alignment: a custom style (a 'Caption' or 'Quote' style that bakes in
+    centering, for instance) leaves paragraph.alignment as None even
+    though the paragraph visibly renders centered."""
+    if paragraph.alignment is not None:
+        return paragraph.alignment
+    try:
+        return paragraph.style.paragraph_format.alignment
+    except Exception:
+        return None
+
+
 def _effective_run_format(run):
     """Returns (bold, italic, underline) for a run, falling back to its
     referenced character style when the run has no direct formatting of
@@ -667,7 +682,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         else:
             p = body_tf.add_paragraph()
         p.level = min(level, 4)
-        pptx_align = _docx_align_to_pptx(para.alignment)
+        pptx_align = _docx_align_to_pptx(_effective_paragraph_alignment(para))
         if pptx_align is not None:
             p.alignment = pptx_align
         if numbered:
