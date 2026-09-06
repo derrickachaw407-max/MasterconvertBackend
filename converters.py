@@ -377,7 +377,7 @@ def _get_docx_comments(doc):
                 return []
             comments = []
             for c in root.findall(qn("w:comment")):
-                text = "".join(t.text or "" for t in c.findall(".//" + qn("w:t"))).strip()
+                text = _all_text_including_deletions(c).strip()
                 if text:
                     author = (c.get(qn("w:author")) or "").strip() or "Comment"
                     comments.append((author, text))
@@ -397,11 +397,22 @@ def _get_docx_header_footer_text(doc):
     for section in doc.sections:
         for container in (section.header, section.footer):
             for p in container.paragraphs:
-                text = p.text.strip()
+                text = _full_paragraph_text(p).strip()
                 if text and text not in seen:
                     seen.add(text)
                     lines.append(text)
     return lines
+
+
+def _all_text_including_deletions(element):
+    """Joins all w:t and w:delText descendant text in true document order —
+    two separate findall() calls (one per tag) would incorrectly group all
+    insertions before all deletions regardless of where each actually sits
+    if a note/comment itself contains tracked changes."""
+    return "".join(
+        el.text or "" for el in element.iter()
+        if el.tag in (qn("w:t"), qn("w:delText"))
+    )
 
 
 def _get_docx_notes(doc, part_name, note_tag):
@@ -425,7 +436,7 @@ def _get_docx_notes(doc, part_name, note_tag):
             for note in root.findall(qn(note_tag)):
                 if note.get(qn("w:type")) in ("separator", "continuationSeparator"):
                     continue
-                text = "".join(t.text or "" for t in note.findall(".//" + qn("w:t"))).strip()
+                text = _all_text_including_deletions(note).strip()
                 if text:
                     notes.append(text)
             return notes
