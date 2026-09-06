@@ -1226,6 +1226,36 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                 except Exception:
                     continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
 
+        try:
+            annotations = page.get("/Annots") or []
+            page_links = []
+            seen_urls = set()
+            for a in annotations:
+                obj = a.get_object()
+                if obj.get("/Subtype") != "/Link":
+                    continue
+                action = obj.get("/A")
+                url = action.get("/URI") if action else None
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    page_links.append(url)
+        except Exception:
+            page_links = []
+        if page_links:
+            # Correlating a link's on-page rectangle to the exact word inside
+            # reflowed, reconstructed paragraph text is fragile — this lists
+            # the real destination URLs instead of guessing at (and risking
+            # getting wrong) which specific word should become clickable.
+            link_p = doc.add_paragraph()
+            link_p.paragraph_format.space_before = DocxPt(8)
+            label_run = link_p.add_run("Links on this page: ")
+            label_run.italic = True
+            label_run.bold = True
+            for j, url in enumerate(page_links):
+                if j > 0:
+                    link_p.add_run(", ")
+                _add_docx_hyperlink(link_p, url, url)
+
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
     doc.save(out_path)
