@@ -924,8 +924,12 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
 
         for shape in table_shapes:
             src_rows = [list(row.cells) for row in shape.table.rows]
+            has_merges = any(cell.is_merge_origin for row in src_rows for cell in row)
             rows = [[cell.text.strip() for cell in row] for row in src_rows]
-            keep = [i for i, r in enumerate(rows) if any(r)]
+            if has_merges:
+                keep = list(range(len(rows)))
+            else:
+                keep = [i for i, r in enumerate(rows) if any(r)]
             if not keep:
                 continue
             rows = [rows[i] for i in keep]
@@ -933,16 +937,19 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             n_rows, n_cols = len(rows), max(len(r) for r in rows)
             word_table = doc.add_table(rows=n_rows, cols=n_cols)
             word_table.style = "Light Grid Accent 1"
+            merge_spans = []
             for r_idx, row in enumerate(rows):
                 for c_idx in range(n_cols):
+                    src_cell = src_rows[r_idx][c_idx] if c_idx < len(src_rows[r_idx]) else None
+                    if src_cell is not None and src_cell.is_spanned and not src_cell.is_merge_origin:
+                        continue  # covered by a merge origin elsewhere — filled in via the merge below
                     cell = word_table.cell(r_idx, c_idx)
                     cell.text = row[c_idx] if c_idx < len(row) else ""
                     if r_idx == 0:
                         for p in cell.paragraphs:
                             for run in p.runs:
                                 run.bold = True
-                    if c_idx < len(src_rows[r_idx]):
-                        src_cell = src_rows[r_idx][c_idx]
+                    if src_cell is not None:
                         try:
                             if src_cell.fill.type == MSO_FILL_TYPE.SOLID:
                                 hex_color = _safe_hex_color(src_cell.fill.fore_color)
@@ -950,6 +957,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                                     _set_docx_cell_shading(cell, hex_color)
                         except Exception:
                             pass
+                        if src_cell.is_merge_origin and (src_cell.span_height > 1 or src_cell.span_width > 1):
+                            merge_spans.append((r_idx, c_idx, r_idx + src_cell.span_height - 1, c_idx + src_cell.span_width - 1))
+            for min_r, min_c, max_r, max_c in merge_spans:
+                try:
+                    word_table.cell(min_r, min_c).merge(word_table.cell(max_r, max_c))
+                except Exception:
+                    pass
 
         for shape in chart_shapes:
             try:
@@ -1266,14 +1280,27 @@ def docx_to_xlsx(src_path, out_dir):
 
     for i, table in enumerate(doc.tables, 1):
         ws = wb.create_sheet(title=f"Table {i}"[:31])
+        src_rows = [list(row.cells) for row in table.rows]
+        n_cols = len(table.columns)
+        merges = _find_docx_merges(src_rows, n_cols)
+        skip_cells = {(r, c) for (min_r, min_c, max_r, max_c) in merges
+                      for r in range(min_r, max_r + 1) for c in range(min_c, max_c + 1)
+                      if (r, c) != (min_r, min_c)}
         for r_idx, row in enumerate(table.rows, 1):
             for c_idx, cell in enumerate(row.cells, 1):
+                if (r_idx - 1, c_idx - 1) in skip_cells:
+                    continue  # covered by a merge origin elsewhere — left blank, filled via the merge below
                 text = _full_cell_text(cell).strip()
                 value = text if r_idx == 1 else coerce_numeric(text)
                 xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
                 shade = _get_docx_cell_shading(cell)
                 if shade:
                     xlsx_cell.fill = XlsxPatternFill(start_color=shade, end_color=shade, fill_type="solid")
+        for min_r, min_c, max_r, max_c in merges:
+            try:
+                ws.merge_cells(start_row=min_r + 1, start_column=min_c + 1, end_row=max_r + 1, end_column=max_c + 1)
+            except Exception:
+                pass
         for cell in ws[1]:
             cell.font = XlsxFont(bold=True)
         autosize_columns(ws, len(table.columns))
