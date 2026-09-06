@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import shutil
+import statistics
 from collections import Counter
 from docx import Document
 from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBColor
@@ -270,6 +271,64 @@ def docx_to_pdf(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- DOCX -> PPTX
+def _cellis_rule_matches(rule, value):
+    """Evaluates whether a value satisfies a simple CellIsRule's numeric
+    comparison (the common 'red if < 0' / 'green if >= 0' traffic-light
+    pattern). Only handles a literal numeric comparison, not a formula
+    referencing other cells — the same proportionate scope as the
+    uncalculated-formula fallback elsewhere in this file: cover the
+    common case honestly rather than build a full formula evaluator."""
+    if value is None or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        formula = [float(f) for f in rule.formula]
+    except (ValueError, TypeError):
+        return False
+    op = rule.operator
+    if op == "lessThan":
+        return value < formula[0]
+    if op == "lessThanOrEqual":
+        return value <= formula[0]
+    if op == "greaterThan":
+        return value > formula[0]
+    if op == "greaterThanOrEqual":
+        return value >= formula[0]
+    if op == "equal":
+        return value == formula[0]
+    if op == "notEqual":
+        return value != formula[0]
+    if op == "between" and len(formula) == 2:
+        return formula[0] <= value <= formula[1]
+    if op == "notBetween" and len(formula) == 2:
+        return not (formula[0] <= value <= formula[1])
+    return False
+
+
+def _xlsx_conditional_fill_hex(ws, cell):
+    """Returns a cell's effective background color from a matching
+    conditional-formatting rule, or None if none applies. Conditional
+    formatting colors live entirely separately from cell.fill — a cell
+    with no direct fill set can still be visibly red/yellow/green through
+    a rule, which _xlsx_cell_fill_hex alone never sees."""
+    try:
+        applicable = []
+        for cf in ws.conditional_formatting:
+            if cell.coordinate not in cf.cells:
+                continue
+            for rule in cf.rules:
+                if rule.type == "cellIs" and rule.dxf and rule.dxf.fill:
+                    applicable.append(rule)
+        applicable.sort(key=lambda r: r.priority)
+        for rule in applicable:
+            if _cellis_rule_matches(rule, cell.value):
+                fg = rule.dxf.fill.fgColor
+                if fg is not None and fg.type == "rgb" and fg.rgb and len(fg.rgb) == 8:
+                    return fg.rgb[2:]
+    except Exception:
+        pass
+    return None
+
+
 def _xlsx_cell_fill_hex(cell):
     """Returns an openpyxl cell's solid fill color as a 6-char hex string,
     or None if it has no solid fill. openpyxl reports colors as 8-char ARGB
@@ -1268,11 +1327,17 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
         text = (page.extract_text() or "").strip()
         page_items.append(_reconstruct_paragraphs(text) if text else [])
 
-    # A short line that repeats verbatim across most pages is a running
-    # header/footer (page title, "Confidential", a date stamp, etc.), not
-    # real content — repeating it once per page in the reconstructed
-    # document just adds clutter. Only applies to documents long enough
-    # that a real repeat pattern is meaningful, not a 2-page coincidence.
+    # A short line that repeats verbatim across most pages is usually a
+    # running header/footer (page title, "Confidential", a date stamp,
+    # etc.), not real content — repeating it once per page in the
+    # reconstructed document just adds clutter. But the same short text
+    # can coincidentally also be a genuine section heading on one specific
+    # page (e.g. "Summary" as a running header everywhere, but the actual
+    # heading for real summary content on the one page that has it) —
+    # suppressing every occurrence outright would silently erase that
+    # page's real heading along with the boilerplate. Only applies to
+    # documents long enough that a real repeat pattern is meaningful, not
+    # a 2-page coincidence.
     line_counts = Counter()
     for items in page_items:
         seen_this_page = {t for t, _k in items if len(t) < 100}
@@ -1280,6 +1345,30 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
             line_counts[t] += 1
     repeat_threshold = max(3, int(n_pages * 0.6))
     noisy_lines = {t for t, count in line_counts.items() if n_pages > 2 and count >= repeat_threshold}
+
+    # For each noisy line, measure how substantial the content immediately
+    # following it is on every page where it appears. A specific occurrence
+    # is exempted from suppression only when what follows it is both a real
+    # paragraph in absolute terms and clearly longer than what typically
+    # follows the same line elsewhere — true boilerplate is followed by
+    # similarly-sized content everywhere (nothing stands out), while a
+    # coincidentally-repeated real heading precedes one page's genuinely
+    # substantial section.
+    follow_lengths_by_line = {t: [] for t in noisy_lines}
+    for items in page_items:
+        for item_idx, (t, _k) in enumerate(items):
+            if t in noisy_lines:
+                flen = len(items[item_idx + 1][0]) if item_idx + 1 < len(items) else 0
+                follow_lengths_by_line[t].append(flen)
+    medians = {t: statistics.median(lens) if lens else 0 for t, lens in follow_lengths_by_line.items()}
+    exempt_occurrences = set()  # (page_idx, item_idx) pairs kept despite matching a noisy line
+    for page_idx, items in enumerate(page_items):
+        for item_idx, (t, _k) in enumerate(items):
+            if t not in noisy_lines:
+                continue
+            flen = len(items[item_idx + 1][0]) if item_idx + 1 < len(items) else 0
+            if flen >= 40 and flen >= medians[t] * 1.8:
+                exempt_occurrences.add((page_idx, item_idx))
 
     doc = Document()
     doc.add_heading("Converted from PDF", 0)
@@ -1291,7 +1380,11 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
             doc.add_heading(f"Page {i}", level=2)
         page_links = _extract_pdf_page_links(page)
         unmatched_links = list(page_links)
-        content_items = [(t, k) for t, k in items if t not in noisy_lines]
+        page_idx = i - 1
+        content_items = [
+            (t, k) for item_idx, (t, k) in enumerate(items)
+            if t not in noisy_lines or (page_idx, item_idx) in exempt_occurrences
+        ]
         if content_items:
             for para_text, kind in content_items:
                 if not para_text:
@@ -1469,7 +1562,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
             keep = [i for i, r in enumerate(rows) if has_content(i, r)]
             rows = [rows[i] for i in keep]
             formula_rows = [formula_rows[i] for i in keep]
-        sheet_rows.append((sheet_name, rows, formula_rows, merged_ranges))
+        sheet_rows.append((sheet_name, rows, formula_rows, merged_ranges, ws))
         if rows:
             max_cols = max(max_cols, max(len(r) for r in rows))
 
@@ -1482,7 +1575,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         section.page_width, section.page_height = section.page_height, section.page_width
 
     doc.add_heading("Converted from Excel", 0)
-    for sheet_name, rows, formula_rows, merged_ranges in sheet_rows:
+    for sheet_name, rows, formula_rows, merged_ranges, ws in sheet_rows:
         doc.add_heading(sheet_name, level=1)
         if not rows:
             doc.add_paragraph("(Empty sheet)")
@@ -1504,7 +1597,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                         for run in p.runs:
                             run.bold = True
                 if src_cell is not None:
-                    fill_hex = _xlsx_cell_fill_hex(src_cell)
+                    fill_hex = _xlsx_conditional_fill_hex(ws, src_cell) or _xlsx_cell_fill_hex(src_cell)
                     if fill_hex:
                         _set_docx_cell_shading(cell, fill_hex)
                     if src_cell.comment is not None:
