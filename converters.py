@@ -861,12 +861,16 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         text_shapes = []
         table_shapes = []
         chart_shapes = []
+        image_shapes = []
         for shape in _iter_flat_shapes(slide.shapes):
             if shape.has_table:
                 table_shapes.append(shape)
                 continue
             if getattr(shape, "has_chart", False):
                 chart_shapes.append(shape)
+                continue
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                image_shapes.append(shape)
                 continue
             if not shape.has_text_frame or not shape.text_frame.text.strip():
                 continue
@@ -876,6 +880,12 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 text_shapes.append(shape)
 
         doc.add_heading(title or f"Slide {i}", level=1)
+
+        for shape in image_shapes:
+            try:
+                doc.add_picture(io.BytesIO(shape.image.blob), width=DocxInches(4))
+            except Exception:
+                continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
 
         for shape in text_shapes:
             for para in shape.text_frame.paragraphs:
