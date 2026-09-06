@@ -1508,12 +1508,33 @@ def pdf_to_pptx(src_path, out_dir, style=None):
 
 
 # --------------------------------------------------------------- XLSX -> DOCX
-def _format_cell_value(val):
+def _count_format_decimals(fmt):
+    """Counts decimal placeholder digits (0 or #) after the last '.' in an
+    Excel number format string, e.g. '0.00' -> 2, '#,##0' -> 0. Stops at
+    the first character that isn't a placeholder digit, so a trailing '%'
+    or literal text doesn't get miscounted as more decimals."""
+    if "." not in fmt:
+        return 0
+    after_dot = fmt.rsplit(".", 1)[1]
+    count = 0
+    for ch in after_dot:
+        if ch in "0#":
+            count += 1
+        else:
+            break
+    return count
+
+
+def _format_cell_value(val, number_format=None):
     """openpyxl hands back raw Python values — a date becomes a datetime
     object, and floating-point arithmetic in the sheet often leaves noise
     like 3.140000000000001. str()'ing these directly is what the old code
-    did, and it looked exactly as raw as that implies. This renders them the
-    way a person actually reads a spreadsheet."""
+    did, and it looked exactly as raw as that implies. This renders them
+    the way a person actually reads a spreadsheet — including honoring
+    the cell's actual display format for the common cases (percentage,
+    currency, thousands separator), since the raw stored value and what
+    Excel actually shows can be completely different: a cell storing 0.15
+    with a percentage format displays as '15%', not '0.15'."""
     if val is None:
         return ""
     if isinstance(val, bool):
@@ -1524,6 +1545,22 @@ def _format_cell_value(val):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, datetime.date):
         return val.strftime("%Y-%m-%d")
+    if isinstance(val, (int, float)) and number_format and number_format != "General":
+        decimals = _count_format_decimals(number_format)
+        if "%" in number_format:
+            return f"{val * 100:.{decimals}f}%"
+        for symbol in ("$", "£", "€", "¥"):
+            if symbol in number_format:
+                return f"{symbol}{val:,.{decimals}f}"
+        if "0" in number_format or "#" in number_format:
+            # Any explicit numeric format (with or without a thousands
+            # separator) means the format is dictating real precision —
+            # e.g. '0.00' forces two decimals even on a whole number like
+            # 3.0, which the generic float cleanup below would otherwise
+            # collapse to '3' and silently lose that explicit precision.
+            if "," in number_format:
+                return f"{val:,.{decimals}f}"
+            return f"{val:.{decimals}f}"
     if isinstance(val, float):
         if val == int(val):
             return str(int(val))
@@ -1591,7 +1628,8 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                 if val is None and c_idx < len(formula_rows[r_idx]) and formula_rows[r_idx][c_idx].data_type == "f":
                     val = formula_rows[r_idx][c_idx].value  # uncalculated formula — show the formula itself, not blank
                 cell = table.cell(r_idx, c_idx)
-                cell.text = _format_cell_value(val)
+                number_format = src_cell.number_format if src_cell is not None else None
+                cell.text = _format_cell_value(val, number_format)
                 if r_idx == 0:
                     for p in cell.paragraphs:
                         for run in p.runs:
@@ -2008,8 +2046,9 @@ def extract_text(src_path, ext):
                     val = cell.value
                     if val is None and fcell.data_type == "f":
                         val = fcell.value  # uncalculated formula — show the formula itself, not blank
-                    if val is not None:
-                        cells.append(str(val))
+                    text = _format_cell_value(val, cell.number_format)
+                    if text:
+                        cells.append(text)
                 if cells:
                     parts.append(" | ".join(cells))
             for row in ws.iter_rows():
