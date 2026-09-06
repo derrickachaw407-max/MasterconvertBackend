@@ -602,24 +602,39 @@ def _get_docx_numbering_formats(doc):
 
 
 def _get_paragraph_direct_list_info(paragraph, numbering_formats):
-    """Returns (level, is_numbered) from the paragraph's own direct numPr
-    formatting — the authoritative source when present — or None if the
-    paragraph has no direct list formatting (in which case a caller should
-    fall back to a style-name-based guess, since a style like 'List Bullet'
-    carries its numbering via the *style* definition rather than direct
-    per-paragraph numPr)."""
-    pPr = paragraph._p.find(qn("w:pPr"))
-    if pPr is None:
+    """Returns (level, is_numbered) from real numPr formatting — the
+    paragraph's own direct numPr when present, else its paragraph style's
+    own numPr. Checking only the paragraph itself misses a real, common
+    case: a custom paragraph style (anything not literally named 'List
+    Bullet'/'List Number') that carries the numbering reference in the
+    STYLE's own definition rather than as direct per-paragraph formatting
+    — the style-name heuristic can't catch this either, since the style
+    might be named anything at all. Returns None only when neither the
+    paragraph nor its style has any numPr, in which case a caller should
+    fall back to the style-*name* guess for the legacy 'List Bullet'/'List
+    Number' built-in styles, which carry numbering a third way (through
+    Word's separate style-to-list linkage rather than an explicit numPr
+    in the style's own pPr)."""
+    def numpr_from(pPr):
+        if pPr is None:
+            return None
+        numPr = pPr.find(qn("w:numPr"))
+        if numPr is None:
+            return None
+        ilvl_el = numPr.find(qn("w:ilvl"))
+        level = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
+        numId_el = numPr.find(qn("w:numId"))
+        num_id = numId_el.get(qn("w:val")) if numId_el is not None else None
+        is_numbered = numbering_formats.get(num_id, False) if num_id else False
+        return (level, is_numbered)
+
+    direct = numpr_from(paragraph._p.find(qn("w:pPr")))
+    if direct is not None:
+        return direct
+    try:
+        return numpr_from(paragraph.style.element.find(qn("w:pPr")))
+    except Exception:
         return None
-    numPr = pPr.find(qn("w:numPr"))
-    if numPr is None:
-        return None
-    ilvl_el = numPr.find(qn("w:ilvl"))
-    level = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
-    numId_el = numPr.find(qn("w:numId"))
-    num_id = numId_el.get(qn("w:val")) if numId_el is not None else None
-    is_numbered = numbering_formats.get(num_id, False) if num_id else False
-    return (level, is_numbered)
 
 
 def _iter_textbox_paragraphs(paragraph):
