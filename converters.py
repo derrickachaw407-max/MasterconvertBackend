@@ -1582,7 +1582,10 @@ def _format_cell_value(val, number_format=None):
         else:
             for symbol in ("$", "£", "€", "¥"):
                 if symbol in fmt:
-                    result = f"{symbol}{work_val:,.{decimals}f}"
+                    if work_val < 0:
+                        result = f"-{symbol}{-work_val:,.{decimals}f}"
+                    else:
+                        result = f"{symbol}{work_val:,.{decimals}f}"
                     break
             if result is None and ("0" in fmt or "#" in fmt):
                 result = f"{work_val:,.{decimals}f}" if "," in fmt else f"{work_val:.{decimals}f}"
