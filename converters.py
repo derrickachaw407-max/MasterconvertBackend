@@ -1196,6 +1196,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         n_cols = max(len(r) for r in rows)
         table = doc.add_table(rows=len(rows), cols=n_cols)
         table.style = "Light Grid Accent 1"
+        cell_comments = []
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
                 src_cell = row[c_idx] if c_idx < len(row) else None
@@ -1210,11 +1211,24 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                     fill_hex = _xlsx_cell_fill_hex(src_cell)
                     if fill_hex:
                         _set_docx_cell_shading(cell, fill_hex)
+                    if src_cell.comment is not None:
+                        note_text = (src_cell.comment.text or "").strip()
+                        if note_text:
+                            author = (src_cell.comment.author or "").strip() or "Comment"
+                            cell_comments.append((src_cell.coordinate, author, note_text))
         for mr in merged_ranges:
             try:
                 table.cell(mr.min_row - 1, mr.min_col - 1).merge(table.cell(mr.max_row - 1, mr.max_col - 1))
             except IndexError:
                 continue  # merge range falls outside the table we built — skip rather than crash
+        if cell_comments:
+            note_heading = doc.add_paragraph()
+            note_heading.paragraph_format.space_before = DocxPt(8)
+            note_run = note_heading.add_run("Cell comments:")
+            note_run.bold = True
+            note_run.italic = True
+            for coord, author, note_text in cell_comments:
+                doc.add_paragraph(f"{coord} ({author}): {note_text}", style="List Bullet")
 
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
@@ -1583,9 +1597,17 @@ def extract_text(src_path, ext):
         wb = openpyxl.load_workbook(src_path, data_only=True)
         parts = []
         for sheet in wb.sheetnames:
-            for row in wb[sheet].iter_rows(values_only=True):
+            ws = wb[sheet]
+            for row in ws.iter_rows(values_only=True):
                 cells = [str(c) for c in row if c is not None]
                 if cells:
                     parts.append(" | ".join(cells))
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.comment is not None:
+                        note_text = (cell.comment.text or "").strip()
+                        if note_text:
+                            author = (cell.comment.author or "").strip() or "Comment"
+                            parts.append(f"[{cell.coordinate} comment by {author}: {note_text}]")
         return "\n".join(parts)
     raise ConversionError(f"Can't extract text from .{ext} files")
