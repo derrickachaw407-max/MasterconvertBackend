@@ -357,6 +357,25 @@ def _safe_hex_color(color):
     return str(rgb) if rgb is not None else None
 
 
+def _get_docx_header_footer_text(doc):
+    """Returns distinct, non-empty header/footer paragraph text across all
+    sections. A header/footer holding only a page-number field returns
+    empty text here (the field's displayed number isn't literal text, just
+    a field code), which conveniently filters out routine pagination
+    boilerplate on its own — only genuine typed content (a report title, a
+    confidentiality line) survives the strip-and-dedupe."""
+    seen = set()
+    lines = []
+    for section in doc.sections:
+        for container in (section.header, section.footer):
+            for p in container.paragraphs:
+                text = p.text.strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    lines.append(text)
+    return lines
+
+
 def _get_docx_footnotes(doc):
     """Returns an ordered list of real footnote texts. python-docx has no
     API for footnotes whatsoever — not even a way to detect they exist —
@@ -641,6 +660,16 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             body_tf = state["body_tf"]
             p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
             p.text = add_bullet_text
+            _style_pptx_body_paragraph(p, template_style)
+            state["bullet_count"] += 1
+
+    header_footer = _get_docx_header_footer_text(doc)
+    if header_footer:
+        new_slide("Header/Footer")
+        for line in header_footer:
+            body_tf = state["body_tf"]
+            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
+            p.text = line
             _style_pptx_body_paragraph(p, template_style)
             state["bullet_count"] += 1
 
@@ -1136,6 +1165,13 @@ def docx_to_xlsx(src_path, out_dir):
         for r, note in enumerate(footnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
+    header_footer = _get_docx_header_footer_text(doc)
+    if header_footer:
+        ws = wb.create_sheet(title="Header-Footer")
+        ws.column_dimensions["A"].width = 100
+        for r, line in enumerate(header_footer, 1):
+            ws.cell(row=r, column=1, value=line)
+
     if not wb.sheetnames:
         ws = wb.create_sheet(title="Sheet1")
         ws["A1"] = "(No content found in document)"
@@ -1374,6 +1410,10 @@ def extract_text(src_path, ext):
         if footnotes:
             parts.append("Footnotes:")
             parts.extend(f"{i}. {note}" for i, note in enumerate(footnotes, 1))
+        header_footer = _get_docx_header_footer_text(doc)
+        if header_footer:
+            parts.append("Header/Footer:")
+            parts.extend(header_footer)
         return "\n".join(parts)
     if ext == "pdf":
         reader = pypdf.PdfReader(src_path)
