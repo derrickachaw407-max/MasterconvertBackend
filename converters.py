@@ -509,6 +509,73 @@ def _full_cell_text(cell):
     return "\n".join(_full_paragraph_text(p) for p in cell.paragraphs)
 
 
+def _get_docx_numbering_formats(doc):
+    """Returns a dict mapping numId -> True if that list numbering
+    definition is genuinely numbered (decimal, lowerLetter, upperRoman,
+    etc.) or False if it's a bullet, read directly from numbering.xml.
+    Needed because Word's toolbar bullet/number buttons apply direct
+    per-paragraph numPr formatting while leaving the paragraph under a
+    generic style name ('List Paragraph', sometimes not even that) — for
+    the overwhelming majority of real-world Word lists (anything created
+    via the ribbon rather than by explicitly picking a legacy style named
+    'List Bullet'/'List Number'), a style-name check alone can't tell a
+    bulleted list from a numbered one, or see indent levels at all."""
+    try:
+        pkg = doc.part.package
+    except Exception:
+        return {}
+    numbering_root = None
+    for part in pkg.iter_parts():
+        if part.partname == "/word/numbering.xml":
+            try:
+                numbering_root = etree.fromstring(part.blob)
+            except Exception:
+                return {}
+            break
+    if numbering_root is None:
+        return {}
+
+    abstract_is_numbered = {}
+    for abstract_num in numbering_root.findall(qn("w:abstractNum")):
+        abstract_id = abstract_num.get(qn("w:abstractNumId"))
+        lvl0 = abstract_num.find(qn("w:lvl"))
+        fmt_val = None
+        if lvl0 is not None:
+            numFmt = lvl0.find(qn("w:numFmt"))
+            fmt_val = numFmt.get(qn("w:val")) if numFmt is not None else None
+        abstract_is_numbered[abstract_id] = fmt_val not in (None, "bullet", "none")
+
+    result = {}
+    for num in numbering_root.findall(qn("w:num")):
+        num_id = num.get(qn("w:numId"))
+        abstract_ref = num.find(qn("w:abstractNumId"))
+        abstract_id = abstract_ref.get(qn("w:val")) if abstract_ref is not None else None
+        if abstract_id in abstract_is_numbered:
+            result[num_id] = abstract_is_numbered[abstract_id]
+    return result
+
+
+def _get_paragraph_direct_list_info(paragraph, numbering_formats):
+    """Returns (level, is_numbered) from the paragraph's own direct numPr
+    formatting — the authoritative source when present — or None if the
+    paragraph has no direct list formatting (in which case a caller should
+    fall back to a style-name-based guess, since a style like 'List Bullet'
+    carries its numbering via the *style* definition rather than direct
+    per-paragraph numPr)."""
+    pPr = paragraph._p.find(qn("w:pPr"))
+    if pPr is None:
+        return None
+    numPr = pPr.find(qn("w:numPr"))
+    if numPr is None:
+        return None
+    ilvl_el = numPr.find(qn("w:ilvl"))
+    level = int(ilvl_el.get(qn("w:val"))) if ilvl_el is not None else 0
+    numId_el = numPr.find(qn("w:numId"))
+    num_id = numId_el.get(qn("w:val")) if numId_el is not None else None
+    is_numbered = numbering_formats.get(num_id, False) if num_id else False
+    return (level, is_numbered)
+
+
 def _iter_textbox_paragraphs(paragraph):
     """Yields each paragraph nested inside a floating text box embedded in
     this paragraph's runs. A text box's own paragraphs live inside a nested
@@ -544,6 +611,7 @@ def _iter_inline_images(paragraph, doc):
 def docx_to_pptx(src_path, out_dir, style="minimal"):
     template_style = PPTX_TEMPLATES.get(style, PPTX_TEMPLATES["minimal"])
     doc = Document(src_path)
+    numbering_formats = _get_docx_numbering_formats(doc)
     prs = Presentation()
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
@@ -743,13 +811,18 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         elif heading_match:
             add_subheading(text)
         else:
-            level = 0
-            numbered = False
-            if "list" in para_style_name:
-                m = re.search(r"(\d+)", para_style_name)
-                if m:
-                    level = max(0, min(int(m.group(1)) - 1, 4))
-                numbered = "number" in para_style_name
+            direct_list_info = _get_paragraph_direct_list_info(para, numbering_formats)
+            if direct_list_info is not None:
+                level, numbered = direct_list_info
+                level = max(0, min(level, 4))
+            else:
+                level = 0
+                numbered = False
+                if "list" in para_style_name:
+                    m = re.search(r"(\d+)", para_style_name)
+                    if m:
+                        level = max(0, min(int(m.group(1)) - 1, 4))
+                    numbered = "number" in para_style_name
             add_bullet(para, level=level, numbered=numbered)
 
     if state["slide"] is None:
