@@ -1566,12 +1566,17 @@ def _format_cell_value(val, number_format=None):
 
         decimals = _count_format_decimals(fmt)
         result = None
-        if "0" not in fmt and "#" not in fmt:
-            # A section with no numeric placeholder at all is pure literal
-            # text — commonly used to hide zeros (a zero-section of just
-            # '"-"' is a standard Excel convention) — so the format's own
-            # literal text is the correct output, not a formatted number.
-            result = fmt.strip('"')
+        if fmt.strip().startswith('"') and fmt.strip().endswith('"'):
+            # A section that's entirely a quoted literal — e.g. a
+            # zero-section of just '"-"', a standard Excel convention for
+            # hiding zeros — should show as that literal text. This is
+            # deliberately narrower than 'no 0 or # present', which would
+            # also (wrongly) match an unquoted, unusual format pattern
+            # like a date format string on a raw number openpyxl didn't
+            # auto-convert to a real datetime — showing that literal
+            # format template ('yyyy-mm-dd') would be worse than falling
+            # through to a plain number.
+            result = fmt.strip().strip('"')
         elif "%" in fmt:
             result = f"{work_val * 100:.{decimals}f}%"
         else:
@@ -1579,7 +1584,7 @@ def _format_cell_value(val, number_format=None):
                 if symbol in fmt:
                     result = f"{symbol}{work_val:,.{decimals}f}"
                     break
-            if result is None:
+            if result is None and ("0" in fmt or "#" in fmt):
                 result = f"{work_val:,.{decimals}f}" if "," in fmt else f"{work_val:.{decimals}f}"
         if result is not None:
             return f"({result})" if use_parens else result
