@@ -329,6 +329,22 @@ def _xlsx_conditional_fill_hex(ws, cell):
     return None
 
 
+def _xlsx_chart_title(chart):
+    """Extracts a chart's title text from openpyxl's deeply nested title
+    object, or None if the chart has no title or an unexpected structure.
+    A chart's own underlying data is just ordinary worksheet cells,
+    already captured by the normal table conversion — this caption is
+    only about letting the reader know a chart existed at all, not about
+    recovering data that would otherwise be lost."""
+    try:
+        rich_paragraphs = chart.title.tx.rich.p
+        parts = [run.t for para in rich_paragraphs for run in (para.r or []) if run.t]
+        text = "".join(parts).strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def _xlsx_cell_fill_hex(cell):
     """Returns an openpyxl cell's solid fill color as a 6-char hex string,
     or None if it has no solid fill. openpyxl reports colors as 8-char ARGB
@@ -1694,6 +1710,15 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
             for coord, author, note_text in cell_comments:
                 doc.add_paragraph(f"{coord} ({author}): {note_text}", style="List Bullet")
 
+        charts = getattr(ws, "_charts", None) or []
+        for chart in charts:
+            chart_title = _xlsx_chart_title(chart)
+            label = f'Chart: "{chart_title}"' if chart_title else "Chart (based on the data above)"
+            chart_p = doc.add_paragraph()
+            chart_p.paragraph_format.space_before = DocxPt(8)
+            chart_run = chart_p.add_run(label)
+            chart_run.italic = True
+
     apply_docx_style(doc, style)
     out_path = os.path.join(out_dir, "converted.docx")
     doc.save(out_path)
@@ -1858,6 +1883,11 @@ def text_to_pptx(raw_text, out_dir):
         title = _BULLET_RE.sub("", lines[0]).strip()
         body_lines = [_BULLET_RE.sub("", l).strip() for l in lines[1:]]
 
+        def set_slide_title(slide, text):
+            tf = slide.shapes.title.text_frame
+            tf.clear()
+            _add_markdown_aware_pptx_text(tf.paragraphs[0], text[:120])
+
         slide = None
         tf = None
         count = 0
@@ -1865,16 +1895,16 @@ def text_to_pptx(raw_text, out_dir):
             if slide is None or count >= MAX_BULLETS_PER_SLIDE:
                 slide_title = title if slide is None else title + " (cont.)"
                 slide = prs.slides.add_slide(title_layout)
-                slide.shapes.title.text = slide_title[:120]
+                set_slide_title(slide, slide_title)
                 tf = slide.placeholders[1].text_frame
                 tf.clear()
                 count = 0
             p = tf.paragraphs[0] if count == 0 else tf.add_paragraph()
-            p.text = line
+            _add_markdown_aware_pptx_text(p, line)
             count += 1
         if slide is None:
             slide = prs.slides.add_slide(title_layout)
-            slide.shapes.title.text = title[:120]
+            set_slide_title(slide, title)
             slide.placeholders[1].text_frame.clear()
 
     if not prs.slides:
@@ -1945,6 +1975,40 @@ def _add_markdown_aware_text(paragraph, text, base_bold=False):
         pos = m.end()
     if pos < len(text):
         _set_run_font(paragraph.add_run(text[pos:]), bold=base_bold)
+
+
+def _add_markdown_aware_pptx_text(paragraph, text):
+    """The pptx equivalent of _add_markdown_aware_text — same shared
+    regex (it's pure text pattern matching, format-agnostic), building
+    pptx runs instead of docx ones. Used for pasted text that may itself
+    contain markdown emphasis syntax — plausible whenever someone copies
+    content from a notes app, a README, or an AI chat response into the
+    paste-to-slides feature, not just for AI-authored text."""
+    pos = 0
+    for m in _MARKDOWN_EMPHASIS_RE.finditer(text):
+        if m.start() > pos:
+            r = paragraph.add_run()
+            r.text = text[pos:m.start()]
+        both_inner = m.group(1) if m.group(1) is not None else m.group(2)
+        bold_inner = m.group(3) if m.group(3) is not None else m.group(4)
+        if both_inner is not None:
+            r = paragraph.add_run()
+            r.text = both_inner
+            r.font.bold = True
+            r.font.italic = True
+        elif bold_inner is not None:
+            r = paragraph.add_run()
+            r.text = bold_inner
+            r.font.bold = True
+        else:
+            italic_inner = m.group(5) if m.group(5) is not None else m.group(6)
+            r = paragraph.add_run()
+            r.text = italic_inner
+            r.font.italic = True
+        pos = m.end()
+    if pos < len(text):
+        r = paragraph.add_run()
+        r.text = text[pos:]
 
 
 def _add_page_number_footer(doc):
