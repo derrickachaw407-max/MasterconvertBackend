@@ -518,6 +518,53 @@ def _get_docx_notes(doc, part_name, note_tag):
     return []
 
 
+def _iter_docx_charts(paragraph, doc):
+    """Yields (title, categories, series) for each chart embedded in this
+    paragraph's runs. python-docx has no chart API at all — a chart's
+    real data lives entirely in a separate chart XML part, reached only
+    via a relationship id on the run's drawing — so without reaching for
+    it directly, a chart's numbers are completely lost rather than just
+    unstyled, the same class of gap PowerPoint charts had before that was
+    fixed. series is a list of (name, values)."""
+    for run in paragraph.runs:
+        for chart_ref in run._element.findall(".//" + qn("c:chart")):
+            r_id = chart_ref.get(qn("r:id"))
+            if not r_id:
+                continue
+            try:
+                chart_part = doc.part.rels[r_id].target_part
+                root = etree.fromstring(chart_part.blob)
+            except Exception:
+                continue
+            title = None
+            try:
+                title_el = root.find(".//" + qn("c:title"))
+                if title_el is not None:
+                    parts = [t.text for t in title_el.iter(qn("a:t")) if t.text]
+                    title = "".join(parts).strip() or None
+            except Exception:
+                pass
+            categories = []
+            try:
+                cat_el = root.find(".//" + qn("c:cat"))
+                if cat_el is not None:
+                    categories = [pt.findtext(qn("c:v")) or "" for pt in cat_el.iter(qn("c:pt"))]
+            except Exception:
+                pass
+            series_list = []
+            try:
+                for ser in root.iter(qn("c:ser")):
+                    name_el = ser.find(".//" + qn("c:tx") + "//" + qn("c:v"))
+                    name = name_el.text if name_el is not None else "Series"
+                    val_el = ser.find(qn("c:val"))
+                    values = [pt.findtext(qn("c:v")) or "" for pt in val_el.iter(qn("c:pt"))] if val_el is not None else []
+                    series_list.append((name, values))
+            except Exception:
+                pass
+            if categories or series_list:
+                yield title, categories, series_list
+
+
 def _get_docx_footnotes(doc):
     return _get_docx_notes(doc, "/word/footnotes.xml", "w:footnote")
 
@@ -906,6 +953,36 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
 
+    def add_chart_slide(title, categories, series_list):
+        n_rows, n_cols = len(categories) + 1, len(series_list) + 1
+        if n_rows < 2 or n_cols < 2:
+            return
+        s = prs.slides.add_slide(title_layout)
+        s.shapes.title.text = title or "Chart"
+        _style_pptx_slide(s, template_style)
+        left, top = PptxInches(0.6), PptxInches(1.6)
+        width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.2)
+        gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
+        gtable.cell(0, 0).text = ""
+        for s_idx, (name, _values) in enumerate(series_list, 1):
+            gtable.cell(0, s_idx).text = name
+        for cat_idx, cat_name in enumerate(categories, 1):
+            gtable.cell(cat_idx, 0).text = cat_name
+            for s_idx, (_name, values) in enumerate(series_list, 1):
+                val = values[cat_idx - 1] if cat_idx - 1 < len(values) else ""
+                try:
+                    val = _format_cell_value(float(val))
+                except (ValueError, TypeError):
+                    pass
+                gtable.cell(cat_idx, s_idx).text = val
+        for cell in gtable.rows[0].cells:
+            for p in cell.text_frame.paragraphs:
+                for run in p.runs:
+                    run.font.bold = True
+        # A loose paragraph right after a chart should land on a fresh
+        # slide rather than silently reusing the chart's slide.
+        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+
     def add_image_slide(image_bytes):
         s = prs.slides.add_slide(blank_layout)
         try:
@@ -938,6 +1015,8 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
                 add_bullet(tb_para, level=0)
+        for chart_title, chart_cats, chart_series in _iter_docx_charts(para, doc):
+            add_chart_slide(chart_title, chart_cats, chart_series)
         text = _full_paragraph_text(para).strip()
         if not text:
             continue
@@ -1785,6 +1864,7 @@ def docx_to_xlsx(src_path, out_dir):
     # and the old behavior silently dropped all of it whenever any table
     # was present.
     text_rows = []
+    chart_data_list = []
     for p in doc.paragraphs:
         full_text = _full_paragraph_text(p).strip()
         if full_text:
@@ -1793,11 +1873,30 @@ def docx_to_xlsx(src_path, out_dir):
             tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
                 text_rows.append(tb_text)
+        for chart_title, chart_cats, chart_series in _iter_docx_charts(p, doc):
+            chart_data_list.append((chart_title, chart_cats, chart_series))
     if text_rows:
         ws = wb.create_sheet(title="Document Text")
         ws.column_dimensions["A"].width = 100
         for r, line in enumerate(text_rows, 1):
             ws.cell(row=r, column=1, value=line)
+
+    for i, (chart_title, chart_cats, chart_series) in enumerate(chart_data_list, 1):
+        sheet_title = (chart_title or f"Chart {i}")[:31]
+        ws = wb.create_sheet(title=sheet_title)
+        ws.cell(row=1, column=1, value="")
+        for s_idx, (name, _values) in enumerate(chart_series, 2):
+            ws.cell(row=1, column=s_idx, value=name).font = XlsxFont(bold=True)
+        for cat_idx, cat_name in enumerate(chart_cats, 2):
+            ws.cell(row=cat_idx, column=1, value=cat_name)
+            for s_idx, (_name, values) in enumerate(chart_series, 2):
+                val = values[cat_idx - 2] if cat_idx - 2 < len(values) else None
+                try:
+                    val = float(val)
+                except (ValueError, TypeError):
+                    pass
+                ws.cell(row=cat_idx, column=s_idx, value=val)
+        autosize_columns(ws, len(chart_series) + 1)
 
     footnotes = _get_docx_footnotes(doc)
     if footnotes:
@@ -2150,6 +2249,11 @@ def extract_text(src_path, ext):
                 tb_text = _full_paragraph_text(tb_para).strip()
                 if tb_text:
                     parts.append(tb_text)
+            for chart_title, chart_cats, chart_series in _iter_docx_charts(p, doc):
+                parts.append(f"Chart: {chart_title}" if chart_title else "Chart data:")
+                for name, values in chart_series:
+                    row = [name] + list(values)
+                    parts.append(" | ".join(row))
         for table in doc.tables:
             for row in table.rows:
                 parts.append(" | ".join(_full_cell_text(c) for c in row.cells))
