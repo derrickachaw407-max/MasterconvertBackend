@@ -1885,11 +1885,12 @@ def text_to_pptx(raw_text, out_dir):
     return out_path
 
 
-def _set_run_font(run, bold=False):
+def _set_run_font(run, bold=False, italic=False):
     run.font.name = "Times New Roman"
     run.font.size = DocxPt(12)
     run.font.color.rgb = DocxRGBColor(0, 0, 0)
     run.bold = bold
+    run.italic = italic
     # Word can silently fall back to a different font for East-Asian text
     # runs unless this is set explicitly alongside the Latin font name above.
     rpr = run._element.get_or_add_rPr()
@@ -1898,6 +1899,46 @@ def _set_run_font(run, bold=False):
         rfonts = OxmlElement("w:rFonts")
         rpr.append(rfonts)
     rfonts.set(qn("w:eastAsia"), "Times New Roman")
+
+
+_MARKDOWN_EMPHASIS_RE = re.compile(
+    r"\*\*\*(\S(?:.*?\S)?)\*\*\*"  # ***bold italic*** — must be tried before ** or *,
+    r"|___(\S(?:.*?\S)?)___"      # or a double-marker alternative would consume only 2
+    r"|\*\*(\S(?:.*?\S)?)\*\*"    # of the 3 leading markers and leave a stray one behind
+    r"|__(\S(?:.*?\S)?)__"        # as literal text in the output.
+    r"|\*(\S(?:.*?\S)?)\*"        # *italic* / _italic_ — content can't start/end with
+    r"|_(\S(?:.*?\S)?)_"          # whitespace, so '3 * 4 = 12 and separately 5 * 6'
+)                                  # (plausible academic multiplication notation) isn't
+                                   # mistaken for italic markup.
+
+
+def _add_markdown_aware_text(paragraph, text, base_bold=False):
+    """Adds text to a paragraph, converting basic markdown emphasis
+    (***bold italic***, **bold**, __bold__, *italic*, _italic_) into real
+    Word formatting instead of leaving literal asterisks/underscores in
+    the output. The text here is AI-generated — LLMs commonly reach for
+    markdown emphasis as a natural writing habit even when nothing asked
+    for markdown specifically, and literal '**word**' in a finished
+    academic Word document reads as broken, not as emphasis. base_bold
+    lets a heading's own bold styling combine correctly with an *italic*
+    span inside it, rather than the emphasis parsing accidentally
+    clearing it."""
+    pos = 0
+    for m in _MARKDOWN_EMPHASIS_RE.finditer(text):
+        if m.start() > pos:
+            _set_run_font(paragraph.add_run(text[pos:m.start()]), bold=base_bold)
+        both_inner = m.group(1) if m.group(1) is not None else m.group(2)
+        bold_inner = m.group(3) if m.group(3) is not None else m.group(4)
+        if both_inner is not None:
+            _set_run_font(paragraph.add_run(both_inner), bold=True, italic=True)
+        elif bold_inner is not None:
+            _set_run_font(paragraph.add_run(bold_inner), bold=True)
+        else:
+            italic_inner = m.group(5) if m.group(5) is not None else m.group(6)
+            _set_run_font(paragraph.add_run(italic_inner), bold=base_bold, italic=True)
+        pos = m.end()
+    if pos < len(text):
+        _set_run_font(paragraph.add_run(text[pos:]), bold=base_bold)
 
 
 def _add_page_number_footer(doc):
@@ -1956,7 +1997,7 @@ def academic_essay_to_docx(payload, out_dir):
         p.paragraph_format.line_spacing = 2.0
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.first_line_indent = DocxInches(0.5)
-        _set_run_font(p.add_run(text))
+        _add_markdown_aware_text(p, text)
         return p
 
     def add_section_heading(text, level=1):
@@ -1965,11 +2006,11 @@ def academic_essay_to_docx(payload, out_dir):
         if level <= 1:
             # APA Level 1: centered, bold
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _set_run_font(p.add_run(text), bold=True)
+            _add_markdown_aware_text(p, text, base_bold=True)
         elif level == 2:
             # APA Level 2: left-aligned, bold
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            _set_run_font(p.add_run(text), bold=True)
+            _add_markdown_aware_text(p, text, base_bold=True)
         else:
             # APA Level 3: left-aligned, bold italic
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
