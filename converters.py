@@ -1996,7 +1996,7 @@ def academic_essay_to_docx(payload, out_dir):
     title_p = doc.add_paragraph()
     title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title_p.paragraph_format.line_spacing = 2.0
-    _set_run_font(title_p.add_run(title), bold=True)
+    _add_markdown_aware_text(title_p, title, base_bold=True)
 
     def add_body_paragraph(text):
         p = doc.add_paragraph()
