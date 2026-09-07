@@ -1902,14 +1902,20 @@ def _set_run_font(run, bold=False, italic=False):
 
 
 _MARKDOWN_EMPHASIS_RE = re.compile(
-    r"\*\*\*(\S(?:.*?\S)?)\*\*\*"  # ***bold italic*** — must be tried before ** or *,
-    r"|___(\S(?:.*?\S)?)___"      # or a double-marker alternative would consume only 2
-    r"|\*\*(\S(?:.*?\S)?)\*\*"    # of the 3 leading markers and leave a stray one behind
-    r"|__(\S(?:.*?\S)?)__"        # as literal text in the output.
-    r"|\*(\S(?:.*?\S)?)\*"        # *italic* / _italic_ — content can't start/end with
-    r"|_(\S(?:.*?\S)?)_"          # whitespace, so '3 * 4 = 12 and separately 5 * 6'
-)                                  # (plausible academic multiplication notation) isn't
-                                   # mistaken for italic markup.
+    r"\*\*\*(\S(?:.*?\S)?)\*\*\*"           # ***bold italic*** — must be tried before
+    r"|(?<!\w)___(\S(?:.*?\S)?)___(?!\w)"   # ** or *, or a double-marker alternative
+    r"|\*\*(\S(?:.*?\S)?)\*\*"              # would consume only 2 of the 3 leading
+    r"|(?<!\w)__(\S(?:.*?\S)?)__(?!\w)"     # markers and leave a stray one behind as
+    r"|\*(\S(?:.*?\S)?)\*"                  # literal text in the output.
+    r"|(?<!\w)_(\S(?:.*?\S)?)_(?!\w)"       # *italic* — content can't start/end with
+)                                            # whitespace, so '3 * 4 = 12 and separately
+                                              # 5 * 6' (academic multiplication notation)
+                                              # isn't mistaken for italic markup.
+                                              # _italic_ additionally requires a word
+                                              # boundary outside each underscore — the
+                                              # same rule CommonMark itself uses — so a
+                                              # variable name like 'user_id' is never
+                                              # mistaken for emphasis and corrupted.
 
 
 def _add_markdown_aware_text(paragraph, text, base_bold=False):
