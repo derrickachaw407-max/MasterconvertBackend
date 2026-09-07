@@ -2058,7 +2058,7 @@ def academic_essay_to_docx(payload, out_dir):
             ref_text = (ref.get("text") or "").strip()
             url = (ref.get("url") or "").strip()
             if ref_text:
-                _set_run_font(p.add_run(ref_text + (" " if url else "")))
+                _add_markdown_aware_text(p, ref_text + (" " if url else ""))
             if url:
                 _set_run_font(p.add_run(url))
 
