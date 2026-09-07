@@ -1559,8 +1559,15 @@ def _format_cell_value(val, number_format=None):
         use_parens = False
         if val < 0 and len(sections) > 1:
             fmt = sections[1]
-            work_val = -val  # the section's own formatting conveys the sign
             use_parens = "(" in fmt
+            if use_parens:
+                # Only strip the sign when parentheses are what convey it —
+                # otherwise leave work_val negative so the normal formatting
+                # below (Python's own '-', or the currency-sign handling)
+                # produces the negative sign itself, instead of a section
+                # like '0%;-0%' or '0.00;-0.00' silently losing the sign
+                # entirely because nothing was left to represent it.
+                work_val = -val
         elif val == 0 and len(sections) > 2:
             fmt = sections[2]
 
