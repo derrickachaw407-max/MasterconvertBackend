@@ -1515,6 +1515,8 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
 # ---------------------------------------------------------------- PDF -> DOCX
 def pdf_to_docx(src_path, out_dir, style="clean"):
     reader = _safe_load(pypdf.PdfReader, src_path)
+    if reader.is_encrypted:
+        raise ConversionError("This PDF is password-protected and can't be converted until it's unlocked.")
     n_pages = len(reader.pages)
 
     page_items = []
@@ -2376,6 +2378,8 @@ def extract_text(src_path, ext):
         return "\n".join(parts)
     if ext == "pdf":
         reader = _safe_load(pypdf.PdfReader, src_path)
+        if reader.is_encrypted:
+            raise ConversionError("This PDF is password-protected and can't be read until it's unlocked.")
         return "\n".join((page.extract_text() or "") for page in reader.pages)
     if ext == "pptx":
         prs = _safe_load(Presentation, src_path)
