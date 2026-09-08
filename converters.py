@@ -789,11 +789,19 @@ def _iter_inline_images(paragraph, doc):
     paragraph, in document order — including images inside a hyperlink.
     python-docx's own paragraph.runs deliberately excludes hyperlink-wrapped
     runs, so walking iter_inner_content() (which covers both) is required
-    here, not just runs, or a clickable image would be silently skipped."""
+    here, not just runs, or a clickable image would be silently skipped.
+    Also excludes any a:blip found inside an mc:Fallback branch — the same
+    duplication risk confirmed for text boxes applies here: if a picture
+    is ever wrapped in mc:AlternateContent (some newer image effects use
+    this for compatibility), both the real and fallback branches could
+    reference what's logically the same image, and this search wouldn't
+    otherwise tell them apart."""
     for item in paragraph.iter_inner_content():
         runs = item.runs if type(item).__name__ == "Hyperlink" else [item]
         for run in runs:
             for blip in run._element.findall(".//" + qn("a:blip")):
+                if any(anc.tag == f"{{{_MC_NS}}}Fallback" for anc in blip.iterancestors()):
+                    continue
                 r_id = blip.get(qn("r:embed"))
                 if not r_id:
                     continue
