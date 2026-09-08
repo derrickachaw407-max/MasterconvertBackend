@@ -1413,12 +1413,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             word_table = doc.add_table(rows=n_rows, cols=n_cols)
             word_table.style = "Light Grid Accent 1"
             merge_spans = []
-            for r_idx, row in enumerate(rows):
+            for r_idx, (doc_row, row) in enumerate(zip(word_table.rows, rows)):
+                doc_cells = doc_row.cells
                 for c_idx in range(n_cols):
                     src_cell = src_rows[r_idx][c_idx] if c_idx < len(src_rows[r_idx]) else None
                     if src_cell is not None and src_cell.is_spanned and not src_cell.is_merge_origin:
                         continue  # covered by a merge origin elsewhere — filled in via the merge below
-                    cell = word_table.cell(r_idx, c_idx)
+                    cell = doc_cells[c_idx]
                     cell.text = row[c_idx] if c_idx < len(row) else ""
                     if r_idx == 0:
                         for p in cell.paragraphs:
@@ -1639,6 +1640,25 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
 
 # ---------------------------------------------------------------- PDF -> PPTX
 def pdf_to_pptx(src_path, out_dir, style=None):
+    # Checked upfront, before rasterization — each page needs rendering
+    # plus roughly 1.2s of sequential OCR (measured directly), so an
+    # unbounded page count could push total processing well past what
+    # typical web infrastructure allows before timing out silently with
+    # no useful error. Reading the page count via pypdf first is fast
+    # (no rendering involved) and avoids wasting the rasterization work
+    # entirely on a file that's going to be rejected anyway.
+    MAX_PDF_PPTX_PAGES = 50
+    try:
+        page_count = len(_safe_load(pypdf.PdfReader, src_path).pages)
+    except ConversionError:
+        raise
+    if page_count > MAX_PDF_PPTX_PAGES:
+        raise ConversionError(
+            f"This PDF has {page_count} pages — each one needs to be rendered and OCR'd "
+            f"individually for this conversion, which isn't practical past "
+            f"{MAX_PDF_PPTX_PAGES} pages. Try splitting it into smaller sections first."
+        )
+
     page_prefix = os.path.join(out_dir, "page")
     try:
         subprocess.run(
@@ -1855,13 +1875,14 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         table = doc.add_table(rows=len(rows), cols=n_cols)
         table.style = "Light Grid Accent 1"
         cell_comments = []
-        for r_idx, row in enumerate(rows):
+        for r_idx, (doc_row, row) in enumerate(zip(table.rows, rows)):
+            doc_cells = doc_row.cells
             for c_idx in range(n_cols):
                 src_cell = row[c_idx] if c_idx < len(row) else None
                 val = src_cell.value if src_cell is not None else None
                 if val is None and c_idx < len(formula_rows[r_idx]) and formula_rows[r_idx][c_idx].data_type == "f":
                     val = formula_rows[r_idx][c_idx].value  # uncalculated formula — show the formula itself, not blank
-                cell = table.cell(r_idx, c_idx)
+                cell = doc_cells[c_idx]
                 number_format = src_cell.number_format if src_cell is not None else None
                 cell.text = _format_cell_value(val, number_format)
                 if r_idx == 0:
