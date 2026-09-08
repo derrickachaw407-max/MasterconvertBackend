@@ -18,6 +18,7 @@ from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBC
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
+from pptx.oxml.ns import qn as pptx_qn
 from docx.oxml import OxmlElement
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
@@ -765,9 +766,20 @@ def _iter_textbox_paragraphs(paragraph):
     <w:txbxContent> deep within the run's drawing XML — a completely
     separate tree from the main document body — so normal paragraph
     iteration (doc.paragraphs, iter_block_items) never sees them at all,
-    silently dropping the text box's entire content."""
+    silently dropping the text box's entire content.
+
+    A modern text box is typically wrapped in <mc:AlternateContent>: a
+    <mc:Choice> branch with the real DrawingML shape, and a <mc:Fallback>
+    branch holding a legacy VML re-representation of that exact same
+    content for older software — confirmed directly by rendering one and
+    checking LibreOffice uses the Choice branch, not the Fallback. Both
+    branches use the identical <w:txbxContent> element name, so a plain
+    descendant search finds the same text twice; this skips anything
+    inside a Fallback branch specifically to avoid that duplication."""
     for run in paragraph.runs:
         for txbx_content in run._element.findall(".//" + qn("w:txbxContent")):
+            if any(anc.tag == f"{{{_MC_NS}}}Fallback" for anc in txbx_content.iterancestors()):
+                continue
             for p_el in txbx_content.findall(qn("w:p")):
                 yield DocxParagraph(p_el, paragraph)
 
@@ -1218,6 +1230,44 @@ def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underlin
     paragraph._p.append(hyperlink)
 
 
+_SMARTART_URI = "http://schemas.microsoft.com/office/drawing/2010/diagram"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _iter_smartart_fallback_text(slide):
+    """Yields (found_smartart, text) — found_smartart is True for every
+    qualifying SmartArt AlternateContent block encountered, independent of
+    whether text came out of it, so a diagram whose fallback shapes happen
+    to carry no text still isn't silently indistinguishable from a slide
+    with no diagram at all. python-pptx's own shape iterator (slide.shapes,
+    and _iter_flat_shapes built on it) silently skips anything wrapped in
+    <mc:AlternateContent> — confirmed directly rather than assumed — so a
+    SmartArt diagram (which real PowerPoint files wrap this way for
+    backward compatibility) is completely invisible to normal shape
+    iteration, not just unrecognized. The fallback content inside
+    <mc:Fallback> is built from ordinary shapes approximating the
+    diagram's own text, and reaching it means walking the slide's raw XML
+    directly rather than relying on python-pptx's shape abstraction at
+    all for this specific case."""
+    sp_tree = slide.shapes._spTree
+    for alt in sp_tree.findall(f".//{{{_MC_NS}}}AlternateContent"):
+        choice = alt.find(f"{{{_MC_NS}}}Choice")
+        if choice is None:
+            continue
+        graphic_data = choice.find(".//" + pptx_qn("a:graphicData"))
+        if graphic_data is None or graphic_data.get("uri") != _SMARTART_URI:
+            continue  # an AlternateContent block for something unrelated to SmartArt
+        yield (True, None)
+        fallback = alt.find(f"{{{_MC_NS}}}Fallback")
+        if fallback is None:
+            continue
+        for sp in fallback.findall(".//" + pptx_qn("p:sp")):
+            for para in sp.findall(".//" + pptx_qn("a:p")):
+                text = "".join(t.text or "" for t in para.findall(".//" + pptx_qn("a:t"))).strip()
+                if text:
+                    yield (False, text)
+
+
 def _iter_flat_shapes(shapes):
     """Yields every shape in a slide's shape collection, recursing into any
     GROUP shape's own .shapes. A grouped shape (very common — logos paired
@@ -1238,15 +1288,19 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
     NUMBER_STYLES = ["List Number", "List Number 2", "List Number 3"]
 
-    _SMARTART_URI = "http://schemas.microsoft.com/office/drawing/2010/diagram"
-
     for i, slide in enumerate(prs.slides, 1):
         title = None
         text_shapes = []
         table_shapes = []
         chart_shapes = []
         image_shapes = []
-        has_smartart = False
+        smartart_found = False
+        smartart_lines = []
+        for found, text in _iter_smartart_fallback_text(slide):
+            if found:
+                smartart_found = True
+            if text:
+                smartart_lines.append(text)
         for shape in _iter_flat_shapes(slide.shapes):
             if shape.has_table:
                 table_shapes.append(shape)
@@ -1257,23 +1311,6 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 image_shapes.append(shape)
                 continue
-            try:
-                graphic_data = shape._element.find(".//" + qn("a:graphicData"))
-                if graphic_data is not None and graphic_data.get("uri") == _SMARTART_URI:
-                    # SmartArt's actual content lives in a separate data-model
-                    # part with no straightforward text/table equivalent —
-                    # correctly reconstructing it is a much larger undertaking
-                    # than reading an already-structured chart or table, so
-                    # this only flags that a diagram existed here rather than
-                    # attempting to reproduce its content, the same honest
-                    # partial-acknowledgment approach used elsewhere in this
-                    # file for cases that are genuinely out of scope (an
-                    # unsupported conditional-formatting rule type, for
-                    # instance) rather than guessing at an unverified fix.
-                    has_smartart = True
-                    continue
-            except Exception:
-                pass
             if not shape.has_text_frame or not shape.text_frame.text.strip():
                 continue
             if shape == slide.shapes.title:
@@ -1414,7 +1451,15 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                     for run in p.runs:
                         run.bold = True
 
-        if has_smartart:
+        if smartart_lines:
+            label_p = doc.add_paragraph()
+            label_p.paragraph_format.space_before = DocxPt(8)
+            label_run = label_p.add_run("Diagram contents:")
+            label_run.italic = True
+            label_run.bold = True
+            for line in smartart_lines:
+                doc.add_paragraph(line, style="List Bullet")
+        elif smartart_found:
             note_p = doc.add_paragraph()
             note_p.paragraph_format.space_before = DocxPt(8)
             run = note_p.add_run(
