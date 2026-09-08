@@ -2278,7 +2278,7 @@ def academic_essay_to_docx(payload, out_dir):
     normal.font.color.rgb = DocxRGBColor(0, 0, 0)
     normal.paragraph_format.line_spacing = 2.0
 
-    title = (payload.get("title") or "Academic Response").strip()[:200]
+    title = str(payload.get("title") or "Academic Response").strip()[:200]
     title_p = doc.add_paragraph()
     title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title_p.paragraph_format.line_spacing = 2.0
@@ -2289,10 +2289,14 @@ def academic_essay_to_docx(payload, out_dir):
         p.paragraph_format.line_spacing = 2.0
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         p.paragraph_format.first_line_indent = DocxInches(0.5)
-        _add_markdown_aware_text(p, text)
+        _add_markdown_aware_text(p, str(text) if text else "")
         return p
 
     def add_section_heading(text, level=1):
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            level = 1
         p = doc.add_paragraph()
         p.paragraph_format.line_spacing = 2.0
         if level <= 1:
@@ -2315,8 +2319,10 @@ def academic_essay_to_docx(payload, out_dir):
         return p
 
     sections = payload.get("sections")
-    if sections:
+    if sections and isinstance(sections, list) and any(isinstance(s, dict) for s in sections):
         for sec in sections:
+            if not isinstance(sec, dict):
+                continue
             heading_text = f"{sec.get('number', '')} {sec.get('heading', '')}".strip()
             if heading_text:
                 add_section_heading(heading_text, level=sec.get("level", 1))
@@ -2328,6 +2334,10 @@ def academic_essay_to_docx(payload, out_dir):
             add_body_paragraph(para)
 
     references = payload.get("references") or []
+    if references and isinstance(references, list):
+        references = [r for r in references if isinstance(r, dict)]
+    else:
+        references = []
     if references:
         # APA requires an alphabetical reference list — sort defensively here
         # rather than trusting whatever order the source list arrived in.
