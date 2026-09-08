@@ -2170,6 +2170,21 @@ _MARKDOWN_EMPHASIS_RE = re.compile(
                                               # mistaken for emphasis and corrupted.
 
 
+_XML_ILLEGAL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize_xml_text(text):
+    """Strips characters that are illegal in XML 1.0 (control characters
+    other than tab/newline/carriage return, which are fine) — python-docx
+    raises immediately when text containing one of these is assigned, not
+    just at save time, and these are a real possibility in AI-generated
+    text (an encoding artifact, a copy-paste quirk), not just a
+    theoretical edge case. Confirmed directly: a bare null byte or a
+    vertical-tab character in otherwise normal text crashes the core
+    essay-generation feature outright without this."""
+    return _XML_ILLEGAL_CHARS_RE.sub("", text)
+
+
 def _add_markdown_aware_text(paragraph, text, base_bold=False):
     """Adds text to a paragraph, converting basic markdown emphasis
     (***bold italic***, **bold**, __bold__, *italic*, _italic_) into real
@@ -2181,6 +2196,7 @@ def _add_markdown_aware_text(paragraph, text, base_bold=False):
     lets a heading's own bold styling combine correctly with an *italic*
     span inside it, rather than the emphasis parsing accidentally
     clearing it."""
+    text = _sanitize_xml_text(text)
     pos = 0
     for m in _MARKDOWN_EMPHASIS_RE.finditer(text):
         if m.start() > pos:
@@ -2310,7 +2326,7 @@ def academic_essay_to_docx(payload, out_dir):
         else:
             # APA Level 3: left-aligned, bold italic
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run = p.add_run(text)
+            run = p.add_run(_sanitize_xml_text(text))
             run.font.name = "Times New Roman"
             run.font.size = DocxPt(12)
             run.font.color.rgb = DocxRGBColor(0, 0, 0)
@@ -2353,12 +2369,12 @@ def academic_essay_to_docx(payload, out_dir):
             p.paragraph_format.line_spacing = 2.0
             p.paragraph_format.left_indent = DocxInches(0.5)
             p.paragraph_format.first_line_indent = DocxInches(-0.5)
-            ref_text = (ref.get("text") or "").strip()
-            url = (ref.get("url") or "").strip()
+            ref_text = str(ref.get("text") or "").strip()
+            url = str(ref.get("url") or "").strip()
             if ref_text:
                 _add_markdown_aware_text(p, ref_text + (" " if url else ""))
             if url:
-                _set_run_font(p.add_run(url))
+                _set_run_font(p.add_run(_sanitize_xml_text(url)))
 
     out_path = os.path.join(out_dir, "Academic_Response.docx")
     doc.save(out_path)
