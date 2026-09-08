@@ -2317,8 +2317,10 @@ def academic_essay_to_docx(payload, out_dir):
     sections = payload.get("sections")
     if sections:
         for sec in sections:
-            add_section_heading(f"{sec['number']} {sec['heading']}", level=sec.get("level", 1))
-            add_body_paragraph(sec["text"])
+            heading_text = f"{sec.get('number', '')} {sec.get('heading', '')}".strip()
+            if heading_text:
+                add_section_heading(heading_text, level=sec.get("level", 1))
+            add_body_paragraph(sec.get("text") or "")
     else:
         text = (payload.get("text") or "").strip()
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
