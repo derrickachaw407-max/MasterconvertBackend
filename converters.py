@@ -278,6 +278,7 @@ def _soffice_convert(src_path, target_format, out_dir):
         capture_output=True, text=True, timeout=60
     )
     base = os.path.splitext(os.path.basename(src_path))[0]
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{base}.{target_format}")
     if not os.path.exists(out_path):
         raise ConversionError(f"LibreOffice conversion failed: {result.stderr or result.stdout}")
@@ -1123,6 +1124,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             _style_pptx_body_paragraph(p, template_style)
             state["bullet_count"] += 1
 
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.pptx")
     prs.save(out_path)
     return out_path
@@ -1289,7 +1291,7 @@ def _iter_smartart_fallback_text(slide):
             continue
         for sp in fallback.findall(".//" + pptx_qn("p:sp")):
             for para in sp.findall(".//" + pptx_qn("a:p")):
-                text = "".join(t.text or "" for t in para.findall(".//" + pptx_qn("a:t"))).strip()
+                text = _sanitize_xml_text("".join(t.text or "" for t in para.findall(".//" + pptx_qn("a:t"))).strip())
                 if text:
                     yield (False, text)
 
@@ -1340,7 +1342,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             if not shape.has_text_frame or not shape.text_frame.text.strip():
                 continue
             if shape == slide.shapes.title:
-                title = shape.text_frame.text.strip()
+                title = _sanitize_xml_text(shape.text_frame.text.strip())
             else:
                 text_shapes.append(shape)
 
@@ -1354,7 +1356,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
 
         for shape in text_shapes:
             for para in shape.text_frame.paragraphs:
-                line = para.text.strip()
+                line = _sanitize_xml_text(para.text.strip())
                 if not line:
                     continue
                 level = min(para.level or 0, 2)
@@ -1373,6 +1375,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 if not runs:
                     p.add_run(line)
                 for run in runs:
+                    run_text = _sanitize_xml_text(run.text)
                     address = None
                     try:
                         address = run.hyperlink.address
@@ -1380,11 +1383,11 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                         pass
                     if address:
                         _add_docx_hyperlink(
-                            p, address, run.text,
+                            p, address, run_text,
                             bold=bool(run.font.bold), italic=bool(run.font.italic),
                         )
                     else:
-                        r = p.add_run(run.text)
+                        r = p.add_run(run_text)
                         r.bold = bool(run.font.bold)
                         r.italic = bool(run.font.italic)
                         r.underline = bool(run.font.underline)
@@ -1400,7 +1403,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         for shape in table_shapes:
             src_rows = [list(row.cells) for row in shape.table.rows]
             has_merges = any(cell.is_merge_origin for row in src_rows for cell in row)
-            rows = [[cell.text.strip() for cell in row] for row in src_rows]
+            rows = [[_sanitize_xml_text(cell.text.strip()) for cell in row] for row in src_rows]
             if has_merges:
                 keep = list(range(len(rows)))
             else:
@@ -1445,7 +1448,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             try:
                 chart = shape.chart
                 plot = chart.plots[0]
-                categories = [str(cat) for cat in plot.categories]
+                categories = [_sanitize_xml_text(str(cat)) for cat in plot.categories]
                 series_list = list(plot.series)
             except Exception:
                 continue
@@ -1455,7 +1458,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             title_text = None
             try:
                 if chart.has_title:
-                    title_text = chart.chart_title.text_frame.text.strip()
+                    title_text = _sanitize_xml_text(chart.chart_title.text_frame.text.strip())
             except Exception:
                 pass
             run = caption.add_run(f"Chart: {title_text}" if title_text else "Chart data")
@@ -1466,7 +1469,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             chart_table.style = "Light Grid Accent 1"
             chart_table.cell(0, 0).text = ""
             for s_idx, series in enumerate(series_list, 1):
-                chart_table.cell(0, s_idx).text = series.name or f"Series {s_idx}"
+                chart_table.cell(0, s_idx).text = _sanitize_xml_text(series.name or f"Series {s_idx}")
             for cat_idx, cat_name in enumerate(categories, 1):
                 chart_table.cell(cat_idx, 0).text = cat_name
                 for s_idx, series in enumerate(series_list, 1):
@@ -1496,7 +1499,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             run.font.size = DocxPt(9)
 
         if slide.has_notes_slide:
-            notes_text = slide.notes_slide.notes_text_frame.text.strip()
+            notes_text = _sanitize_xml_text(slide.notes_slide.notes_text_frame.text.strip())
             if notes_text:
                 note_p = doc.add_paragraph()
                 note_p.paragraph_format.space_before = DocxPt(8)
@@ -1508,6 +1511,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             doc.add_page_break()
 
     apply_docx_style(doc, style)
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.docx")
     doc.save(out_path)
     return out_path
@@ -1522,7 +1526,7 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
 
     page_items = []
     for page in reader.pages:
-        text = (page.extract_text() or "").strip()
+        text = _sanitize_xml_text((page.extract_text() or "").strip())
         page_items.append(_reconstruct_paragraphs(text) if text else [])
 
     # A short line that repeats verbatim across most pages is usually a
@@ -1633,6 +1637,7 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                 _add_docx_hyperlink(link_p, url, url)
 
     apply_docx_style(doc, style)
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.docx")
     doc.save(out_path)
     return out_path
@@ -1719,6 +1724,7 @@ def pdf_to_pptx(src_path, out_dir, style=None):
             ocr_text if ocr_text else "(No text detected by OCR on this page.)"
         )
 
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.pptx")
     prs.save(out_path)
     return out_path
@@ -1922,6 +1928,7 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
             chart_run.italic = True
 
     apply_docx_style(doc, style)
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.docx")
     doc.save(out_path)
     return out_path
@@ -2057,6 +2064,7 @@ def docx_to_xlsx(src_path, out_dir):
         ws = wb.create_sheet(title="Sheet1")
         ws["A1"] = "(No content found in document)"
 
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.xlsx")
     wb.save(out_path)
     return out_path
@@ -2132,6 +2140,7 @@ def text_to_pptx(raw_text, out_dir):
     if not prs.slides:
         raise ConversionError("No usable text found")
 
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "Presentation.pptx")
     prs.save(out_path)
     return out_path
@@ -2170,7 +2179,7 @@ _MARKDOWN_EMPHASIS_RE = re.compile(
                                               # mistaken for emphasis and corrupted.
 
 
-_XML_ILLEGAL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_XML_ILLEGAL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
 
 
 def _sanitize_xml_text(text):
@@ -2376,6 +2385,7 @@ def academic_essay_to_docx(payload, out_dir):
             if url:
                 _set_run_font(p.add_run(_sanitize_xml_text(url)))
 
+    os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "Academic_Response.docx")
     doc.save(out_path)
     return out_path
