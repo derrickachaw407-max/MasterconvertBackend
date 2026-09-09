@@ -38,9 +38,15 @@ MIME_TYPES = {
     "pdf": "application/pdf",
 }
 
-# CORS: locked to the live frontend.
-ALLOWED_ORIGIN = "https://masterconvert-tau.vercel.app"
-FRONTEND_URL = ALLOWED_ORIGIN
+# CORS: allow the app's known frontend origins. The app was renamed from
+# MasterConvert to Docently and redeployed under a new domain — both are
+# allowed here so a stray reference to the old one doesn't silently lock
+# users out again the way a single hardcoded origin just did.
+ALLOWED_ORIGINS = {
+    "https://docently.vercel.app",
+    "https://masterconvert-tau.vercel.app",
+}
+FRONTEND_URL = "https://docently.vercel.app"
 
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -612,7 +618,10 @@ def build_references_list(sources):
 
 @app.after_request
 def add_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary"
