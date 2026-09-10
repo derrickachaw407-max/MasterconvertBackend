@@ -839,6 +839,269 @@ def _iter_inline_images(paragraph, doc):
                     continue
 
 
+# ------------------------------------------------ PPTX auto-fix / cleanup
+# Anchor point for the dynamic budget formulas below: empirically measured
+# on a real uploaded deck (not assumed) — a 4.76"-tall, 11.5"-wide content
+# placeholder at 26pt body text fits 7 short bullets cleanly, and visibly
+# overflows at 9. Other decks' placeholders are scaled proportionally from
+# this measured point rather than from an untested theoretical formula.
+_PPTX_FIX_CAL_WIDTH_IN = 11.5
+_PPTX_FIX_CAL_HEIGHT_IN = 4.76
+_PPTX_FIX_CAL_SIZE_PT = 26
+_PPTX_FIX_CAL_CHARS_PER_LINE = 48
+_PPTX_FIX_CAL_MAX_EFFECTIVE_LINES = 11.2  # 7 bullets * ~1.6 effective lines each (text + spacing overhead)
+_PPTX_FIX_TITLE_SIZE = Pt(40)
+_PPTX_FIX_BODY_SIZE = Pt(26)
+
+
+def _pptx_fix_chars_per_line(width_emu, size_pt):
+    width_in = (width_emu / 914400) if width_emu else _PPTX_FIX_CAL_WIDTH_IN
+    size = size_pt.pt if hasattr(size_pt, "pt") else size_pt
+    return max(10, _PPTX_FIX_CAL_CHARS_PER_LINE * (width_in / _PPTX_FIX_CAL_WIDTH_IN) * (_PPTX_FIX_CAL_SIZE_PT / size))
+
+
+def _pptx_fix_max_effective_lines(height_emu, size_pt):
+    height_in = (height_emu / 914400) if height_emu else _PPTX_FIX_CAL_HEIGHT_IN
+    size = size_pt.pt if hasattr(size_pt, "pt") else size_pt
+    return max(3, _PPTX_FIX_CAL_MAX_EFFECTIVE_LINES * (height_in / _PPTX_FIX_CAL_HEIGHT_IN) * (_PPTX_FIX_CAL_SIZE_PT / size))
+
+
+def _pptx_fix_effective_lines(text, chars_per_line):
+    return max(1, -(-len(text) // int(chars_per_line))) + 0.6  # ceiling division + spacing overhead
+
+
+def _pptx_fix_is_simple_text_shape(shape, title_shape):
+    """A plain bullet-list placeholder — not a table, chart, picture, or
+    the title itself. Only slides built entirely from these are eligible
+    for splitting; anything else (an image, an embedded chart, a table)
+    means the slide is left structurally alone so that element is never
+    at risk of being orphaned from the text that refers to it."""
+    if shape == title_shape:
+        return False
+    if not shape.has_text_frame:
+        return False
+    if shape.has_table or shape.has_chart:
+        return False
+    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+        return False
+    return True
+
+
+def _pptx_fix_extract_bullets(shape):
+    bullets = []
+    for p in shape.text_frame.paragraphs:
+        if not p.text.strip():
+            continue
+        runs = [(r.text, bool(r.font.bold), bool(r.font.italic)) for r in p.runs if r.text]
+        if not runs:
+            runs = [(p.text, False, False)]
+        pPr = p._p.find(pptx_qn("a:pPr"))
+        is_numbered = pPr is not None and pPr.find(pptx_qn("a:buAutoNum")) is not None
+        bullets.append((p.level, runs, is_numbered))
+    return bullets
+
+
+def _pptx_fix_split_bullet_if_long(level, runs, numbered):
+    if numbered:
+        return [(level, runs, numbered)]  # never split a numbered step — it would break the sequence's meaning
+    full_text = "".join(t for t, b, i in runs)
+    if len(full_text.split()) <= _SENTENCE_SPLIT_WORD_THRESHOLD:
+        return [(level, runs, numbered)]
+    runs_data = [(t, b, i, False, False, None, None, None, False) for t, b, i in runs]
+    groups = _split_runs_at_sentence_boundaries(runs_data)
+    if len(groups) <= 1:
+        return [(level, runs, numbered)]
+    return [(level, [(t, bold, italic) for t, bold, italic, *_ in g], False) for g in groups]
+
+
+def _pptx_fix_set_run_style(run, size, bold=None, italic=None):
+    run.font.size = size
+    if bold is not None:
+        run.font.bold = bold
+    if italic is not None:
+        run.font.italic = italic
+
+
+def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False):
+    """Fixes font size and disables autofit on an existing shape without
+    restructuring it — the safe path for any slide too complex to split
+    (has an image, chart, table, or more than one text box), so a table
+    or picture on that slide is never touched."""
+    tf = shape.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    for p in tf.paragraphs:
+        for r in p.runs:
+            r.font.size = size
+            if bold_title:
+                r.font.bold = True
+
+
+def _pptx_fix_move_slide_to(prs, slide, position):
+    """Moves a slide (already added via add_slide, currently at the end)
+    to a specific position in the deck — python-pptx's add_slide always
+    appends, so continuation slides created by a split need to be
+    relocated to immediately follow the slide they split from, rather
+    than landing at the very end of the presentation."""
+    xml_slides = prs.slides._sldIdLst
+    slide_elements = list(xml_slides)
+    xml_slides.remove(slide_elements[-1])
+    xml_slides.insert(position, slide_elements[-1])
+
+
+def pptx_to_pptx(src_path, out_dir, style=None):
+    """Fixes the two most common problems in an already-existing
+    PowerPoint file rather than converting from another format: PowerPoint
+    silently auto-shrinking text on any slide with enough content to
+    overflow (so a specified font size never actually renders at that
+    size), and slides with more bullets than can actually fit at a
+    readable size. Both were confirmed directly on a real uploaded deck —
+    text auto-shrunk down to near-illegible, ten-item lists crammed onto
+    one slide with most of it empty below. Rebuilds every slide with an
+    explicit, generous font size and disabled autofit; text-only slides
+    that don't fit are split into "(cont.)" continuation slides using
+    their own existing content — nothing is invented, and sentence-level
+    splitting is only applied to a single bullet that's a run-on paragraph
+    long enough to be genuinely hard to read as one bullet. Slides with an
+    image, chart, table, or more than one text box are fixed in place
+    without being restructured, since splitting them could orphan a visual
+    element from the text that refers to it."""
+    prs = _safe_load(Presentation, src_path)
+
+    # ---- Pass 1: fix every title in place, and classify each slide ----
+    plan = []  # (slide, is_simple, body_shape_or_None)
+    for slide in prs.slides:
+        title_shape = slide.shapes.title
+        if title_shape is not None and title_shape.has_text_frame:
+            _pptx_fix_apply_sizing_in_place(title_shape, _PPTX_FIX_TITLE_SIZE, bold_title=True)
+
+        other_shapes = [s for s in slide.shapes if s != title_shape]
+        text_shapes = [s for s in other_shapes if _pptx_fix_is_simple_text_shape(s, title_shape)]
+        # A slide is eligible for splitting only if it's title + exactly
+        # one plain bullet placeholder and nothing else at all — any
+        # image, chart, table, or extra text box takes it out of the
+        # running, since restructuring around those risks orphaning them.
+        has_other_visual = any(
+            s.shape_type == MSO_SHAPE_TYPE.PICTURE or s.has_table or s.has_chart
+            for s in other_shapes
+        )
+        is_simple = len(text_shapes) == 1 and len(other_shapes) == 1 and not has_other_visual
+        if not is_simple:
+            for s in other_shapes:
+                if s.has_text_frame:
+                    _pptx_fix_apply_sizing_in_place(s, _PPTX_FIX_BODY_SIZE)
+            plan.append((slide, False, None))
+        else:
+            plan.append((slide, True, text_shapes[0]))
+
+    # ---- Pass 2: for simple slides, split any that don't fit ----
+    insertions = []  # (position_in_current_slide_list, new_slide_element_ref) filled in as we go
+    slide_list = list(prs.slides)
+    for idx, (slide, is_simple, body_shape) in enumerate(plan):
+        if not is_simple:
+            continue
+        title_shape = slide.shapes.title
+        base_title = title_shape.text.strip() if title_shape and title_shape.has_text_frame else ""
+        # Avoid "Title (cont.) (cont.)" when the slide being split was
+        # itself already a manually-made continuation slide in the source
+        # deck — the new continuation slides this produces use the same
+        # base title suffix, not a doubled one.
+        if base_title.endswith("(cont.)"):
+            base_title = base_title[: -len("(cont.)")].strip()
+        bullets = _pptx_fix_extract_bullets(body_shape)
+        expanded = []
+        for level, runs, numbered in bullets:
+            expanded.extend(_pptx_fix_split_bullet_if_long(level, runs, numbered))
+
+        chars_per_line = _pptx_fix_chars_per_line(body_shape.width, _PPTX_FIX_CAL_SIZE_PT)
+        max_lines = _pptx_fix_max_effective_lines(body_shape.height, _PPTX_FIX_CAL_SIZE_PT)
+        groups = [[]]
+        group_lines = [0]
+        lines_used = 0
+        for level, runs, numbered in expanded:
+            text = "".join(t for t, b, i in runs)
+            line_est = _pptx_fix_effective_lines(text, chars_per_line)
+            if groups[-1] and lines_used + line_est > max_lines:
+                groups.append([])
+                group_lines.append(0)
+                lines_used = 0
+            groups[-1].append((level, runs, numbered))
+            lines_used += line_est
+            group_lines[-1] = lines_used
+        # A very small trailing group (e.g. one short leftover bullet that
+        # only barely tipped past the budget) reads as an awkward,
+        # near-empty slide — merging it back into the previous group and
+        # accepting a small bounded overage looks better than that, the
+        # same tradeoff already made for sentence-splitting.
+        if len(groups) > 1 and group_lines[-1] < 2.5:
+            groups[-2].extend(groups[-1])
+            groups.pop()
+            group_lines.pop()
+
+        # rewrite the original slide's body with just the first group
+        tf = body_shape.text_frame
+        tf.word_wrap = True
+        tf.auto_size = MSO_AUTO_SIZE.NONE
+        tf.clear()
+        first_group = groups[0]
+        for i, (level, runs, numbered) in enumerate(first_group):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.level = min(level, 4)
+            if numbered:
+                pPr = p._p.get_or_add_pPr()
+                pPr.append(pPr.makeelement(pptx_qn("a:buAutoNum"), {"type": "arabicPeriod"}))
+            for text, bold, italic in runs:
+                r = p.add_run()
+                r.text = text
+                r.font.size = _PPTX_FIX_BODY_SIZE
+                r.font.bold = bold
+                r.font.italic = italic
+
+        if len(groups) == 1:
+            continue
+
+        # additional groups become new "(cont.)" slides, using the same
+        # layout as the slide they split from so images/backgrounds in a
+        # custom template carry over correctly
+        layout = slide.slide_layout
+        insert_position = idx + 1 + sum(insertions_done for pos, insertions_done in insertions if pos <= idx)
+        for gi, group in enumerate(groups[1:], 1):
+            new_slide = prs.slides.add_slide(layout)
+            if new_slide.shapes.title is not None:
+                new_slide.shapes.title.text = f"{base_title} (cont.)"
+                for p in new_slide.shapes.title.text_frame.paragraphs:
+                    for r in p.runs:
+                        r.font.size = _PPTX_FIX_TITLE_SIZE
+                        r.font.bold = True
+                new_slide.shapes.title.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+            new_body = [s for s in new_slide.placeholders if s.placeholder_format.idx == body_shape.placeholder_format.idx]
+            new_body = new_body[0] if new_body else [s for s in new_slide.placeholders if s != new_slide.shapes.title][0]
+            ntf = new_body.text_frame
+            ntf.word_wrap = True
+            ntf.auto_size = MSO_AUTO_SIZE.NONE
+            ntf.clear()
+            for i, (level, runs, numbered) in enumerate(group):
+                p = ntf.paragraphs[0] if i == 0 else ntf.add_paragraph()
+                p.level = min(level, 4)
+                if numbered:
+                    pPr = p._p.get_or_add_pPr()
+                    pPr.append(pPr.makeelement(pptx_qn("a:buAutoNum"), {"type": "arabicPeriod"}))
+                for text, bold, italic in runs:
+                    r = p.add_run()
+                    r.text = text
+                    r.font.size = _PPTX_FIX_BODY_SIZE
+                    r.font.bold = bold
+                    r.font.italic = italic
+            _pptx_fix_move_slide_to(prs, new_slide, insert_position)
+            insert_position += 1
+        insertions.append((idx, len(groups) - 1))
+
+    out_path = os.path.join(out_dir, "fixed.pptx")
+    os.makedirs(out_dir, exist_ok=True)
+    prs.save(out_path)
+    return out_path
+
+
 def docx_to_pptx(src_path, out_dir, style="minimal"):
     template_style = PPTX_TEMPLATES.get(style, PPTX_TEMPLATES["minimal"])
     doc = _safe_load(Document, src_path)
@@ -2147,6 +2410,7 @@ CONVERTERS = {
     ("pdf", "pptx"): pdf_to_pptx,
     ("xlsx", "docx"): xlsx_to_docx,
     ("docx", "xlsx"): docx_to_xlsx,
+    ("pptx", "pptx"): pptx_to_pptx,
 }
 
 
