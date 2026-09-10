@@ -25,7 +25,7 @@ from docx.text.paragraph import Paragraph as DocxParagraph
 from docx.text.run import Run as DocxRun
 from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
@@ -139,31 +139,40 @@ def _reconstruct_paragraphs(raw_text):
 PPTX_TEMPLATES = {
     "minimal": {
         "bg": None, "title_fill": None,
-        "title_font": "Calibri Light", "title_size": Pt(36), "title_bold": False,
-        "title_color": PptxRGBColor(0x33, 0x33, 0x33),
-        "body_font": "Calibri Light", "body_size": Pt(20),
-        "body_color": PptxRGBColor(0x55, 0x55, 0x55),
+        "title_font": "Calibri", "title_size": Pt(40), "title_bold": True,
+        "title_color": PptxRGBColor(0x1A, 0x1A, 0x1A),
+        "body_font": "Calibri", "body_size": Pt(26),
+        "body_color": PptxRGBColor(0x33, 0x33, 0x33),
+        "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "academic": {
+        # Georgia (serif) replaced with a clean sans-serif — modern
+        # presentation-design standards call for sans-serif body/title
+        # text specifically because it reads better projected at a
+        # distance; the academic template keeps its distinct navy color
+        # identity, just not a serif face.
         "bg": None, "title_fill": None,
-        "title_font": "Georgia", "title_size": Pt(32), "title_bold": True,
+        "title_font": "Calibri", "title_size": Pt(40), "title_bold": True,
         "title_color": PptxRGBColor(0x1F, 0x3A, 0x5F),
-        "body_font": "Georgia", "body_size": Pt(18),
+        "body_font": "Calibri", "body_size": Pt(26),
         "body_color": PptxRGBColor(0x22, 0x22, 0x22),
+        "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "bold": {
         "bg": PptxRGBColor(0x0A, 0x0A, 0x0A), "title_fill": None,
         "title_font": "Arial", "title_size": Pt(44), "title_bold": True,
         "title_color": PptxRGBColor(0xFF, 0xFF, 0xFF),
-        "body_font": "Arial", "body_size": Pt(20),
-        "body_color": PptxRGBColor(0xE0, 0xE0, 0xE0),
+        "body_font": "Arial", "body_size": Pt(26),
+        "body_color": PptxRGBColor(0xE8, 0xE8, 0xE8),
+        "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "classic": {
         "bg": None, "title_fill": PptxRGBColor(0x1F, 0x38, 0x64),
-        "title_font": "Calibri", "title_size": Pt(30), "title_bold": True,
+        "title_font": "Calibri", "title_size": Pt(38), "title_bold": True,
         "title_color": PptxRGBColor(0xFF, 0xFF, 0xFF),
-        "body_font": "Calibri", "body_size": Pt(18),
+        "body_font": "Calibri", "body_size": Pt(26),
         "body_color": PptxRGBColor(0x22, 0x22, 0x22),
+        "subhead_size": Pt(30), "caption_size": Pt(15),
     },
 }
 
@@ -184,9 +193,9 @@ def _style_pptx_slide(slide, style):
             run.font.color.rgb = style["title_color"]
 
 
-def _style_pptx_body_paragraph(p, style):
+def _style_pptx_body_paragraph(p, style, size=None):
     p.font.name = style["body_font"]
-    p.font.size = style["body_size"]
+    p.font.size = size if size is not None else style["body_size"]
     p.font.color.rgb = style["body_color"]
 
 
@@ -840,8 +849,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
     title_layout = prs.slide_layouts[1]  # title + content
     blank_layout = prs.slide_layouts[6]
 
-    MAX_BULLETS_PER_SLIDE = 8  # keep slides readable; overflow spills onto a "(cont.)" slide
-    state = {"slide": None, "body_tf": None, "bullet_count": 0}
+    MAX_LINES_PER_SLIDE = 10  # estimated wrapped-line budget, not a flat bullet count (see
+    # _estimate_line_count) — accounts for bullets of very different lengths now that long
+    # paragraphs get split into shorter, sentence-level bullets rather than staying as one
+    state = {"slide": None, "body_tf": None, "bullet_count": 0, "lines_used": 0}
 
     def new_slide(title_text):
         s = prs.slides.add_slide(title_layout)
@@ -849,74 +860,112 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         _style_pptx_slide(s, template_style)
         tf = s.placeholders[1].text_frame
         tf.clear()
-        state["slide"], state["body_tf"], state["bullet_count"] = s, tf, 0
+        # The slide master's body placeholder inherits <a:normAutofit/> by
+        # default — PowerPoint silently shrinks text to fit whenever it
+        # overflows, which would quietly undo the larger, more readable
+        # font sizes set below the moment a real slide has enough content
+        # to trigger it. Disabling this keeps the specified size honest;
+        # MAX_LINES_PER_SLIDE below is tuned to actually fit at that
+        # size instead, rather than leaning on autofit to paper over it.
+        tf.word_wrap = True
+        tf.auto_size = MSO_AUTO_SIZE.NONE
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = s, tf, 0, 0
         return s, tf
 
     def add_bullet(para, level=0, numbered=False):
         if state["slide"] is None:
             new_slide("Overview")
-        if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
-            current_title = state["slide"].shapes.title.text or "Overview"
-            new_slide(current_title + " (cont.)")
-        body_tf = state["body_tf"]
-        if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
-            p = body_tf.paragraphs[0]
-        else:
-            p = body_tf.add_paragraph()
-        p.level = min(level, 4)
-        pptx_align = _docx_align_to_pptx(_effective_paragraph_alignment(para))
-        if pptx_align is not None:
-            p.alignment = pptx_align
-        if numbered:
-            pPr = p._p.get_or_add_pPr()
-            pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
 
         # iter_inner_content() (like .text and .runs) silently drops any
         # text wrapped in a tracked-change insertion or deletion —
         # _iter_all_runs() is the tracked-changes-aware replacement, and
         # since every item it yields is already a real Run, the hyperlink
         # special-casing this used to need is gone too.
-        captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt, is_deleted)
+        runs_data = []  # (text, bold, italic, underline, is_link, address, hex_color, size_pt, is_deleted)
         for src_run, text, is_link, address, is_deleted in _iter_all_runs(para):
-            r = p.add_run()
-            r.text = text
+            if not text:
+                continue
             style_bold, style_italic, style_underline, style_color, style_size = _effective_run_format(src_run)
-            bold = bool(style_bold)
-            italic = bool(style_italic)
-            underline = True if is_link else bool(style_underline)
-            hex_color = None if is_link else style_color
-            size_pt = style_size
-            if is_link and address:
-                try:
-                    r.hyperlink.address = address
-                except Exception:
-                    pass
-            if is_deleted:
-                r._r.get_or_add_rPr().set("strike", "sngStrike")
-            captured.append((r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted))
-        if not captured:
-            p.text = _full_paragraph_text(para).strip()
-        _style_pptx_body_paragraph(p, template_style)
-        # Re-apply emphasis after the shared style pass, since that pass
-        # sets font attributes on every run and would otherwise stomp the
-        # per-run formatting (and hyperlink coloring) just captured above.
-        for r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted in captured:
-            r.font.bold = bold
-            r.font.italic = italic
-            r.font.underline = underline
-            if size_pt is not None:
-                r.font.size = Pt(size_pt)
-            if is_link:
-                try:
-                    r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
-                except Exception:
-                    pass
-            elif hex_color:
-                try:
-                    r.font.color.rgb = PptxRGBColor.from_string(hex_color)
-                except Exception:
-                    pass
-        state["bullet_count"] += 1
+            runs_data.append((
+                text, bool(style_bold), bool(style_italic),
+                True if is_link else bool(style_underline),
+                is_link, address, (None if is_link else style_color), style_size, is_deleted,
+            ))
+        if not runs_data:
+            fallback_text = _full_paragraph_text(para).strip()
+            if fallback_text:
+                runs_data = [(fallback_text, False, False, False, False, None, None, None, False)]
+
+        full_text = "".join(entry[0] for entry in runs_data)
+        # Long, multi-sentence paragraphs are split into separate, shorter
+        # bullets at real sentence boundaries — see _split_runs_at_sentence_
+        # boundaries. Numbered items are left whole since splitting one
+        # would break the numbering's meaning (item "3" becoming two
+        # separate bullets makes no sense as a numbered step).
+        if not numbered and len(full_text.split()) > _SENTENCE_SPLIT_WORD_THRESHOLD:
+            groups = _split_runs_at_sentence_boundaries(runs_data)
+        else:
+            groups = [runs_data] if runs_data else []
+
+        pptx_align = _docx_align_to_pptx(_effective_paragraph_alignment(para))
+        for group in groups:
+            group_text = "".join(entry[0] for entry in group)
+            group_lines = _estimate_line_count(group_text)
+            # A flat bullet-count cap doesn't account for how much a
+            # bullet's text actually wraps (see _estimate_line_count) —
+            # overflow onto a "(cont.)" slide is judged by estimated
+            # vertical space used instead, so several short bullets and a
+            # couple of long ones are both handled correctly rather than
+            # just counted the same.
+            if state["bullet_count"] > 0 and state["lines_used"] + group_lines > MAX_LINES_PER_SLIDE:
+                current_title = state["slide"].shapes.title.text or "Overview"
+                new_slide(current_title + " (cont.)")
+            body_tf = state["body_tf"]
+            if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
+                p = body_tf.paragraphs[0]
+            else:
+                p = body_tf.add_paragraph()
+            p.level = min(level, 4)
+            if pptx_align is not None:
+                p.alignment = pptx_align
+            if numbered:
+                pPr = p._p.get_or_add_pPr()
+                pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
+
+            captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt, is_deleted)
+            for text, bold, italic, underline, is_link, address, hex_color, size_pt, is_deleted in group:
+                r = p.add_run()
+                r.text = text
+                if is_link and address:
+                    try:
+                        r.hyperlink.address = address
+                    except Exception:
+                        pass
+                if is_deleted:
+                    r._r.get_or_add_rPr().set("strike", "sngStrike")
+                captured.append((r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted))
+            _style_pptx_body_paragraph(p, template_style)
+            # Re-apply emphasis after the shared style pass, since that pass
+            # sets font attributes on every run and would otherwise stomp the
+            # per-run formatting (and hyperlink coloring) just captured above.
+            for r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted in captured:
+                r.font.bold = bold
+                r.font.italic = italic
+                r.font.underline = underline
+                if size_pt is not None:
+                    r.font.size = Pt(size_pt)
+                if is_link:
+                    try:
+                        r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
+                    except Exception:
+                        pass
+                elif hex_color:
+                    try:
+                        r.font.color.rgb = PptxRGBColor.from_string(hex_color)
+                    except Exception:
+                        pass
+            state["bullet_count"] += 1
+            state["lines_used"] += group_lines
 
     def add_subheading(text):
         """Heading 2/3 in the source document reads as a subsection within
@@ -927,7 +976,11 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         if state["slide"] is None:
             new_slide(text)
             return
-        if state["bullet_count"] >= MAX_BULLETS_PER_SLIDE:
+        # A subheading's larger font and extra space-before take up more
+        # visual room than its line count alone suggests, so it's weighted
+        # a bit heavier than a plain estimated-line count would give it.
+        subhead_lines = _estimate_line_count(text) + 1
+        if state["bullet_count"] > 0 and state["lines_used"] + subhead_lines > MAX_LINES_PER_SLIDE:
             current_title = state["slide"].shapes.title.text or "Overview"
             new_slide(current_title + " (cont.)")
         body_tf = state["body_tf"]
@@ -937,10 +990,19 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
             p = body_tf.add_paragraph()
         p.level = 0
         p.text = text
-        _style_pptx_body_paragraph(p, template_style)
-        for r in p.runs:
-            r.font.bold = True
+        # A subheading is a section divider, not another item in the list
+        # — keeping its bullet marker made it look like just another
+        # bullet rather than something that visually "breaks up content"
+        # the way a real section header should.
+        pPr = p._p.get_or_add_pPr()
+        pPr.append(pPr.makeelement(qn("a:buNone"), {}))
+        if state["bullet_count"] > 0:
+            p.space_before = Pt(18)
+        _style_pptx_body_paragraph(p, template_style, size=template_style["subhead_size"])
+        for run in p.runs:
+            run.font.bold = True
         state["bullet_count"] += 1
+        state["lines_used"] += subhead_lines
 
     def add_table_slide(table):
         src_rows = [list(row.cells) for row in table.rows]
@@ -990,7 +1052,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                 pass
         # A loose paragraph appearing right after a table should land on a
         # fresh slide rather than silently reusing the table slide.
-        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
     def add_chart_slide(title, categories, series_list):
         n_rows, n_cols = len(categories) + 1, len(series_list) + 1
@@ -1020,7 +1082,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     run.font.bold = True
         # A loose paragraph right after a chart should land on a fresh
         # slide rather than silently reusing the chart's slide.
-        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
     def add_image_slide(image_bytes):
         s = prs.slides.add_slide(blank_layout)
@@ -1034,7 +1096,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         pic.top = int((prs.slide_height - pic.height) / 2)
         # A loose paragraph appearing right after an image should land on a
         # fresh slide rather than silently reusing the image slide.
-        state["slide"], state["body_tf"], state["bullet_count"] = None, None, 0
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
     MAX_IMAGES = 30
     image_count = 0
@@ -1080,7 +1142,14 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     numbered = "number" in para_style_name
             add_bullet(para, level=level, numbered=numbered)
 
-    if state["slide"] is None:
+    # Only needed as a last-resort guarantee that the presentation has at
+    # least one slide (e.g. a source document that was nothing but a
+    # single image) — if the document already produced real slides and
+    # simply ended on a table/chart/image, state["slide"] being None just
+    # means nothing followed it, not that a slide is missing. Creating one
+    # anyway produced a pointless empty trailing slide a user would have
+    # to notice and delete themselves.
+    if state["slide"] is None and len(prs.slides) == 0:
         new_slide("Untitled Document")
 
     footnotes = _get_docx_footnotes(doc)
@@ -2180,6 +2249,117 @@ _MARKDOWN_EMPHASIS_RE = re.compile(
 
 
 _XML_ILLEGAL_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+
+# ---------------------------------------------- PPTX sentence-splitting
+# Long, multi-sentence source paragraphs read as a dense wall of text once
+# dropped onto a slide — the single biggest reason a converted deck still
+# needed manual cleanup before it was presentation-ready. These split such
+# paragraphs into separate, shorter bullets at real sentence boundaries.
+_SENTENCE_SPLIT_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "prof", "rev", "sen", "rep", "gen", "st", "ave",
+    "jr", "sr", "vs", "etc", "eg", "ie", "us", "uk", "am", "pm", "no", "vol",
+    "fig", "approx", "inc", "corp", "co", "ltd", "dept",
+}
+_SENTENCE_SPLIT_RE = re.compile(r'([.!?]["\')\]]*)\s+(?=[A-Z"\'(])')
+_SENTENCE_TRAILING_END_RE = re.compile(r'[.!?]["\')\]]*\s*$')
+_STARTS_NEW_SENTENCE_RE = re.compile(r'^\s*[A-Z"\'(]')
+_CHARS_PER_LINE_ESTIMATE = 48  # calibrated against rendered output at 26pt on a 16:9 content placeholder
+
+
+def _estimate_line_count(text):
+    """A flat bullet-count cap doesn't account for how much a given
+    bullet's text will actually wrap — six short bullets fit comfortably
+    on a slide, but six two-to-three-line bullets (a realistic outcome
+    once long paragraphs are being split into sentence-level bullets)
+    can overflow it even though the count is the same. This estimates
+    wrapped line count from character length as a proportional-font
+    approximation; it doesn't need to be exact, just conservative enough
+    to trigger a "(cont.)" slide before real overflow happens rather
+    than after."""
+    if not text.strip():
+        return 1
+    return max(1, -(-len(text) // _CHARS_PER_LINE_ESTIMATE))  # ceiling division
+
+_SENTENCE_SPLIT_WORD_THRESHOLD = 22  # below this, even a 2-sentence paragraph reads fine as one bullet
+_MIN_WORDS_PER_SPLIT_BULLET = 4      # avoids spinning off an awkward, near-empty trailing fragment
+
+
+def _split_runs_at_sentence_boundaries(runs_data):
+    """runs_data is a list of (text, *metadata) tuples — one per source
+    run, in order, all belonging to a single source paragraph. Returns a
+    list of groups (each itself a list of the same kind of tuples); each
+    group becomes one bullet. Splitting operates on run text directly
+    rather than the paragraph's plain-text concatenation, so a run's own
+    formatting metadata carries over correctly to both sides of a split
+    (a run split mid-sentence produces two runs sharing the same
+    bold/italic/color, not a loss of formatting). Hyperlink runs are
+    never split internally — a link's display text spans one run, and
+    breaking it across two bullets would split the link itself.
+
+    Checks both within a single run's text AND across a run boundary —
+    a formatting change (bold, italic starting) very often lands exactly
+    at a sentence boundary, so "sentence ends in run N, next sentence
+    starts in run N+1" is at least as common as an in-run split and is
+    not just an edge case to shrug off."""
+    groups = []
+    current_group = []
+    current_word_count = 0
+    n = len(runs_data)
+    for idx, entry in enumerate(runs_data):
+        text = entry[0]
+        is_link = entry[4]
+        if is_link:
+            current_group.append(entry)
+            current_word_count += len(text.split())
+            continue
+        pos = 0
+        for m in _SENTENCE_SPLIT_RE.finditer(text):
+            split_at = m.end(1)
+            preceding = text[pos:split_at - 1]
+            words_before = re.split(r"\s+", preceding.strip())
+            last_word = words_before[-1].lower().rstrip(".") if preceding.strip() else ""
+            if last_word in _SENTENCE_SPLIT_ABBREVIATIONS:
+                continue
+            chunk = text[pos:split_at]
+            if not current_group:
+                chunk = chunk.lstrip()
+            if chunk:
+                current_group.append((chunk,) + entry[1:])
+                current_word_count += len(chunk.split())
+            pos = split_at
+            if current_word_count >= _MIN_WORDS_PER_SPLIT_BULLET and current_group:
+                groups.append(current_group)
+                current_group = []
+                current_word_count = 0
+        remainder = text[pos:]
+        if not current_group:
+            remainder = remainder.lstrip()
+        if remainder:
+            current_group.append((remainder,) + entry[1:])
+            current_word_count += len(remainder.split())
+        # Cross-run boundary: this run's remainder ends a sentence, and
+        # the NEXT run starts a new one.
+        if remainder and _SENTENCE_TRAILING_END_RE.search(remainder):
+            trailing_words = re.split(r"\s+", remainder.strip())
+            last_word = trailing_words[-1].lower().rstrip(".") if trailing_words else ""
+            if last_word not in _SENTENCE_SPLIT_ABBREVIATIONS and idx + 1 < n:
+                next_text, next_is_link = runs_data[idx + 1][0], runs_data[idx + 1][4]
+                if not next_is_link and _STARTS_NEW_SENTENCE_RE.match(next_text) and \
+                        current_word_count >= _MIN_WORDS_PER_SPLIT_BULLET and current_group:
+                    # trim the trailing space this run's text carried
+                    # before the next sentence, matching the leading-space
+                    # trim already applied when a new group starts
+                    last_text, last_meta = current_group[-1][0], current_group[-1][1:]
+                    current_group[-1] = (last_text.rstrip(),) + last_meta
+                    groups.append(current_group)
+                    current_group = []
+                    current_word_count = 0
+    if current_group:
+        if groups and current_word_count < _MIN_WORDS_PER_SPLIT_BULLET:
+            groups[-1].extend(current_group)
+        else:
+            groups.append(current_group)
+    return groups if len(groups) > 1 else [runs_data]
 
 
 def _sanitize_xml_text(text):
