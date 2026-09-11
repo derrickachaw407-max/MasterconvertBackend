@@ -1,5 +1,6 @@
 import json
 import logging
+import base64
 import os
 import re
 import secrets
@@ -23,7 +24,10 @@ from flask import Flask, request, send_file, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
-from converters import convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError
+from converters import (
+    convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
+    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails,
+)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
@@ -1156,6 +1160,184 @@ def convert_batch_endpoint():
         return response
     except Exception as e:
         return jsonify({"error": f"Batch conversion failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/pdf/edit", methods=["POST", "OPTIONS"])
+@auth_required
+def pdf_edit_endpoint():
+    """Runs a chain of PDF edit operations (merge, reorder, delete/
+    extract pages, rotate, page numbers, watermark, password protect/
+    remove, compress) in one pass. 'file' is the primary PDF;
+    'operations' is a JSON-encoded list (see apply_pdf_operations'
+    docstring in converters.py for the schema); any additional files
+    a merge_append step references are uploaded under 'extra_files'
+    (repeatable) and looked up by their own original filename, so the
+    operations JSON can reference "files": ["worksheet2.pdf"] directly
+    rather than needing a separately-assigned key."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext != "pdf":
+        return jsonify({"error": "The primary file must be a .pdf"}), 400
+
+    try:
+        operations = json.loads(request.form.get("operations") or "[]")
+    except json.JSONDecodeError:
+        return jsonify({"error": "'operations' must be valid JSON"}), 400
+    if not isinstance(operations, list):
+        return jsonify({"error": "'operations' must be a JSON list"}), 400
+
+    try:
+        _log_conversion_and_consume(request.current_user, "pdf", "pdf-edit")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_pdfedit_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, file.filename)
+        file.save(src_path)
+
+        extra_files = {}
+        for extra in request.files.getlist("extra_files"):
+            if extra.filename:
+                extra_path = os.path.join(work_dir, extra.filename)
+                extra.save(extra_path)
+                extra_files[extra.filename] = extra_path
+
+        try:
+            result_path = apply_pdf_operations(src_path, operations, work_dir, extra_files)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+
+        base_name = file.filename.rsplit(".", 1)[0]
+        return send_file(
+            result_path, mimetype="application/pdf", as_attachment=True,
+            download_name=f"{base_name}_edited.pdf",
+        )
+    except Exception as e:
+        return jsonify({"error": f"PDF edit failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/pdf/thumbnails", methods=["POST", "OPTIONS"])
+@auth_required
+def pdf_thumbnails_endpoint():
+    """Returns a base64-encoded JPEG thumbnail per page, for a
+    page-picker UI (select pages to delete/extract, drag to reorder)
+    — base64 JSON rather than a zip, since the frontend can drop each
+    one straight into an <img src="data:..."> with no unzip step.
+    Read-only preview, so this doesn't consume conversion quota the
+    way an actual edit does."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_pdfthumb_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, file.filename)
+        file.save(src_path)
+        try:
+            thumb_paths = pdf_get_page_thumbnails(src_path, work_dir)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+
+        thumbnails = []
+        for p in thumb_paths:
+            with open(p, "rb") as f:
+                thumbnails.append(base64.b64encode(f.read()).decode("ascii"))
+        return jsonify({"page_count": len(thumbnails), "thumbnails": thumbnails})
+    except Exception as e:
+        return jsonify({"error": f"Thumbnail generation failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/pdf/split", methods=["POST", "OPTIONS"])
+@auth_required
+def pdf_split_endpoint():
+    """Splits a PDF and returns the parts as a zip. With no 'ranges'
+    field, splits into one file per page; with 'ranges' (a JSON list
+    of page specs, e.g. ["1-3","4-6","7"]), splits into that many
+    files instead."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
+    ranges = None
+    ranges_raw = request.form.get("ranges")
+    if ranges_raw:
+        try:
+            ranges = json.loads(ranges_raw)
+            if not isinstance(ranges, list):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
+            return jsonify({"error": "'ranges' must be a JSON list of page specs"}), 400
+
+    try:
+        _log_conversion_and_consume(request.current_user, "pdf", "pdf-split")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_pdfsplit_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, file.filename)
+        file.save(src_path)
+        try:
+            part_paths = pdf_split(src_path, work_dir, ranges=ranges)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+
+        zip_path = os.path.join(work_dir, "split_pages.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in part_paths:
+                zf.write(p, arcname=os.path.basename(p))
+        return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name="split_pages.zip")
+    except Exception as e:
+        return jsonify({"error": f"Split failed: {e}"}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/pdf/images-to-pdf", methods=["POST", "OPTIONS"])
+@auth_required
+def images_to_pdf_endpoint():
+    """Combines multiple uploaded images (in the order given) into one
+    PDF, one image per page."""
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"error": "No images uploaded"}), 400
+
+    try:
+        _log_conversion_and_consume(request.current_user, "images", "pdf")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_img2pdf_{uuid.uuid4().hex[:8]}_")
+    try:
+        image_paths = []
+        for f in files:
+            if not f.filename:
+                continue
+            p = os.path.join(work_dir, f.filename)
+            f.save(p)
+            image_paths.append(p)
+        try:
+            result_path = images_to_pdf(image_paths, work_dir)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        return send_file(result_path, mimetype="application/pdf", as_attachment=True, download_name="images.pdf")
+    except Exception as e:
+        return jsonify({"error": f"Combining images into a PDF failed: {e}"}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

@@ -4158,3 +4158,577 @@ def extract_text(src_path, ext):
                             parts.append(f"[{cell.coordinate} comment by {author}: {note_text}]")
         return "\n".join(parts)
     raise ConversionError(f"Can't extract text from .{ext} files")
+
+
+# ============================================================
+# PDF EDITING ENGINE
+# ============================================================
+# A real, chainable set of PDF editing operations — merge, split,
+# reorder, delete/extract pages, rotate, page numbers, watermark,
+# password protect/remove, compress, images-to-PDF, and page
+# thumbnails for a page-picker UI. Deliberately does NOT include a
+# generic form-filler or true content-removing redaction: form-filling
+# (per the pdf skill's own FORMS.md workflow) requires visually
+# analyzing each unique form's layout — there's no deterministic,
+# one-click version of that for arbitrary uploaded PDFs. Genuine
+# redaction requires removing the underlying text object, not just
+# drawing a box over it, which is a materially different, higher-risk
+# feature than everything else here; it isn't included until it can be
+# verified to actually strip the underlying text, not just visually
+# cover it.
+
+import reportlab.pdfgen.canvas as _rl_canvas
+from reportlab.lib.pagesizes import letter as _RL_LETTER
+from reportlab.lib.utils import ImageReader
+
+
+class PdfEditError(ConversionError):
+    """Raised for a PDF-edit-specific problem (an invalid page number,
+    an operation applied to the wrong kind of document) — a subclass of
+    ConversionError so it's caught the same way everywhere else, with a
+    name that's clearer in a traceback when several edit operations are
+    chained together in one call."""
+    pass
+
+
+def _parse_pdf_page_spec(spec, total_pages):
+    """Parses a page specification into a 0-indexed list of page
+    numbers, in the order given (callers that don't care about order —
+    delete, most extracts — can sort the result themselves; callers
+    that do — reorder, an extract meant to reshuffle pages — get
+    exactly the order the caller specified, not an auto-sorted one).
+    Accepts: the string "all"; a comma-separated string of 1-indexed
+    page numbers and ranges ("1-3,5,7-9"); or a list/tuple of 1-indexed
+    ints. Every page number is validated against total_pages — an
+    out-of-range or non-numeric entry raises PdfEditError immediately
+    with the offending value named, rather than silently clamping or
+    skipping it, since a silently-dropped page is a worse surprise in
+    an editing tool than a loud, specific error."""
+    if spec == "all" or spec is None:
+        return list(range(total_pages))
+    if isinstance(spec, (list, tuple)):
+        raw_numbers = list(spec)
+    elif isinstance(spec, str):
+        raw_numbers = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part and not part.startswith("-"):
+                bounds = part.split("-")
+                if len(bounds) != 2 or not all(b.strip().isdigit() for b in bounds):
+                    raise PdfEditError(f"'{part}' isn't a valid page range (expected e.g. '2-5').")
+                start, end = int(bounds[0]), int(bounds[1])
+                if start > end:
+                    raise PdfEditError(f"'{part}' is a backwards range — start page is after end page.")
+                raw_numbers.extend(range(start, end + 1))
+            else:
+                if not part.lstrip("-").isdigit():
+                    raise PdfEditError(f"'{part}' isn't a valid page number.")
+                raw_numbers.append(int(part))
+    else:
+        raise PdfEditError(f"Unrecognized page specification: {spec!r}")
+
+    indices = []
+    for n in raw_numbers:
+        if not isinstance(n, int) or n < 1 or n > total_pages:
+            raise PdfEditError(
+                f"Page {n} doesn't exist — this PDF has {total_pages} page"
+                f"{'s' if total_pages != 1 else ''}."
+            )
+        indices.append(n - 1)
+    return indices
+
+
+def _pdf_build_from_indices(reader, indices_0based):
+    """The core rebuild primitive every structural page operation
+    (reorder, delete, extract, split) reduces to: build a fresh
+    PdfWriter containing exactly these pages from reader, in this
+    order. A fresh writer plus add_page, not an in-place reorder of an
+    existing writer's own page list — confirmed directly that
+    PdfWriter.pages (a _VirtualList) doesn't support slice
+    reassignment, so building a new writer from the source reader is
+    the reliable path, not a shortcut taken for convenience."""
+    writer = pypdf.PdfWriter()
+    for idx in indices_0based:
+        writer.add_page(reader.pages[idx])
+    return writer
+
+
+def _pdf_writer_to_file(writer, out_dir, filename="edited.pdf"):
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    with open(out_path, "wb") as f:
+        writer.write(f)
+    return out_path
+
+
+def _check_pdf_not_encrypted(reader, action="edit"):
+    if reader.is_encrypted:
+        raise PdfEditError(
+            f"This PDF is password-protected and can't be {action}d until it's unlocked "
+            f"— use the remove-password tool first, with the correct password."
+        )
+
+
+def pdf_merge(pdf_paths, out_dir, filename="merged.pdf"):
+    """Merges multiple PDFs, in the given order, into one document."""
+    if len(pdf_paths) < 2:
+        raise PdfEditError("Merging needs at least two PDF files.")
+    writer = pypdf.PdfWriter()
+    for path in pdf_paths:
+        reader = _safe_load(pypdf.PdfReader, path)
+        _check_pdf_not_encrypted(reader, "merge")
+        for page in reader.pages:
+            writer.add_page(page)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_reorder_pages(pdf_path, out_dir, order_spec, filename="reordered.pdf"):
+    """Reorders every page in the document according to order_spec — a
+    page spec (see _parse_pdf_page_spec) that must reference every
+    existing page exactly once. Rejected (rather than silently
+    dropping or duplicating pages) if it doesn't — a partial reorder
+    spec is far more likely to be a mistake (a page the user forgot to
+    include) than an intentional page deletion, and delete_pages is
+    the explicit, named tool for that."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "reorder")
+    total = len(reader.pages)
+    indices = _parse_pdf_page_spec(order_spec, total)
+    if sorted(indices) != list(range(total)):
+        missing = sorted(set(range(total)) - set(indices))
+        dup_check = len(indices) != len(set(indices))
+        if dup_check:
+            raise PdfEditError("The new page order lists the same page more than once.")
+        raise PdfEditError(
+            f"The new page order is missing page(s) "
+            f"{', '.join(str(i + 1) for i in missing)} — every page needs a new position, "
+            f"not just some of them. Use delete_pages first if you actually want to drop pages."
+        )
+    writer = _pdf_build_from_indices(reader, indices)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_delete_pages(pdf_path, out_dir, pages_spec, filename="deleted.pdf"):
+    """Removes the specified pages, keeping the rest in their original
+    order."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "edit")
+    total = len(reader.pages)
+    to_remove = set(_parse_pdf_page_spec(pages_spec, total))
+    if len(to_remove) >= total:
+        raise PdfEditError("That would delete every page — a PDF can't be left with zero pages.")
+    keep = [i for i in range(total) if i not in to_remove]
+    writer = _pdf_build_from_indices(reader, keep)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_extract_pages(pdf_path, out_dir, pages_spec, filename="extracted.pdf"):
+    """Keeps only the specified pages, in the order given — e.g.
+    extracting "5,2" produces a 2-page document with the original page
+    5 first, then the original page 2, which is deliberate: this is
+    also how a user reorders while dropping pages in one step, rather
+    than needing reorder and delete as two separate operations."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "edit")
+    total = len(reader.pages)
+    indices = _parse_pdf_page_spec(pages_spec, total)
+    if not indices:
+        raise PdfEditError("No pages were specified to extract.")
+    writer = _pdf_build_from_indices(reader, indices)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_split(pdf_path, out_dir, ranges=None):
+    """Splits a PDF into multiple files. With ranges=None, splits into
+    one file per page. With ranges given (a list of page specs, e.g.
+    ["1-3", "4-6", "7"]), produces one file per range instead. Returns
+    a list of output paths, in order."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "split")
+    total = len(reader.pages)
+    os.makedirs(out_dir, exist_ok=True)
+    out_paths = []
+    if ranges is None:
+        pad = len(str(total))
+        for i in range(total):
+            writer = _pdf_build_from_indices(reader, [i])
+            out_paths.append(_pdf_writer_to_file(writer, out_dir, f"page_{str(i + 1).zfill(pad)}.pdf"))
+        return out_paths
+    if len(ranges) < 2:
+        raise PdfEditError("Splitting by ranges needs at least two ranges — a single range is just an extract.")
+    pad = len(str(len(ranges)))
+    for i, r in enumerate(ranges, 1):
+        indices = _parse_pdf_page_spec(r, total)
+        if not indices:
+            raise PdfEditError(f"Range '{r}' didn't resolve to any pages.")
+        writer = _pdf_build_from_indices(reader, indices)
+        out_paths.append(_pdf_writer_to_file(writer, out_dir, f"part_{str(i).zfill(pad)}.pdf"))
+    return out_paths
+
+
+def pdf_rotate_pages(pdf_path, out_dir, pages_spec, degrees, filename="rotated.pdf"):
+    """Rotates the specified pages (pages_spec, or "all") clockwise by
+    degrees, which must be a multiple of 90 — pypdf's own rotate()
+    requires this, and a non-multiple would silently produce a subtly
+    skewed page rather than a clean quarter/half/three-quarter turn."""
+    if degrees % 90 != 0:
+        raise PdfEditError("Rotation must be a multiple of 90 degrees.")
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "rotate")
+    total = len(reader.pages)
+    targets = set(_parse_pdf_page_spec(pages_spec, total))
+    writer = pypdf.PdfWriter()
+    for i in range(total):
+        page = reader.pages[i]
+        added = writer.add_page(page)
+        if i in targets:
+            added.rotate(degrees % 360)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+_PDF_NUMBER_POSITIONS = {
+    "bottom-center": lambda w, h: (w / 2, 0.4 * 72, "center"),
+    "bottom-right": lambda w, h: (w - 0.6 * 72, 0.4 * 72, "right"),
+    "bottom-left": lambda w, h: (0.6 * 72, 0.4 * 72, "left"),
+    "top-center": lambda w, h: (w / 2, h - 0.6 * 72, "center"),
+    "top-right": lambda w, h: (w - 0.6 * 72, h - 0.6 * 72, "right"),
+    "top-left": lambda w, h: (0.6 * 72, h - 0.6 * 72, "left"),
+}
+
+
+def pdf_add_page_numbers(pdf_path, out_dir, position="bottom-center", start_at=1,
+                          fmt="{n}", pages_spec="all", filename="numbered.pdf"):
+    """Overlays a page number on each targeted page. fmt is a template
+    with {n} (this page's number, starting from start_at) and {total}
+    (the count of numbered pages) — e.g. "Page {n} of {total}". Built
+    per-page rather than with one fixed overlay, since pages in a real
+    PDF can have different sizes (a merged document combining a
+    portrait worksheet with a landscape scan, for instance), and a
+    single fixed-size overlay would misplace the number on any page
+    that doesn't match it."""
+    if position not in _PDF_NUMBER_POSITIONS:
+        raise PdfEditError(f"Unknown position '{position}' — choose one of {', '.join(_PDF_NUMBER_POSITIONS)}.")
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "number")
+    total_pages = len(reader.pages)
+    targets = set(_parse_pdf_page_spec(pages_spec, total_pages))
+    total_numbered = len(targets)
+    writer = pypdf.PdfWriter()
+    numbered_so_far = 0
+    for i in range(total_pages):
+        page = reader.pages[i]
+        if i in targets:
+            numbered_so_far += 1
+            n = start_at + numbered_so_far - 1
+            label = fmt.format(n=n, total=total_numbered)
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = _rl_canvas.Canvas(buf, pagesize=(w, h))
+            c.setFont("Helvetica", 10)
+            c.setFillColorRGB(0.3, 0.3, 0.3)
+            x, y, align = _PDF_NUMBER_POSITIONS[position](w, h)
+            if align == "center":
+                c.drawCentredString(x, y, label)
+            elif align == "right":
+                c.drawRightString(x, y, label)
+            else:
+                c.drawString(x, y, label)
+            c.save()
+            buf.seek(0)
+            overlay_page = pypdf.PdfReader(buf).pages[0]
+            page.merge_page(overlay_page)
+        writer.add_page(page)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_add_watermark(pdf_path, out_dir, text, pages_spec="all", opacity=0.3,
+                       angle=45, font_size=60, color="808080", filename="watermarked.pdf"):
+    """Overlays diagonal (or any angle) semi-transparent watermark text
+    across the targeted pages, sized to each page individually for the
+    same reason page numbering is — a mixed-size document shouldn't get
+    a watermark positioned for the wrong page size."""
+    if not (0 < opacity <= 1):
+        raise PdfEditError("Watermark opacity must be greater than 0 and at most 1.")
+    try:
+        rgb = tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        raise PdfEditError(f"'{color}' isn't a valid hex color (expected e.g. '808080').")
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "watermark")
+    total_pages = len(reader.pages)
+    targets = set(_parse_pdf_page_spec(pages_spec, total_pages))
+    writer = pypdf.PdfWriter()
+    for i in range(total_pages):
+        page = reader.pages[i]
+        if i in targets:
+            w, h = float(page.mediabox.width), float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = _rl_canvas.Canvas(buf, pagesize=(w, h))
+            c.saveState()
+            c.setFillAlpha(opacity)
+            c.setFillColorRGB(*rgb)
+            c.setFont("Helvetica-Bold", font_size)
+            c.translate(w / 2, h / 2)
+            c.rotate(angle)
+            c.drawCentredString(0, 0, text)
+            c.restoreState()
+            c.save()
+            buf.seek(0)
+            overlay_page = pypdf.PdfReader(buf).pages[0]
+            page.merge_page(overlay_page)
+        writer.add_page(page)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_set_password(pdf_path, out_dir, user_password, owner_password=None, filename="protected.pdf"):
+    """Encrypts the PDF — user_password is required to open it at all;
+    owner_password (defaults to the same as user_password if not given)
+    governs permissions like printing/editing in readers that enforce
+    that distinction."""
+    if not user_password:
+        raise PdfEditError("A password is required to protect a PDF.")
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "password-protect")
+    writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(user_password, owner_password or user_password)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_remove_password(pdf_path, out_dir, password, filename="unlocked.pdf"):
+    """Decrypts a password-protected PDF given the correct password."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    if not reader.is_encrypted:
+        raise PdfEditError("This PDF isn't password-protected — there's nothing to remove.")
+    try:
+        result = reader.decrypt(password)
+    except Exception:
+        result = 0
+    if not result:
+        raise PdfEditError("That password didn't unlock this PDF — check it and try again.")
+    writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def pdf_compress(pdf_path, out_dir, image_quality=60, filename="compressed.pdf"):
+    """Shrinks file size primarily by recompressing embedded images at
+    a lower JPEG quality (most of a scanned-worksheet PDF's size is
+    almost always its images, not its text/vector content) — pypdf's
+    own compress_content_streams also runs, which helps vector-heavy
+    pages but does little for an image-heavy scan on its own."""
+    if not (1 <= image_quality <= 100):
+        raise PdfEditError("Image quality must be between 1 and 100.")
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "compress")
+    writer = pypdf.PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    for page in writer.pages:
+        for img in page.images:
+            try:
+                img.replace(img.image, quality=image_quality)
+            except Exception:
+                continue  # an image pypdf can't safely re-encode is left as-is, not dropped
+    try:
+        writer.compress_identical_objects()
+    except Exception:
+        pass
+    for page in writer.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:
+            pass
+    out_path = _pdf_writer_to_file(writer, out_dir, filename)
+    # A PDF whose images were already simple/well-compressed (a
+    # screenshot, a flat-color diagram) can come out of a JPEG
+    # re-encode *larger* than the source, confirmed directly — a
+    # "compress" feature that sometimes makes the file bigger is a
+    # real defect, not a rare edge case worth ignoring, so fall back to
+    # the original file whenever the result doesn't actually shrink it.
+    if os.path.getsize(out_path) >= os.path.getsize(pdf_path):
+        os.remove(out_path)
+        fallback_path = os.path.join(out_dir, filename)
+        with open(pdf_path, "rb") as src, open(fallback_path, "wb") as dst:
+            dst.write(src.read())
+        return fallback_path
+    return out_path
+    return _pdf_writer_to_file(writer, out_dir, filename)
+
+
+def images_to_pdf(image_paths, out_dir, filename="images.pdf"):
+    """Combines one or more images into a PDF, one image per page,
+    each page sized to that image's own aspect ratio (letter-width,
+    scaled) rather than forcing every image into one fixed page size
+    and distorting or letterboxing it."""
+    from PIL import Image
+    if not image_paths:
+        raise PdfEditError("No images were given to combine into a PDF.")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    page_w = _RL_LETTER[0]
+    c = _rl_canvas.Canvas(out_path)
+    for img_path in image_paths:
+        try:
+            with Image.open(img_path) as im:
+                im = im.convert("RGB")
+                iw, ih = im.size
+                page_h = page_w * ih / iw
+                c.setPageSize((page_w, page_h))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=90)
+                buf.seek(0)
+                c.drawImage(ImageReader(buf), 0, 0, width=page_w, height=page_h)
+                c.showPage()
+        except Exception as e:
+            raise PdfEditError(f"Couldn't add image '{os.path.basename(img_path)}': {e}")
+    c.save()
+    return out_path
+
+
+def pdf_get_page_thumbnails(pdf_path, out_dir, max_pages=200, dpi=80):
+    """Rasterizes each page to a small JPEG thumbnail, for a page-picker
+    UI where a user selects/reorders pages visually rather than by
+    typing page numbers. Capped at max_pages for a very long document,
+    since rendering hundreds of thumbnails at once isn't a reasonable
+    single request regardless of how fast any one page is."""
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "preview")
+    total = len(reader.pages)
+    if total > max_pages:
+        raise PdfEditError(
+            f"This PDF has {total} pages — thumbnail preview is limited to {max_pages} "
+            f"pages at a time. Split it first if you need to work with all of it."
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = os.path.join(out_dir, "thumb")
+    subprocess.run(
+        ["pdftoppm", "-jpeg", "-r", str(dpi), pdf_path, prefix],
+        capture_output=True, text=True, timeout=60, check=True
+    )
+    # pdftoppm zero-pads its numeric suffix to the width of the total
+    # page count (page 1 of a 12-page PDF becomes "thumb-01.jpg", but
+    # "thumb-1.jpg" for a 5-page one) — confirmed directly against both
+    # a single-digit and a double-digit page count, rather than assumed.
+    pad = len(str(total))
+    thumbs = [f"{prefix}-{str(i).zfill(pad)}.jpg" for i in range(1, total + 1)]
+    missing = [p for p in thumbs if not os.path.exists(p)]
+    if missing:
+        raise PdfEditError(f"Thumbnail generation produced {total - len(missing)} of {total} expected pages.")
+    return thumbs
+
+
+def apply_pdf_operations(pdf_path, operations, out_dir, extra_files=None):
+    """Applies a list of edit operations in sequence to build one final
+    PDF — the real editing-pipeline experience (merge, then number the
+    pages, then watermark, all exported together in one pass) rather
+    than requiring a separate round-trip download/re-upload between
+    each step. Each operation is a dict with a "type" key and whatever
+    parameters that type needs:
+
+      {"type": "merge_append", "files": ["key1", "key2"]}
+        appends the named files (looked up in extra_files) to the end
+        of the current document, in the order given
+      {"type": "reorder_pages", "order": "3,1,2,4"}
+      {"type": "delete_pages", "pages": "2,4"}
+      {"type": "extract_pages", "pages": "1-3,5"}
+      {"type": "rotate", "pages": "all", "degrees": 90}
+      {"type": "add_page_numbers", "position": "bottom-center",
+       "start_at": 1, "fmt": "Page {n} of {total}", "pages": "all"}
+      {"type": "add_watermark", "text": "DRAFT", "pages": "all",
+       "opacity": 0.3, "angle": 45, "font_size": 60, "color": "808080"}
+      {"type": "set_password", "user_password": "...", "owner_password": "..."}
+      {"type": "remove_password", "password": "..."}
+      {"type": "compress", "image_quality": 60}
+
+    extra_files maps a name referenced by a merge_append operation to
+    an actual file path — the additional PDFs being merged in, kept
+    separate from pdf_path so the caller doesn't need to pre-merge
+    anything before building the operation list. Raises PdfEditError
+    (naming which operation, by position, failed) on an unknown
+    operation type or invalid parameters — a chain of edits failing
+    silently partway through and returning a half-edited file would be
+    far worse than stopping with a clear error."""
+    if not operations:
+        raise PdfEditError("No edit operations were specified.")
+    extra_files = extra_files or {}
+    current_path = pdf_path
+    os.makedirs(out_dir, exist_ok=True)
+    for step_num, op in enumerate(operations, 1):
+        op_type = op.get("type")
+        try:
+            if op_type == "merge_append":
+                file_keys = op.get("files") or []
+                if not file_keys:
+                    raise PdfEditError("merge_append needs at least one file to append.")
+                paths = [current_path]
+                for key in file_keys:
+                    if key not in extra_files:
+                        raise PdfEditError(f"merge_append referenced '{key}', which wasn't provided.")
+                    paths.append(extra_files[key])
+                current_path = pdf_merge(paths, out_dir, filename=f"step{step_num}.pdf")
+            elif op_type == "reorder_pages":
+                current_path = pdf_reorder_pages(current_path, out_dir, op["order"], filename=f"step{step_num}.pdf")
+            elif op_type == "delete_pages":
+                current_path = pdf_delete_pages(current_path, out_dir, op["pages"], filename=f"step{step_num}.pdf")
+            elif op_type == "extract_pages":
+                current_path = pdf_extract_pages(current_path, out_dir, op["pages"], filename=f"step{step_num}.pdf")
+            elif op_type == "rotate":
+                current_path = pdf_rotate_pages(
+                    current_path, out_dir, op.get("pages", "all"), op["degrees"], filename=f"step{step_num}.pdf"
+                )
+            elif op_type == "add_page_numbers":
+                current_path = pdf_add_page_numbers(
+                    current_path, out_dir,
+                    position=op.get("position", "bottom-center"),
+                    start_at=op.get("start_at", 1),
+                    fmt=op.get("fmt", "{n}"),
+                    pages_spec=op.get("pages", "all"),
+                    filename=f"step{step_num}.pdf",
+                )
+            elif op_type == "add_watermark":
+                if "text" not in op:
+                    raise PdfEditError("add_watermark needs 'text'.")
+                current_path = pdf_add_watermark(
+                    current_path, out_dir, text=op["text"],
+                    pages_spec=op.get("pages", "all"),
+                    opacity=op.get("opacity", 0.3),
+                    angle=op.get("angle", 45),
+                    font_size=op.get("font_size", 60),
+                    color=op.get("color", "808080"),
+                    filename=f"step{step_num}.pdf",
+                )
+            elif op_type == "set_password":
+                if "user_password" not in op:
+                    raise PdfEditError("set_password needs 'user_password'.")
+                current_path = pdf_set_password(
+                    current_path, out_dir, op["user_password"], op.get("owner_password"),
+                    filename=f"step{step_num}.pdf",
+                )
+            elif op_type == "remove_password":
+                if "password" not in op:
+                    raise PdfEditError("remove_password needs 'password'.")
+                current_path = pdf_remove_password(current_path, out_dir, op["password"], filename=f"step{step_num}.pdf")
+            elif op_type == "compress":
+                current_path = pdf_compress(
+                    current_path, out_dir, op.get("image_quality", 60), filename=f"step{step_num}.pdf"
+                )
+            else:
+                raise PdfEditError(f"Unknown edit operation '{op_type}'.")
+        except KeyError as e:
+            raise PdfEditError(f"Step {step_num} ('{op_type}') is missing required field {e}.")
+        except PdfEditError as e:
+            raise PdfEditError(f"Step {step_num} ('{op_type}'): {e}")
+    final_path = os.path.join(out_dir, "edited_final.pdf")
+    if current_path != final_path:
+        with open(current_path, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
+    return final_path
+
+
+
+
