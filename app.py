@@ -38,15 +38,32 @@ MIME_TYPES = {
     "pdf": "application/pdf",
 }
 
-# CORS: allow the app's known frontend origins. The app was renamed from
-# MasterConvert to Docently and redeployed under a new domain — both are
-# allowed here so a stray reference to the old one doesn't silently lock
-# users out again the way a single hardcoded origin just did.
+# CORS: allow the app's known frontend origins. This has broken twice now
+# on an exact-string allowlist — first the MasterConvert->Docently rename,
+# then a second Vercel deployment landing on docently-1.vercel.app instead
+# of the original docently.vercel.app (redeploying to the same Vercel
+# project keeps the same URL; getting a new "-1" suffix usually means a
+# new project was created instead of pushing to the existing one — worth
+# checking the Vercel dashboard for duplicate projects). Rather than keep
+# adding one more exact domain each time this happens, any deployment
+# under the docently* naming pattern is allowed, so a future redeploy
+# landing on yet another suffixed URL doesn't silently lock everyone out
+# again the same way.
+_ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://docently[a-z0-9-]*\.vercel\.app$")
 ALLOWED_ORIGINS = {
     "https://docently.vercel.app",
     "https://masterconvert-tau.vercel.app",
 }
+# Additional origins can be added without a code change via this env var
+# (comma-separated) — set on Render if a custom domain is added later.
+ALLOWED_ORIGINS |= {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()}
 FRONTEND_URL = "https://docently.vercel.app"
+
+
+def _origin_is_allowed(origin):
+    if not origin:
+        return False
+    return origin in ALLOWED_ORIGINS or bool(_ALLOWED_ORIGIN_PATTERN.match(origin))
 
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -619,7 +636,7 @@ def build_references_list(sources):
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin", "")
-    if origin in ALLOWED_ORIGINS:
+    if _origin_is_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
