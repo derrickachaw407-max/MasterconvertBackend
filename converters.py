@@ -8,6 +8,7 @@ import datetime
 import io
 import os
 import re
+import copy
 import subprocess
 import tempfile
 import shutil
@@ -27,10 +28,11 @@ from pptx import Presentation
 from pptx.util import Inches as PptxInches, Pt
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
-from pptx.enum.dml import MSO_FILL_TYPE
+from pptx.enum.dml import MSO_FILL_TYPE, MSO_COLOR_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.chart.data import CategoryChartData
+from pptx.text.text import _Run
 from pptx.opc.constants import RELATIONSHIP_TYPE as _PPTX_RT
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -1162,11 +1164,13 @@ def _pptx_fix_set_run_style(run, size, bold=None, italic=None):
         run.font.italic = italic
 
 
-def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False):
+def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False, font_name=None):
     """Fixes font size and disables autofit on an existing shape without
     restructuring it — the safe path for any slide too complex to split
     (has an image, chart, table, or more than one text box), so a table
-    or picture on that slide is never touched."""
+    or picture on that slide is never touched. font_name is only passed
+    when a custom template's brand font should replace whatever the
+    source file's own text used."""
     tf = shape.text_frame
     tf.word_wrap = True
     tf.auto_size = MSO_AUTO_SIZE.NONE
@@ -1175,6 +1179,8 @@ def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False):
             r.font.size = size
             if bold_title:
                 r.font.bold = True
+            if font_name:
+                r.font.name = font_name
 
 
 def _pptx_fix_move_slide_to(prs, slide, position):
@@ -1189,7 +1195,211 @@ def _pptx_fix_move_slide_to(prs, slide, position):
     xml_slides.insert(position, slide_elements[-1])
 
 
-def pptx_to_pptx(src_path, out_dir, style=None):
+def _relative_luminance(r, g, b):
+    """WCAG 2.x relative luminance from sRGB channel values (0-255)."""
+    def channel(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def _contrast_ratio(rgb1, rgb2):
+    l1, l2 = _relative_luminance(*rgb1), _relative_luminance(*rgb2)
+    lighter, darker = max(l1, l2), min(l1, l2)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _pptx_fix_get_slide_bg_rgb(slide):
+    """Resolves a slide's effective background color for contrast
+    checking, walking slide -> layout -> master -> a plain white
+    fallback. Only handles an explicit solid RGB fill at each level
+    (not gradients, pictures, or theme-color references) — those are
+    left alone rather than guessed at, since contrast-fixing text
+    against a background color that's actually a guess could easily
+    make things worse, not better."""
+    for source in (slide, slide.slide_layout, slide.slide_layout.slide_master):
+        try:
+            fill = source.background.fill
+            if fill.type is not None and fill.fore_color.type == MSO_COLOR_TYPE.RGB:
+                rgb = fill.fore_color.rgb
+                return (rgb[0], rgb[1], rgb[2])
+        except (AttributeError, TypeError, KeyError):
+            continue
+    return (255, 255, 255)  # the overwhelming majority default
+
+
+def _pptx_fix_apply_contrast_fixes(prs):
+    """Checks each text run with an explicit color against its slide's
+    resolved background and snaps it to black or white (whichever gives
+    stronger contrast) when it falls below WCAG AA's 4.5:1 threshold for
+    normal text — a real, common accessibility failure most decks have
+    without the author ever noticing, since it's invisible until someone
+    actually needs the contrast. Runs with no explicit color (inheriting
+    from the layout/theme instead) are left alone rather than guessed at."""
+    for slide in prs.slides:
+        bg_rgb = _pptx_fix_get_slide_bg_rgb(slide)
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            for para in shape.text_frame.paragraphs:
+                for run in para.runs:
+                    try:
+                        if run.font.color.type != MSO_COLOR_TYPE.RGB:  # only an explicit RGB color is safe to evaluate
+                            continue
+                        rgb = run.font.color.rgb
+                        text_rgb = (rgb[0], rgb[1], rgb[2])
+                    except (AttributeError, TypeError):
+                        continue
+                    if _contrast_ratio(text_rgb, bg_rgb) < 4.5:
+                        black_ratio = _contrast_ratio((0, 0, 0), bg_rgb)
+                        white_ratio = _contrast_ratio((255, 255, 255), bg_rgb)
+                        run.font.color.rgb = PptxRGBColor(0, 0, 0) if black_ratio >= white_ratio else PptxRGBColor(255, 255, 255)
+
+
+def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font):
+    """Inserts an agenda slide right after the title slide, listing each
+    distinct section's own title verbatim — built entirely from titles
+    the deck already has, nothing invented. Only added once the deck has
+    enough distinct sections to actually be worth summarizing, and
+    skipped (rather than spilling onto a second agenda slide) once there
+    are more sections than a single overview slide can usefully list —
+    an agenda that itself needs "(cont.)" defeats its own purpose."""
+    slides = list(prs.slides)
+    if len(slides) < 2:
+        return
+    section_titles = []
+    for slide in slides[1:]:
+        title_shape = slide.shapes.title
+        if title_shape is None or not title_shape.has_text_frame:
+            continue
+        text = title_shape.text.strip()
+        if not text or text.endswith("(cont.)"):
+            continue
+        section_titles.append(text)
+
+    MIN_SECTIONS_FOR_AGENDA = 4
+    MAX_AGENDA_ITEMS = 10
+    if not (MIN_SECTIONS_FOR_AGENDA <= len(section_titles) <= MAX_AGENDA_ITEMS):
+        return
+
+    layout = _find_best_pptx_layout(prs, "content")
+    agenda_slide = prs.slides.add_slide(layout)
+    if agenda_slide.shapes.title is not None:
+        agenda_slide.shapes.title.text = "Agenda"
+        for p in agenda_slide.shapes.title.text_frame.paragraphs:
+            for r in p.runs:
+                r.font.size = title_size
+                r.font.bold = True
+                if title_font:
+                    r.font.name = title_font
+        agenda_slide.shapes.title.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+
+    body_ph = [s for s in agenda_slide.placeholders if s != agenda_slide.shapes.title and s.has_text_frame]
+    if not body_ph:
+        return
+    tf = body_ph[0].text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.clear()
+    for i, title_text in enumerate(section_titles):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        r = p.add_run()
+        r.text = title_text
+        r.font.size = body_size
+        if body_font:
+            r.font.name = body_font
+    _pptx_fix_move_slide_to(prs, agenda_slide, 1)
+
+
+_SMART_EMPHASIS_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*(?:°\s*[CF]\b|%|(?:seconds?|minutes?|hours?|days?)\b)",
+    re.IGNORECASE,
+)
+_SMART_EMPHASIS_COLOR = PptxRGBColor(0xC0, 0x39, 0x2B)  # a clear, warm red-orange — reads as "pay attention to this number"
+
+
+def _pptx_fix_split_run_for_emphasis(run, paragraph):
+    """Splits a single run's text at each key-data-point match (a
+    temperature, duration, or percentage — the kind of number a reader's
+    eye should catch immediately) into separate runs, bolding and
+    color-accenting just the matched portion while the surrounding text
+    keeps its original formatting untouched. The same visual "pop"
+    modern AI-generated decks give numbers, applied to text the deck
+    already has — nothing is reworded or invented, only re-emphasized."""
+    text = run.text
+    matches = list(_SMART_EMPHASIS_RE.finditer(text))
+    if not matches:
+        return
+    insert_after_el = run._r
+    pos = 0
+    for m in matches:
+        if m.start() > pos:
+            plain_el = copy.deepcopy(run._r)
+            insert_after_el.addnext(plain_el)
+            plain_run = _Run(plain_el, paragraph)
+            plain_run.text = text[pos:m.start()]
+            insert_after_el = plain_el
+        emph_el = copy.deepcopy(run._r)
+        insert_after_el.addnext(emph_el)
+        emph_run = _Run(emph_el, paragraph)
+        emph_run.text = text[m.start():m.end()]
+        emph_run.font.bold = True
+        emph_run.font.color.rgb = _SMART_EMPHASIS_COLOR
+        insert_after_el = emph_el
+        pos = m.end()
+    if pos < len(text):
+        plain_el = copy.deepcopy(run._r)
+        insert_after_el.addnext(plain_el)
+        plain_run = _Run(plain_el, paragraph)
+        plain_run.text = text[pos:]
+    run._r.getparent().remove(run._r)
+
+
+def _pptx_fix_apply_smart_emphasis(prs):
+    """Applies smart auto-emphasis to every plain-text bullet placeholder
+    across the deck — table cells, chart data, and titles are left
+    alone, since this is specifically about making a key number stand
+    out within otherwise-plain body prose, not decorating every text
+    element in the file."""
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape == slide.shapes.title or not shape.has_text_frame:
+                continue
+            if shape.has_table or shape.has_chart:
+                continue
+            for para in shape.text_frame.paragraphs:
+                # snapshot first - the loop body inserts new sibling runs,
+                # which would otherwise be picked up again mid-iteration
+                for run in list(para.runs):
+                    if not run.font.bold:  # don't re-emphasize text already emphasized
+                        _pptx_fix_split_run_for_emphasis(run, para)
+
+
+def _pptx_fix_apply_transitions(prs):
+    """Applies a uniform, subtle fade transition across every slide — a
+    deck presented with no transitions at all (the overwhelming default
+    for anything not built directly in a template gallery) reads as
+    noticeably less polished than one with even a simple, consistent
+    fade between every slide. Kept to a single, unobtrusive transition
+    for the whole deck rather than mixing flashy ones per-slide, since
+    a consistent, quiet transition reads as intentional design and a
+    different one every slide reads as distracting default-clicking."""
+    p_ns = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    for slide in prs.slides:
+        sld_el = slide._element
+        existing = sld_el.find(f"{{{p_ns}}}transition")
+        if existing is not None:
+            sld_el.remove(existing)
+        csld_el = sld_el.find(f"{{{p_ns}}}cSld")
+        clrmapovr_el = sld_el.find(f"{{{p_ns}}}clrMapOvr")
+        transition_el = sld_el.makeelement(f"{{{p_ns}}}transition", {"spd": "med"})
+        fade_el = transition_el.makeelement(f"{{{p_ns}}}fade", {})
+        transition_el.append(fade_el)
+        anchor = clrmapovr_el if clrmapovr_el is not None else csld_el
+        anchor.addnext(transition_el)
+
+
+def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
     """Fixes the two most common problems in an already-existing
     PowerPoint file rather than converting from another format: PowerPoint
     silently auto-shrinking text on any slide with enough content to
@@ -1205,15 +1415,46 @@ def pptx_to_pptx(src_path, out_dir, style=None):
     long enough to be genuinely hard to read as one bullet. Slides with an
     image, chart, table, or more than one text box are fixed in place
     without being restructured, since splitting them could orphan a visual
-    element from the text that refers to it."""
+    element from the text that refers to it.
+
+    template_path, if given, is an uploaded corporate .potx/.pptx whose
+    font scheme, color scheme, and title/body sizes are applied to the
+    fixed deck. This deliberately does not migrate every slide onto the
+    template's own layouts the way docx_to_pptx does for a fresh
+    conversion — moving existing tables, charts, and images between two
+    different presentations' layout structures is a much less reliable
+    operation than placing fresh content once, and risking a corrupted
+    or dropped chart to gain layout positions isn't a good trade for a
+    tool whose whole purpose is fixing an existing file, not endangering
+    it further. Brand fonts and colors carry through faithfully; the
+    original file's own slide structure and placeholder positions do."""
     prs = _safe_load(Presentation, src_path)
+
+    title_size, body_size, title_font, body_font = _PPTX_FIX_TITLE_SIZE, _PPTX_FIX_BODY_SIZE, None, None
+    if template_path:
+        template_prs = _safe_load(Presentation, template_path)
+        template_content_layout = _find_best_pptx_layout(template_prs, "content")
+        template_style = _extract_template_style(template_prs, template_content_layout)
+        title_size, body_size = template_style["title_size"], template_style["body_size"]
+        title_font, body_font = template_style["title_font"], template_style["body_font"]
+        # Swapping the theme part's own XML (color scheme + font scheme)
+        # gives the fixed file the template's actual brand palette and
+        # font scheme without migrating a single shape between the two
+        # presentations — far more reliable than trying to move tables,
+        # charts, and images onto a different layout structure.
+        try:
+            template_theme_part = template_prs.slide_masters[0].part.part_related_by(_PPTX_RT.THEME)
+            for master in prs.slide_masters:
+                master.part.part_related_by(_PPTX_RT.THEME)._blob = template_theme_part.blob
+        except Exception:
+            pass  # a template with an unusual/missing theme part shouldn't sink the whole fix
 
     # ---- Pass 1: fix every title in place, and classify each slide ----
     plan = []  # (slide, is_simple, body_shape_or_None)
     for slide in prs.slides:
         title_shape = slide.shapes.title
         if title_shape is not None and title_shape.has_text_frame:
-            _pptx_fix_apply_sizing_in_place(title_shape, _PPTX_FIX_TITLE_SIZE, bold_title=True)
+            _pptx_fix_apply_sizing_in_place(title_shape, title_size, bold_title=True, font_name=title_font)
 
         other_shapes = [s for s in slide.shapes if s != title_shape]
         text_shapes = [s for s in other_shapes if _pptx_fix_is_simple_text_shape(s, title_shape)]
@@ -1229,7 +1470,7 @@ def pptx_to_pptx(src_path, out_dir, style=None):
         if not is_simple:
             for s in other_shapes:
                 if s.has_text_frame:
-                    _pptx_fix_apply_sizing_in_place(s, _PPTX_FIX_BODY_SIZE)
+                    _pptx_fix_apply_sizing_in_place(s, body_size, font_name=body_font)
             plan.append((slide, False, None))
         else:
             plan.append((slide, True, text_shapes[0]))
@@ -1255,16 +1496,49 @@ def pptx_to_pptx(src_path, out_dir, style=None):
 
         chars_per_line = _pptx_fix_chars_per_line(body_shape.width, _PPTX_FIX_CAL_SIZE_PT)
         max_lines = _pptx_fix_max_effective_lines(body_shape.height, _PPTX_FIX_CAL_SIZE_PT)
+
+        def is_section_header(gi):
+            """A level-0, fully-bold bullet immediately followed by at
+            least one indented (level>0) bullet reads as a genuine
+            sub-section header within the slide — structurally distinct
+            from an ordinary bullet that just happens to use bold for
+            emphasis — mirroring how Heading 1/2 drives splitting for a
+            DOCX source. Requires an actual indented child, not just
+            "bold and top-level" alone, since that alone is too easy to
+            misfire on a bullet a user simply emphasized. Text ending in
+            a colon is excluded even when it otherwise matches — a
+            colon overwhelmingly signals "here's a list within this same
+            topic" ("Common sources:") rather than a new topic of its
+            own, confirmed directly: without this, "Common sources:"
+            under "Cross-Contamination" was pulled into its own slide,
+            leaving both it and the parent slide thin and oddly split."""
+            level, runs, numbered = expanded[gi]
+            if level != 0 or numbered or not runs or not all(bold for _, bold, _ in runs):
+                return False
+            text = "".join(t for t, _, _ in runs).strip()
+            if text.endswith(":"):
+                return False
+            if gi + 1 >= len(expanded):
+                return False
+            next_level, _, _ = expanded[gi + 1]
+            return next_level > 0
+
         groups = [[]]
         group_lines = [0]
+        group_titles = [None]  # None = use the slide's own title / "(cont.)" of it
         lines_used = 0
-        for level, runs, numbered in expanded:
+        for gi, (level, runs, numbered) in enumerate(expanded):
             text = "".join(t for t, b, i in runs)
             line_est = _pptx_fix_effective_lines(text, chars_per_line)
-            if groups[-1] and lines_used + line_est > max_lines:
+            starts_section = bool(groups[-1]) and is_section_header(gi)
+            overflows = bool(groups[-1]) and lines_used + line_est > max_lines
+            if starts_section or overflows:
                 groups.append([])
                 group_lines.append(0)
+                group_titles.append(text.strip() if starts_section else None)
                 lines_used = 0
+                if starts_section:
+                    continue  # this bullet becomes the new slide's title, not a bullet on it
             groups[-1].append((level, runs, numbered))
             lines_used += line_est
             group_lines[-1] = lines_used
@@ -1272,11 +1546,15 @@ def pptx_to_pptx(src_path, out_dir, style=None):
         # only barely tipped past the budget) reads as an awkward,
         # near-empty slide — merging it back into the previous group and
         # accepting a small bounded overage looks better than that, the
-        # same tradeoff already made for sentence-splitting.
-        if len(groups) > 1 and group_lines[-1] < 2.5:
+        # same tradeoff already made for sentence-splitting. Not applied
+        # when the small group is its own genuine section header, though
+        # — that split was a deliberate structural choice, not incidental
+        # overflow, so it stays even if the section itself is short.
+        if len(groups) > 1 and group_lines[-1] < 2.5 and group_titles[-1] is None:
             groups[-2].extend(groups[-1])
             groups.pop()
             group_lines.pop()
+            group_titles.pop()
 
         # rewrite the original slide's body with just the first group
         tf = body_shape.text_frame
@@ -1293,26 +1571,34 @@ def pptx_to_pptx(src_path, out_dir, style=None):
             for text, bold, italic in runs:
                 r = p.add_run()
                 r.text = text
-                r.font.size = _PPTX_FIX_BODY_SIZE
+                r.font.size = body_size
                 r.font.bold = bold
                 r.font.italic = italic
+                if body_font:
+                    r.font.name = body_font
 
         if len(groups) == 1:
             continue
 
-        # additional groups become new "(cont.)" slides, using the same
-        # layout as the slide they split from so images/backgrounds in a
-        # custom template carry over correctly
+        # additional groups become new slides — a section-header-triggered
+        # group uses that header's own text as its title (the analogue of
+        # a DOCX Heading 1/2 becoming a new slide's title); an
+        # overflow-triggered group falls back to "(cont.)" of the
+        # original slide's title, using the same layout as the slide it
+        # split from so images/backgrounds in a custom template carry
+        # over correctly
         layout = slide.slide_layout
         insert_position = idx + 1 + sum(insertions_done for pos, insertions_done in insertions if pos <= idx)
         for gi, group in enumerate(groups[1:], 1):
             new_slide = prs.slides.add_slide(layout)
             if new_slide.shapes.title is not None:
-                new_slide.shapes.title.text = f"{base_title} (cont.)"
+                new_slide.shapes.title.text = group_titles[gi] or f"{base_title} (cont.)"
                 for p in new_slide.shapes.title.text_frame.paragraphs:
                     for r in p.runs:
-                        r.font.size = _PPTX_FIX_TITLE_SIZE
+                        r.font.size = title_size
                         r.font.bold = True
+                        if title_font:
+                            r.font.name = title_font
                 new_slide.shapes.title.text_frame.auto_size = MSO_AUTO_SIZE.NONE
             new_body = [s for s in new_slide.placeholders if s.placeholder_format.idx == body_shape.placeholder_format.idx]
             new_body = new_body[0] if new_body else [s for s in new_slide.placeholders if s != new_slide.shapes.title][0]
@@ -1329,12 +1615,19 @@ def pptx_to_pptx(src_path, out_dir, style=None):
                 for text, bold, italic in runs:
                     r = p.add_run()
                     r.text = text
-                    r.font.size = _PPTX_FIX_BODY_SIZE
+                    r.font.size = body_size
                     r.font.bold = bold
                     r.font.italic = italic
+                    if body_font:
+                        r.font.name = body_font
             _pptx_fix_move_slide_to(prs, new_slide, insert_position)
             insert_position += 1
         insertions.append((idx, len(groups) - 1))
+
+    _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font)
+    _pptx_fix_apply_contrast_fixes(prs)
+    _pptx_fix_apply_smart_emphasis(prs)
+    _pptx_fix_apply_transitions(prs)
 
     out_path = os.path.join(out_dir, "fixed.pptx")
     os.makedirs(out_dir, exist_ok=True)
