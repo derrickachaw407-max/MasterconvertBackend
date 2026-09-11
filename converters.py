@@ -28,7 +28,10 @@ from pptx.util import Inches as PptxInches, Pt
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.chart.data import CategoryChartData
+from pptx.opc.constants import RELATIONSHIP_TYPE as _PPTX_RT
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font as XlsxFont, PatternFill as XlsxPatternFill
@@ -177,6 +180,84 @@ PPTX_TEMPLATES = {
 }
 
 
+def _find_best_pptx_layout(prs, kind):
+    """Finds the layout in an uploaded custom template closest to what's
+    needed, by name and placeholder shape — a corporate .potx has its own
+    layout order and naming, so assuming layout index 1 is always
+    "Title and Content" (true only for python-pptx's own default
+    template) would silently land content on the wrong layout entirely."""
+    layouts = list(prs.slide_layouts)
+    if kind == "content":
+        for layout in layouts:
+            name = (layout.name or "").lower()
+            has_title = any(p.placeholder_format.idx == 0 for p in layout.placeholders)
+            has_body = any(p.placeholder_format.idx == 1 for p in layout.placeholders)
+            if has_title and has_body and ("content" in name or "title and" in name):
+                return layout
+        for layout in layouts:
+            has_title = any(p.placeholder_format.idx == 0 for p in layout.placeholders)
+            has_body = any(p.placeholder_format.idx == 1 for p in layout.placeholders)
+            if has_title and has_body:
+                return layout
+        return layouts[min(1, len(layouts) - 1)]
+    else:  # "blank"
+        for layout in layouts:
+            if "blank" in (layout.name or "").lower():
+                return layout
+        fewest = min(layouts, key=lambda l: len(list(l.placeholders)))
+        return fewest
+
+
+def _extract_template_style(prs, content_layout):
+    """Builds a template_style dict (the same shape as PPTX_TEMPLATES'
+    entries) from an uploaded custom template's own actual master and
+    theme, instead of one of this file's own hardcoded style choices —
+    the whole point of a custom template is that its own brand fonts,
+    sizes, and colors carry through, not get overwritten by a default
+    meant for when no template was provided. Colors are deliberately
+    left as None (see _style_pptx_slide / _style_pptx_body_paragraph) so
+    a theme-color-based brand palette stays tied to the theme rather
+    than being frozen into a specific RGB snapshot."""
+    master = content_layout.slide_master
+    master_xml = master.element
+
+    def read_style_size(style_tag, fallback_pt):
+        el = master_xml.find(".//" + pptx_qn(f"p:{style_tag}") + "/" + qn("a:lvl1pPr") + "/" + qn("a:defRPr"))
+        if el is not None and el.get("sz"):
+            try:
+                return Pt(int(el.get("sz")) / 100)
+            except (ValueError, TypeError):
+                pass
+        return Pt(fallback_pt)
+
+    def read_theme_font(major):
+        tag = "majorFont" if major else "minorFont"
+        try:
+            theme_part = master.part.part_related_by(_PPTX_RT.THEME)
+            theme_root = etree.fromstring(theme_part.blob)
+            font_el = theme_root.find(".//" + qn("a:fontScheme") + "/" + qn(f"a:{tag}") + "/" + qn("a:latin"))
+            if font_el is not None and font_el.get("typeface"):
+                return font_el.get("typeface")
+        except Exception:
+            pass
+        return "Calibri"
+
+    title_size = read_style_size("titleStyle", 40)
+    body_size = read_style_size("bodyStyle", 26)
+    title_font = read_theme_font(major=True)
+    body_font = read_theme_font(major=False)
+
+    return {
+        "bg": None, "title_fill": None,
+        "title_font": title_font, "title_size": title_size, "title_bold": True,
+        "title_color": None,
+        "body_font": body_font, "body_size": body_size,
+        "body_color": None,
+        "subhead_size": Pt(min(body_size.pt + 4, title_size.pt - 4)),
+        "caption_size": Pt(max(body_size.pt - 11, 12)),
+    }
+
+
 def _style_pptx_slide(slide, style):
     if style["bg"] is not None:
         slide.background.fill.solid()
@@ -190,13 +271,20 @@ def _style_pptx_slide(slide, style):
             run.font.name = style["title_font"]
             run.font.size = style["title_size"]
             run.font.bold = style["title_bold"]
-            run.font.color.rgb = style["title_color"]
+            # A custom uploaded template's color may be a theme-color
+            # reference rather than a fixed RGB value (a brand palette
+            # that's meant to stay tied to the theme) — style["title_color"]
+            # is None specifically for that case, so it's left alone here
+            # rather than overwritten with an extracted snapshot color.
+            if style["title_color"] is not None:
+                run.font.color.rgb = style["title_color"]
 
 
 def _style_pptx_body_paragraph(p, style, size=None):
     p.font.name = style["body_font"]
     p.font.size = size if size is not None else style["body_size"]
-    p.font.color.rgb = style["body_color"]
+    if style["body_color"] is not None:
+        p.font.color.rgb = style["body_color"]
 
 
 # ---------------------------------------------------------- DOCX styles
@@ -548,13 +636,17 @@ def _get_docx_notes(doc, part_name, note_tag):
 
 
 def _iter_docx_charts(paragraph, doc):
-    """Yields (title, categories, series) for each chart embedded in this
-    paragraph's runs. python-docx has no chart API at all — a chart's
-    real data lives entirely in a separate chart XML part, reached only
-    via a relationship id on the run's drawing — so without reaching for
-    it directly, a chart's numbers are completely lost rather than just
-    unstyled, the same class of gap PowerPoint charts had before that was
-    fixed. series is a list of (name, values)."""
+    """Yields (title, categories, series, chart_type) for each chart
+    embedded in this paragraph's runs. python-docx has no chart API at
+    all — a chart's real data lives entirely in a separate chart XML
+    part, reached only via a relationship id on the run's drawing — so
+    without reaching for it directly, a chart's numbers are completely
+    lost rather than just unstyled, the same class of gap PowerPoint
+    charts had before that was fixed. series is a list of (name, values).
+    chart_type is an XL_CHART_TYPE value, detected from which plot
+    element (c:barChart, c:lineChart, etc.) the source chart actually
+    used, so the recreated chart is the same kind of chart, not always a
+    generic bar chart regardless of what the original document had."""
     for run in paragraph.runs:
         for chart_ref in run._element.findall(".//" + qn("c:chart")):
             r_id = chart_ref.get(qn("r:id"))
@@ -590,8 +682,70 @@ def _iter_docx_charts(paragraph, doc):
                     series_list.append((name, values))
             except Exception:
                 pass
+            chart_type = _detect_docx_chart_type(root)
             if categories or series_list:
-                yield title, categories, series_list
+                yield title, categories, series_list, chart_type
+
+
+def _detect_docx_chart_type(chart_root):
+    """Maps the source chart's actual plot element to the closest
+    XL_CHART_TYPE, so a recreated native chart matches the kind of chart
+    the original document had (a line chart stays a line chart) instead
+    of every chart defaulting to the same generic type regardless of
+    source. Falls back to a clustered column chart — the most broadly
+    readable default — for chart kinds not worth specifically detecting
+    (3D variants, radar, stock, bubble, surface)."""
+    def has(tag):
+        return chart_root.find(".//" + qn(tag)) is not None
+
+    if has("c:pieChart") or has("c:pie3DChart"):
+        return XL_CHART_TYPE.PIE
+    if has("c:doughnutChart"):
+        return XL_CHART_TYPE.DOUGHNUT
+    if has("c:lineChart"):
+        return XL_CHART_TYPE.LINE_MARKERS
+    if has("c:areaChart"):
+        return XL_CHART_TYPE.AREA
+    if has("c:scatterChart"):
+        return XL_CHART_TYPE.XY_SCATTER
+    if has("c:barChart"):
+        bar_dir_el = chart_root.find(".//" + qn("c:barChart") + "//" + qn("c:barDir"))
+        grouping_el = chart_root.find(".//" + qn("c:barChart") + "//" + qn("c:grouping"))
+        is_bar = bar_dir_el is not None and bar_dir_el.get("val") == "bar"
+        grouping = grouping_el.get("val") if grouping_el is not None else "clustered"
+        if is_bar:
+            return XL_CHART_TYPE.BAR_STACKED if grouping == "stacked" else XL_CHART_TYPE.BAR_CLUSTERED
+        return XL_CHART_TYPE.COLUMN_STACKED if grouping == "stacked" else XL_CHART_TYPE.COLUMN_CLUSTERED
+    return XL_CHART_TYPE.COLUMN_CLUSTERED
+
+
+def _add_chart_as_table_fallback(slide, categories, series_list, slide_width, slide_height):
+    """The previous, already-working behavior for every chart, kept as a
+    fallback specifically for chart data python-pptx's native chart API
+    can't build from — a plain table of the same numbers is still far
+    more useful than losing the chart's data entirely."""
+    n_rows, n_cols = len(categories) + 1, len(series_list) + 1
+    if n_rows < 2 or n_cols < 2:
+        return
+    left, top = PptxInches(0.6), PptxInches(1.6)
+    width, height = slide_width - PptxInches(1.2), slide_height - PptxInches(2.2)
+    gtable = slide.shapes.add_table(n_rows, n_cols, left, top, width, height).table
+    gtable.cell(0, 0).text = ""
+    for s_idx, (name, _values) in enumerate(series_list, 1):
+        gtable.cell(0, s_idx).text = name
+    for cat_idx, cat_name in enumerate(categories, 1):
+        gtable.cell(cat_idx, 0).text = cat_name
+        for s_idx, (_name, values) in enumerate(series_list, 1):
+            val = values[cat_idx - 1] if cat_idx - 1 < len(values) else ""
+            try:
+                val = _format_cell_value(float(val))
+            except (ValueError, TypeError):
+                pass
+            gtable.cell(cat_idx, s_idx).text = val
+    for cell in gtable.rows[0].cells:
+        for p in cell.text_frame.paragraphs:
+            for run in p.runs:
+                run.font.bold = True
 
 
 def _get_docx_footnotes(doc):
@@ -665,7 +819,19 @@ def _iter_all_runs(paragraph):
     someone accepts the change."""
     def run_text(r_el, deleted):
         tag = qn("w:delText") if deleted else qn("w:t")
-        return "".join(t.text or "" for t in r_el.findall(tag))
+        # .findall() searches all descendants, not just direct content —
+        # a run containing a shape's <w:drawing> has that shape's own
+        # internal paragraph/run/text structure nested inside it (a
+        # wps:txbx text box, same as a floating text box's w:txbxContent),
+        # and without excluding it here, a shape's own label text gets
+        # silently absorbed into the outer paragraph's text too, on top
+        # of wherever it's separately extracted from (_iter_docx_shapes).
+        results = []
+        for t in r_el.findall(tag):
+            if any(anc.tag in (f"{{{_WPS_NS}}}txbx", qn("w:txbxContent")) for anc in t.iterancestors()):
+                continue
+            results.append(t.text or "")
+        return "".join(results)
 
     def walk(container_el, deleted, link_address):
         for child in container_el:
@@ -837,6 +1003,80 @@ def _iter_inline_images(paragraph, doc):
                     yield doc.part.related_parts[r_id].blob
                 except KeyError:
                     continue
+
+
+_WPS_NS = "http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+
+# OOXML's preset geometry names (the a:prstGeom "prst" attribute) are the
+# same standardized vocabulary in both Word and PowerPoint's DrawingML —
+# this maps the ones most likely to actually appear in a real document
+# (flowchart boxes, callouts, arrows) to the closest MSO_SHAPE for
+# recreating them as real, editable PowerPoint shapes rather than losing
+# them or falling back to a plain rectangle for everything.
+_DOCX_SHAPE_PRESET_MAP = {
+    "rect": MSO_SHAPE.RECTANGLE,
+    "roundRect": MSO_SHAPE.ROUNDED_RECTANGLE,
+    "ellipse": MSO_SHAPE.OVAL,
+    "triangle": MSO_SHAPE.ISOSCELES_TRIANGLE,
+    "rtTriangle": MSO_SHAPE.RIGHT_TRIANGLE,
+    "diamond": MSO_SHAPE.DIAMOND,
+    "pentagon": MSO_SHAPE.REGULAR_PENTAGON,
+    "hexagon": MSO_SHAPE.HEXAGON,
+    "chevron": MSO_SHAPE.CHEVRON,
+    "rightArrow": MSO_SHAPE.RIGHT_ARROW,
+    "leftArrow": MSO_SHAPE.LEFT_ARROW,
+    "upArrow": MSO_SHAPE.UP_ARROW,
+    "downArrow": MSO_SHAPE.DOWN_ARROW,
+    "leftRightArrow": MSO_SHAPE.LEFT_RIGHT_ARROW,
+    "upDownArrow": MSO_SHAPE.UP_DOWN_ARROW,
+    "star4": MSO_SHAPE.STAR_4_POINT,
+    "star5": MSO_SHAPE.STAR_5_POINT,
+    "star6": MSO_SHAPE.STAR_6_POINT,
+    "cloud": MSO_SHAPE.CLOUD,
+    "heart": MSO_SHAPE.HEART,
+    "lightningBolt": MSO_SHAPE.LIGHTNING_BOLT,
+    "smileyFace": MSO_SHAPE.SMILEY_FACE,
+    "wedgeRectCallout": MSO_SHAPE.RECTANGULAR_CALLOUT,
+    "wedgeRoundRectCallout": MSO_SHAPE.ROUNDED_RECTANGULAR_CALLOUT,
+    "wedgeEllipseCallout": MSO_SHAPE.OVAL_CALLOUT,
+}
+
+
+def _iter_docx_shapes(paragraph):
+    """Yields (mso_shape, fill_hex, text, width_emu, height_emu) for each
+    DrawingML shape (a Word AutoShape — a callout, an arrow, a flowchart
+    box) found in this paragraph. These are structurally distinct from
+    a:blip picture references (_iter_inline_images) — a shape has no
+    embedded image at all, just a preset outline filled with color and
+    optionally holding its own text box, so the picture-extraction path
+    never sees them and they'd otherwise be silently dropped entirely."""
+    for run in paragraph.runs:
+        for wsp in run._element.findall(".//{%s}wsp" % _WPS_NS):
+            prst_el = wsp.find(".//" + qn("a:prstGeom"))
+            prst = prst_el.get("prst") if prst_el is not None else None
+            mso_shape = _DOCX_SHAPE_PRESET_MAP.get(prst, MSO_SHAPE.RECTANGLE)
+
+            fill_hex = None
+            fill_el = wsp.find(".//{%s}spPr/" % _WPS_NS + qn("a:solidFill") + "/" + qn("a:srgbClr"))
+            if fill_el is not None:
+                fill_hex = fill_el.get("val")
+
+            text_parts = []
+            for t in wsp.findall(".//{%s}txbx//" % _WPS_NS + qn("w:t")):
+                if t.text:
+                    text_parts.append(t.text)
+            text = "".join(text_parts).strip()
+
+            width_emu = height_emu = None
+            ext_el = wsp.find(".//{%s}spPr/" % _WPS_NS + qn("a:xfrm") + "/" + qn("a:ext"))
+            if ext_el is not None:
+                try:
+                    width_emu = int(ext_el.get("cx"))
+                    height_emu = int(ext_el.get("cy"))
+                except (TypeError, ValueError):
+                    pass
+
+            yield mso_shape, fill_hex, text, width_emu, height_emu
 
 
 # ------------------------------------------------ PPTX auto-fix / cleanup
@@ -1102,15 +1342,33 @@ def pptx_to_pptx(src_path, out_dir, style=None):
     return out_path
 
 
-def docx_to_pptx(src_path, out_dir, style="minimal"):
-    template_style = PPTX_TEMPLATES.get(style, PPTX_TEMPLATES["minimal"])
+def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
+    """style selects one of this file's own built-in visual themes
+    (minimal/academic/bold/classic) and is ignored when template_path is
+    given. template_path, if provided, is a path to an uploaded .potx (or
+    .pptx used as a template) — a corporate brand template — whose own
+    masters, layouts, fonts, and colors are used instead, so the
+    converted content maps into the uploaded template's own pre-styled
+    layouts rather than one of this file's built-in looks."""
+    if template_path:
+        prs = _safe_load(Presentation, template_path)
+        title_layout = _find_best_pptx_layout(prs, "content")
+        blank_layout = _find_best_pptx_layout(prs, "blank")
+        template_style = _extract_template_style(prs, title_layout)
+        # A .potx/.pptx template's own slide size is part of its brand
+        # design (many corporate templates are intentionally 4:3, or a
+        # custom size) — overwriting it the way the no-template path does
+        # would fight the very template the user uploaded to preserve.
+    else:
+        template_style = PPTX_TEMPLATES.get(style, PPTX_TEMPLATES["minimal"])
+        prs = Presentation()
+        prs.slide_width = PptxInches(13.333)
+        prs.slide_height = PptxInches(7.5)
+        title_layout = prs.slide_layouts[1]  # title + content
+        blank_layout = prs.slide_layouts[6]
+
     doc = _safe_load(Document, src_path)
     numbering_formats = _get_docx_numbering_formats(doc)
-    prs = Presentation()
-    prs.slide_width = PptxInches(13.333)
-    prs.slide_height = PptxInches(7.5)
-    title_layout = prs.slide_layouts[1]  # title + content
-    blank_layout = prs.slide_layouts[6]
 
     MAX_LINES_PER_SLIDE = 10  # estimated wrapped-line budget, not a flat bullet count (see
     # _estimate_line_count) — accounts for bullets of very different lengths now that long
@@ -1317,32 +1575,43 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # fresh slide rather than silently reusing the table slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
-    def add_chart_slide(title, categories, series_list):
-        n_rows, n_cols = len(categories) + 1, len(series_list) + 1
-        if n_rows < 2 or n_cols < 2:
+    def add_chart_slide(title, categories, series_list, chart_type):
+        if len(categories) < 1 or len(series_list) < 1:
             return
         s = prs.slides.add_slide(title_layout)
         s.shapes.title.text = title or "Chart"
         _style_pptx_slide(s, template_style)
-        left, top = PptxInches(0.6), PptxInches(1.6)
-        width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.2)
-        gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
-        gtable.cell(0, 0).text = ""
-        for s_idx, (name, _values) in enumerate(series_list, 1):
-            gtable.cell(0, s_idx).text = name
-        for cat_idx, cat_name in enumerate(categories, 1):
-            gtable.cell(cat_idx, 0).text = cat_name
-            for s_idx, (_name, values) in enumerate(series_list, 1):
-                val = values[cat_idx - 1] if cat_idx - 1 < len(values) else ""
+        left, top = PptxInches(1.0), PptxInches(1.7)
+        width, height = prs.slide_width - PptxInches(2.0), prs.slide_height - PptxInches(2.4)
+
+        chart_data = CategoryChartData()
+        chart_data.categories = categories
+        for name, values in series_list:
+            numeric_values = []
+            for v in values:
                 try:
-                    val = _format_cell_value(float(val))
+                    numeric_values.append(float(v))
                 except (ValueError, TypeError):
-                    pass
-                gtable.cell(cat_idx, s_idx).text = val
-        for cell in gtable.rows[0].cells:
-            for p in cell.text_frame.paragraphs:
-                for run in p.runs:
-                    run.font.bold = True
+                    numeric_values.append(None)  # a blank/non-numeric cell breaks the whole
+                    # series if left as a string — python-pptx's chart data requires numbers
+                    # or None, not the raw text values straight from the source chart's XML
+            chart_data.add_series(name or "Series", numeric_values)
+
+        try:
+            graphic_frame = s.shapes.add_chart(chart_type, left, top, width, height, chart_data)
+            chart = graphic_frame.chart
+            chart.has_legend = len(series_list) > 1
+            if chart.has_legend:
+                chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+                chart.legend.include_in_layout = False
+        except Exception:
+            # A source chart type or data shape python-pptx's chart API
+            # can't build (e.g. malformed values, an unusual combination
+            # chart) shouldn't sink the whole conversion — fall back to
+            # a plain table of the same data, which was the previous,
+            # already-working behavior for every chart before this.
+            _add_chart_as_table_fallback(s, categories, series_list, prs.slide_width, prs.slide_height)
+
         # A loose paragraph right after a chart should land on a fresh
         # slide rather than silently reusing the chart's slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
@@ -1361,8 +1630,44 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
         # fresh slide rather than silently reusing the image slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
+    def add_shape_slide(mso_shape, fill_hex, shape_text, width_emu, height_emu):
+        s = prs.slides.add_slide(blank_layout)
+        # Preserve the shape's own aspect ratio when it had real dimensions,
+        # scaled up to a reasonable on-slide size, rather than stretching
+        # every recreated shape to one fixed box regardless of its source
+        # proportions (a wide arrow shouldn't come out square).
+        max_w, max_h = prs.slide_width - PptxInches(2), prs.slide_height - PptxInches(2)
+        if width_emu and height_emu:
+            scale = min(max_w / width_emu, max_h / height_emu, 4.0)
+            w, h = int(width_emu * scale), int(height_emu * scale)
+        else:
+            w, h = PptxInches(4), PptxInches(2)
+        left, top = int((prs.slide_width - w) / 2), int((prs.slide_height - h) / 2)
+        try:
+            shape = s.shapes.add_shape(mso_shape, left, top, w, h)
+        except Exception:
+            return  # an unusual/malformed shape shouldn't sink the whole conversion
+        if fill_hex:
+            try:
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = PptxRGBColor.from_string(fill_hex)
+            except Exception:
+                pass
+        if shape_text:
+            shape.text_frame.text = shape_text
+            for p in shape.text_frame.paragraphs:
+                p.alignment = PP_ALIGN.CENTER
+                for run in p.runs:
+                    run.font.size = Pt(20)
+                    run.font.color.rgb = PptxRGBColor(0xFF, 0xFF, 0xFF) if fill_hex else PptxRGBColor(0x00, 0x00, 0x00)
+        # Same reasoning as after an image or table — a loose paragraph
+        # right after a shape belongs on its own fresh slide.
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
+
     MAX_IMAGES = 30
     image_count = 0
+    MAX_SHAPES = 30
+    shape_count = 0
 
     for block in _iter_block_items(doc):
         if isinstance(block, DocxTable):
@@ -1375,18 +1680,30 @@ def docx_to_pptx(src_path, out_dir, style="minimal"):
                     break
                 add_image_slide(img_bytes)
                 image_count += 1
+        if shape_count < MAX_SHAPES:
+            for mso_shape, fill_hex, shape_text, w_emu, h_emu in _iter_docx_shapes(para):
+                if shape_count >= MAX_SHAPES:
+                    break
+                add_shape_slide(mso_shape, fill_hex, shape_text, w_emu, h_emu)
+                shape_count += 1
         for tb_para in _iter_textbox_paragraphs(para):
             tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
                 add_bullet(tb_para, level=0)
-        for chart_title, chart_cats, chart_series in _iter_docx_charts(para, doc):
-            add_chart_slide(chart_title, chart_cats, chart_series)
+        for chart_title, chart_cats, chart_series, chart_type in _iter_docx_charts(para, doc):
+            add_chart_slide(chart_title, chart_cats, chart_series, chart_type)
         text = _full_paragraph_text(para).strip()
         if not text:
             continue
         para_style_name = (para.style.name or "").lower()
         heading_match = re.match(r"heading (\d+)", para_style_name)
-        if para_style_name == "title" or (heading_match and int(heading_match.group(1)) <= 1):
+        # Heading 1 and Heading 2 both start a new slide — matching how
+        # most outline-based DOCX->PPTX tools split a document, and how a
+        # reader would expect a document's own structure to map onto
+        # slide boundaries. Heading 3+ stays as a bolded subheading within
+        # the current slide rather than fragmenting into ever-thinner
+        # slides for what's usually meant to be one cohesive topic.
+        if para_style_name == "title" or (heading_match and int(heading_match.group(1)) <= 2):
             new_slide(text)
         elif heading_match:
             add_subheading(text)
@@ -2335,7 +2652,7 @@ def docx_to_xlsx(src_path, out_dir):
             tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
                 text_rows.append(tb_text)
-        for chart_title, chart_cats, chart_series in _iter_docx_charts(p, doc):
+        for chart_title, chart_cats, chart_series, _chart_type in _iter_docx_charts(p, doc):
             chart_data_list.append((chart_title, chart_cats, chart_series))
     if text_rows:
         ws = wb.create_sheet(title="Document Text")
@@ -2854,7 +3171,7 @@ def extract_text(src_path, ext):
                 tb_text = _full_paragraph_text(tb_para).strip()
                 if tb_text:
                     parts.append(tb_text)
-            for chart_title, chart_cats, chart_series in _iter_docx_charts(p, doc):
+            for chart_title, chart_cats, chart_series, _chart_type in _iter_docx_charts(p, doc):
                 parts.append(f"Chart: {chart_title}" if chart_title else "Chart data:")
                 for name, values in chart_series:
                     row = [name] + list(values)
