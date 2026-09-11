@@ -8,3 +8,4 @@ gunicorn==23.0.0
 requests==2.33.1
 psycopg2-binary==2.9.10
 google-auth==2.36.0
+pdfplumber
