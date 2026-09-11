@@ -1523,6 +1523,50 @@ def _pptx_fix_reposition_offslide_pictures(prs):
             shape.top = max(0, min(shape.top, prs.slide_height - shape.height))
 
 
+def _pptx_fix_force_white_bg_black_text(prs):
+    """Forces every slide's background to solid white and every piece of
+    text in the deck to solid black — an explicit, absolute request
+    that overrides anything else in this pipeline (a custom template's
+    brand palette, the smart-emphasis accent color, a slide's own
+    inherited layout/master background), since it runs as the very last
+    step. Bold from smart emphasis is left in place — it's the one part
+    of that feature that isn't a color, so it doesn't conflict with
+    "text is always black" the way the accent color would."""
+    white, black = PptxRGBColor(255, 255, 255), PptxRGBColor(0, 0, 0)
+
+    def blacken(text_frame):
+        for para in text_frame.paragraphs:
+            for run in para.runs:
+                run.font.color.rgb = black
+
+    for slide in prs.slides:
+        try:
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = white
+        except Exception:
+            pass  # an unusual background fill type shouldn't sink the rest of the fix
+
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                blacken(shape.text_frame)
+            if shape.has_table:
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        blacken(cell.text_frame)
+            if shape.has_chart:
+                chart = shape.chart
+                try:
+                    if chart.has_legend:
+                        chart.legend.font.color.rgb = black
+                except Exception:
+                    pass
+                for axis_attr in ("category_axis", "value_axis"):
+                    try:
+                        getattr(chart, axis_attr).tick_labels.font.color.rgb = black
+                    except (AttributeError, ValueError):
+                        pass  # not every chart type has both axes (e.g. a pie chart)
+
+
 def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
     """Fixes the two most common problems in an already-existing
     PowerPoint file rather than converting from another format: PowerPoint
@@ -1758,10 +1802,10 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
         insertions.append((idx, len(groups) - 1))
 
     _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font)
-    _pptx_fix_apply_contrast_fixes(prs)
     _pptx_fix_apply_smart_emphasis(prs)
     _pptx_fix_reposition_offslide_pictures(prs)
     _pptx_fix_apply_transitions(prs)
+    _pptx_fix_force_white_bg_black_text(prs)
 
     out_path = os.path.join(out_dir, "fixed.pptx")
     os.makedirs(out_dir, exist_ok=True)
