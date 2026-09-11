@@ -1399,6 +1399,130 @@ def _pptx_fix_apply_transitions(prs):
         anchor.addnext(transition_el)
 
 
+def _pptx_fix_try_numeric(text):
+    """Parses a cell's text as a float, tolerating a leading currency
+    symbol, thousands separators, and a trailing percent sign — the
+    common ways a number shows up in a real table cell. Returns None if
+    the text isn't recognizably numeric."""
+    if not text:
+        return None
+    cleaned = text.strip().replace(",", "").replace("$", "").replace("%", "")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _pptx_fix_detect_chart_shaped_table(grid):
+    """Determines whether an existing table's data is actually a numeric
+    chart in table form — a header row of series labels, a header
+    column of categories, and a body that's uniformly numeric — the
+    classic Excel-paste-into-PowerPoint pattern. Deliberately strict
+    (every body cell must parse as a number, not just "most") to avoid
+    misfiring on an ordinary table that happens to contain a few numbers
+    (a schedule with times, a roster with ages) — a wrongly "smart"
+    conversion that throws away real tabular content would be a worse
+    outcome than leaving a genuine chart-shaped table exactly as it
+    already is. Returns (categories, series_list) or None."""
+    if len(grid) < 3 or len(grid[0]) < 2:
+        return None  # need a header row plus at least 2 data rows, and at least one series
+    n_cols = len(grid[0])
+    if any(len(row) != n_cols for row in grid):
+        return None  # ragged table (merged cells etc.) - not safe to reinterpret as chart data
+    if n_cols > 7 or len(grid) > 11:
+        return None  # too many series/categories to make a readable chart anyway
+
+    header_row, body_rows = grid[0], grid[1:]
+    if any(_pptx_fix_try_numeric(c) is not None for c in header_row[1:]):
+        return None  # a numeric "label" means this probably isn't a labeled header row at all
+    if any(_pptx_fix_try_numeric(row[0]) is not None for row in body_rows):
+        return None  # a numeric "category" means this column isn't acting as row labels
+
+    numeric_grid = []
+    for row in body_rows:
+        numeric_row = []
+        for cell in row[1:]:
+            val = _pptx_fix_try_numeric(cell)
+            if val is None:
+                return None  # strict: even one non-numeric body cell means this isn't chart data
+            numeric_row.append(val)
+        numeric_grid.append(numeric_row)
+
+    categories = [row[0] for row in body_rows]
+    series_names = header_row[1:]
+    series_list = [
+        (series_names[i], [numeric_grid[r][i] for r in range(len(body_rows))])
+        for i in range(len(series_names))
+    ]
+    return categories, series_list
+
+
+def _pptx_fix_convert_table_to_chart(slide, table_shape):
+    """Replaces a chart-shaped table with a real, native, editable chart
+    in the same position and size — the "modernized" version of pasting
+    numbers into a table instead of building an actual chart. Leaves the
+    table completely untouched on any failure (a shape that isn't
+    actually a table, data that doesn't pass the strict chart-shape
+    check, or a chart the API can't build from it), since the original
+    table is always a safe, working fallback."""
+    if not table_shape.has_table:
+        return False
+    grid = [[cell.text.strip() for cell in row.cells] for row in table_shape.table.rows]
+    detected = _pptx_fix_detect_chart_shaped_table(grid)
+    if detected is None:
+        return False
+    categories, series_list = detected
+
+    chart_data = CategoryChartData()
+    chart_data.categories = categories
+    for name, values in series_list:
+        chart_data.add_series(name or "Series", values)
+
+    left, top, width, height = table_shape.left, table_shape.top, table_shape.width, table_shape.height
+    try:
+        graphic_frame = slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, left, top, width, height, chart_data)
+        chart = graphic_frame.chart
+        chart.has_legend = len(series_list) > 1
+        if chart.has_legend:
+            chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+            chart.legend.include_in_layout = False
+    except Exception:
+        return False
+
+    table_shape._element.getparent().remove(table_shape._element)
+    return True
+
+
+def _pptx_fix_reposition_offslide_pictures(prs):
+    """Rescales and repositions any picture that extends off the visible
+    slide area back to fully within the slide bounds, preserving its
+    aspect ratio — deliberately scoped to this one objectively-broken
+    state (an image can never be intentionally placed partly off the
+    canvas) rather than any subjective "better layout" judgment about
+    images that are simply positioned unusually but still fully
+    visible, which the source author may well have placed on purpose."""
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.shape_type != MSO_SHAPE_TYPE.PICTURE:
+                continue
+            if not (shape.width and shape.height):
+                continue
+            off_slide = (
+                shape.left < 0 or shape.top < 0
+                or shape.left + shape.width > prs.slide_width
+                or shape.top + shape.height > prs.slide_height
+            )
+            if not off_slide:
+                continue
+            max_w = prs.slide_width - PptxInches(0.5)
+            max_h = prs.slide_height - PptxInches(0.5)
+            scale = min(max_w / shape.width, max_h / shape.height, 1.0)
+            shape.width = int(shape.width * scale)
+            shape.height = int(shape.height * scale)
+            shape.left = max(0, min(shape.left, prs.slide_width - shape.width))
+            shape.top = max(0, min(shape.top, prs.slide_height - shape.height))
+
+
 def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
     """Fixes the two most common problems in an already-existing
     PowerPoint file rather than converting from another format: PowerPoint
@@ -1456,6 +1580,15 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
         if title_shape is not None and title_shape.has_text_frame:
             _pptx_fix_apply_sizing_in_place(title_shape, title_size, bold_title=True, font_name=title_font)
 
+        other_shapes = [s for s in slide.shapes if s != title_shape]
+        # Upgrade any chart-shaped table (numeric data pasted into a
+        # table instead of a real chart) into a native chart before
+        # classifying the slide — the classification below needs to see
+        # whatever the slide actually ends up with, not the pre-upgrade
+        # shape list.
+        for s in list(other_shapes):
+            if s.has_table:
+                _pptx_fix_convert_table_to_chart(slide, s)
         other_shapes = [s for s in slide.shapes if s != title_shape]
         text_shapes = [s for s in other_shapes if _pptx_fix_is_simple_text_shape(s, title_shape)]
         # A slide is eligible for splitting only if it's title + exactly
@@ -1627,6 +1760,7 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
     _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font)
     _pptx_fix_apply_contrast_fixes(prs)
     _pptx_fix_apply_smart_emphasis(prs)
+    _pptx_fix_reposition_offslide_pictures(prs)
     _pptx_fix_apply_transitions(prs)
 
     out_path = os.path.join(out_dir, "fixed.pptx")
