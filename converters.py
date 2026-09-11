@@ -2344,6 +2344,126 @@ def _add_docx_paragraph_with_links(doc, text, page_links, style=None):
     return p, used_links
 
 
+def _add_docx_toc_field(doc, heading_texts):
+    """Inserts a real Word TOC field (not a manually-typed list) right
+    where called, built from headings the document already has — a
+    genuinely clickable, navigable table of contents rather than plain
+    text. The field's cached display text is pre-populated with the
+    actual heading names (one per line) rather than a generic "please
+    update this field" placeholder, confirmed directly: without this,
+    the document shows that placeholder message until a field refresh
+    happens, which many readers never trigger. It becomes a fully
+    page-numbered, dot-leadered TOC automatically the first time it's
+    opened in real Word, since the document is also marked to refresh
+    fields on open — but reads correctly even for a reader who never
+    triggers that refresh."""
+    paragraph = doc.add_paragraph()
+    run = paragraph.add_run()
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr_text = OxmlElement("w:instrText")
+    instr_text.set(qn("xml:space"), "preserve")
+    instr_text.text = 'TOC \\o "1-3" \\h \\z \\u'
+    fld_separate = OxmlElement("w:fldChar")
+    fld_separate.set(qn("w:fldCharType"), "separate")
+    run._r.append(fld_begin)
+    run._r.append(instr_text)
+    run._r.append(fld_separate)
+
+    cached_run = OxmlElement("w:r")
+    for i, text in enumerate(heading_texts):
+        if i > 0:
+            cached_run.append(OxmlElement("w:br"))
+        t_el = OxmlElement("w:t")
+        t_el.set(qn("xml:space"), "preserve")
+        t_el.text = text
+        cached_run.append(t_el)
+    paragraph._p.append(cached_run)
+
+    end_run = paragraph.add_run()
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    end_run._r.append(fld_end)
+
+    update_fields = OxmlElement("w:updateFields")
+    update_fields.set(qn("w:val"), "true")
+    # <w:updateFields> has a specific required position in CT_Settings'
+    # schema sequence — confirmed directly against the OOXML schema
+    # after an initial attempt (just appending it) failed validation:
+    # it must come immediately before <w:compat>, not at the end of the
+    # element, or Word/validators reject the whole settings part as
+    # out of sequence.
+    compat_el = doc.settings.element.find(qn("w:compat"))
+    if compat_el is not None:
+        compat_el.addprevious(update_fields)
+    else:
+        doc.settings.element.append(update_fields)
+    return paragraph
+
+
+# The CT_PPrBase sequence (the subset relevant to elements this file ever
+# inserts into a paragraph's pPr) — used to insert a new pPr child at the
+# position the OOXML schema actually requires relative to whatever's
+# already there, rather than assuming pPr is empty and simply appending.
+# Confirmed necessary directly: paragraph_format.space_before (called
+# before the callout styling below) already creates a <w:spacing>
+# element, and appending pBdr/shd after it put them out of the required
+# order, which real validation caught.
+_PPR_CHILD_ORDER = [
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl",
+    "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens",
+    "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN",
+    "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing",
+    "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment",
+    "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange",
+]
+
+
+def _insert_pPr_child_in_order(pPr, new_el):
+    """Inserts new_el into a <w:pPr> at the position CT_PPrBase's schema
+    sequence requires relative to whatever children are already
+    present, rather than assuming pPr is empty and just appending —
+    appending blindly is only safe when nothing else has touched this
+    paragraph's formatting yet, which isn't a safe assumption in
+    general (space_before, alignment, indentation can all have been set
+    first)."""
+    new_local = new_el.tag.split("}")[-1]
+    new_idx = _PPR_CHILD_ORDER.index(new_local) if new_local in _PPR_CHILD_ORDER else len(_PPR_CHILD_ORDER)
+    for child in pPr:
+        child_local = child.tag.split("}")[-1]
+        child_idx = _PPR_CHILD_ORDER.index(child_local) if child_local in _PPR_CHILD_ORDER else len(_PPR_CHILD_ORDER)
+        if child_idx > new_idx:
+            child.addprevious(new_el)
+            return
+    pPr.append(new_el)
+
+
+def _add_docx_callout_style(paragraph, fill_hex="F2F2F2", border_hex="808080"):
+    """Gives a paragraph a shaded background and a colored left border —
+    the "callout box" treatment modern documentation tools (Notion,
+    GitHub's markdown admonitions) use to visually separate an aside
+    from the main flow of text, applied here to speaker notes so they
+    read as a distinct annotation rather than blending into the body
+    content as more small italic text would."""
+    pPr = paragraph._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    left = OxmlElement("w:left")
+    left.set(qn("w:val"), "single")
+    left.set(qn("w:sz"), "24")
+    left.set(qn("w:space"), "4")
+    left.set(qn("w:color"), border_hex)
+    pBdr.append(left)
+    _insert_pPr_child_in_order(pPr, pBdr)
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill_hex)
+    _insert_pPr_child_in_order(pPr, shd)
+    ind = OxmlElement("w:ind")
+    ind.set(qn("w:left"), "200")
+    _insert_pPr_child_in_order(pPr, ind)
+
+
 def _add_docx_hyperlink(paragraph, url, text, bold=False, italic=False, underline=True):
     """python-docx has no high-level API for creating a hyperlink — this is
     the standard recipe: register the external relationship, then build the
@@ -2432,9 +2552,38 @@ def _iter_flat_shapes(shapes):
 def pptx_to_docx(src_path, out_dir, style="clean"):
     prs = _safe_load(Presentation, src_path)
     doc = Document()
+    # python-docx's own default template ships a <w:zoom val="bestFit"/>
+    # missing the "percent" attribute the OOXML schema actually requires
+    # on it — confirmed directly against the schema and present even in
+    # a completely unmodified new Document(), unrelated to anything in
+    # this function. Fixed here rather than left in, since it's a
+    # one-line, safe correction now that it's been found.
+    zoom_el = doc.settings.element.find(qn("w:zoom"))
+    if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
+        zoom_el.set(qn("w:percent"), "100")
     doc.add_heading("Slide Handout", 0)
     BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
     NUMBER_STYLES = ["List Number", "List Number 2", "List Number 3"]
+
+    # A quick pre-pass just for titles, to build a real, clickable table
+    # of contents up front before any slide content is added — skipped
+    # for a short deck, where flipping through a handful of headings is
+    # faster than reading a table of contents for them.
+    slide_titles = []
+    for i, slide in enumerate(prs.slides, 1):
+        title_shape = slide.shapes.title
+        if title_shape is not None and title_shape.has_text_frame and title_shape.text_frame.text.strip():
+            slide_titles.append(_sanitize_xml_text(title_shape.text_frame.text.strip()))
+        else:
+            slide_titles.append(None)
+    real_titles = [t for t in slide_titles if t]
+    if len(real_titles) >= 4:
+        toc_heading = doc.add_paragraph()
+        toc_heading_run = toc_heading.add_run("Contents")
+        toc_heading_run.bold = True
+        toc_heading_run.font.size = DocxPt(14)
+        _add_docx_toc_field(doc, real_titles)
+        doc.add_page_break()
 
     for i, slide in enumerate(prs.slides, 1):
         title = None
@@ -2467,6 +2616,18 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 text_shapes.append(shape)
 
         doc.add_heading(title or f"Slide {i}", level=1)
+        if title:
+            # A small, secondary "Slide N" label lets a reader cross-
+            # reference back to the exact slide in the original
+            # presentation — only shown when the heading itself is a
+            # real title, since it would just repeat the heading's own
+            # text for a slide that has no title of its own.
+            slide_num_p = doc.add_paragraph()
+            slide_num_run = slide_num_p.add_run(f"Slide {i}")
+            slide_num_run.italic = True
+            slide_num_run.font.size = DocxPt(9)
+            slide_num_run.font.color.rgb = DocxRGBColor(0x80, 0x80, 0x80)
+            slide_num_p.paragraph_format.space_after = DocxPt(2)
 
         for shape in image_shapes:
             try:
@@ -2623,9 +2784,13 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             if notes_text:
                 note_p = doc.add_paragraph()
                 note_p.paragraph_format.space_before = DocxPt(8)
-                run = note_p.add_run(f"Speaker notes: {notes_text}")
-                run.italic = True
-                run.font.size = DocxPt(9)
+                label_run = note_p.add_run("Speaker Notes\n")
+                label_run.bold = True
+                label_run.font.size = DocxPt(10)
+                text_run = note_p.add_run(notes_text)
+                text_run.italic = True
+                text_run.font.size = DocxPt(10)
+                _add_docx_callout_style(note_p)
 
         if i < len(prs.slides):
             doc.add_page_break()
