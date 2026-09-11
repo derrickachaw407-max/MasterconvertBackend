@@ -39,6 +39,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font as XlsxFont, PatternFill as XlsxPatternFill
 from lxml import etree
 import pypdf
+import pdfplumber
 
 
 class ConversionError(Exception):
@@ -80,7 +81,7 @@ def _iter_block_items(doc):
 
 
 _BULLET_RE = re.compile(
-    r"^([\u2022\u25CF\u25AA\u25E6\uf0b7\uf0a7\uf076\uf0d8\-\*]|\d{1,3}[\.\)])\s+"
+    r"^([\u2022\u25CF\u25AA\u25E6\uf0b7\uf0a7\uf076\uf0d8\x7f\-\*]|\d{1,3}[\.\)])\s+"
 )
 _SENTENCE_END_RE = re.compile(r"[.!?][\'\")\]]*$")
 _SHORT_LINE_LEN = 70  # a full wrapped line in a standard document usually runs
@@ -90,7 +91,7 @@ _SHORT_LINE_LEN = 70  # a full wrapped line in a standard document usually runs
                       # exposes real layout/whitespace metadata to check instead.
 
 
-def _reconstruct_paragraphs(raw_text):
+def _reconstruct_paragraphs(raw_text, font_headings=None, allow_heading_fallback=True):
     """pypdf's extract_text() reflects the PDF's internal line-by-line visual
     layout, not its semantic paragraph structure — a single paragraph comes
     back as many short lines with no reliable blank-line separator, and two
@@ -104,8 +105,19 @@ def _reconstruct_paragraphs(raw_text):
     rather than a mid-sentence wrap that happens to land near a period).
     Bullet/numbered list items and short heading-like lines are kept on
     their own line instead, since those usually aren't meant to be joined
-    with what follows. Returns a list of (text, kind) tuples, kind in
-    {"para", "bullet", "heading"}."""
+    with what follows. font_headings, if given, is this page's {line_text:
+    level} map from _extract_pdf_font_size_headings — real typographic
+    signal takes precedence over the text-shape-only heuristic below when
+    a line matches. allow_heading_fallback disables that text-shape guess
+    entirely when there's no font_headings data to fall back on — used for
+    OCR'd text specifically, confirmed directly to need this: OCR output
+    line-wraps according to the scanned image's visual layout rather than
+    sentence structure, so an ordinary line that happens to lack ending
+    punctuation (because the sentence continues on the next OCR line) is
+    otherwise easy to misclassify as a heading. Returns a list of (text,
+    kind) tuples, kind in {"para", "bullet", "heading1", "heading2",
+    "heading3"}."""
+    font_headings = font_headings or {}
     lines = [l.strip() for l in raw_text.split("\n")]
     items = []
     current = []
@@ -119,18 +131,29 @@ def _reconstruct_paragraphs(raw_text):
         if not line:
             flush()
             continue
+        font_level = font_headings.get(line)
+        if font_level is not None:
+            flush()
+            items.append((line, f"heading{font_level}"))
+            continue
         if _BULLET_RE.match(line):
             flush()
             items.append((_BULLET_RE.sub("", line).strip(), "bullet"))
             continue
         ends_sentence = bool(_SENTENCE_END_RE.search(line))
-        if not current and not ends_sentence and len(line) < 80 and line[:1].isupper():
+        if (
+            allow_heading_fallback and not font_headings
+            and not current and not ends_sentence and len(line) < 80 and line[:1].isupper()
+        ):
             # A short line, sitting on its own, that doesn't end mid-sentence
             # and starts capitalized reads as a heading far more often than
             # not — e.g. "Section One", "PDF Test Document" — this no longer
             # relies on line.istitle()-style checks, which break on any line
-            # containing an all-caps acronym.
-            items.append((line, "heading"))
+            # containing an all-caps acronym. Used as a fallback only when
+            # font_headings has no real typographic data for this page at
+            # all (a pdfplumber parse failure) — real font-size signal
+            # always wins over this text-shape guess when both are present.
+            items.append((line, "heading3"))
             continue
         current.append(line)
         if ends_sentence and len(line) < _SHORT_LINE_LEN:
@@ -138,6 +161,140 @@ def _reconstruct_paragraphs(raw_text):
     flush()
     return items
 
+
+
+
+def _extract_pdf_font_size_headings(pdf_path):
+    """Uses pdfplumber's real per-character font size and weight data
+    (pypdf's extract_text() returns plain strings with no typographic
+    info at all) to detect which lines across the document are genuine
+    headings — text visibly larger than the document's own body text —
+    rather than relying purely on the text-shape heuristic in
+    _reconstruct_paragraphs (short, capitalized, doesn't end
+    mid-sentence), which has no way to see an actual font-size jump.
+    Distinct heading sizes are ranked into levels (the largest text in
+    the document becomes level 1, the next distinct size level 2, and
+    so on, capped at 3) rather than using a fixed size-ratio cutoff —
+    confirmed directly that a fixed ratio threshold conflates a 24pt
+    document title and a 16pt section heading into the same level,
+    since both comfortably clear a single "big enough" bar. Returns
+    (headings_by_page, body_size) where headings_by_page maps
+    page_index -> {line_text: level}."""
+    all_sizes = Counter()
+    page_lines = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_idx, page in enumerate(pdf.pages):
+                try:
+                    words = page.extract_words(extra_attrs=["size", "fontname"])
+                except Exception:
+                    page_lines.append((page_idx, {}))
+                    continue
+                lines = {}
+                for w in words:
+                    key = round(w["top"])
+                    lines.setdefault(key, []).append(w)
+                line_data = {}
+                for top, line_words in lines.items():
+                    text = " ".join(w["text"] for w in line_words).strip()
+                    if not text:
+                        continue
+                    size = max(w["size"] for w in line_words)
+                    bold = any("bold" in w["fontname"].lower() for w in line_words)
+                    line_data[top] = (text, size, bold)
+                    all_sizes[round(size)] += len(text)  # weighted by character count, so
+                    # body text (far more total characters than any heading) dominates
+                page_lines.append((page_idx, line_data))
+    except Exception:
+        return {}, None  # a malformed/unusual PDF structure pdfplumber can't parse falls
+        # back to the existing text-pattern-only heading heuristic, not a hard failure
+
+    if not all_sizes:
+        return {}, None
+    body_size = all_sizes.most_common(1)[0][0]
+
+    candidate_sizes = sorted({s for s in all_sizes if s >= body_size * 1.15}, reverse=True)
+    size_to_level = {}
+    level = 1
+    prev_size = None
+    for s in candidate_sizes:
+        if prev_size is not None and prev_size - s >= 2:
+            level += 1
+        size_to_level[s] = level
+        prev_size = s
+        if level > 3:
+            break
+
+    headings_by_page = {}
+    for page_idx, line_data in page_lines:
+        page_headings = {}
+        for top, (text, size, bold) in line_data.items():
+            if len(text) > 120:
+                continue  # a genuine heading is short; a large pull-quote or similar isn't safe to treat as one
+            rounded = round(size)
+            if rounded in size_to_level:
+                page_headings[text] = size_to_level[rounded]
+        if page_headings:
+            headings_by_page[page_idx] = page_headings
+    return headings_by_page, body_size
+
+
+def _extract_pdf_ruled_tables(pdf_path, page_idx):
+    """Detects tables on one page via pdfplumber's default ruled-line
+    strategy only — deliberately not the more permissive text-alignment
+    strategy, confirmed directly to be unsafe: tested against a real
+    page of ordinary prose, the text-alignment strategy swallowed the
+    entire page (headings and paragraphs alike) into one garbled
+    "table" based on incidental column alignment, which would corrupt
+    far more content than the tables it might additionally catch are
+    worth. The trade-off is real but the right one: a table with no
+    visible ruling lines at all is missed and falls back to the
+    existing paragraph-reconstruction text flow, rather than risking a
+    false positive that corrupts a page of real prose."""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_idx >= len(pdf.pages):
+                return []
+            return pdf.pages[page_idx].extract_tables()
+    except Exception:
+        return []
+
+
+def _ocr_pdf_page(pdf_path, page_num, work_dir):
+    """Rasterizes one PDF page (1-indexed, matching pdftoppm's -f/-l page
+    numbering) and runs tesseract on it — the same rasterize-then-OCR
+    pattern already used for pdf_to_pptx, scoped here to a single page
+    rather than the whole document, since pdf_to_docx only ever needs
+    OCR for the specific pages that had no extractable text at all
+    (most PDFs are mostly or entirely text-based already). Returns the
+    recognized text, or an empty string on any failure — OCR not
+    working shouldn't sink the rest of the conversion, just leave that
+    one page's placeholder message in place."""
+    page_prefix = os.path.join(work_dir, f"ocr_page_{page_num}")
+    try:
+        subprocess.run(
+            ["pdftoppm", "-png", "-r", "200", "-f", str(page_num), "-l", str(page_num), pdf_path, page_prefix],
+            capture_output=True, text=True, timeout=30, check=True
+        )
+    except Exception:
+        return ""
+    png_candidates = [f for f in os.listdir(work_dir) if f.startswith(f"ocr_page_{page_num}") and f.endswith(".png")]
+    if not png_candidates:
+        return ""
+    png_path = os.path.join(work_dir, png_candidates[0])
+    try:
+        ocr = subprocess.run(
+            ["tesseract", png_path, "-", "--psm", "6"],
+            capture_output=True, text=True, timeout=30
+        )
+        return ocr.stdout.strip()
+    except Exception:
+        return ""
+    finally:
+        try:
+            os.remove(png_path)  # scratch file — not part of the delivered output
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------- PPTX templates
@@ -2808,11 +2965,59 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     if reader.is_encrypted:
         raise ConversionError("This PDF is password-protected and can't be converted until it's unlocked.")
     n_pages = len(reader.pages)
+    os.makedirs(out_dir, exist_ok=True)  # needed early: OCR (if any page requires it,
+    # below) writes a scratch rasterized PNG into out_dir well before the
+    # final document save, which is the only place this used to be called
+
+    font_headings_by_page, _body_size = _extract_pdf_font_size_headings(src_path)
+
+    # Ruled tables (real grid lines, not just aligned text — see
+    # _extract_pdf_ruled_tables for why the more permissive strategy
+    # isn't used) are pulled out per page so they can be rebuilt as real
+    # Word tables rather than left to come through the ordinary text
+    # flow as a garbled run of individual cell values.
+    MAX_TABLE_PAGES = 40  # a table-detection pass opens the PDF again per page; capped for very long documents
+    tables_by_page = {}
+    if n_pages <= MAX_TABLE_PAGES:
+        for page_idx in range(n_pages):
+            tables = _extract_pdf_ruled_tables(src_path, page_idx)
+            if tables:
+                tables_by_page[page_idx] = tables
 
     page_items = []
-    for page in reader.pages:
-        text = _sanitize_xml_text((page.extract_text() or "").strip())
-        page_items.append(_reconstruct_paragraphs(text) if text else [])
+    for page_idx, page in enumerate(reader.pages):
+        raw_text = page.extract_text() or ""
+        page_tables = tables_by_page.get(page_idx, [])
+        if page_tables:
+            # Remove each table's own cell text from the plain line
+            # stream before paragraph reconstruction sees it — otherwise
+            # the same content appears twice: once correctly as a real
+            # table, once again as a garbled run of individual values
+            # from the ordinary text-extraction path, which has no
+            # concept of the table's row/column structure. A cell's text
+            # is split on embedded newlines before being added to the
+            # filter set — pdfplumber sometimes merges two visually-close
+            # values into one cell with a line break between them, and
+            # pypdf's own line-by-line extraction still produces those as
+            # two separate lines, so matching against the whole
+            # (possibly multi-line) cell value as a single unit misses
+            # them entirely, confirmed directly against a real merged
+            # cell leaking into the surrounding paragraph text.
+            table_cell_texts = {
+                part.strip()
+                for table in page_tables
+                for row in table
+                for cell in row
+                if cell
+                for part in str(cell).split("\n")
+                if part.strip()
+            }
+            raw_text = "\n".join(
+                line for line in raw_text.split("\n") if line.strip() not in table_cell_texts
+            )
+        text = _sanitize_xml_text(raw_text.strip())
+        page_font_headings = font_headings_by_page.get(page_idx, {})
+        page_items.append(_reconstruct_paragraphs(text, page_font_headings) if text else [])
 
     # A short line that repeats verbatim across most pages is usually a
     # running header/footer (page title, "Confidential", a date stamp,
@@ -2858,9 +3063,41 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                 exempt_occurrences.add((page_idx, item_idx))
 
     doc = Document()
+    # python-docx's own default template ships a <w:zoom val="bestFit"/>
+    # missing the "percent" attribute the OOXML schema actually requires
+    # on it — same pre-existing, library-wide quirk found and fixed in
+    # pptx_to_docx, present in every fresh Document() regardless of which
+    # function creates it.
+    zoom_el = doc.settings.element.find(qn("w:zoom"))
+    if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
+        zoom_el.set(qn("w:percent"), "100")
     doc.add_heading("Converted from PDF", 0)
+
+    # A real, clickable table of contents built from the PDF's own
+    # most-prominent detected headings (level 1 — the document's own
+    # section titles, not the sequential "Page N" markers, which aren't
+    # meaningful document structure on their own) — only worth adding
+    # once there's enough real structure to summarize.
+    level1_headings = []
+    for page_idx in sorted(font_headings_by_page.keys()):
+        for text, lvl in font_headings_by_page[page_idx].items():
+            if lvl == 1:
+                level1_headings.append(text)
+    if len(level1_headings) >= 4:
+        toc_heading = doc.add_paragraph()
+        toc_heading_run = toc_heading.add_run("Contents")
+        toc_heading_run.bold = True
+        toc_heading_run.font.size = DocxPt(14)
+        _add_docx_toc_field(doc, level1_headings)
+        doc.add_page_break()
+
     MAX_IMAGES = 30
     image_count = 0
+    MAX_OCR_PAGES = 15  # OCR is comparatively expensive (rasterize + tesseract
+    # per page); this covers a few scanned pages mixed into an otherwise
+    # text-based PDF, or a fully-scanned document up to a reasonable length,
+    # without unbounded processing time on a very long scanned file.
+    ocr_page_count = 0
 
     for i, (page, items) in enumerate(zip(reader.pages, page_items), 1):
         if n_pages > 1:
@@ -2879,8 +3116,15 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                 candidates = [(lt, url) for lt, url in page_links if lt in para_text]
                 if kind == "bullet":
                     _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates, style="List Bullet")
-                elif kind == "heading":
-                    doc.add_heading(para_text, level=3)
+                elif kind.startswith("heading"):
+                    # "Page N" (when present) already occupies level 2, so
+                    # the PDF's own content headings nest under it starting
+                    # at level 3 — pdf_level 1 (the document's biggest,
+                    # most prominent heading) becomes Word level 3, and so
+                    # on, rather than competing with "Page N" for the same
+                    # level or going shallower than it.
+                    pdf_level = int(kind[len("heading"):]) if kind[len("heading"):].isdigit() else 3
+                    doc.add_heading(para_text, level=min(pdf_level + 2, 9))
                     used = []
                 else:
                     _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates)
@@ -2888,9 +3132,51 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                     if m in unmatched_links:
                         unmatched_links.remove(m)
         elif not items:
-            doc.add_paragraph("[No extractable text on this page — likely a scanned image.]")
+            ocr_text = ""
+            if ocr_page_count < MAX_OCR_PAGES:
+                ocr_page_count += 1
+                ocr_text = _ocr_pdf_page(src_path, i, out_dir)
+            if ocr_text:
+                for para_text, kind in _reconstruct_paragraphs(_sanitize_xml_text(ocr_text), allow_heading_fallback=False):
+                    if not para_text:
+                        continue
+                    if kind == "bullet":
+                        doc.add_paragraph(para_text, style="List Bullet")
+                    elif kind.startswith("heading"):
+                        doc.add_heading(para_text, level=3)
+                    else:
+                        doc.add_paragraph(para_text)
+                note_p = doc.add_paragraph()
+                note_run = note_p.add_run("(Text on this page was recovered via OCR from a scanned image and may contain recognition errors.)")
+                note_run.italic = True
+                note_run.font.size = DocxPt(9)
+            else:
+                doc.add_paragraph("[No extractable text on this page — likely a scanned image, and OCR did not recover any text.]")
         # else: the page had only repeated header/footer noise and nothing
         # else — nothing worth showing, so leave it at just the page heading.
+
+        for table_rows in tables_by_page.get(page_idx, []):
+            # Drop fully-empty rows (a spacer row between ruled sections,
+            # common in PDFs that draw extra grid lines for visual
+            # padding) rather than rendering a table with blank rows in it.
+            clean_rows = [
+                [(_sanitize_xml_text(str(cell).strip()) if cell else "") for cell in row]
+                for row in table_rows if any(cell and str(cell).strip() for cell in row)
+            ]
+            if not clean_rows:
+                continue
+            n_cols = max(len(r) for r in clean_rows)
+            word_table = doc.add_table(rows=len(clean_rows), cols=n_cols)
+            word_table.style = "Light Grid Accent 1"
+            for r_idx, row in enumerate(clean_rows):
+                for c_idx in range(n_cols):
+                    cell = word_table.rows[r_idx].cells[c_idx]
+                    cell.text = row[c_idx] if c_idx < len(row) else ""
+                    if r_idx == 0:
+                        for p in cell.paragraphs:
+                            for run in p.runs:
+                                run.bold = True
+            doc.add_paragraph()  # breathing room after the table before whatever comes next
 
         if image_count < MAX_IMAGES:
             try:
