@@ -4560,19 +4560,28 @@ def pdf_compress(pdf_path, out_dir, image_quality=60, filename="compressed.pdf")
     return _pdf_writer_to_file(writer, out_dir, filename)
 
 
-def images_to_pdf(image_paths, out_dir, filename="images.pdf"):
+def images_to_pdf(image_paths, out_dir, filename="images.pdf", display_names=None):
     """Combines one or more images into a PDF, one image per page,
     each page sized to that image's own aspect ratio (letter-width,
     scaled) rather than forcing every image into one fixed page size
-    and distorting or letterboxing it."""
+    and distorting or letterboxing it. display_names, if given, is a
+    list parallel to image_paths holding the user's original filenames
+    — used only for the error message below, since image_paths itself
+    is a list of randomized server-side temp paths (see
+    safe_upload_filename in app.py) that mean nothing to the user and
+    shouldn't appear in anything shown to them. The underlying PIL
+    exception is deliberately not included in that message either — it
+    embeds the same server-side path in its own text."""
     from PIL import Image
     if not image_paths:
         raise PdfEditError("No images were given to combine into a PDF.")
+    display_names = display_names or [os.path.basename(p) for p in image_paths]
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
     page_w = _RL_LETTER[0]
     c = _rl_canvas.Canvas(out_path)
-    for img_path in image_paths:
+    for i, img_path in enumerate(image_paths):
+        display_name = display_names[i] if i < len(display_names) else os.path.basename(img_path)
         try:
             with Image.open(img_path) as im:
                 im = im.convert("RGB")
@@ -4584,8 +4593,8 @@ def images_to_pdf(image_paths, out_dir, filename="images.pdf"):
                 buf.seek(0)
                 c.drawImage(ImageReader(buf), 0, 0, width=page_w, height=page_h)
                 c.showPage()
-        except Exception as e:
-            raise PdfEditError(f"Couldn't add image '{os.path.basename(img_path)}': {e}")
+        except Exception:
+            raise PdfEditError(f"'{display_name}' doesn't look like a valid image file — couldn't add it to the PDF.")
     c.save()
     return out_path
 

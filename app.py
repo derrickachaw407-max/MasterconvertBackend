@@ -42,6 +42,40 @@ MIME_TYPES = {
     "pdf": "application/pdf",
 }
 
+# File-upload safety: a user-supplied filename must never be used
+# directly to build a server-side path. Confirmed directly, not just in
+# theory — a filename like "../../../../tmp/x.docx" actually escaped
+# the intended temp working directory and wrote a file elsewhere on
+# disk when tested against this exact codebase. The fix separates two
+# things that were conflated before: the server-side disk path (which
+# the user never sees, so it can just be a safe random name) from the
+# download filename (which should stay human-readable, including
+# non-ASCII scripts — werkzeug's own secure_filename was tested here
+# too and rejected for this second purpose specifically, since it
+# strips non-ASCII entirely: a Chinese filename like "简历.docx" comes
+# back as just "docx", which would be a real, confusing regression for
+# any user not writing in Latin script).
+def safe_upload_filename(original_filename):
+    """A safe, random server-side filename for a saved upload,
+    preserving only a sanitized (lowercased, alphanumeric-only)
+    extension from the original — never the original name itself."""
+    ext = original_filename.rsplit(".", 1)[-1].lower() if original_filename and "." in original_filename else ""
+    ext = re.sub(r"[^a-z0-9]", "", ext)[:10]
+    return "upload_" + uuid.uuid4().hex + (f".{ext}" if ext else ""), ext
+
+
+def safe_download_name(original_filename, fallback="download"):
+    """Sanitizes a filename for safe use in a Content-Disposition
+    header — strips path separators and control characters (which
+    could break the header or inject something unintended) while
+    preserving Unicode letters, spaces, and punctuation for
+    readability, unlike secure_filename."""
+    if not original_filename:
+        return fallback
+    cleaned = re.sub(r"[/\\\x00-\x1f\x7f]", "", original_filename).strip()
+    return cleaned or fallback
+
+
 # CORS: allow the app's known frontend origins. This has broken twice now
 # on an exact-string allowlist — first the MasterConvert->Docently rename,
 # then a second Vercel deployment landing on docently-1.vercel.app instead
@@ -649,6 +683,34 @@ def add_cors_headers(resp):
     return resp
 
 
+# Consistent JSON error responses for every status code the API can
+# return — without these, Flask's own default HTML error pages leak
+# through for cases the code never explicitly handles (an oversized
+# upload, a bad route, a wrong HTTP method), which breaks every
+# frontend call expecting resp.json() to work, confirmed directly: an
+# oversized upload was actually returning a raw HTML page before this.
+@app.errorhandler(413)
+def handle_too_large(e):
+    max_mb = app.config.get("MAX_CONTENT_LENGTH", 0) // (1024 * 1024)
+    return jsonify({"error": f"That file is too large — the limit is {max_mb}MB."}), 413
+
+
+@app.errorhandler(404)
+def handle_not_found(e):
+    return jsonify({"error": "That endpoint doesn't exist."}), 404
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(e):
+    return jsonify({"error": "That method isn't allowed on this endpoint."}), 405
+
+
+@app.errorhandler(500)
+def handle_server_error(e):
+    logger.error(f"Unhandled server error: {e}", exc_info=True)
+    return jsonify({"error": "Something went wrong on our end. Please try again."}), 500
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -1063,7 +1125,8 @@ def convert_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_{uuid.uuid4().hex[:8]}_")
     try:
-        src_path = os.path.join(work_dir, file.filename)
+        safe_name, _ext = safe_upload_filename(file.filename)
+        src_path = os.path.join(work_dir, safe_name)
         file.save(src_path)
 
         try:
@@ -1073,7 +1136,7 @@ def convert_endpoint():
         except FileNotFoundError as e:
             return jsonify({"error": f"Required conversion tool missing on server: {e}"}), 500
 
-        base_name = file.filename.rsplit(".", 1)[0]
+        base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
         download_name = f"{base_name}.{to_fmt}"
 
         return send_file(
@@ -1083,7 +1146,8 @@ def convert_endpoint():
             download_name=download_name,
         )
     except Exception as e:
-        return jsonify({"error": f"Conversion failed: {e}"}), 500
+        logger.error(f"Conversion failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Conversion failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1120,11 +1184,11 @@ def convert_batch_endpoint():
                 details.append({"filename": filename, "success": False, "error": str(e)})
                 continue
 
-            src_path = os.path.join(work_dir, filename)
+            src_path = os.path.join(work_dir, safe_upload_filename(filename)[0])
             file.save(src_path)
             try:
                 result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style)
-                base_name = filename.rsplit(".", 1)[0]
+                base_name = safe_download_name(filename).rsplit(".", 1)[0]
                 converted.append((result_path, f"{base_name}.{to_fmt}"))
                 details.append({"filename": filename, "success": True})
             except ConversionError as e:
@@ -1159,7 +1223,8 @@ def convert_batch_endpoint():
         response.headers["X-Batch-Summary"] = json.dumps(summary)
         return response
     except Exception as e:
-        return jsonify({"error": f"Batch conversion failed: {e}"}), 500
+        logger.error(f"Batch conversion failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Batch conversion failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1199,14 +1264,21 @@ def pdf_edit_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_pdfedit_{uuid.uuid4().hex[:8]}_")
     try:
-        src_path = os.path.join(work_dir, file.filename)
+        safe_name, _ext = safe_upload_filename(file.filename)
+        src_path = os.path.join(work_dir, safe_name)
         file.save(src_path)
 
         extra_files = {}
         for extra in request.files.getlist("extra_files"):
             if extra.filename:
-                extra_path = os.path.join(work_dir, extra.filename)
+                extra_safe_name, _ext = safe_upload_filename(extra.filename)
+                extra_path = os.path.join(work_dir, extra_safe_name)
                 extra.save(extra_path)
+                # Keyed by the *original* filename on purpose — the
+                # operations JSON's merge_append step references files
+                # by that name, and a dict key is just an in-memory
+                # string with no filesystem risk; only the disk write
+                # location (the path above) needed to be randomized.
                 extra_files[extra.filename] = extra_path
 
         try:
@@ -1214,13 +1286,14 @@ def pdf_edit_endpoint():
         except ConversionError as e:
             return jsonify({"error": str(e)}), 422
 
-        base_name = file.filename.rsplit(".", 1)[0]
+        base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
         return send_file(
             result_path, mimetype="application/pdf", as_attachment=True,
             download_name=f"{base_name}_edited.pdf",
         )
     except Exception as e:
-        return jsonify({"error": f"PDF edit failed: {e}"}), 500
+        logger.error(f"PDF edit failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "PDF edit failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1242,7 +1315,7 @@ def pdf_thumbnails_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_pdfthumb_{uuid.uuid4().hex[:8]}_")
     try:
-        src_path = os.path.join(work_dir, file.filename)
+        src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
         file.save(src_path)
         try:
             thumb_paths = pdf_get_page_thumbnails(src_path, work_dir)
@@ -1255,7 +1328,8 @@ def pdf_thumbnails_endpoint():
                 thumbnails.append(base64.b64encode(f.read()).decode("ascii"))
         return jsonify({"page_count": len(thumbnails), "thumbnails": thumbnails})
     except Exception as e:
-        return jsonify({"error": f"Thumbnail generation failed: {e}"}), 500
+        logger.error(f"Thumbnail generation failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Thumbnail generation failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1290,7 +1364,7 @@ def pdf_split_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_pdfsplit_{uuid.uuid4().hex[:8]}_")
     try:
-        src_path = os.path.join(work_dir, file.filename)
+        src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
         file.save(src_path)
         try:
             part_paths = pdf_split(src_path, work_dir, ranges=ranges)
@@ -1303,7 +1377,8 @@ def pdf_split_endpoint():
                 zf.write(p, arcname=os.path.basename(p))
         return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name="split_pages.zip")
     except Exception as e:
-        return jsonify({"error": f"Split failed: {e}"}), 500
+        logger.error(f"PDF split failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Split failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1325,19 +1400,22 @@ def images_to_pdf_endpoint():
     work_dir = tempfile.mkdtemp(prefix=f"mc_img2pdf_{uuid.uuid4().hex[:8]}_")
     try:
         image_paths = []
+        display_names = []
         for f in files:
             if not f.filename:
                 continue
-            p = os.path.join(work_dir, f.filename)
+            p = os.path.join(work_dir, safe_upload_filename(f.filename)[0])
             f.save(p)
             image_paths.append(p)
+            display_names.append(safe_download_name(f.filename))
         try:
-            result_path = images_to_pdf(image_paths, work_dir)
+            result_path = images_to_pdf(image_paths, work_dir, display_names=display_names)
         except ConversionError as e:
             return jsonify({"error": str(e)}), 422
         return send_file(result_path, mimetype="application/pdf", as_attachment=True, download_name="images.pdf")
     except Exception as e:
-        return jsonify({"error": f"Combining images into a PDF failed: {e}"}), 500
+        logger.error(f"images-to-pdf failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Combining these images into a PDF failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1364,7 +1442,8 @@ def text_to_pptx_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        return jsonify({"error": f"Conversion failed: {e}"}), 500
+        logger.error(f"Text-to-presentation failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't build the presentation. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1381,16 +1460,17 @@ def extract_text_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_ext_{uuid.uuid4().hex[:8]}_")
     try:
-        src_path = os.path.join(work_dir, file.filename)
+        src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
         file.save(src_path)
         text = extract_text(src_path, ext)
         if len(text) > 20000:
             text = text[:20000]
-        return jsonify({"text": text, "filename": file.filename})
+        return jsonify({"text": text, "filename": safe_download_name(file.filename)})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        return jsonify({"error": f"Couldn't read file: {e}"}), 500
+        logger.error(f"Text extraction failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't read this file. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1843,7 +1923,8 @@ def write_export_docx_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        return jsonify({"error": f"Export failed: {e}"}), 500
+        logger.error(f"Document export failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Export failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
