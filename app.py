@@ -988,6 +988,10 @@ def update_profile():
     email = (data.get("email") or "").strip().lower()
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
+    if len(name) > 200:
+        return jsonify({"error": "That name is too long (200 characters max)"}), 400
+    if len(email) > 254:
+        return jsonify({"error": "That email is too long"}), 400
     if not EMAIL_RE.match(email):
         return jsonify({"error": "That doesn't look like a valid email"}), 400
 
@@ -1000,11 +1004,18 @@ def update_profile():
             )
             if cur.fetchone():
                 return jsonify({"error": "That email is already in use"}), 409
-            cur.execute(
-                "UPDATE users SET name = %s, email = %s WHERE id = %s RETURNING *",
-                (name, email, request.current_user["id"]),
-            )
-            row = cur.fetchone()
+            try:
+                cur.execute(
+                    "UPDATE users SET name = %s, email = %s WHERE id = %s RETURNING *",
+                    (name, email, request.current_user["id"]),
+                )
+                row = cur.fetchone()
+            except psycopg2.errors.UniqueViolation:
+                # Same narrow race as signup/google sign-in: another
+                # account could claim this exact email between the
+                # check above and this update.
+                conn.rollback()
+                return jsonify({"error": "That email is already in use"}), 409
     finally:
         conn.close()
 
