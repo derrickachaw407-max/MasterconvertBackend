@@ -323,7 +323,7 @@ def user_row_to_dict(row):
         "email": row["email"],
         "plan": row["plan"],
         "referral_code": row["referral_code"],
-        "bonus_credit_months": row["bonus_credit_months"],
+        "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
         "conversions_remaining": max(0, FREE_CONVERSIONS_LIMIT - used) if is_free else None,
         "conversions_limit": FREE_CONVERSIONS_LIMIT if is_free else None,
     }
@@ -733,6 +733,10 @@ def signup():
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are all required"}), 400
+    if len(name) > 200:
+        return jsonify({"error": "That name is too long (200 characters max)"}), 400
+    if len(email) > 254:  # RFC 5321's own limit on a valid email address
+        return jsonify({"error": "That email is too long"}), 400
     if not EMAIL_RE.match(email):
         return jsonify({"error": "That doesn't look like a valid email"}), 400
     if len(password) < 8:
@@ -746,15 +750,26 @@ def signup():
                 return jsonify({"error": "An account with that email already exists"}), 409
 
             referral_code = generate_referral_code(name)
-            cur.execute(
-                """
-                INSERT INTO users (name, email, password_hash, referral_code)
-                VALUES (%s, %s, %s, %s)
-                RETURNING *
-                """,
-                (name, email, generate_password_hash(password), referral_code),
-            )
-            row = cur.fetchone()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO users (name, email, password_hash, referral_code)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (name, email, generate_password_hash(password), referral_code),
+                )
+                row = cur.fetchone()
+            except psycopg2.errors.UniqueViolation:
+                # The explicit check above has a real, if narrow, race: two
+                # signups for the same email arriving at nearly the same
+                # moment can both pass it before either commits. The
+                # database's own unique constraint is the actual backstop,
+                # and its violation is translated to the same clear
+                # message the explicit check gives, rather than falling
+                # through to a generic 500.
+                conn.rollback()
+                return jsonify({"error": "An account with that email already exists"}), 409
     finally:
         conn.close()
 
@@ -772,6 +787,9 @@ def login():
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
 
+    if not email or not password:
+        return jsonify({"error": "Email and password are both required"}), 400
+
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -780,7 +798,18 @@ def login():
     finally:
         conn.close()
 
-    if not row or not row["password_hash"] or not check_password_hash(row["password_hash"], password):
+    # check_password_hash always runs, even for an email that doesn't
+    # exist at all (against a fixed dummy hash in that case) — hashing
+    # is deliberately the slow part of this check, and skipping it
+    # specifically when the email is unknown would make that one case
+    # measurably faster than a wrong-password case, which is exactly
+    # the kind of timing gap that lets an attacker enumerate which
+    # emails have accounts without ever seeing a password.
+    dummy_hash = "pbkdf2:sha256:600000$0000000000000000$0000000000000000000000000000000000000000000000000000000000000000"
+    stored_hash = (row["password_hash"] if row and row["password_hash"] else dummy_hash)
+    password_ok = check_password_hash(stored_hash, password)
+
+    if not row or not row["password_hash"] or not password_ok:
         return jsonify({"error": "Incorrect email or password"}), 401
 
     return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
@@ -855,6 +884,13 @@ def reset_password():
                 "UPDATE users SET password_hash = %s WHERE id = %s",
                 (generate_password_hash(new_password), user_id),
             )
+            if cur.rowcount == 0:
+                # The token's signature was valid, but the account it
+                # points to no longer exists (deleted after the reset
+                # link was sent, or similar) — telling the user their
+                # password was updated when nothing was actually
+                # changed would be a false success.
+                return jsonify({"error": "This account no longer exists."}), 400
     finally:
         conn.close()
 
@@ -875,12 +911,22 @@ def google_signin():
 
     data = request.get_json(silent=True) or {}
     credential = data.get("credential") or ""
+    if not credential:
+        return jsonify({"error": "No Google credential was provided"}), 400
     try:
         payload = google_id_token.verify_oauth2_token(
             credential, google_requests.Request(), GOOGLE_CLIENT_ID
         )
     except ValueError:
-        return jsonify({"error": "Google sign-in failed"}), 401
+        return jsonify({"error": "Google sign-in failed — that credential wasn't valid"}), 401
+    except Exception as e:
+        # verify_oauth2_token can also fail on a transient network/transport
+        # problem reaching Google's own servers, not just an invalid
+        # credential (a ValueError) — worth its own message, since "isn't
+        # valid" would be misleading for what's actually a connectivity
+        # blip on our end.
+        logger.error(f"Google sign-in verification failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't reach Google to verify sign-in. Please try again."}), 503
 
     google_sub = payload["sub"]
     email = (payload.get("email") or "").strip().lower()
@@ -897,15 +943,31 @@ def google_signin():
                     row = cur.fetchone()
             else:
                 referral_code = generate_referral_code(name)
-                cur.execute(
-                    """
-                    INSERT INTO users (name, email, google_sub, referral_code)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING *
-                    """,
-                    (name, email, google_sub, referral_code),
-                )
-                row = cur.fetchone()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO users (name, email, google_sub, referral_code)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (name, email, google_sub, referral_code),
+                    )
+                    row = cur.fetchone()
+                except psycopg2.errors.UniqueViolation:
+                    # The same narrow race as signup's — two sign-in
+                    # attempts for the same brand-new Google account
+                    # landing at nearly the same moment. Unlike signup,
+                    # this isn't really the user's fault and isn't a
+                    # "duplicate account" in the same sense — the other
+                    # concurrent request already created the account by
+                    # now, so re-querying and continuing normally
+                    # fulfills the same "sign in with Google" intent
+                    # instead of surfacing an error for it.
+                    conn.rollback()
+                    cur.execute("SELECT * FROM users WHERE google_sub = %s OR email = %s", (google_sub, email))
+                    row = cur.fetchone()
+                    if not row:
+                        return jsonify({"error": "Google sign-in failed. Please try again."}), 500
     finally:
         conn.close()
 
