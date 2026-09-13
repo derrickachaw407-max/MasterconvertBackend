@@ -2153,7 +2153,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         state["bullet_count"] += 1
         state["lines_used"] += subhead_lines
 
-    def add_table_slide(table):
+    def add_table_slide(table, carried_title=None):
         src_rows = [list(row.cells) for row in table.rows]
         rows = [[_full_cell_text(cell).strip() for cell in row] for row in src_rows]
         keep = [i for i, r in enumerate(rows) if any(r)]
@@ -2162,9 +2162,31 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         rows = [rows[i] for i in keep]
         src_rows = [src_rows[i] for i in keep]
         n_rows, n_cols = len(rows), max(len(r) for r in rows)
-        s = prs.slides.add_slide(blank_layout)
-        left, top = PptxInches(0.6), PptxInches(0.6)
-        width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
+
+        # carried_title (the heading immediately preceding this table, if
+        # any) comes from the caller's own lookahead, not from deleting an
+        # already-created slide here — confirmed directly that python-pptx's
+        # documented slide-deletion recipe only detaches the <p:sldId>
+        # reference and leaves the underlying part/relationship orphaned,
+        # which silently corrupted the saved file (a duplicate slide part
+        # name) the moment a second such table appeared later in the same
+        # document. Never creating the empty slide in the first place
+        # avoids that whole class of problem.
+        s = prs.slides.add_slide(title_layout if carried_title else blank_layout)
+        if carried_title:
+            s.shapes.title.text = carried_title
+            _style_pptx_slide(s, template_style)
+            # The title layout's own body placeholder isn't needed here —
+            # the table below is the slide's actual content — and leaving
+            # an empty placeholder box behind would just be visual clutter.
+            body_ph = s.placeholders[1] if len(s.placeholders) > 1 else None
+            if body_ph is not None:
+                body_ph._element.getparent().remove(body_ph._element)
+            left, top = PptxInches(0.6), PptxInches(1.7)
+            width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3)
+        else:
+            left, top = PptxInches(0.6), PptxInches(0.6)
+            width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
         gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
         merges = _find_docx_merges(src_rows, n_cols)
@@ -2297,10 +2319,18 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     MAX_SHAPES = 30
     shape_count = 0
 
-    for block in _iter_block_items(doc):
+    # A list, not the raw generator, specifically so a heading can look
+    # one item ahead to see whether a table follows it immediately — see
+    # the comment in add_table_slide for why that lookahead exists.
+    blocks = list(_iter_block_items(doc))
+    pending_table_title = None
+
+    for block_idx, block in enumerate(blocks):
         if isinstance(block, DocxTable):
-            add_table_slide(block)
+            add_table_slide(block, carried_title=pending_table_title)
+            pending_table_title = None
             continue
+        pending_table_title = None
         para = block
         if image_count < MAX_IMAGES:
             for img_bytes in _iter_inline_images(para, doc):
@@ -2332,7 +2362,16 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # the current slide rather than fragmenting into ever-thinner
         # slides for what's usually meant to be one cohesive topic.
         if para_style_name == "title" or (heading_match and int(heading_match.group(1)) <= 2):
-            new_slide(text)
+            next_block = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
+            if isinstance(next_block, DocxTable):
+                # This heading has nothing else to show but a table right
+                # after it — deferring the slide entirely (rather than
+                # creating one now and a second, unlabeled one for the
+                # table) means the table gets exactly one properly
+                # titled slide instead of two confusing ones.
+                pending_table_title = text
+            else:
+                new_slide(text)
         elif heading_match:
             add_subheading(text)
         else:
