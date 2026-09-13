@@ -26,7 +26,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from converters import (
     convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
-    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails,
+    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx,
 )
 
 app = Flask(__name__)
@@ -1571,6 +1571,132 @@ def summarize_endpoint():
         return jsonify({"bullets": bullets})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
+
+
+QUIZ_SYSTEM_PROMPT = (
+    "You write practice quiz questions for a tutoring app, from whatever study material the "
+    "user gives you. Return ONLY a JSON array — no markdown code fences, no preamble, no "
+    "commentary before or after it, nothing but the array itself, starting with [ and ending "
+    "with ].\n\n"
+    "Each element is an object with exactly these keys:\n"
+    '  "type": either "multiple_choice" or "short_answer"\n'
+    '  "question": the question text, self-contained and answerable from the material given\n'
+    '  "options": for multiple_choice ONLY — an array of exactly 4 plausible answer choices, '
+    "in any order, as plain strings with no letter prefixes (the document adds A/B/C/D itself); "
+    "omit this key entirely for short_answer\n"
+    '  "correct_answer": for multiple_choice, the exact text of the correct option, copied '
+    "verbatim from the options array; for short_answer, a concise model answer\n"
+    '  "explanation": one short sentence on why that answer is correct — this is for an '
+    "answer key a tutor reviews with a student, not for the student's copy of the quiz\n\n"
+    "Write a mix of multiple_choice and short_answer unless told otherwise. Base every "
+    "question strictly on the material provided — never introduce facts the material doesn't "
+    "support or contradict it. Vary difficulty and phrasing rather than restating the same "
+    "fact multiple ways. If the material is too short or thin to support the requested number "
+    "of distinct questions, return as many genuinely distinct ones as it actually supports "
+    "rather than padding with repetitive or trivial ones."
+)
+
+
+def _parse_quiz_json(raw_text):
+    """Claude is instructed to return a bare JSON array, but models
+    sometimes wrap it in a markdown code fence despite that instruction
+    — stripped defensively here rather than trusting the instruction
+    held. Raises ConversionError with a clear, non-technical message on
+    anything that still doesn't parse, rather than letting a JSON
+    error surface as a raw 500."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        text = text.strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise ConversionError("Couldn't generate a quiz from that material — please try again.")
+    if not isinstance(data, list) or not data:
+        raise ConversionError("Couldn't generate a quiz from that material — please try again.")
+
+    questions = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        q_type = item.get("type") if item.get("type") in ("multiple_choice", "short_answer") else "short_answer"
+        q_text = str(item.get("question") or "").strip()
+        if not q_text:
+            continue
+        options = item.get("options") if isinstance(item.get("options"), list) else None
+        if q_type == "multiple_choice" and (not options or len(options) < 2):
+            q_type = "short_answer"  # a malformed MC question still becomes a usable question, not a dropped one
+            options = None
+        questions.append({
+            "type": q_type,
+            "question": q_text,
+            "options": [str(o) for o in options][:8] if options else None,
+            "correct_answer": str(item.get("correct_answer") or "").strip(),
+            "explanation": str(item.get("explanation") or "").strip(),
+        })
+    if not questions:
+        raise ConversionError("Couldn't generate a quiz from that material — please try again.")
+    return questions
+
+
+@app.route("/api/quiz/generate", methods=["POST", "OPTIONS"])
+@auth_required
+def quiz_generate_endpoint():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    title = (data.get("title") or "Practice Quiz").strip()[:150]
+    if not text:
+        return jsonify({"error": "No study material provided"}), 400
+    if len(text) > 30000:
+        return jsonify({"error": "Text too long (30,000 character limit)"}), 400
+
+    num_questions = data.get("num_questions", 8)
+    try:
+        num_questions = int(num_questions)
+    except (TypeError, ValueError):
+        num_questions = 8
+    num_questions = max(3, min(20, num_questions))
+
+    question_style = data.get("question_style") or "a mix of multiple_choice and short_answer"
+    if question_style == "multiple_choice":
+        question_style = "only multiple_choice"
+    elif question_style == "short_answer":
+        question_style = "only short_answer"
+    else:
+        question_style = "a mix of multiple_choice and short_answer"
+
+    user_message = (
+        f"Generate exactly {num_questions} questions ({question_style}) from this material:\n\n{text}"
+    )
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_quiz_{uuid.uuid4().hex[:8]}_")
+    try:
+        try:
+            result = call_claude(
+                system_prompt=QUIZ_SYSTEM_PROMPT,
+                user_message=user_message,
+                max_tokens=4000,
+            )
+            questions = _parse_quiz_json(result)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 502
+
+        try:
+            result_path = quiz_to_docx(title, questions, work_dir)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+
+        safe_title = safe_download_name(title).replace(" ", "_") or "Practice_Quiz"
+        return send_file(
+            result_path, mimetype=MIME_TYPES["docx"], as_attachment=True,
+            download_name=f"{safe_title}.docx",
+        )
+    except Exception as e:
+        logger.error(f"Quiz generation failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Quiz generation failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 ROLE_DESCRIPTION = (

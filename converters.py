@@ -4074,6 +4074,127 @@ def academic_essay_to_docx(payload, out_dir):
     return out_path
 
 
+def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
+    """Builds a polished, printable practice quiz from AI-generated
+    question data — deliberately styled differently from
+    academic_essay_to_docx (Calibri, single-spaced, generous blank space
+    for handwritten answers) since a worksheet a student writes on and
+    a formal essay serve completely different purposes. No AI involved
+    here — pure deterministic formatting of content the caller already
+    generated and validated.
+
+    questions is a list of dicts, each with:
+      "type": "multiple_choice" or "short_answer"
+      "question": the question text
+      "options": list of answer choices (multiple_choice only)
+      "correct_answer": the correct option text, or a model short answer
+      "explanation": a brief note on why, shown only in the answer key
+    """
+    if not questions:
+        raise ConversionError("No questions were generated.")
+
+    doc = Document()
+    section = doc.sections[0]
+    section.left_margin = DocxInches(1)
+    section.right_margin = DocxInches(1)
+    section.top_margin = DocxInches(1)
+    section.bottom_margin = DocxInches(1)
+    _add_page_number_footer(doc)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = DocxPt(11)
+    normal.font.color.rgb = DocxRGBColor(0x22, 0x22, 0x22)
+    normal.paragraph_format.line_spacing = 1.15
+
+    def set_run(run, size=11, bold=False, italic=False, color=None):
+        run.font.name = "Calibri"
+        run.font.size = DocxPt(size)
+        run.font.color.rgb = color or DocxRGBColor(0x22, 0x22, 0x22)
+        run.bold = bold
+        run.italic = italic
+        return run
+
+    title_p = doc.add_paragraph()
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_run(title_p.add_run(_sanitize_xml_text(str(title)[:200])), size=20, bold=True)
+
+    # A real, printable worksheet has somewhere to write a name and
+    # date — a small, deliberate touch that a plain AI-generated
+    # question list wouldn't include on its own.
+    name_p = doc.add_paragraph()
+    name_p.paragraph_format.space_before = DocxPt(18)
+    name_p.paragraph_format.space_after = DocxPt(18)
+    set_run(name_p.add_run("Name: " + "_" * 28 + "        Date: " + "_" * 14), size=11)
+
+    for i, q in enumerate(questions, 1):
+        q_type = q.get("type") or "short_answer"
+        q_text = str(q.get("question") or "").strip()
+        if not q_text:
+            continue
+
+        q_p = doc.add_paragraph()
+        q_p.paragraph_format.space_before = DocxPt(14)
+        q_p.paragraph_format.space_after = DocxPt(4)
+        set_run(q_p.add_run(f"{i}. "), bold=True)
+        set_run(q_p.add_run(_sanitize_xml_text(q_text)), bold=True)
+
+        if q_type == "multiple_choice" and isinstance(q.get("options"), list) and q["options"]:
+            letters = "ABCDEFGH"
+            for j, opt in enumerate(q["options"][:8]):
+                opt_p = doc.add_paragraph()
+                opt_p.paragraph_format.left_indent = DocxInches(0.4)
+                opt_p.paragraph_format.space_after = DocxPt(2)
+                set_run(opt_p.add_run(f"{letters[j]}. "), bold=False)
+                set_run(opt_p.add_run(_sanitize_xml_text(str(opt))))
+        else:
+            # Short answer: three ruled writing lines made of literal
+            # underscore text, not paragraph borders — confirmed
+            # directly that consecutive paragraph borders here get
+            # merged by Word/LibreOffice's rendering into a single
+            # line (a real, known OOXML behavior for adjacent
+            # identical borders), which silently produced only one
+            # visible line no matter how the spacing was adjusted.
+            # Underscores as actual run content sidestep that
+            # entirely and render exactly as three separate lines.
+            for _ in range(3):
+                line_p = doc.add_paragraph()
+                line_p.paragraph_format.left_indent = DocxInches(0.4)
+                line_p.paragraph_format.space_before = DocxPt(16)
+                set_run(line_p.add_run("_" * 70), color=DocxRGBColor(0x99, 0x99, 0x99))
+
+    # Answer key on its own page — a tutor handing this to a student
+    # hands over the first page only, or the whole thing to grade it
+    # themselves; either way the two need to be cleanly separable.
+    doc.add_page_break()
+    key_title = doc.add_paragraph()
+    key_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    set_run(key_title.add_run("Answer Key"), size=18, bold=True)
+
+    for i, q in enumerate(questions, 1):
+        q_text = str(q.get("question") or "").strip()
+        if not q_text:
+            continue
+        ans = str(q.get("correct_answer") or "").strip()
+        expl = str(q.get("explanation") or "").strip()
+
+        ans_p = doc.add_paragraph()
+        ans_p.paragraph_format.space_before = DocxPt(10)
+        ans_p.paragraph_format.space_after = DocxPt(1)
+        set_run(ans_p.add_run(f"{i}. "), bold=True)
+        set_run(ans_p.add_run(_sanitize_xml_text(ans)), bold=True, color=DocxRGBColor(0x1a, 0x7a, 0x4a))
+
+        if expl:
+            expl_p = doc.add_paragraph()
+            expl_p.paragraph_format.left_indent = DocxInches(0.3)
+            set_run(expl_p.add_run(_sanitize_xml_text(expl)), size=10, italic=True, color=DocxRGBColor(0x66, 0x66, 0x66))
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    doc.save(out_path)
+    return out_path
+
+
 # --------------------------------------------------------- extract raw text
 def extract_text(src_path, ext):
     """Pull plain text out of an uploaded file for use in the AI tools.
