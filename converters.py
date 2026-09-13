@@ -3693,6 +3693,15 @@ CONVERTERS = {
 
 
 def convert(src_path, from_fmt, to_fmt, out_dir, style=None):
+    # Confirmed directly: a zero-byte upload doesn't fail at all for
+    # some conversion pairs (docx->pdf via LibreOffice happily produces
+    # a "successful," completely blank PDF from an empty source) —
+    # arguably worse than an error, since the user has no idea their
+    # own file was the problem rather than the tool. One check here
+    # covers every conversion pair, since they all route through this
+    # single function.
+    if os.path.getsize(src_path) == 0:
+        raise ConversionError("This file appears to be empty — there's nothing to convert.")
     key = (from_fmt.lower(), to_fmt.lower())
     if key not in CONVERTERS:
         raise ConversionError(f"Unsupported conversion: {from_fmt} -> {to_fmt}")
@@ -4423,10 +4432,17 @@ def _pdf_writer_to_file(writer, out_dir, filename="edited.pdf"):
     return out_path
 
 
-def _check_pdf_not_encrypted(reader, action="edit"):
+def _check_pdf_not_encrypted(reader, action="edited"):
+    """action is the full past-participle word ("compressed", "split",
+    "watermarked"), not a bare verb — a naive action+"d" suffix was
+    tried here originally and confirmed broken for most of the actual
+    call sites ("compress"+"d" reads as "compressd", "split"+"d" as
+    "splitd"), since English past participles don't form from a
+    single fixed rule. Passing the whole correct word avoids needing
+    one."""
     if reader.is_encrypted:
         raise PdfEditError(
-            f"This PDF is password-protected and can't be {action}d until it's unlocked "
+            f"This PDF is password-protected and can't be {action} until it's unlocked "
             f"— use the remove-password tool first, with the correct password."
         )
 
@@ -4438,7 +4454,7 @@ def pdf_merge(pdf_paths, out_dir, filename="merged.pdf"):
     writer = pypdf.PdfWriter()
     for path in pdf_paths:
         reader = _safe_load(pypdf.PdfReader, path)
-        _check_pdf_not_encrypted(reader, "merge")
+        _check_pdf_not_encrypted(reader, "merged")
         for page in reader.pages:
             writer.add_page(page)
     return _pdf_writer_to_file(writer, out_dir, filename)
@@ -4453,7 +4469,7 @@ def pdf_reorder_pages(pdf_path, out_dir, order_spec, filename="reordered.pdf"):
     include) than an intentional page deletion, and delete_pages is
     the explicit, named tool for that."""
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "reorder")
+    _check_pdf_not_encrypted(reader, "reordered")
     total = len(reader.pages)
     indices = _parse_pdf_page_spec(order_spec, total)
     if sorted(indices) != list(range(total)):
@@ -4474,7 +4490,7 @@ def pdf_delete_pages(pdf_path, out_dir, pages_spec, filename="deleted.pdf"):
     """Removes the specified pages, keeping the rest in their original
     order."""
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "edit")
+    _check_pdf_not_encrypted(reader, "edited")
     total = len(reader.pages)
     to_remove = set(_parse_pdf_page_spec(pages_spec, total))
     if len(to_remove) >= total:
@@ -4491,7 +4507,7 @@ def pdf_extract_pages(pdf_path, out_dir, pages_spec, filename="extracted.pdf"):
     also how a user reorders while dropping pages in one step, rather
     than needing reorder and delete as two separate operations."""
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "edit")
+    _check_pdf_not_encrypted(reader, "edited")
     total = len(reader.pages)
     indices = _parse_pdf_page_spec(pages_spec, total)
     if not indices:
@@ -4536,7 +4552,7 @@ def pdf_rotate_pages(pdf_path, out_dir, pages_spec, degrees, filename="rotated.p
     if degrees % 90 != 0:
         raise PdfEditError("Rotation must be a multiple of 90 degrees.")
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "rotate")
+    _check_pdf_not_encrypted(reader, "rotated")
     total = len(reader.pages)
     targets = set(_parse_pdf_page_spec(pages_spec, total))
     writer = pypdf.PdfWriter()
@@ -4571,7 +4587,7 @@ def pdf_add_page_numbers(pdf_path, out_dir, position="bottom-center", start_at=1
     if position not in _PDF_NUMBER_POSITIONS:
         raise PdfEditError(f"Unknown position '{position}' — choose one of {', '.join(_PDF_NUMBER_POSITIONS)}.")
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "number")
+    _check_pdf_not_encrypted(reader, "numbered")
     total_pages = len(reader.pages)
     targets = set(_parse_pdf_page_spec(pages_spec, total_pages))
     total_numbered = len(targets)
@@ -4616,7 +4632,7 @@ def pdf_add_watermark(pdf_path, out_dir, text, pages_spec="all", opacity=0.3,
     except (ValueError, IndexError):
         raise PdfEditError(f"'{color}' isn't a valid hex color (expected e.g. '808080').")
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "watermark")
+    _check_pdf_not_encrypted(reader, "watermarked")
     total_pages = len(reader.pages)
     targets = set(_parse_pdf_page_spec(pages_spec, total_pages))
     writer = pypdf.PdfWriter()
@@ -4650,7 +4666,7 @@ def pdf_set_password(pdf_path, out_dir, user_password, owner_password=None, file
     if not user_password:
         raise PdfEditError("A password is required to protect a PDF.")
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "password-protect")
+    _check_pdf_not_encrypted(reader, "password-protected")
     writer = pypdf.PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
@@ -4684,7 +4700,7 @@ def pdf_compress(pdf_path, out_dir, image_quality=60, filename="compressed.pdf")
     if not (1 <= image_quality <= 100):
         raise PdfEditError("Image quality must be between 1 and 100.")
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "compress")
+    _check_pdf_not_encrypted(reader, "compressed")
     writer = pypdf.PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
@@ -4766,7 +4782,7 @@ def pdf_get_page_thumbnails(pdf_path, out_dir, max_pages=200, dpi=80):
     since rendering hundreds of thumbnails at once isn't a reasonable
     single request regardless of how fast any one page is."""
     reader = _safe_load(pypdf.PdfReader, pdf_path)
-    _check_pdf_not_encrypted(reader, "preview")
+    _check_pdf_not_encrypted(reader, "previewed")
     total = len(reader.pages)
     if total > max_pages:
         raise PdfEditError(
@@ -4825,6 +4841,22 @@ def apply_pdf_operations(pdf_path, operations, out_dir, extra_files=None):
     if not operations:
         raise PdfEditError("No edit operations were specified.")
     extra_files = extra_files or {}
+
+    # set_password is deferred to the end of the chain regardless of
+    # where the caller placed it — confirmed directly that queuing it
+    # before any other operation (compress, watermark, anything) fails
+    # with an encrypted-file error, since every other operation needs
+    # to read the PDF's actual content. The frontend's tool grid lets
+    # someone tap "Add password" and "Compress" in either order, and
+    # there's exactly one order that ever makes sense regardless of
+    # which was tapped first — so the system enforces it rather than
+    # relying on the user to have gotten the sequence right themselves.
+    # remove_password is deliberately untouched: it has to run first,
+    # not last, to unlock the file for whatever follows it.
+    password_ops = [op for op in operations if op.get("type") == "set_password"]
+    other_ops = [op for op in operations if op.get("type") != "set_password"]
+    operations = other_ops + password_ops
+
     current_path = pdf_path
     os.makedirs(out_dir, exist_ok=True)
     for step_num, op in enumerate(operations, 1):
