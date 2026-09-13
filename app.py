@@ -1628,11 +1628,27 @@ def _parse_quiz_json(raw_text):
         if q_type == "multiple_choice" and (not options or len(options) < 2):
             q_type = "short_answer"  # a malformed MC question still becomes a usable question, not a dropped one
             options = None
+        correct_answer = str(item.get("correct_answer") or "").strip()
+        if q_type == "multiple_choice" and options and correct_answer:
+            # Confirmed directly this is a real failure mode, not a
+            # theoretical one: a model can name a correct_answer that
+            # doesn't actually match any of its own listed options
+            # (case/whitespace variation, or an outright inconsistency
+            # like answering "Paris" to a question whose choices are
+            # London/Berlin/Madrid/Rome). A student checking the answer
+            # key against a quiz where the right answer isn't even one
+            # of the choices is a worse experience than a short-answer
+            # question, so this downgrades the same way too-few-options
+            # already does above rather than shipping a quiz that
+            # can't actually be answered as multiple-choice.
+            if not any(correct_answer.lower() == str(o).strip().lower() for o in options):
+                q_type = "short_answer"
+                options = None
         questions.append({
             "type": q_type,
             "question": q_text,
             "options": [str(o) for o in options][:8] if options else None,
-            "correct_answer": str(item.get("correct_answer") or "").strip(),
+            "correct_answer": correct_answer,
             "explanation": str(item.get("explanation") or "").strip(),
         })
     if not questions:
