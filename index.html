@@ -1275,6 +1275,7 @@
 
       <div class="segment" id="aiSegment">
         <button class="seg-btn active" data-mode="summarize" onclick="setAIMode('summarize')">Smart Summarize</button>
+        <button class="seg-btn" data-mode="quiz" onclick="setAIMode('quiz')">Practice Quiz</button>
         <button class="seg-btn" data-mode="cite" onclick="setAIMode('cite')">Evidence-Based Writing</button>
       </div>
       
@@ -1303,6 +1304,34 @@
           <ul class="bullet-list" id="summarizeBulletList"></ul>
           <button class="btn btn-secondary btn-block" id="exportPptxBtn" style="margin-top:0;" onclick="exportTextToPptx()">Export to PowerPoint</button>
         </div>
+      </div>
+
+      <div id="aiQuizPanel" style="display:none;">
+        <label class="field-label" for="quizInput">Study Material</label>
+        <textarea class="textarea" id="quizInput" placeholder="Upload a document (.txt, .docx, .pdf) or paste lecture notes, a textbook chapter, or any material to build a practice quiz from..."></textarea>
+
+        <button class="btn btn-secondary btn-block" type="button" onclick="triggerAIUpload('quiz')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="M8 8l4-4 4 4"/><path d="M5 16v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/></svg>
+          Upload Document (.txt, .docx, .pdf)
+        </button>
+
+        <div class="section-label" style="margin-top:16px;">Number of Questions</div>
+        <div style="display:flex; gap:8px;" id="quizCountChips">
+          <button class="chip" data-count="5" onclick="selectQuizChip(this, 'count')">5</button>
+          <button class="chip selected" data-count="8" onclick="selectQuizChip(this, 'count')">8</button>
+          <button class="chip" data-count="12" onclick="selectQuizChip(this, 'count')">12</button>
+          <button class="chip" data-count="15" onclick="selectQuizChip(this, 'count')">15</button>
+        </div>
+
+        <div class="section-label">Question Style</div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;" id="quizStyleChips">
+          <button class="chip selected" data-style="mixed" onclick="selectQuizChip(this, 'style')">Mixed</button>
+          <button class="chip" data-style="multiple_choice" onclick="selectQuizChip(this, 'style')">Multiple Choice</button>
+          <button class="chip" data-style="short_answer" onclick="selectQuizChip(this, 'style')">Short Answer</button>
+        </div>
+
+        <button class="btn btn-primary btn-block" id="quizGenerateBtn" style="margin-top:16px;" onclick="runQuizGenerate()">Generate Practice Quiz</button>
+        <p class="hint" id="quizStatus" style="display:none; margin-top:10px;"></p>
       </div>
 
       <div id="aiCitePanel" style="display:none;">
@@ -2906,6 +2935,7 @@
   function setAIMode(mode){
     document.querySelectorAll('#aiSegment .seg-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
     document.getElementById('aiSummarizePanel').style.display = mode === 'summarize' ? 'block' : 'none';
+    document.getElementById('aiQuizPanel').style.display = mode === 'quiz' ? 'block' : 'none';
     document.getElementById('aiCitePanel').style.display = mode === 'cite' ? 'block' : 'none';
   }
   
@@ -2980,6 +3010,82 @@
     })
     .catch(function(err){ showToast(err.message || 'Summarize failed'); })
     .finally(function(){ btn.textContent = 'Summarize to Slides'; btn.disabled = false; });
+  }
+
+  // ---------- Practice Quiz Generator ----------
+  let quizSelectedCount = 8;
+  let quizSelectedStyle = 'mixed';
+
+  function selectQuizChip(el, kind){
+    const container = kind === 'count' ? document.getElementById('quizCountChips') : document.getElementById('quizStyleChips');
+    container.querySelectorAll('.chip').forEach(function(c){ c.classList.remove('selected'); });
+    el.classList.add('selected');
+    if (kind === 'count') quizSelectedCount = parseInt(el.dataset.count, 10);
+    else quizSelectedStyle = el.dataset.style;
+  }
+
+  function quizSetStatus(text, isError){
+    const el = document.getElementById('quizStatus');
+    if (!text){ el.style.display = 'none'; return; }
+    el.style.display = '';
+    el.textContent = text;
+    el.style.color = isError ? 'var(--coral)' : 'var(--ash-dim)';
+  }
+
+  function runQuizGenerate(){
+    const text = document.getElementById('quizInput').value.trim();
+    if (!text) { showToast('Please enter text or upload a document first.'); return; }
+    if (!navigator.onLine) { showToast('No internet connection.'); return; }
+    if (API_BASE.indexOf('your-backend-url') !== -1) { showToast('Backend not connected yet — see backend/README.md'); return; }
+
+    const btn = document.getElementById('quizGenerateBtn');
+    btn.textContent = 'Generating…'; btn.disabled = true;
+    quizSetStatus('Generating your practice quiz…', false);
+
+    // XHR with responseType 'blob', not authFetch — this endpoint
+    // returns a .docx file to download, not JSON, matching the same
+    // pattern already used for convert and the PDF editor's apply step.
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', API_BASE + '/api/quiz/generate');
+    xhr.responseType = 'blob';
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    if (authToken) xhr.setRequestHeader('Authorization', 'Bearer ' + authToken);
+    xhr.onload = function(){
+      if (xhr.status === 401){
+        clearToken(); showAuthScreenUI();
+        showToast('Your session expired — please log in again');
+        btn.textContent = 'Generate Practice Quiz'; btn.disabled = false;
+        quizSetStatus('', false);
+        return;
+      }
+      if (xhr.status === 200){
+        const blobUrl = URL.createObjectURL(xhr.response);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = 'Practice_Quiz.docx';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        quizSetStatus('Done — your practice quiz has downloaded.', false);
+      } else {
+        xhr.response.text().then(function(t){
+          let msg = 'Quiz generation failed.';
+          try { msg = JSON.parse(t).error || msg; } catch(e) {}
+          quizSetStatus(msg, true);
+        }).catch(function(){ quizSetStatus('Quiz generation failed.', true); });
+      }
+      btn.textContent = 'Generate Practice Quiz'; btn.disabled = false;
+    };
+    xhr.onerror = function(){
+      quizSetStatus('Network error — check your connection and try again.', true);
+      btn.textContent = 'Generate Practice Quiz'; btn.disabled = false;
+    };
+    xhr.ontimeout = function(){
+      quizSetStatus("That's taking too long — check your connection and try again.", true);
+      btn.textContent = 'Generate Practice Quiz'; btn.disabled = false;
+    };
+    xhr.timeout = 90000; // same reasoning as summarize's override: a real LLM call, not a quick DB op
+    xhr.send(JSON.stringify({ text: text, num_questions: quizSelectedCount, question_style: quizSelectedStyle }));
   }
 
   function escapeHtml(s){
