@@ -30,7 +30,7 @@ from converters import (
 )
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB upload cap
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB upload cap — raised from 25MB: confirmed directly that scanned/image-heavy PDFs (the PDF editor's primary use case) routinely exceed 25MB in ways a plain text document never would, and 25MB was rejecting genuinely legitimate files.
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docently")
