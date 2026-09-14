@@ -164,7 +164,7 @@ def _reconstruct_paragraphs(raw_text, font_headings=None, allow_heading_fallback
 
 
 
-def _extract_pdf_font_size_headings(pdf_path):
+def _extract_pdf_font_size_headings(pdfplumber_pdf):
     """Uses pdfplumber's real per-character font size and weight data
     (pypdf's extract_text() returns plain strings with no typographic
     info at all) to detect which lines across the document are genuine
@@ -179,32 +179,43 @@ def _extract_pdf_font_size_headings(pdf_path):
     document title and a 16pt section heading into the same level,
     since both comfortably clear a single "big enough" bar. Returns
     (headings_by_page, body_size) where headings_by_page maps
-    page_index -> {line_text: level}."""
+    page_index -> {line_text: level}.
+
+    Takes an already-open pdfplumber PDF object, not a path — this and
+    _extract_pdf_ruled_tables used to each open their own independent
+    pdfplumber.open() on the same file, the latter doing so once per
+    page. Profiled directly against a realistic 10-page document and
+    confirmed pdfplumber's own page-parsing machinery (page.objects and
+    everything it triggers) accounted for the overwhelming majority of
+    this function's total time -- re-opening and re-parsing the entire
+    file body eleven separate times for one document's worth of work.
+    pdf_to_docx now opens the file exactly once and passes that same
+    object to both functions.
+    """
     all_sizes = Counter()
     page_lines = []
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_idx, page in enumerate(pdf.pages):
-                try:
-                    words = page.extract_words(extra_attrs=["size", "fontname"])
-                except Exception:
-                    page_lines.append((page_idx, {}))
+        for page_idx, page in enumerate(pdfplumber_pdf.pages):
+            try:
+                words = page.extract_words(extra_attrs=["size", "fontname"])
+            except Exception:
+                page_lines.append((page_idx, {}))
+                continue
+            lines = {}
+            for w in words:
+                key = round(w["top"])
+                lines.setdefault(key, []).append(w)
+            line_data = {}
+            for top, line_words in lines.items():
+                text = " ".join(w["text"] for w in line_words).strip()
+                if not text:
                     continue
-                lines = {}
-                for w in words:
-                    key = round(w["top"])
-                    lines.setdefault(key, []).append(w)
-                line_data = {}
-                for top, line_words in lines.items():
-                    text = " ".join(w["text"] for w in line_words).strip()
-                    if not text:
-                        continue
-                    size = max(w["size"] for w in line_words)
-                    bold = any("bold" in w["fontname"].lower() for w in line_words)
-                    line_data[top] = (text, size, bold)
-                    all_sizes[round(size)] += len(text)  # weighted by character count, so
-                    # body text (far more total characters than any heading) dominates
-                page_lines.append((page_idx, line_data))
+                size = max(w["size"] for w in line_words)
+                bold = any("bold" in w["fontname"].lower() for w in line_words)
+                line_data[top] = (text, size, bold)
+                all_sizes[round(size)] += len(text)  # weighted by character count, so
+                # body text (far more total characters than any heading) dominates
+            page_lines.append((page_idx, line_data))
     except Exception:
         return {}, None  # a malformed/unusual PDF structure pdfplumber can't parse falls
         # back to the existing text-pattern-only heading heuristic, not a hard failure
@@ -239,7 +250,7 @@ def _extract_pdf_font_size_headings(pdf_path):
     return headings_by_page, body_size
 
 
-def _extract_pdf_ruled_tables(pdf_path, page_idx):
+def _extract_pdf_ruled_tables(pdfplumber_pdf, page_idx):
     """Detects tables on one page via pdfplumber's default ruled-line
     strategy only — deliberately not the more permissive text-alignment
     strategy, confirmed directly to be unsafe: tested against a real
@@ -250,12 +261,17 @@ def _extract_pdf_ruled_tables(pdf_path, page_idx):
     worth. The trade-off is real but the right one: a table with no
     visible ruling lines at all is missed and falls back to the
     existing paragraph-reconstruction text flow, rather than risking a
-    false positive that corrupts a page of real prose."""
+    false positive that corrupts a page of real prose.
+
+    Takes an already-open pdfplumber PDF object, not a path — see
+    _extract_pdf_font_size_headings for why (this was, until now, the
+    more severe half of that same problem: called once per page, each
+    call re-opening and re-parsing the entire file just to use one page
+    of the result)."""
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            if page_idx >= len(pdf.pages):
-                return []
-            return pdf.pages[page_idx].extract_tables()
+        if page_idx >= len(pdfplumber_pdf.pages):
+            return []
+        return pdfplumber_pdf.pages[page_idx].extract_tables()
     except Exception:
         return []
 
@@ -471,32 +487,46 @@ DOCX_STYLES = {
 }
 
 
-def _style_docx_headings(doc, style):
-    """Applies to every heading paragraph already in the document (headings
-    are added via doc.add_heading before this runs)."""
+def apply_docx_style(doc, style_name):
+    style = DOCX_STYLES.get(style_name, DOCX_STYLES["clean"])
+    # A single pass over doc.paragraphs, not two: _style_docx_headings
+    # and _style_docx_body previously each looped over every paragraph
+    # independently, meaning the same paragraph's .style.name — a
+    # property confirmed elsewhere in this file to be expensive,
+    # python-docx re-walking the style's XML from scratch on every
+    # access — was resolved twice. Merging into one pass halves that
+    # immediately; the cache below (keyed by the cheap raw XML value
+    # rather than the expensive resolved name, the same fix applied to
+    # docx_to_pptx above) additionally means paragraphs sharing the same
+    # style, the common case for a document's many body paragraphs,
+    # only pay that cost once for the whole document rather than once
+    # per paragraph. Scoped as a local, not module-level like the
+    # docx_to_pptx caches, since this function is itself the natural,
+    # single-call boundary — nothing to clear between conversions.
+    is_heading_cache = {}
     for para in doc.paragraphs:
-        if not para.style.name.lower().startswith("heading") and para.style.name != "Title":
-            continue
-        if style["uppercase_headings"]:
-            for run in para.runs:
-                run.text = run.text.upper()
-        for run in para.runs:
-            run.font.name = style["heading_font"]
-            run.font.color.rgb = style["heading_color"]
-
-
-def _style_docx_body(doc, style):
-    for para in doc.paragraphs:
-        is_heading = para.style.name.lower().startswith("heading") or para.style.name == "Title"
+        cache_key = para._p.style
+        if cache_key not in is_heading_cache:
+            name = para.style.name
+            is_heading_cache[cache_key] = name.lower().startswith("heading") or name == "Title"
+        is_heading = is_heading_cache[cache_key]
         if is_heading:
-            continue
-        for run in para.runs:
-            run.font.name = style["body_font"]
-            if run.font.size is None:
-                run.font.size = style["body_size"]
-        if style.get("tight_spacing"):
-            para.paragraph_format.space_before = DocxPt(0)
-            para.paragraph_format.space_after = DocxPt(2)
+            if style["uppercase_headings"]:
+                for run in para.runs:
+                    run.text = run.text.upper()
+            for run in para.runs:
+                run.font.name = style["heading_font"]
+                run.font.color.rgb = style["heading_color"]
+        else:
+            for run in para.runs:
+                run.font.name = style["body_font"]
+                if run.font.size is None:
+                    run.font.size = style["body_size"]
+            if style.get("tight_spacing"):
+                para.paragraph_format.space_before = DocxPt(0)
+                para.paragraph_format.space_after = DocxPt(2)
+    if style["page_numbers"]:
+        _add_docx_page_number_footer(doc)
 
 
 def _add_docx_page_number_footer(doc):
@@ -515,14 +545,6 @@ def _add_docx_page_number_footer(doc):
     run._r.append(fld_begin)
     run._r.append(instr)
     run._r.append(fld_end)
-
-
-def apply_docx_style(doc, style_name):
-    style = DOCX_STYLES.get(style_name, DOCX_STYLES["clean"])
-    _style_docx_headings(doc, style)
-    _style_docx_body(doc, style)
-    if style["page_numbers"]:
-        _add_docx_page_number_footer(doc)
 
 
 def _soffice_convert(src_path, target_format, out_dir):
@@ -3058,20 +3080,36 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     # below) writes a scratch rasterized PNG into out_dir well before the
     # final document save, which is the only place this used to be called
 
-    font_headings_by_page, _body_size = _extract_pdf_font_size_headings(src_path)
 
-    # Ruled tables (real grid lines, not just aligned text — see
-    # _extract_pdf_ruled_tables for why the more permissive strategy
-    # isn't used) are pulled out per page so they can be rebuilt as real
-    # Word tables rather than left to come through the ordinary text
-    # flow as a garbled run of individual cell values.
-    MAX_TABLE_PAGES = 40  # a table-detection pass opens the PDF again per page; capped for very long documents
+    # A single pdfplumber.open() for the whole function, not one per
+    # page: confirmed directly (profiled against a realistic 10-page
+    # document) that _extract_pdf_ruled_tables previously re-opened and
+    # re-parsed the entire file from scratch on every single page just
+    # to use one page of the result, and _extract_pdf_font_size_headings
+    # opened it separately again on top of that — eleven total opens of
+    # the same file for one document. try/except here preserves the
+    # same graceful fallback _extract_pdf_font_size_headings always had
+    # for a PDF structure pdfplumber itself can't open at all: text
+    # extraction still proceeds via pypdf below, just without the
+    # font-size heading detection or ruled-table extraction this pass
+    # adds on top of it.
     tables_by_page = {}
-    if n_pages <= MAX_TABLE_PAGES:
-        for page_idx in range(n_pages):
-            tables = _extract_pdf_ruled_tables(src_path, page_idx)
-            if tables:
-                tables_by_page[page_idx] = tables
+    try:
+        with pdfplumber.open(src_path) as pdfplumber_pdf:
+            font_headings_by_page, _body_size = _extract_pdf_font_size_headings(pdfplumber_pdf)
+            # Ruled tables (real grid lines, not just aligned text — see
+            # _extract_pdf_ruled_tables for why the more permissive strategy
+            # isn't used) are pulled out per page so they can be rebuilt as real
+            # Word tables rather than left to come through the ordinary text
+            # flow as a garbled run of individual cell values.
+            MAX_TABLE_PAGES = 40  # capped for very long documents
+            if n_pages <= MAX_TABLE_PAGES:
+                for page_idx in range(n_pages):
+                    tables = _extract_pdf_ruled_tables(pdfplumber_pdf, page_idx)
+                    if tables:
+                        tables_by_page[page_idx] = tables
+    except Exception:
+        font_headings_by_page, _body_size = {}, None
 
     page_items = []
     for page_idx, page in enumerate(reader.pages):
