@@ -2,6 +2,7 @@ import json
 import logging
 import base64
 import os
+import random
 import re
 import secrets
 import smtplib
@@ -1581,7 +1582,7 @@ QUIZ_SYSTEM_PROMPT = (
     "Each element is an object with exactly these keys:\n"
     '  "type": either "multiple_choice" or "short_answer"\n'
     '  "question": the question text, self-contained and answerable from the material given\n'
-    '  "options": for multiple_choice ONLY — an array of exactly 4 plausible answer choices, '
+    '  "options": for multiple_choice ONLY — an array of exactly 4 answer choices, '
     "in any order, as plain strings with no letter prefixes (the document adds A/B/C/D itself); "
     "omit this key entirely for short_answer\n"
     '  "correct_answer": for multiple_choice, the exact text of the correct option, copied '
@@ -1590,10 +1591,47 @@ QUIZ_SYSTEM_PROMPT = (
     "answer key a tutor reviews with a student, not for the student's copy of the quiz\n\n"
     "Write a mix of multiple_choice and short_answer unless told otherwise. Base every "
     "question strictly on the material provided — never introduce facts the material doesn't "
-    "support or contradict it. Vary difficulty and phrasing rather than restating the same "
-    "fact multiple ways. If the material is too short or thin to support the requested number "
-    "of distinct questions, return as many genuinely distinct ones as it actually supports "
-    "rather than padding with repetitive or trivial ones."
+    "support or contradict it. If the material is too short or thin to support the requested "
+    "number of distinct questions, return as many genuinely distinct ones as it actually "
+    "supports rather than padding with repetitive or trivial ones.\n\n"
+    "The multiple-choice questions you write must avoid these specific, well-documented "
+    "failure modes of AI-generated MCQs — each one is a concrete, checkable property, not a "
+    "vague quality goal:\n\n"
+    "1. NOT JUST RECALL. Don't make every question 'what is the definition of X' or 'which "
+    "term means Y'. For most questions, require applying a concept to a new situation, "
+    "comparing two ideas from the material, interpreting what a result or example implies, or "
+    "identifying why a plausible-sounding claim is actually wrong. A good rule of thumb: if the "
+    "question could be answered by finding one sentence in the material and matching its "
+    "wording to an option, rewrite it so the student has to reason with the material instead of "
+    "just locating it.\n"
+    "2. DISTRACTORS MUST BE GENUINELY TEMPTING, NOT OBVIOUSLY WRONG. Never write a throwaway, "
+    "silly, or extreme wrong option (nothing a student could eliminate without knowing the "
+    "material at all). Each of the 3 incorrect options should be something a student who "
+    "half-understood the material, or who holds a common misconception about it, would "
+    "plausibly pick. Base wrong options on: a real misconception about the topic, a mixed-up "
+    "adjacent fact from elsewhere in the material, a common calculation or reasoning error, or "
+    "a statement that's true in general but wrong in this specific context.\n"
+    "3. NO STRUCTURAL GIVEAWAYS. All 4 options must be similar to each other in length, "
+    "grammatical form, and level of detail — never make the correct answer the longest, the "
+    "most qualified/hedged, or the only one written as a complete sentence when the others are "
+    "fragments. A student should not be able to spot the answer by how it's written.\n"
+    "4. NO KEYWORD ECHOING. The correct option should not simply repeat a distinctive word or "
+    "phrase straight from the question stem — that's a giveaway that requires no actual "
+    "understanding. Paraphrase the correct answer using different wording than the stem where "
+    "the material allows it, and don't compensate by stuffing that same keyword into the "
+    "distractors either (vary all 4 options' wording naturally).\n"
+    "5. WRITE WITH A PURPOSE, NOT TO FILL A QUOTA. Before writing each question, identify one "
+    "specific fact, relationship, or skill from the material it's meant to test — don't "
+    "generate generic filler questions just to hit the requested count. Prefer testing the "
+    "ideas most central to the material, and points students commonly get confused about, over "
+    "minor or incidental details.\n"
+    "6. VARY DIFFICULTY ACROSS THE SET. Don't make every question the same difficulty — include "
+    "a genuine range from straightforward to challenging so the quiz can distinguish partial "
+    "understanding from mastery, not just pass/fail on the same level of question repeated.\n\n"
+    "You don't need to track or balance which letter position (A/B/C/D) ends up correct — "
+    "options are shuffled into random order after you write them, so putting the correct "
+    "answer in a natural, sensible place in your own options array (rather than always first "
+    "or always last) is all that's needed here."
 )
 
 
@@ -1644,10 +1682,24 @@ def _parse_quiz_json(raw_text):
             if not any(correct_answer.lower() == str(o).strip().lower() for o in options):
                 q_type = "short_answer"
                 options = None
+        final_options = [str(o) for o in options][:8] if options else None
+        if final_options:
+            # A model's own habits about *where* it places the correct
+            # option (first, or last, after the distractors) would
+            # otherwise carry straight through to the printed quiz —
+            # exactly the "predictable letter position" weakness a
+            # prompt instruction alone can't reliably fix, since an
+            # LLM asked to "randomize" its own output order isn't
+            # actually drawing from a uniform distribution. A real
+            # shuffle here is the only way to guarantee it. correct_answer
+            # is stored and matched by its text, not by position (the
+            # answer key prints that text directly, never a letter), so
+            # reordering this list can never desynchronize the two.
+            random.shuffle(final_options)
         questions.append({
             "type": q_type,
             "question": q_text,
-            "options": [str(o) for o in options][:8] if options else None,
+            "options": final_options,
             "correct_answer": correct_answer,
             "explanation": str(item.get("explanation") or "").strip(),
         })
@@ -1672,7 +1724,7 @@ def quiz_generate_endpoint():
         num_questions = int(num_questions)
     except (TypeError, ValueError):
         num_questions = 8
-    num_questions = max(3, min(20, num_questions))
+    num_questions = max(3, min(200, num_questions))
 
     question_style = data.get("question_style") or "a mix of multiple_choice and short_answer"
     if question_style == "multiple_choice":
@@ -1686,13 +1738,27 @@ def quiz_generate_endpoint():
         f"Generate exactly {num_questions} questions ({question_style}) from this material:\n\n{text}"
     )
 
+    # Scales with num_questions rather than a flat value: confirmed
+    # against the actual JSON shape (question + 4 options + answer +
+    # explanation per item) that a fixed 4000-token budget — sized for
+    # the old 20-question cap — would silently truncate a large
+    # request into invalid, unparseable JSON well before reaching 200
+    # questions. 300 tokens/question is a deliberately generous
+    # per-question estimate, since the richer, more carefully-reasoned
+    # distractors this prompt now asks for run longer than the
+    # shorter, weaker ones a bare-minimum prompt would produce.
+    # Capped at 64000 to stay within every current model's max-output
+    # ceiling (verified as low as 64K tokens for some tiers) regardless
+    # of which one handles this request.
+    max_tokens = min(64000, max(4000, num_questions * 300 + 500))
+
     work_dir = tempfile.mkdtemp(prefix=f"mc_quiz_{uuid.uuid4().hex[:8]}_")
     try:
         try:
             result = call_claude(
                 system_prompt=QUIZ_SYSTEM_PROMPT,
                 user_message=user_message,
-                max_tokens=4000,
+                max_tokens=max_tokens,
             )
             questions = _parse_quiz_json(result)
         except ConversionError as e:
