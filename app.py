@@ -1919,7 +1919,7 @@ def summarize_endpoint():
         except (TypeError, ValueError):
             slide_count = None
         else:
-            slide_count = max(3, min(15, slide_count))
+            slide_count = max(3, min(20, slide_count))
 
     # "auto" (slide_count is None) is a real, first-class default here,
     # not a missing value to fall back from: letting the AI decide slide
@@ -1938,11 +1938,25 @@ def summarize_endpoint():
     else:
         user_message = text
 
+    # Scales with the requested count rather than a flat number, the
+    # same fix already applied to the quiz generator's own token budget
+    # and for the identical reason: a fixed budget sized for a small
+    # request silently truncates a larger one into invalid, unparseable
+    # JSON rather than a clean error, which is exactly the failure mode
+    # a "give me 20 slides" option would otherwise hit. 300 tokens/slide
+    # is deliberately generous — a slide's JSON includes its header,
+    # up to 6 bullets, an icon, and sometimes chart data, and richer
+    # bullets (this prompt's whole point) run longer than bare-minimum
+    # ones would. The "auto" case (no explicit count) still gets more
+    # than the old flat 3000, since a long, rich source document can
+    # reasonably warrant many slides even without an explicit request.
+    max_tokens = min(8000, max(4000, (slide_count or 12) * 300 + 500))
+
     try:
         result = call_claude(
             system_prompt=SUMMARIZE_SYSTEM_PROMPT,
             user_message=user_message,
-            max_tokens=3000,
+            max_tokens=max_tokens,
         )
         slides = _parse_summary_json(result)
         return jsonify({"slides": slides})
