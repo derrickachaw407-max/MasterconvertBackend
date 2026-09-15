@@ -3799,6 +3799,139 @@ def convert(src_path, from_fmt, to_fmt, out_dir, style=None):
 
 
 # ------------------------------------------------------- raw text -> PPTX
+_SUMMARY_CHART_TYPES = {
+    "bar": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    "line": XL_CHART_TYPE.LINE,
+    "pie": XL_CHART_TYPE.PIE,
+}
+
+
+def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
+    """Builds the actual slide deck from the AI's structured slide plan
+    (see SUMMARIZE_SYSTEM_PROMPT / _parse_summary_json in app.py) — the
+    piece that was missing entirely before this: the app's own "Export
+    to PowerPoint" button had never actually used the AI's summary at
+    all, instead re-running the raw, un-summarized source text through
+    the separate text_to_pptx below. This is what genuinely turns a
+    condensed slide plan into a visually deliberate presentation, not
+    just a text dump with a title.
+
+    Custom-positioned textboxes throughout, not the standard title-and-
+    content placeholder layout used elsewhere in this file: this slide
+    plan's specific look (a large icon beside the header, generous fixed
+    margins, deliberately sparse vertical rhythm between bullets) needs
+    precise control a stock placeholder layout doesn't give.
+    """
+    if not slides:
+        raise ConversionError("No slides to build a presentation from.")
+
+    prs = Presentation()
+    prs.slide_width = PptxInches(13.333)
+    prs.slide_height = PptxInches(7.5)
+    blank_layout = prs.slide_layouts[6]
+
+    # Deliberately generous, fixed margins on every slide — combined with
+    # the 6-bullets/6-words cap already enforced upstream in the prompt,
+    # this is what actually produces the requested 30-40% empty space:
+    # sparse content alone isn't enough if the content box itself still
+    # spans nearly the full slide, so the usable area is kept well
+    # inside the true slide bounds on all four sides.
+    margin_x = PptxInches(1.0)
+    margin_top = PptxInches(0.9)
+    margin_bottom = PptxInches(0.9)
+    content_width = prs.slide_width - (2 * margin_x)
+
+    HEADER_COLOR = PptxRGBColor(0x1A, 0x1A, 0x1A)
+    BODY_COLOR = PptxRGBColor(0x33, 0x33, 0x33)
+    CTA_ACCENT = PptxRGBColor(0x1F, 0x6F, 0x4B)
+    CTA_BG = PptxRGBColor(0xF2, 0xF9, 0xF5)
+
+    for slide_data in slides:
+        slide = prs.slides.add_slide(blank_layout)
+        is_cta = bool(slide_data.get("is_cta"))
+        if is_cta:
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = CTA_BG
+
+        # Icon and header share one row: the icon sits as its own large,
+        # short textbox immediately left of the header rather than
+        # inline in the same run, since a single emoji glyph at a much
+        # larger point size than surrounding text renders unreliably
+        # mixed into one run across PowerPoint's various renderers.
+        icon = (slide_data.get("icon") or "").strip()
+        header_left = margin_x
+        if icon:
+            icon_box = slide.shapes.add_textbox(margin_x, margin_top, PptxInches(1.1), PptxInches(1.1))
+            icon_tf = icon_box.text_frame
+            icon_tf.word_wrap = False
+            icon_p = icon_tf.paragraphs[0]
+            icon_run = icon_p.add_run()
+            icon_run.text = icon
+            icon_run.font.size = Pt(44)
+            header_left = margin_x + PptxInches(1.15)
+
+        header_width = content_width - (header_left - margin_x)
+        header_box = slide.shapes.add_textbox(header_left, margin_top, header_width, PptxInches(1.1))
+        header_tf = header_box.text_frame
+        header_tf.word_wrap = True
+        header_p = header_tf.paragraphs[0]
+        header_run = header_p.add_run()
+        header_run.text = slide_data["header"]
+        header_run.font.size = Pt(32)  # meets the 32pt+ header requirement directly
+        header_run.font.bold = True
+        header_run.font.color.rgb = CTA_ACCENT if is_cta else HEADER_COLOR
+
+        content_top = margin_top + PptxInches(1.3)
+        content_height = prs.slide_height - content_top - margin_bottom
+
+        chart = slide_data.get("chart")
+        if chart:
+            chart_data = CategoryChartData()
+            chart_data.categories = chart["categories"]
+            chart_data.add_series(chart["series_name"], chart["values"])
+            try:
+                graphic_frame = slide.shapes.add_chart(
+                    _SUMMARY_CHART_TYPES[chart["type"]],
+                    margin_x, content_top, content_width, content_height,
+                    chart_data,
+                )
+                gc = graphic_frame.chart
+                gc.has_legend = chart["type"] == "pie"
+                if gc.has_legend:
+                    gc.legend.position = XL_LEGEND_POSITION.BOTTOM
+                    gc.legend.include_in_layout = False
+            except Exception:
+                # Same reasoning as the existing add_chart_slide elsewhere
+                # in this file: a data shape python-pptx's chart API can't
+                # build shouldn't sink the one slide, let alone the deck —
+                # fall back to the same plain-table rendering already
+                # proven elsewhere for exactly this failure case.
+                _add_chart_as_table_fallback(
+                    slide, chart["categories"], [(chart["series_name"], chart["values"])],
+                    prs.slide_width, prs.slide_height,
+                )
+        else:
+            body_box = slide.shapes.add_textbox(margin_x, content_top, content_width, content_height)
+            body_tf = body_box.text_frame
+            body_tf.word_wrap = True
+            for i, bullet in enumerate(slide_data.get("bullets") or []):
+                p = body_tf.paragraphs[0] if i == 0 else body_tf.add_paragraph()
+                # Generous space_after, not tight default paragraph spacing:
+                # this is the other half (with the fixed margins above) of
+                # actually producing visible whitespace between the sparse
+                # bullets themselves, not just around the content block.
+                p.space_after = Pt(22)
+                _add_markdown_aware_pptx_text(p, bullet)
+                for run in p.runs:
+                    run.font.size = Pt(22)  # comfortably clears the 18pt+ body requirement
+                    if run.font.color.type is None:
+                        run.font.color.rgb = BODY_COLOR
+
+    result_path = os.path.join(out_dir, filename)
+    prs.save(result_path)
+    return result_path
+
+
 def text_to_pptx(raw_text, out_dir):
     """Turn pasted plain text into a slide deck. Blocks separated by a
     blank line become slides; each block's first line is the slide title,
