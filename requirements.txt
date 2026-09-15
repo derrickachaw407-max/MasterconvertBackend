@@ -13,3 +13,5 @@ reportlab
 lxml
 Pillow
 google-auth
+PyJWT
+cryptography
