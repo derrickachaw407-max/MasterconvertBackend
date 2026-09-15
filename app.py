@@ -713,7 +713,7 @@ def add_cors_headers(resp):
     if _origin_is_allowed(origin):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary"
     return resp
@@ -1367,6 +1367,26 @@ def conversions_history():
             ]
         }
     )
+
+
+@app.route("/api/conversions/history", methods=["DELETE", "OPTIONS"])
+@auth_required
+def clear_conversions_history():
+    """Deletes this user's own conversion history rows — the record of
+    past conversions used to populate the home screen's Recent Activity
+    list, not the converted files themselves (those were never stored
+    server-side in the first place; each download happens directly from
+    the temporary work directory of that request and is gone once it
+    completes). A real, working action, not another cosmetic button —
+    unlike the pre-existing "Clear Local File Cache" button beside it in
+    Account Settings, which has nothing real to act on in a web app."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM conversions WHERE user_id = %s", (request.current_user["id"],))
+    finally:
+        conn.close()
+    return jsonify({"success": True})
 
 
 def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
