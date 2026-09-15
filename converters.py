@@ -3806,7 +3806,29 @@ _SUMMARY_CHART_TYPES = {
 }
 
 
-def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
+_SUMMARY_STYLES = {
+    "visual": {
+        "show_icon": True,
+        "cta_accent": True,
+        "bullet_prefix": "",  # relies on spacing/bold alone for hierarchy, not a bullet glyph
+    },
+    "plain": {
+        # "Plain" means undecorated styling, not lower-quality content —
+        # the 6x6 condensation, bold key-term spans, real charts, and
+        # generous whitespace are genuinely good regardless of visual
+        # theme, so none of that changes here. What's actually stripped
+        # is decoration: no emoji icon, no color accent distinguishing
+        # the CTA slide, and traditional bullet glyphs instead of relying
+        # on spacing alone — closer to a plain, formal outline a reader
+        # who wants the AI's text without a designed look would expect.
+        "show_icon": False,
+        "cta_accent": False,
+        "bullet_prefix": "\u2022  ",
+    },
+}
+
+
+def summary_slides_to_pptx(slides, out_dir, style="visual", filename="Summary.pptx"):
     """Builds the actual slide deck from the AI's structured slide plan
     (see SUMMARIZE_SYSTEM_PROMPT / _parse_summary_json in app.py) — the
     piece that was missing entirely before this: the app's own "Export
@@ -3816,6 +3838,12 @@ def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
     condensed slide plan into a visually deliberate presentation, not
     just a text dump with a title.
 
+    style picks between _SUMMARY_STYLES ("visual", the original
+    icon-and-accent-color look, or "plain", the undecorated variant) —
+    this only changes how the same already-generated slide plan is
+    rendered, not the plan itself, so re-exporting in the other style
+    needs no new AI call.
+
     Custom-positioned textboxes throughout, not the standard title-and-
     content placeholder layout used elsewhere in this file: this slide
     plan's specific look (a large icon beside the header, generous fixed
@@ -3824,6 +3852,7 @@ def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
     """
     if not slides:
         raise ConversionError("No slides to build a presentation from.")
+    style_conf = _SUMMARY_STYLES.get(style, _SUMMARY_STYLES["visual"])
 
     prs = Presentation()
     prs.slide_width = PptxInches(13.333)
@@ -3848,7 +3877,7 @@ def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
 
     for slide_data in slides:
         slide = prs.slides.add_slide(blank_layout)
-        is_cta = bool(slide_data.get("is_cta"))
+        is_cta = bool(slide_data.get("is_cta")) and style_conf["cta_accent"]
         if is_cta:
             slide.background.fill.solid()
             slide.background.fill.fore_color.rgb = CTA_BG
@@ -3858,7 +3887,7 @@ def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
         # inline in the same run, since a single emoji glyph at a much
         # larger point size than surrounding text renders unreliably
         # mixed into one run across PowerPoint's various renderers.
-        icon = (slide_data.get("icon") or "").strip()
+        icon = (slide_data.get("icon") or "").strip() if style_conf["show_icon"] else ""
         header_left = margin_x
         if icon:
             icon_box = slide.shapes.add_textbox(margin_x, margin_top, PptxInches(1.1), PptxInches(1.1))
@@ -3921,9 +3950,15 @@ def summary_slides_to_pptx(slides, out_dir, filename="Summary.pptx"):
                 # actually producing visible whitespace between the sparse
                 # bullets themselves, not just around the content block.
                 p.space_after = Pt(22)
+                if style_conf["bullet_prefix"]:
+                    prefix_run = p.add_run()
+                    prefix_run.text = style_conf["bullet_prefix"]
+                    prefix_run.font.size = Pt(22)
+                    prefix_run.font.color.rgb = BODY_COLOR
                 _add_markdown_aware_pptx_text(p, bullet)
                 for run in p.runs:
-                    run.font.size = Pt(22)  # comfortably clears the 18pt+ body requirement
+                    if run.font.size is None:
+                        run.font.size = Pt(22)  # comfortably clears the 18pt+ body requirement
                     if run.font.color.type is None:
                         run.font.color.rgb = BODY_COLOR
 

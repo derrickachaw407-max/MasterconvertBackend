@@ -27,7 +27,7 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from converters import (
-    convert, text_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
+    convert, text_to_pptx, summary_slides_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx,
 )
 
@@ -1791,6 +1791,117 @@ def extract_text_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+SUMMARIZE_SYSTEM_PROMPT = (
+    "You turn dense study material into a slide-by-slide presentation plan for a tutoring "
+    "app — not a flat list of bullet points, but a genuine sequence of slides, each doing one "
+    "job. Return ONLY a JSON array — no markdown code fences, no preamble, no commentary "
+    "before or after it, nothing but the array itself, starting with [ and ending with ].\n\n"
+    "Each element is one slide, an object with exactly these keys:\n"
+    '  "header": an action-oriented or descriptive headline for this one slide (e.g. '
+    '"Revenue Grew 15% in Q3", not a generic label like "Financials")\n'
+    '  "bullets": an array of short strings for this slide — omit or leave empty when '
+    'this slide instead uses "chart" below\n'
+    '  "icon": one single emoji that visually represents this slide\'s content (e.g. '
+    '\U0001F4C8 for growth, \U0001F4A1 for an idea, \u2705 for a takeaway/action) — pick '
+    "one that actually fits the specific content, not the same one repeatedly\n"
+    '  "chart": either null, or an object {"type": "bar"|"line"|"pie", "categories": '
+    '[...], "series_name": "...", "values": [...]} when — and only when — the source '
+    "material contains real numeric/comparative data suited to a chart\n"
+    '  "is_cta": true only on the final slide, false everywhere else\n\n'
+    "Follow every one of these — each is a specific, checkable property, not a vague style "
+    "goal:\n\n"
+    "1. RADICAL CONTENT CONDENSATION. The 6x6 rule: at most 6 bullets per slide, at most 6 "
+    "words per bullet. One idea per slide — isolate a single core message per slide rather "
+    "than crowding several concepts onto one; this means splitting the material across "
+    "multiple slides is expected and correct, not a fallback. Every header is an "
+    "action-oriented or descriptive headline stating the actual takeaway, never a generic "
+    "category label.\n"
+    "2. VISUAL HIERARCHY THROUGH BOLDING. Wrap key metrics, dates, names, and other "
+    "load-bearing terms in **double asterisks** so a reader can scan the slide in under "
+    "three seconds and immediately see what matters — but don't bold everything; bolding "
+    "every word bolds nothing.\n"
+    "3. DATA BECOMES CHARTS, NOT PROSE. When the source material contains real comparative "
+    'or numeric data (figures across categories, a trend over time, a breakdown of parts), '
+    'represent it with the "chart" field instead of describing it in bullets — a table or '
+    "paragraph of numbers in the source should become a bar/line/pie chart on the slide, not "
+    "restated as text. Only use a chart when the source genuinely has this kind of data; "
+    "don't invent numbers or force a chart where none fits.\n"
+    "4. PROGRESSIVE DISCLOSURE. Order the slides so they flow from a high-level big-picture "
+    "opening slide, through supporting detail slides, to a final takeaway/call-to-action "
+    "slide (is_cta: true) — never end on a random supporting detail.\n"
+    "5. CONTEXT IS PRESERVED, NEVER STRIPPED. Names, acronyms, dates, and specific figures "
+    "keep their exact original meaning — condensing to 6 words a bullet doesn't mean "
+    "vague-ing out a specific number or a proper noun; cut filler words, never cut the "
+    "load-bearing fact itself.\n\n"
+    "If the material is too short or thin to support multiple genuinely distinct slides, "
+    "return fewer slides rather than padding with repetitive or trivial ones — a real "
+    "2-slide summary beats a padded 6-slide one."
+)
+
+
+def _parse_summary_json(raw_text):
+    """Parses and validates the summarize AI's slide-plan JSON, the same
+    defensive-parsing approach as _parse_quiz_json: an AI's raw JSON output
+    is never trusted as-is, since a per-item structural mistake (a bad
+    chart shape, a missing header) should downgrade that one slide
+    gracefully rather than take down the whole presentation."""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        raise ConversionError("Couldn't generate a presentation from that material — please try again.")
+    if not isinstance(data, list):
+        raise ConversionError("Couldn't generate a presentation from that material — please try again.")
+
+    slides = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        header = str(item.get("header") or "").strip()
+        if not header:
+            continue
+        bullets = [str(b).strip() for b in (item.get("bullets") or []) if str(b).strip()][:6]
+        icon = str(item.get("icon") or "").strip()
+        chart = item.get("chart")
+        if isinstance(chart, dict):
+            chart_type = chart.get("type") if chart.get("type") in ("bar", "line", "pie") else None
+            categories = [str(c) for c in (chart.get("categories") or [])]
+            values = chart.get("values") or []
+            try:
+                values = [float(v) for v in values]
+            except (TypeError, ValueError):
+                values = []
+            # A chart needs a type and matching category/value pairs to mean
+            # anything — anything less isn't a valid chart, just downgrade
+            # to no chart for this slide rather than fail the whole request.
+            if not (chart_type and categories and values and len(categories) == len(values)):
+                chart = None
+            else:
+                chart = {
+                    "type": chart_type,
+                    "categories": categories,
+                    "series_name": str(chart.get("series_name") or "Value"),
+                    "values": values,
+                }
+        else:
+            chart = None
+        if not bullets and not chart:
+            continue  # a slide with neither content type is empty; skip it
+        slides.append({
+            "header": header,
+            "bullets": bullets,
+            "icon": icon,
+            "chart": chart,
+            "is_cta": bool(item.get("is_cta")),
+        })
+    if not slides:
+        raise ConversionError("Couldn't generate a presentation from that material — please try again.")
+    return slides
+
+
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
 @auth_required
 def summarize_endpoint():
@@ -1800,20 +1911,77 @@ def summarize_endpoint():
         return jsonify({"error": "No text provided"}), 400
     if len(text) > 20000:
         return jsonify({"error": "Text too long (20,000 character limit)"}), 400
+
+    slide_count = data.get("slide_count")
+    if slide_count is not None:
+        try:
+            slide_count = int(slide_count)
+        except (TypeError, ValueError):
+            slide_count = None
+        else:
+            slide_count = max(3, min(15, slide_count))
+
+    # "auto" (slide_count is None) is a real, first-class default here,
+    # not a missing value to fall back from: letting the AI decide slide
+    # count from how much the material actually supports is frequently
+    # the better choice than forcing a number, the same tension already
+    # handled in the quiz generator's own "don't pad thin material"
+    # instruction — this just makes that choice explicit and available
+    # to the user rather than only ever inferred.
+    if slide_count:
+        user_message = (
+            f"Aim for approximately {slide_count} slides — match this closely when the "
+            f"material genuinely supports that many genuinely distinct slides, but return "
+            f"fewer rather than padding with repetitive or trivial ones if it doesn't. "
+            f"Material:\n\n{text}"
+        )
+    else:
+        user_message = text
+
     try:
         result = call_claude(
-            system_prompt=(
-                "You condense study notes into slide-ready bullet points for a tutoring app. "
-                "Return 4 to 7 short bullet points capturing the material, one per line, no "
-                "numbering, no markdown, no preamble or closing remarks — plain lines only."
-            ),
-            user_message=text,
-            max_tokens=500,
+            system_prompt=SUMMARIZE_SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=3000,
         )
-        bullets = [ln.strip(" -•\t") for ln in result.strip().split("\n") if ln.strip()]
-        return jsonify({"bullets": bullets})
+        slides = _parse_summary_json(result)
+        return jsonify({"slides": slides})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/summary-to-pptx", methods=["POST", "OPTIONS"])
+@auth_required
+def summary_to_pptx_endpoint():
+    """Builds the actual presentation from an already-generated slide
+    plan (the response of /api/summarize above), rather than the
+    previous "Export to PowerPoint" behavior of silently re-running the
+    original, un-summarized text through the unrelated text_to_pptx —
+    confirmed directly that the AI's summary was, until now, never
+    actually used for the export a user downloads, only shown inline
+    in the app and then discarded the moment they clicked export."""
+    data = request.get_json(silent=True) or {}
+    slides = data.get("slides")
+    if not isinstance(slides, list) or not slides:
+        return jsonify({"error": "No slide plan provided."}), 400
+    style = data.get("style") if data.get("style") in ("visual", "plain") else "visual"
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_sum_{uuid.uuid4().hex[:8]}_")
+    try:
+        result_path = summary_slides_to_pptx(slides, work_dir, style=style)
+        return send_file(
+            result_path,
+            mimetype=MIME_TYPES["pptx"],
+            as_attachment=True,
+            download_name="Presentation.pptx",
+        )
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        logger.error(f"Summary-to-presentation failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't build the presentation. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 QUIZ_SYSTEM_PROMPT = (
