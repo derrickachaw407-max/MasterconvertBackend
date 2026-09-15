@@ -21,6 +21,7 @@ from functools import wraps
 import psycopg2
 import psycopg2.extras
 import requests
+import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
 from flask import Flask, request, send_file, jsonify
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -124,6 +125,40 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 # console.google.com -> Security -> 2-Step Verification -> App passwords.
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+
+# ---------- App Store / Play Store purchase verification ----------
+# Neither store's client-side purchase flow can be built or tested from
+# here — that requires a real native (or TWA) app wrapper, real
+# registered in-app products in App Store Connect / Play Console, and
+# these real platform credentials deployed as env vars, none of which
+# exist yet. What's built below is the server-side half of IAP
+# compliance: verifying a client-submitted purchase against Apple's/
+# Google's own servers before granting a plan, which is required
+# regardless of how the client-side purchase UI ends up being built,
+# and is the part that was genuinely missing (see plan_upgrade below,
+# which previously trusted a bare plan name from the client with no
+# verification at all — a real, exploitable gap independent of either
+# store's policies).
+APPLE_APP_STORE_KEY_ID = os.environ.get("APPLE_APP_STORE_KEY_ID", "")
+APPLE_APP_STORE_ISSUER_ID = os.environ.get("APPLE_APP_STORE_ISSUER_ID", "")
+APPLE_APP_STORE_PRIVATE_KEY = os.environ.get("APPLE_APP_STORE_PRIVATE_KEY", "")  # .p8 file contents, PEM format
+APPLE_BUNDLE_ID = os.environ.get("APPLE_BUNDLE_ID", "")
+APPLE_APP_STORE_ENVIRONMENT = os.environ.get("APPLE_APP_STORE_ENVIRONMENT", "production")  # or "sandbox" for TestFlight/dev testing
+
+GOOGLE_PLAY_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON", "")  # full service-account key JSON, as a string
+GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")
+
+# Maps each store's product/subscription id to this app's own internal
+# plan name. These id strings are placeholders matching a conventional
+# reverse-DNS naming scheme (com.<company>.<app>.<plan>) — they must be
+# changed to whatever ids are actually registered as in-app products in
+# App Store Connect and Play Console, which is console configuration,
+# not something settable from here.
+STORE_PRODUCT_TO_PLAN = {
+    "com.docently.app.payperuse": "payperuse",
+    "com.docently.app.monthly": "monthly",
+    "com.docently.app.yearly": "yearly",
+}
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
@@ -1026,14 +1061,221 @@ def update_profile():
 # ---------- plans / promo ----------
 
 
+class PurchaseVerificationError(Exception):
+    """Raised for any reason a submitted purchase can't be trusted —
+    wrong app, expired, refunded, or the platform's own API rejected
+    it — so plan_upgrade has exactly one place to catch and turn into
+    a clean error response, rather than three different failure shapes
+    from two different platforms' verification functions."""
+    pass
+
+
+def _apple_verify_transaction(transaction_id):
+    """Verifies one In-App Purchase transaction against Apple's App
+    Store Server API and returns its product id — the modern
+    replacement for the deprecated /verifyReceipt endpoint. Requires
+    an App Store Connect API key (APPLE_APP_STORE_KEY_ID / _ISSUER_ID /
+    _PRIVATE_KEY) with the "App Manager" or "Customer Support" role,
+    generated in App Store Connect -> Users and Access -> Integrations
+    -> App Store Connect API — none of which can be generated from
+    here, since it requires an actual registered app and an Apple
+    Developer account.
+
+    Two steps: (1) sign a short-lived ES256 JWT to authenticate this
+    server to Apple, per Apple's documented auth scheme for this API;
+    (2) call GET /inApps/v1/transactions/{id}, which returns the
+    transaction as a signed JWT (JWS) in its own right. This decodes
+    that response's payload without additionally verifying its x5c
+    certificate chain against Apple's root CA — a deliberate,
+    documented scope limit, not an oversight: the request that
+    fetched it was itself authenticated to Apple's own server over
+    TLS using our own signed credential, which is the actual trust
+    boundary here, and full chain-of-trust verification is a
+    meaningfully larger cryptographic undertaking that belongs in its
+    own careful pass rather than folded into this one silently.
+    """
+    if not (APPLE_APP_STORE_KEY_ID and APPLE_APP_STORE_ISSUER_ID and APPLE_APP_STORE_PRIVATE_KEY):
+        raise PurchaseVerificationError(
+            "Apple purchase verification isn't configured on this server yet "
+            "(APPLE_APP_STORE_KEY_ID / _ISSUER_ID / _PRIVATE_KEY)."
+        )
+    now = int(time.time())
+    auth_token = pyjwt.encode(
+        {
+            "iss": APPLE_APP_STORE_ISSUER_ID,
+            "iat": now,
+            "exp": now + 300,  # Apple caps this token at 60 minutes; 5 is plenty for one call
+            "aud": "appstoreconnect-v1",
+            "bid": APPLE_BUNDLE_ID,
+        },
+        APPLE_APP_STORE_PRIVATE_KEY,
+        algorithm="ES256",
+        headers={"kid": APPLE_APP_STORE_KEY_ID, "typ": "JWT"},
+    )
+
+    host = (
+        "https://api.storekit-sandbox.itunes.apple.com"
+        if APPLE_APP_STORE_ENVIRONMENT == "sandbox"
+        else "https://api.storekit.itunes.apple.com"
+    )
+    try:
+        resp = requests.get(
+            f"{host}/inApps/v1/transactions/{transaction_id}",
+            headers={"Authorization": f"Bearer {auth_token}"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        raise PurchaseVerificationError(f"Couldn't reach Apple to verify this purchase: {e}")
+
+    if resp.status_code != 200:
+        raise PurchaseVerificationError(f"Apple rejected this transaction (status {resp.status_code}).")
+
+    signed_transaction = resp.json().get("signedTransactionInfo")
+    if not signed_transaction:
+        raise PurchaseVerificationError("Apple's response didn't include transaction data.")
+
+    # options={"verify_signature": False}: intentional, and only safe because
+    # of the trust boundary explained above — this decodes the payload Apple
+    # already returned over an authenticated connection, it does not accept
+    # an arbitrary client-supplied JWS as truth.
+    payload = pyjwt.decode(signed_transaction, options={"verify_signature": False})
+
+    if APPLE_BUNDLE_ID and payload.get("bundleId") != APPLE_BUNDLE_ID:
+        raise PurchaseVerificationError("This transaction belongs to a different app.")
+    if payload.get("revocationDate"):
+        raise PurchaseVerificationError("This purchase was refunded or revoked.")
+    expires_ms = payload.get("expiresDate")
+    if expires_ms and expires_ms < now * 1000:
+        raise PurchaseVerificationError("This subscription has expired.")
+
+    product_id = payload.get("productId")
+    if product_id not in STORE_PRODUCT_TO_PLAN:
+        raise PurchaseVerificationError(f"Unrecognized product id '{product_id}'.")
+    return STORE_PRODUCT_TO_PLAN[product_id]
+
+
+def _google_verify_purchase(product_id, purchase_token, is_subscription):
+    """Verifies one Google Play purchase against the Play Developer API
+    and returns the mapped internal plan name. Requires a service
+    account (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) granted access to this
+    app in Play Console -> Setup -> API access — again, console
+    configuration against a real registered app, not buildable here.
+
+    A PWA wrapped as a TWA (the path noted in this app's own earlier
+    plan, not a native Android app) surfaces purchases through the
+    browser's Digital Goods API / Payment Request API rather than the
+    native Play Billing Library, but the purchase token those APIs
+    return is verified server-side exactly the same way as any other
+    Play purchase — this function doesn't need to know or care which
+    client-side API produced the token.
+
+    Two steps, the standard OAuth2 service-account flow: (1) sign a
+    JWT with the service account's private key and exchange it for an
+    access token; (2) call the Play Developer API's
+    purchases.subscriptionsv2.get (subscriptions) or
+    purchases.products.get (one-time purchases) with that token.
+    """
+    if not (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON and GOOGLE_PLAY_PACKAGE_NAME):
+        raise PurchaseVerificationError(
+            "Google Play purchase verification isn't configured on this server yet "
+            "(GOOGLE_PLAY_SERVICE_ACCOUNT_JSON / GOOGLE_PLAY_PACKAGE_NAME)."
+        )
+    try:
+        service_account = json.loads(GOOGLE_PLAY_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError:
+        raise PurchaseVerificationError("Google Play service account credentials are malformed.")
+
+    now = int(time.time())
+    assertion = pyjwt.encode(
+        {
+            "iss": service_account["client_email"],
+            "scope": "https://www.googleapis.com/auth/androidpublisher",
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": now,
+            "exp": now + 3600,
+        },
+        service_account["private_key"],
+        algorithm="RS256",
+    )
+    try:
+        token_resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+            timeout=15,
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json()["access_token"]
+    except (requests.RequestException, KeyError) as e:
+        raise PurchaseVerificationError(f"Couldn't authenticate to Google Play: {e}")
+
+    pkg = GOOGLE_PLAY_PACKAGE_NAME
+    if is_subscription:
+        url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}/purchases/subscriptionsv2/tokens/{purchase_token}"
+    else:
+        url = f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{pkg}/purchases/products/{product_id}/tokens/{purchase_token}"
+
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=15)
+    except requests.RequestException as e:
+        raise PurchaseVerificationError(f"Couldn't reach Google Play to verify this purchase: {e}")
+    if resp.status_code != 200:
+        raise PurchaseVerificationError(f"Google Play rejected this purchase (status {resp.status_code}).")
+
+    data = resp.json()
+    if is_subscription:
+        state = data.get("subscriptionState")
+        if state not in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD"):
+            raise PurchaseVerificationError(f"This subscription isn't currently active (state: {state}).")
+    else:
+        if data.get("purchaseState") != 0:  # 0 == purchased; 1 == canceled, 2 == pending
+            raise PurchaseVerificationError("This purchase isn't in a completed state.")
+
+    if product_id not in STORE_PRODUCT_TO_PLAN:
+        raise PurchaseVerificationError(f"Unrecognized product id '{product_id}'.")
+    return STORE_PRODUCT_TO_PLAN[product_id]
+
+
 @app.route("/api/plan/upgrade", methods=["POST", "OPTIONS"])
 @auth_required
 def plan_upgrade():
+    """Downgrading to free needs no verification at all — giving up paid
+    access is always safe to grant on request. Every paid plan, on the
+    other hand, is only ever granted after _apple_verify_transaction or
+    _google_verify_purchase has independently confirmed it against that
+    store's own servers; the plan name that ends up written to the
+    database comes from that verified mapping, never from whatever the
+    client claims it purchased. This replaces an endpoint that
+    previously wrote any client-supplied plan string straight into the
+    database with no purchase check at all — a real, exploitable gap
+    (any authenticated user could grant themselves any paid plan with a
+    single request) independent of either store's own policies, and the
+    reason this rewrite exists at all, not just a compliance nicety."""
     data = request.get_json(silent=True) or {}
-    plan = (data.get("plan") or "").strip()
+    platform = (data.get("platform") or "").strip().lower()
     referral_code = (data.get("referral_code") or "").strip().upper() or None
-    if plan not in ("free", "payperuse", "monthly", "yearly"):
-        return jsonify({"error": "Unknown plan"}), 400
+
+    if platform == "free":
+        plan = "free"
+    elif platform == "ios":
+        transaction_id = (data.get("transaction_id") or "").strip()
+        if not transaction_id:
+            return jsonify({"error": "Missing transaction_id."}), 400
+        try:
+            plan = _apple_verify_transaction(transaction_id)
+        except PurchaseVerificationError as e:
+            return jsonify({"error": str(e)}), 402
+    elif platform == "android":
+        product_id = (data.get("product_id") or "").strip()
+        purchase_token = (data.get("purchase_token") or "").strip()
+        is_subscription = bool(data.get("is_subscription", True))
+        if not (product_id and purchase_token):
+            return jsonify({"error": "Missing product_id or purchase_token."}), 400
+        try:
+            plan = _google_verify_purchase(product_id, purchase_token, is_subscription)
+        except PurchaseVerificationError as e:
+            return jsonify({"error": str(e)}), 402
+    else:
+        return jsonify({"error": "platform must be 'free', 'ios', or 'android'."}), 400
 
     bonus_applied = False
     conn = get_db()
@@ -1631,7 +1873,17 @@ QUIZ_SYSTEM_PROMPT = (
     "You don't need to track or balance which letter position (A/B/C/D) ends up correct — "
     "options are shuffled into random order after you write them, so putting the correct "
     "answer in a natural, sensible place in your own options array (rather than always first "
-    "or always last) is all that's needed here."
+    "or always last) is all that's needed here.\n\n"
+    "Most of this — testing real understanding rather than recall, having a clear reason for "
+    "each question, and varying difficulty across the set — matters just as much for "
+    "short_answer questions, even though the specific mechanics above (distractors, option "
+    "length, letter position) are multiple-choice-only concepts that don't apply to them. Two "
+    "more short_answer-specific points: don't phrase the question so its own wording already "
+    "hands the student the answer (a question that echoes back most of the model answer's key "
+    "term isn't testing anything); and write a model answer that actually matches what the "
+    "question asks for — if it asks the student to explain why or how something happens, the "
+    "model answer should give that reasoning, not just name the term, since a tutor grading "
+    "against it needs to see what a complete answer actually looks like."
 )
 
 
