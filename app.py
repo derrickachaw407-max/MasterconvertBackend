@@ -382,13 +382,6 @@ def send_email(to_email, subject, body):
 
 
 def user_row_to_dict(row):
-    now = datetime.now(timezone.utc)
-    used = row["conversions_used"]
-    reset_at = row["conversions_reset_at"]
-    if reset_at and now - reset_at > timedelta(days=FREE_WINDOW_DAYS):
-        used = 0  # window has rolled over; reflect that even before the next write
-
-    is_free = row["plan"] == "free"
     return {
         "id": row["id"],
         "name": row["name"],
@@ -396,8 +389,11 @@ def user_row_to_dict(row):
         "plan": row["plan"],
         "referral_code": row["referral_code"],
         "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
-        "conversions_remaining": max(0, FREE_CONVERSIONS_LIMIT - used) if is_free else None,
-        "conversions_limit": FREE_CONVERSIONS_LIMIT if is_free else None,
+        # File conversions are free and unlimited on every plan now — no
+        # limit/remaining count to report for any plan, free included,
+        # rather than the free tier's old fixed cap.
+        "conversions_remaining": None,
+        "conversions_limit": None,
     }
 
 
@@ -1435,11 +1431,12 @@ def clear_conversions_history():
 
 
 def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
-    """Enforce the free-tier cap and record the conversion. Raises ConversionError if over the limit.
-
-    Runs as one explicit transaction (not autocommit) so the row lock from
-    SELECT ... FOR UPDATE actually holds until the increment is written —
-    otherwise two conversions fired at once could both slip past the cap.
+    """Records the conversion for Recent Activity and usage tracking.
+    File conversions are free and unlimited on every plan — this no
+    longer enforces FREE_CONVERSIONS_LIMIT at all, by explicit
+    decision; conversions_used keeps incrementing (still meaningful as
+    a usage signal, and reset_at keeps rolling over the same way) but
+    nothing here ever raises ConversionError over it anymore.
     """
     conn = get_db()
     conn.autocommit = False
@@ -1453,12 +1450,6 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
             if reset_at and now - reset_at > timedelta(days=FREE_WINDOW_DAYS):
                 used = 0
                 reset_at = now
-
-            if row["plan"] == "free" and used >= FREE_CONVERSIONS_LIMIT:
-                conn.rollback()
-                raise ConversionError(
-                    "You've used your 2 free conversions this month. Upgrade for unlimited."
-                )
 
             cur.execute(
                 "UPDATE users SET conversions_used = %s, conversions_reset_at = %s WHERE id = %s",
