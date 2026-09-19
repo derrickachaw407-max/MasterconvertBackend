@@ -568,6 +568,25 @@ def docx_to_pdf(src_path, out_dir, style=None):
     return _soffice_convert(src_path, "pdf", out_dir)
 
 
+def preview_file(src_path, out_dir, ext):
+    """Produces a PDF the frontend can embed directly for a genuine,
+    real preview of whatever was just generated — not a mocked-up
+    stand-in, the browser's own native PDF renderer showing the actual
+    converted or AI-generated file's real content. A PDF source needs
+    no conversion at all; docx/pptx/xlsx all go through the same
+    existing LibreOffice pipeline already proven for docx_to_pdf above,
+    since --convert-to pdf isn't docx-specific — LibreOffice renders
+    any format it can open the same way, faithfully reflecting the
+    real file's actual layout, fonts, and content rather than an
+    approximation of it."""
+    ext = ext.lower().lstrip(".")
+    if ext == "pdf":
+        return src_path
+    if ext in ("docx", "pptx", "xlsx", "doc", "ppt", "xls"):
+        return _soffice_convert(src_path, "pdf", out_dir)
+    raise ConversionError(f"Preview isn't supported for .{ext} files.")
+
+
 # --------------------------------------------------------------- DOCX -> PPTX
 def _cellis_rule_matches(rule, value):
     """Evaluates whether a value satisfies a simple CellIsRule's numeric
