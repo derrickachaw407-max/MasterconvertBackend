@@ -108,6 +108,15 @@ def _origin_is_allowed(origin):
 # AI features (Smart Summarize / drafting) call Claude directly.
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = "claude-sonnet-5"
+# The strongest currently-available model, reserved for Sage (the app's
+# general-purpose tutoring assistant, /api/sage below) specifically —
+# Sonnet already handles the other three tools' narrower, structured-
+# output tasks (a slide plan, a quiz, a citation-checked draft) more
+# than capably, so there's little to gain there from the slower, more
+# expensive model; Sage's job is open-ended tutoring help across
+# whatever a student or tutor brings to it, which is exactly the kind
+# of broad, unpredictable reasoning this model is worth spending on.
+ANTHROPIC_MODEL_STRONG = "claude-opus-5"
 
 # Optional — without this, Semantic Scholar's public API shares a very tight
 # anonymous rate limit across every caller on Render's IP range, which is what
@@ -390,14 +399,23 @@ def auth_required(fn):
     return wrapper
 
 
-def call_claude(system_prompt, user_message, max_tokens=600, use_search=False, return_meta=False):
+def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None):
+    """messages, when given, is sent to the API exactly as the native
+    multi-turn conversation it already is (alternating user/assistant
+    turns) — the correct way to give Claude real conversational
+    context, rather than flattening prior turns into one large string
+    inside user_message the way the existing /api/write endpoint's own
+    history handling does elsewhere in this file. Sage (the assistant
+    this exists for) is a genuine back-and-forth conversation, so it
+    gets the native form; user_message alone still works unchanged for
+    every existing single-shot caller."""
     if not ANTHROPIC_API_KEY:
         raise ConversionError("AI features need ANTHROPIC_API_KEY set on the server")
     payload = {
-        "model": ANTHROPIC_MODEL,
+        "model": model or ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
         "system": system_prompt,
-        "messages": [{"role": "user", "content": user_message}],
+        "messages": messages if messages is not None else [{"role": "user", "content": user_message}],
     }
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
@@ -1922,7 +1940,84 @@ def _parse_summary_json(raw_text):
     return slides
 
 
-@app.route("/api/summarize", methods=["POST", "OPTIONS"])
+SAGE_SYSTEM_PROMPT = (
+    "You are Sage, Docently's built-in AI tutor — not a narrow, single-purpose tool "
+    "like the app's other AI features, but a genuine, open-ended assistant a tutor or "
+    "student can bring almost anything to. Docently also has three purpose-built AI "
+    "tools you can point people toward when they'd genuinely help more than a chat "
+    "answer would: Smart Summarize (condenses a document into a slide deck), Practice "
+    "Quiz (generates a quiz with an answer key from source material), and Evidence-"
+    "Based Writing (drafts academic writing with real, verified citations). Mention one "
+    "only when it's a clearly better fit for what they're actually asking — e.g. "
+    "someone pasting a long document and asking for a slide deck should be pointed to "
+    "Smart Summarize rather than have you attempt it inline — never as a reflexive "
+    "sign-off.\n\n"
+    "What you're actually for: explaining a concept at whatever depth and level "
+    "actually fits the person in front of you, working through a problem step by step "
+    "rather than only handing over a final answer, answering questions about material "
+    "someone has pasted or uploaded, helping plan out how to study or teach a topic, "
+    "and anything else a tutor or student would reasonably bring to a knowledgeable, "
+    "patient assistant. You have access to web search for anything that depends on "
+    "current or fast-changing information — use it rather than guessing when it "
+    "matters, and don't reach for it for timeless, well-established material you "
+    "already know well.\n\n"
+    "Be direct and genuinely useful over performatively warm: skip preamble, answer the "
+    "actual question first, and match the length of your response to what the question "
+    "actually needs — a quick factual question earns a few sentences, a request to "
+    "work through a proof or a step-by-step problem earns the space that takes. When "
+    "someone's question is ambiguous, make the most reasonable assumption and say so "
+    "briefly rather than stalling on a clarifying question."
+)
+
+
+@app.route("/api/sage", methods=["POST", "OPTIONS"])
+@auth_required
+def sage_endpoint():
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "No message provided"}), 400
+    if len(message) > 20000:
+        return jsonify({"error": "That's too long for one message (20,000 character limit)"}), 400
+
+    attachment = (data.get("attachment") or "").strip()
+    if len(attachment) > 20000:
+        return jsonify({"error": "That attached document is too long (20,000 character limit)"}), 400
+
+    # Real multi-turn history, capped the same way /api/write already
+    # caps its own — bounded so a very long-running conversation can't
+    # grow the request without limit, not because 8 turns is some ideal
+    # number, just a proven, already-working budget elsewhere in this
+    # file.
+    raw_history = data.get("history") or []
+    turns = []
+    if isinstance(raw_history, list):
+        for turn in raw_history[-8:]:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role")
+            content = (turn.get("content") or "").strip()[:4000]
+            if role in ("user", "assistant") and content:
+                turns.append({"role": role, "content": content})
+
+    user_content = message
+    if attachment:
+        user_content = f"[Attached document]\n{attachment}\n\n[Message]\n{message}"
+    turns.append({"role": "user", "content": user_content})
+
+    try:
+        result = call_claude(
+            system_prompt=SAGE_SYSTEM_PROMPT,
+            messages=turns,
+            max_tokens=4000,
+            use_search=True,
+            model=ANTHROPIC_MODEL_STRONG,
+        )
+        return jsonify({"reply": result})
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @auth_required
 def summarize_endpoint():
     data = request.get_json(silent=True) or {}
