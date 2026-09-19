@@ -2091,6 +2091,7 @@ def sage_endpoint():
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/api/summarize", methods=["POST", "OPTIONS"])
 @auth_required
 def summarize_endpoint():
     data = request.get_json(silent=True) or {}
