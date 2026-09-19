@@ -1537,6 +1537,43 @@ def convert_endpoint():
     if ext != from_fmt:
         return jsonify({"error": f"File extension .{ext} doesn't match declared source format '{from_fmt}'"}), 400
 
+    # Fix Slides' own font/format options — read and validated here,
+    # right at the API boundary, rather than trusting raw form input
+    # all the way into a file-generation pipeline. Every field is
+    # optional; pptx_to_pptx already has sensible defaults (and a
+    # template-derived style, when a template's uploaded) for anything
+    # left unset. Only ever built for the pptx->pptx pair specifically.
+    pptx_options = None
+    if from_fmt == "pptx" and to_fmt == "pptx":
+        pptx_options = {}
+        for size_field, key in (("title_size", "title_size"), ("body_size", "body_size")):
+            raw = request.form.get(size_field)
+            if raw:
+                try:
+                    size_val = float(raw)
+                except ValueError:
+                    return jsonify({"error": f"'{size_field}' must be a number"}), 400
+                if not (6 <= size_val <= 200):
+                    return jsonify({"error": f"'{size_field}' must be between 6 and 200 points"}), 400
+                pptx_options[key] = size_val
+        for font_field in ("title_font", "body_font"):
+            raw = (request.form.get(font_field) or "").strip()
+            if raw:
+                if len(raw) > 100:
+                    return jsonify({"error": f"'{font_field}' is too long"}), 400
+                pptx_options[font_field] = raw
+        for color_field in ("title_color", "body_color"):
+            raw = (request.form.get(color_field) or "").strip().lstrip("#")
+            if raw:
+                if not re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
+                    return jsonify({"error": f"'{color_field}' must be a 6-digit hex color"}), 400
+                pptx_options[color_field] = raw
+        title_align = (request.form.get("title_align") or "").strip().lower()
+        if title_align:
+            if title_align not in ("left", "center", "right"):
+                return jsonify({"error": "'title_align' must be left, center, or right"}), 400
+            pptx_options["title_align"] = title_align
+
     try:
         _log_conversion_and_consume(request.current_user, from_fmt, to_fmt)
     except ConversionError as e:
@@ -1549,7 +1586,7 @@ def convert_endpoint():
         file.save(src_path)
 
         try:
-            result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style)
+            result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style, pptx_options=pptx_options)
         except ConversionError as e:
             return jsonify({"error": str(e)}), 422
         except FileNotFoundError as e:
@@ -2375,31 +2412,48 @@ def quiz_generate_endpoint():
     # of which one handles this request.
     max_tokens = min(64000, max(4000, num_questions * 300 + 500))
 
+    try:
+        result = call_claude(
+            system_prompt=QUIZ_SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=max_tokens,
+        )
+        questions = _parse_quiz_json(result)
+        return jsonify({"questions": questions, "title": title})
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/quiz/export-docx", methods=["POST", "OPTIONS"])
+@auth_required
+def quiz_export_docx_endpoint():
+    """Builds the actual .docx from an already-generated quiz (the
+    response of /api/quiz/generate above) — the same split already
+    proven for Smart Summarize (/api/summarize generates the JSON plan,
+    /api/summary-to-pptx builds the file from it), applied here for the
+    identical reason: generating and exporting were one inseparable
+    step before, downloading a quiz the user had never actually seen,
+    with no way to review it first."""
+    data = request.get_json(silent=True) or {}
+    questions = data.get("questions")
+    title = (data.get("title") or "Practice Quiz").strip()[:150]
+    if not isinstance(questions, list) or not questions:
+        return jsonify({"error": "No quiz to export."}), 400
+
     work_dir = tempfile.mkdtemp(prefix=f"mc_quiz_{uuid.uuid4().hex[:8]}_")
     try:
-        try:
-            result = call_claude(
-                system_prompt=QUIZ_SYSTEM_PROMPT,
-                user_message=user_message,
-                max_tokens=max_tokens,
-            )
-            questions = _parse_quiz_json(result)
-        except ConversionError as e:
-            return jsonify({"error": str(e)}), 502
-
         try:
             result_path = quiz_to_docx(title, questions, work_dir)
         except ConversionError as e:
             return jsonify({"error": str(e)}), 422
-
         safe_title = safe_download_name(title).replace(" ", "_") or "Practice_Quiz"
         return send_file(
             result_path, mimetype=MIME_TYPES["docx"], as_attachment=True,
             download_name=f"{safe_title}.docx",
         )
     except Exception as e:
-        logger.error(f"Quiz generation failed unexpectedly: {e}", exc_info=True)
-        return jsonify({"error": "Quiz generation failed. Please try again."}), 500
+        logger.error(f"Quiz export failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't build the quiz document. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

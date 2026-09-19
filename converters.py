@@ -25,7 +25,7 @@ from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 from docx.text.run import Run as DocxRun
 from pptx import Presentation
-from pptx.util import Inches as PptxInches, Pt
+from pptx.util import Inches as PptxInches, Pt, Length
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE, MSO_COLOR_TYPE
@@ -1391,23 +1391,36 @@ def _pptx_fix_set_run_style(run, size, bold=None, italic=None):
         run.font.italic = italic
 
 
-def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False, font_name=None):
+_PPTX_FIX_ALIGN_MAP = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}
+
+
+def _pptx_fix_apply_sizing_in_place(shape, size, bold_title=False, font_name=None, font_color=None, text_align=None):
     """Fixes font size and disables autofit on an existing shape without
     restructuring it — the safe path for any slide too complex to split
     (has an image, chart, table, or more than one text box), so a table
     or picture on that slide is never touched. font_name is only passed
     when a custom template's brand font should replace whatever the
-    source file's own text used."""
+    source file's own text used. font_color, when given, is a "RRGGBB"
+    hex string (the natural form a color-picker input sends) — left
+    None to leave the source file's existing text color untouched.
+    text_align is one of "left"/"center"/"right", a paragraph-level
+    property in PowerPoint's object model, so it's set once per
+    paragraph rather than per run."""
     tf = shape.text_frame
     tf.word_wrap = True
     tf.auto_size = MSO_AUTO_SIZE.NONE
+    align_value = _PPTX_FIX_ALIGN_MAP.get(text_align)
     for p in tf.paragraphs:
+        if align_value is not None:
+            p.alignment = align_value
         for r in p.runs:
             r.font.size = size
             if bold_title:
                 r.font.bold = True
             if font_name:
                 r.font.name = font_name
+            if font_color:
+                r.font.color.rgb = PptxRGBColor.from_string(font_color)
 
 
 def _pptx_fix_move_slide_to(prs, slide, position):
@@ -1483,7 +1496,8 @@ def _pptx_fix_apply_contrast_fixes(prs):
                         run.font.color.rgb = PptxRGBColor(0, 0, 0) if black_ratio >= white_ratio else PptxRGBColor(255, 255, 255)
 
 
-def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font):
+def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font,
+                                title_color=None, body_color=None, title_align=None):
     """Inserts an agenda slide right after the title slide, listing each
     distinct section's own title verbatim — built entirely from titles
     the deck already has, nothing invented. Only added once the deck has
@@ -1511,14 +1525,19 @@ def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font
 
     layout = _find_best_pptx_layout(prs, "content")
     agenda_slide = prs.slides.add_slide(layout)
+    align_value = _PPTX_FIX_ALIGN_MAP.get(title_align)
     if agenda_slide.shapes.title is not None:
         agenda_slide.shapes.title.text = "Agenda"
         for p in agenda_slide.shapes.title.text_frame.paragraphs:
+            if align_value is not None:
+                p.alignment = align_value
             for r in p.runs:
                 r.font.size = title_size
                 r.font.bold = True
                 if title_font:
                     r.font.name = title_font
+                if title_color:
+                    r.font.color.rgb = PptxRGBColor.from_string(title_color)
         agenda_slide.shapes.title.text_frame.auto_size = MSO_AUTO_SIZE.NONE
 
     body_ph = [s for s in agenda_slide.placeholders if s != agenda_slide.shapes.title and s.has_text_frame]
@@ -1535,6 +1554,8 @@ def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font
         r.font.size = body_size
         if body_font:
             r.font.name = body_font
+        if body_color:
+            r.font.color.rgb = PptxRGBColor.from_string(body_color)
     _pptx_fix_move_slide_to(prs, agenda_slide, 1)
 
 
@@ -1794,7 +1815,9 @@ def _pptx_fix_force_white_bg_black_text(prs):
                         pass  # not every chart type has both axes (e.g. a pie chart)
 
 
-def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
+def pptx_to_pptx(src_path, out_dir, style=None, template_path=None,
+                  title_size=None, body_size=None, title_font=None, body_font=None,
+                  title_color=None, body_color=None, title_align=None):
     """Fixes the two most common problems in an already-existing
     PowerPoint file rather than converting from another format: PowerPoint
     silently auto-shrinking text on any slide with enough content to
@@ -1825,13 +1848,30 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
     original file's own slide structure and placeholder positions do."""
     prs = _safe_load(Presentation, src_path)
 
-    title_size, body_size, title_font, body_font = _PPTX_FIX_TITLE_SIZE, _PPTX_FIX_BODY_SIZE, None, None
+    # title_size/body_size, when explicitly passed by a caller (as
+    # opposed to arriving via the default/template precedence chain
+    # below, which already deals in Pt(...) objects), are plain point
+    # values — an int or float, the natural form for a UI's numeric
+    # input to send. Converting them here, once, at the point they're
+    # received, keeps that contract in exactly one place rather than
+    # every call site needing to know to wrap them.
+    if title_size is not None and not isinstance(title_size, Length):
+        title_size = Pt(title_size)
+    if body_size is not None and not isinstance(body_size, Length):
+        body_size = Pt(body_size)
+
+    # Precedence, lowest to highest: built-in defaults, then a template's
+    # extracted style (if a template was uploaded), then whatever the
+    # caller explicitly asked for — an explicit choice in the UI is a
+    # more specific, intentional decision than either a hardcoded
+    # default or a font size incidentally pulled from a template file.
+    _title_size, _body_size, _title_font, _body_font = _PPTX_FIX_TITLE_SIZE, _PPTX_FIX_BODY_SIZE, None, None
     if template_path:
         template_prs = _safe_load(Presentation, template_path)
         template_content_layout = _find_best_pptx_layout(template_prs, "content")
         template_style = _extract_template_style(template_prs, template_content_layout)
-        title_size, body_size = template_style["title_size"], template_style["body_size"]
-        title_font, body_font = template_style["title_font"], template_style["body_font"]
+        _title_size, _body_size = template_style["title_size"], template_style["body_size"]
+        _title_font, _body_font = template_style["title_font"], template_style["body_font"]
         # Swapping the theme part's own XML (color scheme + font scheme)
         # gives the fixed file the template's actual brand palette and
         # font scheme without migrating a single shape between the two
@@ -1844,12 +1884,17 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
         except Exception:
             pass  # a template with an unusual/missing theme part shouldn't sink the whole fix
 
+    title_size = title_size if title_size is not None else _title_size
+    body_size = body_size if body_size is not None else _body_size
+    title_font = title_font if title_font is not None else _title_font
+    body_font = body_font if body_font is not None else _body_font
+
     # ---- Pass 1: fix every title in place, and classify each slide ----
     plan = []  # (slide, is_simple, body_shape_or_None)
     for slide in prs.slides:
         title_shape = slide.shapes.title
         if title_shape is not None and title_shape.has_text_frame:
-            _pptx_fix_apply_sizing_in_place(title_shape, title_size, bold_title=True, font_name=title_font)
+            _pptx_fix_apply_sizing_in_place(title_shape, title_size, bold_title=True, font_name=title_font, font_color=title_color, text_align=title_align)
 
         other_shapes = [s for s in slide.shapes if s != title_shape]
         # Upgrade any chart-shaped table (numeric data pasted into a
@@ -1874,7 +1919,7 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
         if not is_simple:
             for s in other_shapes:
                 if s.has_text_frame:
-                    _pptx_fix_apply_sizing_in_place(s, body_size, font_name=body_font)
+                    _pptx_fix_apply_sizing_in_place(s, body_size, font_name=body_font, font_color=body_color)
             plan.append((slide, False, None))
         else:
             plan.append((slide, True, text_shapes[0]))
@@ -1980,6 +2025,8 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
                 r.font.italic = italic
                 if body_font:
                     r.font.name = body_font
+                if body_color:
+                    r.font.color.rgb = PptxRGBColor.from_string(body_color)
 
         if len(groups) == 1:
             continue
@@ -1997,12 +2044,17 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
             new_slide = prs.slides.add_slide(layout)
             if new_slide.shapes.title is not None:
                 new_slide.shapes.title.text = group_titles[gi] or f"{base_title} (cont.)"
+                align_value = _PPTX_FIX_ALIGN_MAP.get(title_align)
                 for p in new_slide.shapes.title.text_frame.paragraphs:
+                    if align_value is not None:
+                        p.alignment = align_value
                     for r in p.runs:
                         r.font.size = title_size
                         r.font.bold = True
                         if title_font:
                             r.font.name = title_font
+                        if title_color:
+                            r.font.color.rgb = PptxRGBColor.from_string(title_color)
                 new_slide.shapes.title.text_frame.auto_size = MSO_AUTO_SIZE.NONE
             new_body = [s for s in new_slide.placeholders if s.placeholder_format.idx == body_shape.placeholder_format.idx]
             new_body = new_body[0] if new_body else [s for s in new_slide.placeholders if s != new_slide.shapes.title][0]
@@ -2024,15 +2076,31 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None):
                     r.font.italic = italic
                     if body_font:
                         r.font.name = body_font
+                    if body_color:
+                        r.font.color.rgb = PptxRGBColor.from_string(body_color)
             _pptx_fix_move_slide_to(prs, new_slide, insert_position)
             insert_position += 1
         insertions.append((idx, len(groups) - 1))
 
-    _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font)
+    _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font,
+                                title_color=title_color, body_color=body_color, title_align=title_align)
     _pptx_fix_apply_smart_emphasis(prs)
     _pptx_fix_reposition_offslide_pictures(prs)
     _pptx_fix_apply_transitions(prs)
-    _pptx_fix_force_white_bg_black_text(prs)
+    # Skipped entirely once the caller has explicitly chosen a text
+    # color — this step's whole purpose is forcing solid black text on
+    # solid white as an unconditional safety default, deliberately
+    # overriding even a template's own brand palette (see its own
+    # docstring). That's the right default when nobody's asked for
+    # anything else, but it silently overwrote a user's own explicit
+    # title/body color choice — confirmed directly: title_color kept
+    # coming back 000000 regardless of what was requested, traced all
+    # the way to this exact call. Leaving the background alone too,
+    # not just the text, avoids a worse failure mode than the original
+    # bug: forcing white behind a color someone explicitly picked (say,
+    # white title text) would make it invisible instead of merely wrong.
+    if not title_color and not body_color:
+        _pptx_fix_force_white_bg_black_text(prs)
 
     out_path = os.path.join(out_dir, "fixed.pptx")
     os.makedirs(out_dir, exist_ok=True)
@@ -3780,7 +3848,7 @@ CONVERTERS = {
 }
 
 
-def convert(src_path, from_fmt, to_fmt, out_dir, style=None):
+def convert(src_path, from_fmt, to_fmt, out_dir, style=None, pptx_options=None):
     # Confirmed directly: a zero-byte upload doesn't fail at all for
     # some conversion pairs (docx->pdf via LibreOffice happily produces
     # a "successful," completely blank PDF from an empty source) —
@@ -3793,6 +3861,14 @@ def convert(src_path, from_fmt, to_fmt, out_dir, style=None):
     key = (from_fmt.lower(), to_fmt.lower())
     if key not in CONVERTERS:
         raise ConversionError(f"Unsupported conversion: {from_fmt} -> {to_fmt}")
+    # pptx_options is deliberately only ever forwarded for the pptx->pptx
+    # ("Fix Slides") pair specifically, not passed generically to
+    # whichever converter `key` happens to resolve to — every other
+    # converter function has no matching keyword arguments at all, so
+    # passing this through unconditionally would be a hard TypeError on
+    # every other conversion pair the moment a caller supplied it.
+    if key == ("pptx", "pptx") and pptx_options:
+        return CONVERTERS[key](src_path, out_dir, **pptx_options)
     if style:
         return CONVERTERS[key](src_path, out_dir, style=style)
     return CONVERTERS[key](src_path, out_dir)
