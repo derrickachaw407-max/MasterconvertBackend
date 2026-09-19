@@ -28,7 +28,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from converters import (
     convert, text_to_pptx, summary_slides_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
-    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx,
+    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
 )
 
 app = Flask(__name__)
@@ -1604,6 +1604,48 @@ def convert_endpoint():
     except Exception as e:
         logger.error(f"Conversion failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": "Conversion failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/preview-file", methods=["POST", "OPTIONS"])
+@auth_required
+def preview_file_endpoint():
+    """Takes a file the frontend already has in hand — one it just
+    produced via a conversion or an AI export — and returns a PDF of
+    it for the browser to render natively, so "preview" means the
+    genuine converted or generated file's real content, not a mocked
+    stand-in. Deliberately a separate, additive endpoint rather than a
+    change to convert_endpoint or the AI export endpoints themselves:
+    every one of those keeps returning exactly what it already did,
+    so nothing already working is put at risk by adding this."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    if ext not in ("pdf", "docx", "pptx", "xlsx", "doc", "ppt", "xls"):
+        return jsonify({"error": f"Preview isn't supported for .{ext} files."}), 400
+
+    work_dir = tempfile.mkdtemp(prefix=f"mc_preview_{uuid.uuid4().hex[:8]}_")
+    try:
+        safe_name, _ext = safe_upload_filename(file.filename)
+        src_path = os.path.join(work_dir, safe_name)
+        file.save(src_path)
+
+        try:
+            result_path = preview_file(src_path, work_dir, ext)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        except FileNotFoundError as e:
+            return jsonify({"error": f"Required preview tool missing on server: {e}"}), 500
+
+        return send_file(result_path, mimetype="application/pdf", as_attachment=False)
+    except Exception as e:
+        logger.error(f"Preview generation failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Couldn't generate a preview. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
