@@ -174,6 +174,21 @@ RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
 FREE_CONVERSIONS_LIMIT = 2
 FREE_WINDOW_DAYS = 30
 
+# Sage runs on the strongest available model with web search enabled —
+# real per-message cost confirmed directly against Anthropic's current
+# published rates: roughly $0.01-$0.02 for a typical message, more once
+# a conversation's accumulated history or a triggered search is
+# factored in. That's meaningfully more expensive than the flat,
+# one-shot cost of a file conversion, and unlike a conversion, nothing
+# about a chat naturally stops a user at one message — a monthly cap is
+# the only thing standing between "a tutor asks Sage a few genuine
+# questions" and "an unbounded, unmetered bill." Free tier gets enough
+# to genuinely try it; paid tiers get a high ceiling meant to catch
+# runaway or automated use, not to be hit by normal tutoring use.
+SAGE_FREE_MESSAGES_LIMIT = 10
+SAGE_PAID_MESSAGES_LIMIT = 200
+SAGE_WINDOW_DAYS = 30
+
 _serializer = URLSafeTimedSerializer(SECRET_KEY) if SECRET_KEY else None
 
 
@@ -217,6 +232,18 @@ def init_db():
                 )
                 """
             )
+            # This file has never had a real migration mechanism — every
+            # column added after the table's first deployment (including
+            # the ones already above, going by how bare CREATE TABLE IF
+            # NOT EXISTS can't retroactively alter a table that already
+            # exists in production) must have been added by hand outside
+            # this code, which is a genuine gap: without something like
+            # this, the two new columns below only ever land in a fresh
+            # database, never the live one already running. Postgres's
+            # own ADD COLUMN IF NOT EXISTS is safe to run unconditionally
+            # on every startup, whether the columns already exist or not.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sage_messages_used INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sage_messages_reset_at TIMESTAMPTZ NOT NULL DEFAULT now()")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversions (
@@ -1449,6 +1476,53 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
+def _log_sage_message_and_consume(user_row):
+    """Enforce Sage's own monthly message cap and record the message —
+    same row-locking pattern as _log_conversion_and_consume above, for
+    the same reason (a concurrent pair of requests must not both slip
+    past the cap), but with its own counter and its own limit that
+    applies on every plan, not just free: SAGE_PAID_MESSAGES_LIMIT
+    exists specifically because "paid" doesn't mean "an unbounded bill
+    is fine," it means a much higher ceiling aimed at runaway or
+    automated use rather than genuine tutoring conversations."""
+    conn = get_db()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
+            row = cur.fetchone()
+            now = datetime.now(timezone.utc)
+            used = row["sage_messages_used"]
+            reset_at = row["sage_messages_reset_at"]
+            if reset_at and now - reset_at > timedelta(days=SAGE_WINDOW_DAYS):
+                used = 0
+                reset_at = now
+
+            limit = SAGE_FREE_MESSAGES_LIMIT if row["plan"] == "free" else SAGE_PAID_MESSAGES_LIMIT
+            if used >= limit:
+                conn.rollback()
+                if row["plan"] == "free":
+                    raise ConversionError(
+                        f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Sage this month. "
+                        "Upgrade for a much higher limit."
+                    )
+                raise ConversionError(
+                    f"You've reached Sage's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
+                    "account. It resets next month."
+                )
+
+            cur.execute(
+                "UPDATE users SET sage_messages_used = %s, sage_messages_reset_at = %s WHERE id = %s",
+                (used + 1, reset_at, row["id"]),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 # ---------- conversion + AI endpoints (unchanged logic, now behind auth) ----------
 
 
@@ -2004,6 +2078,14 @@ def sage_endpoint():
     if attachment:
         user_content = f"[Attached document]\n{attachment}\n\n[Message]\n{message}"
     turns.append({"role": "user", "content": user_content})
+
+    # Checked and consumed before the expensive call below, not after —
+    # the whole point is to never spend the API cost on a request that
+    # was already over its limit.
+    try:
+        _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 429
 
     try:
         result = call_claude(
