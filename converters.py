@@ -10,6 +10,7 @@ import os
 import re
 import copy
 import subprocess
+import signal
 import tempfile
 import shutil
 import statistics
@@ -549,17 +550,49 @@ def _add_docx_page_number_footer(doc):
 
 def _soffice_convert(src_path, target_format, out_dir):
     """Use headless LibreOffice for true rendering-based conversions
-    (currently: docx->pdf). Raises ConversionError on failure."""
-    result = subprocess.run(
-        ["soffice", "--headless", "--nologo", "--nofirststartwizard",
-         "--convert-to", target_format, "--outdir", out_dir, src_path],
-        capture_output=True, text=True, timeout=60
-    )
+    (currently: docx->pdf, and any supported format -> pdf for preview).
+    Raises ConversionError on failure.
+
+    Each call gets its own throwaway LibreOffice user-profile dir and
+    its own OS process group. Two real production failure modes this
+    closes: (1) overlapping calls sharing the default profile can
+    contend on LibreOffice's profile lock; (2) a plain subprocess
+    timeout only kills the `soffice` launcher, not the `soffice.bin`
+    renderer it spawns — so one slow conversion can leave a zombie
+    process holding that lock and silently wedge every conversion
+    after it (preview and regular convert alike) until the whole
+    service is restarted. 180s leaves headroom under the app's 240s
+    request timeout for upload/response overhead on top of the render."""
+    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    stdout, stderr = "", ""
+    try:
+        proc = subprocess.Popen(
+            ["soffice", "--headless", "--nologo", "--nofirststartwizard",
+             f"-env:UserInstallation=file://{profile_dir}",
+             "--convert-to", target_format, "--outdir", out_dir, src_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise ConversionError(
+                "That file took too long to render. Please try again — "
+                "if it keeps happening, the file may be unusually large or complex."
+            )
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
     base = os.path.splitext(os.path.basename(src_path))[0]
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{base}.{target_format}")
     if not os.path.exists(out_path):
-        raise ConversionError(f"LibreOffice conversion failed: {result.stderr or result.stdout}")
+        raise ConversionError(f"LibreOffice conversion failed: {stderr or stdout}")
     return out_path
 
 
