@@ -92,18 +92,17 @@ def safe_download_name(original_filename, fallback="download"):
     return cleaned or fallback
 
 
-# CORS: allow the app's known frontend origins. This has broken twice now
-# on an exact-string allowlist — first the MasterConvert->Docently rename,
+# CORS: allow the app's known frontend origins. This has broken three times
+# now on a too-narrow allowlist — first the MasterConvert->Docently rename,
 # then a second Vercel deployment landing on docently-1.vercel.app instead
-# of the original docently.vercel.app (redeploying to the same Vercel
-# project keeps the same URL; getting a new "-1" suffix usually means a
-# new project was created instead of pushing to the existing one — worth
-# checking the Vercel dashboard for duplicate projects). Rather than keep
-# adding one more exact domain each time this happens, any deployment
-# under the docently* naming pattern is allowed, so a future redeploy
-# landing on yet another suffixed URL doesn't silently lock everyone out
-# again the same way.
-_ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://docently[a-z0-9-]*\.vercel\.app$")
+# of the original docently.vercel.app, then the Docently->Docente rename
+# landing on docente-1-dusky.vercel.app. Note "docente" is NOT "docently"
+# with a suffix chopped off — they share only the root "docent" and then
+# diverge ("-e" vs "-ly"), so the pattern below matches on that shared
+# root plus either ending, covering both brand generations at once. That
+# way neither a future suffix change nor another rebrand locks everyone
+# out again.
+_ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://docent(e|ly)[a-z0-9-]*\.vercel\.app$")
 ALLOWED_ORIGINS = {
     "https://docently.vercel.app",
     "https://masterconvert-tau.vercel.app",
