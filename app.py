@@ -24,6 +24,8 @@ import requests
 import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
 from flask import Flask, request, send_file, jsonify
 from flask_compress import Compress
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -47,6 +49,31 @@ app.config["COMPRESS_MIMETYPES"] = [
 ]
 app.config["COMPRESS_MIN_SIZE"] = 500  # skip tiny replies — not worth the CPU
 Compress(app)
+
+# Rate limiting — login/signup/password-reset had no throttling at all, so
+# nothing stopped a scripted credential-stuffing run or a mass password-reset
+# email-bomb against a real account beyond the natural cost of the password
+# hash itself. In-memory storage (the default) is genuinely fine here, not a
+# shortcut: this service runs as a single Render instance (numInstances: 1),
+# so there's no second process with its own separate counters to get out of
+# sync with. If this ever moves to multiple instances, this needs a shared
+# backend (e.g. Redis) instead, or each instance enforces its own limit
+# independently and the effective limit multiplies by instance count.
+limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
+
+
+@limiter.request_filter
+def _exempt_cors_preflight():
+    """Every route below handles OPTIONS as a CORS preflight (returns 204
+    with no auth or rate-limit logic run). Flask-Limiter applies a route's
+    limit to all of that route's methods by default, so without this, a
+    client that had already used up its POST limit could then also get
+    its OPTIONS preflight rejected — which would break the real request
+    the browser was about to make right after, not just the one being
+    limited."""
+    return request.method == "OPTIONS"
+
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docently")
@@ -810,6 +837,7 @@ def health():
 
 
 @app.route("/api/auth/signup", methods=["POST", "OPTIONS"])
+@limiter.limit("10 per hour")
 def signup():
     if request.method == "OPTIONS":
         return "", 204
@@ -867,6 +895,7 @@ def signup():
 
 
 @app.route("/api/auth/login", methods=["POST", "OPTIONS"])
+@limiter.limit("10 per minute; 30 per hour")
 def login():
     if request.method == "OPTIONS":
         return "", 204
@@ -906,6 +935,7 @@ def login():
 
 
 @app.route("/api/auth/forgot-password", methods=["POST", "OPTIONS"])
+@limiter.limit("5 per hour")
 def forgot_password():
     if request.method == "OPTIONS":
         return "", 204
@@ -950,6 +980,7 @@ def forgot_password():
 
 
 @app.route("/api/auth/reset-password", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per hour")
 def reset_password():
     if request.method == "OPTIONS":
         return "", 204

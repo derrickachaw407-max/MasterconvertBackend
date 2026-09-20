@@ -1,5 +1,6 @@
 Flask
 Flask-Compress
+Flask-Limiter
 Werkzeug
 gunicorn
 psycopg2-binary
