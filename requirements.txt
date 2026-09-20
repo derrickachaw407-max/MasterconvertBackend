@@ -1,4 +1,5 @@
 Flask
+Flask-Compress
 Werkzeug
 gunicorn
 psycopg2-binary

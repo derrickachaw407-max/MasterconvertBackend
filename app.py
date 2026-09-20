@@ -23,6 +23,7 @@ import psycopg2.extras
 import requests
 import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
 from flask import Flask, request, send_file, jsonify
+from flask_compress import Compress
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -33,6 +34,19 @@ from converters import (
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB upload cap — raised from 25MB: confirmed directly that scanned/image-heavy PDFs (the PDF editor's primary use case) routinely exceed 25MB in ways a plain text document never would, and 25MB was rejecting genuinely legitimate files.
+
+# Gzip text-ish responses (JSON API replies, Sage/chat history, quiz data) —
+# cheap on this box compared to a LibreOffice conversion, and meaningfully
+# cuts payload size on slow mobile connections. Deliberately NOT compressing
+# docx/pptx/xlsx/pdf downloads: those formats are already internally
+# compressed (zip-based), so re-gzipping them burns CPU for near-zero size
+# gain.
+app.config["COMPRESS_MIMETYPES"] = [
+    "application/json", "text/html", "text/css", "text/javascript",
+    "application/javascript", "text/plain", "application/manifest+json",
+]
+app.config["COMPRESS_MIN_SIZE"] = 500  # skip tiny replies — not worth the CPU
+Compress(app)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docently")
@@ -922,9 +936,9 @@ def forgot_password():
         try:
             send_email(
                 email,
-                "Reset your Docently password",
+                "Reset your Docente password",
                 f"Hi {row['name'] or ''},\n\n"
-                "We received a request to reset your Docently password. "
+                "We received a request to reset your Docente password. "
                 "This link expires in 1 hour:\n\n"
                 f"{reset_link}\n\n"
                 "If you didn't request this, you can safely ignore this email — "
@@ -1494,11 +1508,11 @@ def _log_sage_message_and_consume(user_row):
                 conn.rollback()
                 if row["plan"] == "free":
                     raise ConversionError(
-                        f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Sage this month. "
+                        f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
                         "Upgrade for a much higher limit."
                     )
                 raise ConversionError(
-                    f"You've reached Sage's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
+                    f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
                     "account. It resets next month."
                 )
 
@@ -2085,9 +2099,9 @@ def _parse_summary_json(raw_text):
 
 
 SAGE_SYSTEM_PROMPT = (
-    "You are Sage, Docently's built-in AI tutor — not a narrow, single-purpose tool "
+    "You are Remy, Docente's built-in AI tutor — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant a tutor or "
-    "student can bring almost anything to. Docently also has three purpose-built AI "
+    "student can bring almost anything to. Docente also has three purpose-built AI "
     "tools you can point people toward when they'd genuinely help more than a chat "
     "answer would: Smart Summarize (condenses a document into a slide deck), Practice "
     "Quiz (generates a quiz with an answer key from source material), and Evidence-"
@@ -2501,7 +2515,7 @@ def quiz_export_docx_endpoint():
 
 
 ROLE_DESCRIPTION = (
-    "You're Docently's academic writing partner for a student or researcher — help with "
+    "You're Docente's academic writing partner for a student or researcher — help with "
     "whatever the work actually needs: drafting a proposal, lit review, or full paper; "
     "tightening grammar and tone in something they've pasted in; formatting APA citations; "
     "talking through gaps in an argument or methodology; explaining a concept or a study in "
