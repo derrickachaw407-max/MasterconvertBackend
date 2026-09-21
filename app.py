@@ -1511,6 +1511,29 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
+def _refund_sage_message(user_row):
+    """Returns one Remy message to the user's monthly allowance, for a
+    request that was counted but never got a reply. Never goes below zero
+    (the allowance may have reset in between). Best-effort: a failure here
+    is logged, never shown to the user on top of the original error."""
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s",
+                (user_row["id"],),
+            )
+        conn.commit()
+    except Exception as e:
+        logger.error("Couldn't refund a Remy message for user %s: %s", user_row.get("id"), e)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+
+
 def _log_sage_message_and_consume(user_row):
     """Enforce Sage's own monthly message cap and record the message —
     same row-locking pattern as _log_conversion_and_consume above, for
@@ -2209,9 +2232,16 @@ def sage_endpoint():
             use_search=True,
             model=ANTHROPIC_MODEL_STRONG,
         )
-        return jsonify({"reply": result})
-    except ConversionError as e:
-        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        # The message was counted above, before the AI call — but no reply
+        # arrived, so give it back. Otherwise a timeout or AI outage quietly
+        # spent one of a free user's 10 monthly messages, and tapping Retry
+        # spent another.
+        _refund_sage_message(request.current_user)
+        if isinstance(e, ConversionError):
+            return jsonify({"error": str(e)}), 502
+        raise
+    return jsonify({"reply": result})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
