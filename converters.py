@@ -6,6 +6,7 @@ no direct renderer path between them.
 """
 import datetime
 import io
+import hashlib
 import os
 import re
 import copy
@@ -30,7 +31,7 @@ from pptx.util import Inches as PptxInches, Pt, Length
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE, MSO_COLOR_TYPE
-from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE, PP_PLACEHOLDER
 from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.chart.data import CategoryChartData
 from pptx.text.text import _Run
@@ -139,7 +140,11 @@ def _reconstruct_paragraphs(raw_text, font_headings=None, allow_heading_fallback
             continue
         if _BULLET_RE.match(line):
             flush()
-            items.append((_BULLET_RE.sub("", line).strip(), "bullet"))
+            _m = _BULLET_RE.match(line)
+            # "1." / "2)" markers are numbered steps, not bullets — keeping
+            # them apart is what lets Word number them again (they used to
+            # come out as plain bullets with the numbers stripped).
+            items.append((_BULLET_RE.sub("", line).strip(), "number" if (_m and _m.group(1)[:1].isdigit()) else "bullet"))
             continue
         ends_sentence = bool(_SENTENCE_END_RE.search(line))
         if (
@@ -434,6 +439,30 @@ def _extract_template_style(prs, content_layout):
     }
 
 
+def _fit_layouts_to_widescreen(prs, designed_width=None):
+    """python-pptx's built-in template is laid out for a 10-inch-wide (4:3)
+    slide. Widening the slide to 13.33in (16:9) doesn't move the layouts'
+    placeholders, so every title and text box stayed 9in wide at the left:
+    3.8in (29%) of each slide sat empty on the right, titles were off-centre,
+    and text wrapped early onto extra slides. This stretches every
+    placeholder's horizontal position and width to the real slide width.
+    Only placeholders with their own position are scaled; ones that inherit
+    from the master are covered by scaling the master once."""
+    designed_width = designed_width or PptxInches(10)
+    f = prs.slide_width / designed_width
+    if abs(f - 1) < 0.01:
+        return
+    def scale(ph):
+        if not ph._element.xpath('./p:spPr/a:xfrm'):
+            return
+        ph.left, ph.width = int(ph.left * f), int(ph.width * f)
+    for ph in prs.slide_master.placeholders:
+        scale(ph)
+    for layout in prs.slide_layouts:
+        for ph in layout.placeholders:
+            scale(ph)
+
+
 def _style_pptx_slide(slide, style):
     if style["bg"] is not None:
         slide.background.fill.solid()
@@ -526,6 +555,18 @@ def apply_docx_style(doc, style_name):
             if style.get("tight_spacing"):
                 para.paragraph_format.space_before = DocxPt(0)
                 para.paragraph_format.space_after = DocxPt(2)
+    # doc.paragraphs is only the top-level body — text inside tables never
+    # got the document's font, so every table switched to its table style's
+    # own typeface (a serif, beside sans-serif text all around it).
+    def _style_table_runs(tables):
+        for t in tables:
+            for row in t.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        for run in para.runs:
+                            run.font.name = style["body_font"]
+                    _style_table_runs(cell.tables)
+    _style_table_runs(doc.tables)
     if style["page_numbers"]:
         _add_docx_page_number_footer(doc)
 
@@ -2184,6 +2225,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         prs = Presentation()
         prs.slide_width = PptxInches(13.333)
         prs.slide_height = PptxInches(7.5)
+        _fit_layouts_to_widescreen(prs)
         title_layout = prs.slide_layouts[1]  # title + content
         blank_layout = prs.slide_layouts[6]
 
@@ -2193,7 +2235,19 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     MAX_LINES_PER_SLIDE = 10  # estimated wrapped-line budget, not a flat bullet count (see
     # _estimate_line_count) — accounts for bullets of very different lengths now that long
     # paragraphs get split into shorter, sentence-level bullets rather than staying as one
-    state = {"slide": None, "body_tf": None, "bullet_count": 0, "lines_used": 0}
+    state = {"slide": None, "body_tf": None, "bullet_count": 0, "lines_used": 0, "section_title": None}
+
+    def _cont(title):
+        """"X (cont.)" — without stacking into "X (cont.) (cont.)" when a long
+        section runs over more than one continuation slide."""
+        base = re.sub(r"(\s*\(cont\.\))+$", "", title or "").strip() or "Overview"
+        return base + " (cont.)"
+
+    def _continuation_title():
+        # Bullets that arrive with no slide open (right after a picture or a
+        # table) used to get a generic "Overview" title, which told the
+        # audience nothing. They continue the current section instead.
+        return _cont(state["section_title"]) if state["section_title"] else "Overview"
 
     def new_slide(title_text):
         s = prs.slides.add_slide(title_layout)
@@ -2215,7 +2269,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
 
     def add_bullet(para, level=0, numbered=False):
         if state["slide"] is None:
-            new_slide("Overview")
+            new_slide(_continuation_title())
 
         # iter_inner_content() (like .text and .runs) silently drops any
         # text wrapped in a tracked-change insertion or deletion —
@@ -2260,7 +2314,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             # just counted the same.
             if state["bullet_count"] > 0 and state["lines_used"] + group_lines > MAX_LINES_PER_SLIDE:
                 current_title = state["slide"].shapes.title.text or "Overview"
-                new_slide(current_title + " (cont.)")
+                new_slide(_cont(current_title))
             body_tf = state["body_tf"]
             if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
                 p = body_tf.paragraphs[0]
@@ -2323,7 +2377,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         subhead_lines = _estimate_line_count(text) + 1
         if state["bullet_count"] > 0 and state["lines_used"] + subhead_lines > MAX_LINES_PER_SLIDE:
             current_title = state["slide"].shapes.title.text or "Overview"
-            new_slide(current_title + " (cont.)")
+            new_slide(_cont(current_title))
         body_tf = state["body_tf"]
         if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
             p = body_tf.paragraphs[0]
@@ -2364,21 +2418,41 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # name) the moment a second such table appeared later in the same
         # document. Never creating the empty slide in the first place
         # avoids that whole class of problem.
-        s = prs.slides.add_slide(title_layout if carried_title else blank_layout)
-        if carried_title:
-            s.shapes.title.text = carried_title
-            _style_pptx_slide(s, template_style)
-            # The title layout's own body placeholder isn't needed here —
-            # the table below is the slide's actual content — and leaving
-            # an empty placeholder box behind would just be visual clutter.
-            body_ph = s.placeholders[1] if len(s.placeholders) > 1 else None
-            if body_ph is not None:
-                body_ph._element.getparent().remove(body_ph._element)
-            left, top = PptxInches(0.6), PptxInches(1.7)
-            width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3)
-        else:
-            left, top = PptxInches(0.6), PptxInches(0.6)
-            width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
+        # A small table right after a short intro line ("A vendor recorded
+        # weekly sales at different prices:") goes on that same slide, under
+        # the line — rather than leaving the intro alone on one slide and the
+        # table, untitled, on the next.
+        cur = state["slide"]
+        cur_body = cur.placeholders[1] if (cur is not None and len(cur.placeholders) > 1) else None
+        placed_here = False
+        if cur_body is not None and 0 < state["bullet_count"] and state["lines_used"] <= 3:
+            text_h = int(PptxInches(0.48) * state["lines_used"] + PptxInches(0.35))
+            need = int(PptxInches(0.5) * n_rows)
+            if need <= cur_body.height - text_h:
+                L, T, W = cur_body.left, cur_body.top, cur_body.width
+                cur_body.left, cur_body.top, cur_body.width, cur_body.height = L, T, W, text_h
+                s = cur
+                left, top, width, height = L, T + text_h, W, need
+                placed_here = True
+        if not placed_here:
+            s = prs.slides.add_slide(title_layout if carried_title else blank_layout)
+            if carried_title:
+                s.shapes.title.text = carried_title
+                _style_pptx_slide(s, template_style)
+                # The title layout's own body placeholder isn't needed here —
+                # the table below is the slide's actual content — and leaving
+                # an empty placeholder box behind would just be visual clutter.
+                body_ph = s.placeholders[1] if len(s.placeholders) > 1 else None
+                if body_ph is not None:
+                    body_ph._element.getparent().remove(body_ph._element)
+                left, top = PptxInches(0.6), PptxInches(1.7)
+                width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3)
+            else:
+                left, top = PptxInches(0.6), PptxInches(0.6)
+                width, height = prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(1.2)
+            # Rows sized to their content instead of stretched to fill the
+            # slide: a six-row table used to get ~0.9in-tall rows.
+            height = min(height, int(PptxInches(0.55) * n_rows))
         gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, height).table
 
         merges = _find_docx_merges(src_rows, n_cols)
@@ -2390,12 +2464,21 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
                       for r in range(min_r, max_r + 1) for c in range(min_c, max_c + 1)
                       if (r, c) != (min_r, min_c)}
 
+        # Cell text had no size of its own and fell back to a small default
+        # (about 12pt as rendered) — hard to read across a room. Sized to the
+        # table instead, in the deck's own body font.
+        cell_pt = Pt(20 if (n_rows <= 6 and n_cols <= 4) else 16 if (n_rows <= 10 and n_cols <= 6) else 13)
         for r_idx, row in enumerate(rows):
             for c_idx in range(n_cols):
                 if (r_idx, c_idx) in skip_cells:
                     continue
                 cell = gtable.cell(r_idx, c_idx)
                 cell.text = row[c_idx] if c_idx < len(row) else ""
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = cell_pt
+                        if template_style.get("body_font"):
+                            run.font.name = template_style["body_font"]
                 if r_idx == 0:
                     for p in cell.text_frame.paragraphs:
                         for run in p.runs:
@@ -2458,16 +2541,66 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # slide rather than silently reusing the chart's slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
 
-    def add_image_slide(image_bytes):
-        s = prs.slides.add_slide(blank_layout)
+    def _picture_size(image_bytes):
+        """Pixel size via python-pptx's own image reader — so anything it can
+        embed is accepted, and a malformed picture is rejected before any
+        slide is created for it (deleting a slide afterwards isn't safe)."""
         try:
-            pic = s.shapes.add_picture(io.BytesIO(image_bytes), 0, 0)
+            from pptx.parts.image import Image as _PptxImage
+            return _PptxImage.from_blob(image_bytes).size
         except Exception:
+            return None
+
+    def _place_image_beside_text(image_bytes, px):
+        """With only a few lines on the current slide, the picture sits to
+        the right of the text instead of on a slide of its own."""
+        s = state["slide"]
+        if s is None or state["bullet_count"] == 0 or state["lines_used"] > 5:
+            return False
+        iw, ih = px
+        if not iw or not ih or iw / ih > 2.3:   # very wide pictures would be tiny in half a slide
+            return False
+        body = s.placeholders[1] if len(s.placeholders) > 1 else None
+        if body is None:
+            return False
+        L, T, W, H = body.left, body.top, body.width, body.height
+        text_w, gap = int(W * 0.56), int(W * 0.04)
+        img_l, img_w = L + text_w + gap, W - text_w - gap
+        scale = min(img_w / iw, H / ih)
+        pw, ph_ = int(iw * scale), int(ih * scale)
+        s.shapes.add_picture(io.BytesIO(image_bytes), img_l + (img_w - pw) // 2, T + (H - ph_) // 2, pw, ph_)
+        body.left, body.top, body.width, body.height = L, T, text_w, H
+        # This slide is complete; whatever follows starts a new one.
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
+        return True
+
+    def add_image_slide(image_bytes):
+        px = _picture_size(image_bytes)
+        if px is None:
             return  # a malformed/unsupported embedded image shouldn't sink the whole conversion
-        scale = min(prs.slide_width / pic.width, prs.slide_height / pic.height, 1) if pic.width and pic.height else 1
-        pic.width, pic.height = int(pic.width * scale), int(pic.height * scale)
-        pic.left = int((prs.slide_width - pic.width) / 2)
-        pic.top = int((prs.slide_height - pic.height) / 2)
+        if _place_image_beside_text(image_bytes, px):
+            return
+        # Otherwise a slide of its own — now titled with its section, where
+        # it used to be an untitled full-bleed picture cut off from the topic
+        # it illustrated.
+        titled = bool(state["section_title"])
+        s = prs.slides.add_slide(title_layout if titled else blank_layout)
+        if titled:
+            s.shapes.title.text = state["section_title"]
+            _style_pptx_slide(s, template_style)
+            body_ph = s.placeholders[1] if len(s.placeholders) > 1 else None
+            if body_ph is not None:
+                area = (body_ph.left, body_ph.top, body_ph.width, body_ph.height)
+                body_ph._element.getparent().remove(body_ph._element)
+            else:
+                area = (PptxInches(0.6), PptxInches(1.7), prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3))
+        else:
+            area = (0, 0, prs.slide_width, prs.slide_height)
+        aL, aT, aW, aH = area
+        iw, ih = px
+        scale = min(aW / iw, aH / ih, 1) if iw and ih else 1
+        pw, ph_ = int(iw * scale) if iw else aW, int(ih * scale) if ih else aH
+        s.shapes.add_picture(io.BytesIO(image_bytes), aL + (aW - pw) // 2, aT + (aH - ph_) // 2, pw, ph_)
         # A loose paragraph appearing right after an image should land on a
         # fresh slide rather than silently reusing the image slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
@@ -2516,10 +2649,58 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     # the comment in add_table_slide for why that lookahead exists.
     blocks = list(_iter_block_items(doc))
     pending_table_title = None
+    skip_blocks = set()
+
+    def _make_title_slide(text, block_idx):
+        """The document's Title becomes a real title slide: centred, with the
+        short line under it (course code, author, date) as its subtitle. It
+        used to be laid out like any content slide, with that line shown as
+        a bullet point."""
+        layout = None
+        for lo in prs.slide_layouts:
+            kinds = [p.placeholder_format.type for p in lo.placeholders]
+            if PP_PLACEHOLDER.SUBTITLE in kinds and any(p.placeholder_format.idx == 0 for p in lo.placeholders):
+                layout = lo
+                break
+        if layout is None:
+            return False
+        s = prs.slides.add_slide(layout)
+        s.shapes.title.text = text
+        _style_pptx_slide(s, template_style)
+        sub_ph = next((p for p in s.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
+        nxt = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
+        used = False
+        if sub_ph is not None and nxt is not None and not isinstance(nxt, DocxTable):
+            nstyle = (nxt.style.name or "").lower()
+            ntext = _full_paragraph_text(nxt).strip()
+            if (ntext and not nstyle.startswith("heading") and nstyle != "title" and "list" not in nstyle
+                    and len(ntext.split()) <= 25 and not any(True for _ in _iter_inline_images(nxt, doc))):
+                sub_ph.text_frame.text = ntext
+                for p in sub_ph.text_frame.paragraphs:
+                    _style_pptx_body_paragraph(p, template_style, size=Pt(24))
+                skip_blocks.add(block_idx + 1)
+                used = True
+        if sub_ph is not None and not used:
+            sub_ph._element.getparent().remove(sub_ph._element)
+        state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
+        return True
+
+    def _is_lead_in(text):
+        t = text.strip()
+        return t.endswith(":") and 2 <= len(t.split()) <= 14
+
+    def _next_is_list_item(block_idx):
+        nxt = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
+        if nxt is None or isinstance(nxt, DocxTable):
+            return False
+        return (_get_paragraph_direct_list_info(nxt, numbering_formats) is not None
+                or "list" in (nxt.style.name or "").lower())
 
     for block_idx, block in enumerate(blocks):
+        if block_idx in skip_blocks:
+            continue
         if isinstance(block, DocxTable):
-            add_table_slide(block, carried_title=pending_table_title)
+            add_table_slide(block, carried_title=pending_table_title or state["section_title"])
             pending_table_title = None
             continue
         pending_table_title = None
@@ -2554,6 +2735,9 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # the current slide rather than fragmenting into ever-thinner
         # slides for what's usually meant to be one cohesive topic.
         if para_style_name == "title" or (heading_match and int(heading_match.group(1)) <= 2):
+            state["section_title"] = text
+            if para_style_name == "title" and len(prs.slides) == 0 and _make_title_slide(text, block_idx):
+                continue
             next_block = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
             if isinstance(next_block, DocxTable):
                 # This heading has nothing else to show but a table right
@@ -2567,6 +2751,12 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         elif heading_match:
             add_subheading(text)
         else:
+            if state["slide"] is None and _is_lead_in(text) and _next_is_list_item(block_idx):
+                # A short lead-in ending in a colon, right before a list, with
+                # no slide open (just after a picture or table): it says what
+                # the list is about, so it becomes that slide's title.
+                new_slide(text.strip().rstrip(":").rstrip())
+                continue
             direct_list_info = _get_paragraph_direct_list_info(para, numbering_formats)
             if direct_list_info is not None:
                 level, numbered = direct_list_info
@@ -2937,6 +3127,31 @@ def _iter_flat_shapes(shapes):
             yield shape
 
 
+def _handout_title(prs, slides):
+    """The handout's title comes from the deck itself: its title slide, with
+    that slide's subtitle (course, date, presenter) underneath — else the
+    file's own title property. It used to always be the words "Slide
+    Handout". Returns (title, subtitle, whether slide 1 is fully used up by
+    this, so it can be left out of the body instead of repeated there)."""
+    if slides:
+        first = slides[0]
+        kinds = {ph.placeholder_format.type for ph in first.placeholders}
+        t = first.shapes.title
+        ttext = t.text_frame.text.strip() if (t is not None and t.has_text_frame) else ""
+        if ttext and (PP_PLACEHOLDER.CENTER_TITLE in kinds or PP_PLACEHOLDER.SUBTITLE in kinds):
+            sub = next((ph for ph in first.placeholders if ph.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
+            stext = sub.text_frame.text.strip() if (sub is not None and sub.has_text_frame) else ""
+            used = {id(t._element)} | ({id(sub._element)} if sub is not None else set())
+            other = [sh for sh in first.shapes if id(sh._element) not in used and
+                     (getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip()
+                      or sh.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.TABLE, MSO_SHAPE_TYPE.CHART))]
+            has_notes = first.has_notes_slide and first.notes_slide.notes_text_frame.text.strip()
+            return (_sanitize_xml_text(ttext), _sanitize_xml_text(stext) or None,
+                    not other and not has_notes)
+    core = (prs.core_properties.title or "").strip()
+    return (_sanitize_xml_text(core) if core else "Slide handout"), None, False
+
+
 def pptx_to_docx(src_path, out_dir, style="clean"):
     prs = _safe_load(Presentation, src_path)
     doc = Document()
@@ -2949,7 +3164,10 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     zoom_el = doc.settings.element.find(qn("w:zoom"))
     if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
         zoom_el.set(qn("w:percent"), "100")
-    doc.add_heading("Slide Handout", 0)
+    doc_title, doc_subtitle, skip_title_slide = _handout_title(prs, list(prs.slides))
+    doc.add_heading(doc_title, 0)
+    if doc_subtitle:
+        doc.add_paragraph(doc_subtitle, style="Subtitle")
     BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
     NUMBER_STYLES = ["List Number", "List Number 2", "List Number 3"]
 
@@ -2964,8 +3182,12 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             slide_titles.append(_sanitize_xml_text(title_shape.text_frame.text.strip()))
         else:
             slide_titles.append(None)
+    if skip_title_slide:
+        slide_titles[0] = None
     real_titles = [t for t in slide_titles if t]
-    if len(real_titles) >= 4:
+    # A contents page only earns its space on a long deck — a 5-slide deck
+    # used to get a whole page listing its handful of headings.
+    if len(real_titles) >= 10:
         toc_heading = doc.add_paragraph()
         toc_heading_run = toc_heading.add_run("Contents")
         toc_heading_run.bold = True
@@ -2974,6 +3196,8 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         doc.add_page_break()
 
     for i, slide in enumerate(prs.slides, 1):
+        if skip_title_slide and i == 1:
+            continue
         title = None
         text_shapes = []
         table_shapes = []
@@ -3180,8 +3404,9 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
                 text_run.font.size = DocxPt(10)
                 _add_docx_callout_style(note_p)
 
-        if i < len(prs.slides):
-            doc.add_page_break()
+        # No page break per slide: that made a 6-slide deck into 7 mostly
+        # blank pages — wasteful for students paying to print handouts.
+        # Each slide's heading starts its section in one continuous document.
 
     apply_docx_style(doc, style)
     os.makedirs(out_dir, exist_ok=True)
@@ -3191,6 +3416,101 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
 
 
 # ---------------------------------------------------------------- PDF -> DOCX
+_TABLE_MARK = "\u2063"   # invisible separator — never appears in real PDF text
+
+
+def _mark_table_lines(text, tables):
+    """pypdf reads a table's rows as ordinary lines of text, so every table
+    appeared twice — once as a real table (added at the end of the page) and
+    once as a jumbled paragraph of its cell values. This takes those lines
+    out of the text and leaves a marker where the table's first row was, so
+    the real table goes back in its actual place. Only rows with two or more
+    filled cells are matched, so a lone number elsewhere is never removed."""
+    if not tables or not text:
+        return text
+    norm = lambda s: re.sub(r"\s+", " ", s or "").strip().lower()
+    row_owner = {}
+    for t_idx, rows in enumerate(tables):
+        for row in rows:
+            cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+            if len(cells) >= 2:
+                row_owner.setdefault(norm(" ".join(cells)), t_idx)
+    out, placed = [], set()
+    for line in text.split("\n"):
+        t_idx = row_owner.get(norm(line))
+        if t_idx is None:
+            out.append(line)
+        elif t_idx not in placed:
+            placed.add(t_idx)
+            out.append(f"{_TABLE_MARK}{t_idx}{_TABLE_MARK}")
+    return "\n".join(out)
+
+
+def _split_table_markers(items):
+    """Turns table markers inside reconstructed paragraphs into their own
+    ("<index>", "table") items, wherever the paragraph joining put them."""
+    pat = re.compile(re.escape(_TABLE_MARK) + r"(\d+)" + re.escape(_TABLE_MARK))
+    out = []
+    for text, kind in items:
+        pos = 0
+        for m in pat.finditer(text):
+            before = text[pos:m.start()].strip()
+            if before:
+                out.append((before, kind))
+            out.append((m.group(1), "table"))
+            pos = m.end()
+        rest = text[pos:].strip()
+        if rest:
+            out.append((rest, kind if pos == 0 else ("para" if kind.startswith("heading") else kind)))
+    return out
+
+
+def _pdf_drawn_images(src_path):
+    """{page_index: [(image_name, top, text_just_above)]} for the images each
+    page actually draws, top to bottom. pypdf lists every image a page's
+    resources *reference* — PDFs that share one resource dictionary across
+    pages (LibreOffice's do) made the same chart appear on every page. The
+    line of text just above each image is used to put it back in place."""
+    result = {}
+    try:
+        with pdfplumber.open(src_path) as pdf:
+            for p_idx, page in enumerate(pdf.pages):
+                imgs = sorted(page.images, key=lambda im: im.get("top", 0))
+                if not imgs:
+                    continue
+                try:
+                    lines = page.extract_text_lines()
+                except Exception:
+                    lines = []
+                entries = []
+                for im in imgs:
+                    above = [ln for ln in lines if ln.get("bottom", 0) <= im.get("top", 0) + 1]
+                    anchor = above[-1]["text"] if above else ""
+                    entries.append((str(im.get("name", "")), im.get("top", 0), anchor))
+                result[p_idx] = entries
+    except Exception:
+        return None
+    return result
+
+
+def _merge_wrapped_headings(items):
+    """A heading that wrapped onto two lines in the PDF came through as two
+    headings ("Introduction to Economics: Demand" / "and Supply"). Joins a
+    heading with the next one at the same level when that one clearly
+    continues it: it starts in lowercase, or the first ends on a joining word."""
+    out = []
+    joiners = ("and", "or", "of", "the", "to", "for", "in", "with", "on", "&", "a", "an")
+    for text, kind in items:
+        if (out and kind.startswith("heading") and out[-1][1] == kind and text
+                and (text[:1].islower() or out[-1][0].rstrip().lower().split()[-1:] and
+                     out[-1][0].rstrip().lower().split()[-1] in joiners)
+                and not re.search(r"[.!?:]$", out[-1][0].rstrip())):
+            out[-1] = (out[-1][0].rstrip() + " " + text.strip(), kind)
+        else:
+            out.append((text, kind))
+    return out
+
+
 def pdf_to_docx(src_path, out_dir, style="clean"):
     reader = _safe_load(pypdf.PdfReader, src_path)
     if reader.is_encrypted:
@@ -3264,7 +3584,8 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
             )
         text = _sanitize_xml_text(raw_text.strip())
         page_font_headings = font_headings_by_page.get(page_idx, {})
-        page_items.append(_reconstruct_paragraphs(text, page_font_headings) if text else [])
+        text = _mark_table_lines(text, tables_by_page.get(page_idx, []))
+        page_items.append(_split_table_markers(_reconstruct_paragraphs(text, page_font_headings)) if text else [])
 
     # A short line that repeats verbatim across most pages is usually a
     # running header/footer (page title, "Confidential", a date stamp,
@@ -3318,7 +3639,107 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     zoom_el = doc.settings.element.find(qn("w:zoom"))
     if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
         zoom_el.set(qn("w:percent"), "100")
-    doc.add_heading("Converted from PDF", 0)
+    # Headers/footers repeated on every page are dropped first, so the
+    # rearranging below can't disturb which occurrences were exempted.
+    filtered_pages = [
+        [(t, k) for item_idx, (t, k) in enumerate(items)
+         if t not in noisy_lines or (p_idx, item_idx) in exempt_occurrences]
+        for p_idx, items in enumerate(page_items)
+    ]
+    filtered_pages = [_merge_wrapped_headings(items) for items in filtered_pages]
+
+    def _lvl(kind):
+        tail = kind[len("heading"):]
+        return int(tail) if tail.isdigit() else 3
+    all_levels = [_lvl(k) for items in filtered_pages for _t, k in items if k.startswith("heading")]
+    doc_title = None
+    if filtered_pages and filtered_pages[0] and filtered_pages[0][0][1].startswith("heading") \
+            and all_levels and _lvl(filtered_pages[0][0][1]) == min(all_levels):
+        # The document's own first, most prominent heading is its title. The
+        # Word file used to be titled "Converted from PDF" instead.
+        doc_title = filtered_pages[0].pop(0)[0]
+    if not doc_title:
+        meta_title = ""
+        try:
+            meta_title = (reader.metadata.title or "").strip() if reader.metadata else ""
+        except Exception:
+            pass
+        doc_title = _sanitize_xml_text(meta_title) if meta_title else None
+    if doc_title:
+        doc.add_heading(doc_title, 0)
+    rest_levels = [_lvl(k) for items in filtered_pages for _t, k in items if k.startswith("heading")]
+    base_level = min(rest_levels) if rest_levels else 1
+
+    def _word_level(pdf_level):
+        # The biggest remaining headings become Heading 1. They used to be
+        # pushed down two levels to sit under "Page N" headings, so a main
+        # section like "What is demand?" came out as Heading 4.
+        return max(1, min(pdf_level - base_level + 1, 9))
+
+    drawn_images = _pdf_drawn_images(src_path)
+    seen_image_hashes = set()
+    emitted_tables_by_page = {}
+    emitted_images_by_page = {}
+    if drawn_images:
+        norm = lambda s: re.sub(r"\s+", " ", s or "").strip()
+        for p_idx, entries in drawn_images.items():
+            if p_idx >= len(filtered_pages):
+                continue
+            items = filtered_pages[p_idx]
+            for name, _top, anchor in entries:
+                a = norm(anchor)[-40:]
+                pos = None
+                if a:
+                    for k in range(len(items) - 1, -1, -1):
+                        if items[k][1] not in ("table", "image") and a in norm(items[k][0]):
+                            pos = k + 1
+                            break
+                if pos is None and not a:
+                    pos = 0        # nothing above it: the picture opens the page
+                if pos is not None:
+                    items.insert(pos, (name, "image"))
+
+    def _emit_table(table_rows):
+        clean_rows = [
+            [(_sanitize_xml_text(str(cell).strip()) if cell else "") for cell in row]
+            for row in table_rows if any(cell and str(cell).strip() for cell in row)
+        ]
+        if not clean_rows:
+            return
+        n_cols = max(len(r) for r in clean_rows)
+        word_table = doc.add_table(rows=len(clean_rows), cols=n_cols)
+        word_table.style = "Light Grid Accent 1"
+        for r_idx, row in enumerate(clean_rows):
+            for c_idx in range(n_cols):
+                cell = word_table.rows[r_idx].cells[c_idx]
+                cell.text = row[c_idx] if c_idx < len(row) else ""
+                if r_idx == 0:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.bold = True
+        doc.add_paragraph()  # breathing room after the table before whatever comes next
+
+    def _emit_image(page, page_idx, name):
+        nonlocal image_count
+        if image_count >= MAX_IMAGES:
+            return
+        emitted_images_by_page.setdefault(page_idx, set()).add(name)
+        try:
+            by_name = {os.path.splitext(img.name)[0]: img for img in page.images}
+        except Exception:
+            return
+        img = by_name.get(name)
+        if img is None:
+            return
+        digest = hashlib.sha1(img.data).hexdigest()
+        if digest in seen_image_hashes:
+            return   # the same picture (a logo on every page) goes in once
+        try:
+            doc.add_picture(io.BytesIO(img.data), width=DocxInches(6))
+            seen_image_hashes.add(digest)
+            image_count += 1
+        except Exception:
+            pass  # a malformed/unsupported embedded image shouldn't sink the whole conversion
 
     # A real, clickable table of contents built from the PDF's own
     # most-prominent detected headings (level 1 — the document's own
@@ -3347,22 +3768,28 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
     ocr_page_count = 0
 
     for i, (page, items) in enumerate(zip(reader.pages, page_items), 1):
-        if n_pages > 1:
-            doc.add_heading(f"Page {i}", level=2)
         page_links = _extract_pdf_page_links(page)
         unmatched_links = list(page_links)
         page_idx = i - 1
-        content_items = [
-            (t, k) for item_idx, (t, k) in enumerate(items)
-            if t not in noisy_lines or (page_idx, item_idx) in exempt_occurrences
-        ]
+        content_items = filtered_pages[page_idx]
         if content_items:
             for para_text, kind in content_items:
                 if not para_text:
                     continue
+                if kind == "table":
+                    t_list = tables_by_page.get(page_idx, [])
+                    if para_text.isdigit() and int(para_text) < len(t_list):
+                        emitted_tables_by_page.setdefault(page_idx, set()).add(int(para_text))
+                        _emit_table(t_list[int(para_text)])
+                    continue
+                if kind == "image":
+                    _emit_image(page, page_idx, para_text)
+                    continue
                 candidates = [(lt, url) for lt, url in page_links if lt in para_text]
                 if kind == "bullet":
                     _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates, style="List Bullet")
+                elif kind == "number":
+                    _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates, style="List Number")
                 elif kind.startswith("heading"):
                     # "Page N" (when present) already occupies level 2, so
                     # the PDF's own content headings nest under it starting
@@ -3371,7 +3798,7 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                     # on, rather than competing with "Page N" for the same
                     # level or going shallower than it.
                     pdf_level = int(kind[len("heading"):]) if kind[len("heading"):].isdigit() else 3
-                    doc.add_heading(para_text, level=min(pdf_level + 2, 9))
+                    doc.add_heading(para_text, level=_word_level(pdf_level))
                     used = []
                 else:
                     _p, used = _add_docx_paragraph_with_links(doc, para_text, candidates)
@@ -3389,8 +3816,10 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
                         continue
                     if kind == "bullet":
                         doc.add_paragraph(para_text, style="List Bullet")
+                    elif kind == "number":
+                        doc.add_paragraph(para_text, style="List Number")
                     elif kind.startswith("heading"):
-                        doc.add_heading(para_text, level=3)
+                        doc.add_heading(para_text, level=2)
                     else:
                         doc.add_paragraph(para_text)
                 note_p = doc.add_paragraph()
@@ -3402,42 +3831,22 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
         # else: the page had only repeated header/footer noise and nothing
         # else — nothing worth showing, so leave it at just the page heading.
 
-        for table_rows in tables_by_page.get(page_idx, []):
-            # Drop fully-empty rows (a spacer row between ruled sections,
-            # common in PDFs that draw extra grid lines for visual
-            # padding) rather than rendering a table with blank rows in it.
-            clean_rows = [
-                [(_sanitize_xml_text(str(cell).strip()) if cell else "") for cell in row]
-                for row in table_rows if any(cell and str(cell).strip() for cell in row)
-            ]
-            if not clean_rows:
-                continue
-            n_cols = max(len(r) for r in clean_rows)
-            word_table = doc.add_table(rows=len(clean_rows), cols=n_cols)
-            word_table.style = "Light Grid Accent 1"
-            for r_idx, row in enumerate(clean_rows):
-                for c_idx in range(n_cols):
-                    cell = word_table.rows[r_idx].cells[c_idx]
-                    cell.text = row[c_idx] if c_idx < len(row) else ""
-                    if r_idx == 0:
-                        for p in cell.paragraphs:
-                            for run in p.runs:
-                                run.bold = True
-            doc.add_paragraph()  # breathing room after the table before whatever comes next
-
-        if image_count < MAX_IMAGES:
+        # Anything that couldn't be put in place (a table whose rows didn't
+        # match the text, a picture with no text above it to anchor to)
+        # still goes in, at the end of its page as before.
+        for t_idx, table_rows in enumerate(tables_by_page.get(page_idx, [])):
+            if t_idx not in emitted_tables_by_page.get(page_idx, set()):
+                _emit_table(table_rows)
+        if drawn_images is not None:
+            leftover = [n for n, _t, _a in drawn_images.get(page_idx, [])
+                        if n not in emitted_images_by_page.get(page_idx, set())]
+        else:
             try:
-                page_images = list(page.images)
+                leftover = [os.path.splitext(img.name)[0] for img in page.images]
             except Exception:
-                page_images = []
-            for img in page_images:
-                if image_count >= MAX_IMAGES:
-                    break
-                try:
-                    doc.add_picture(io.BytesIO(img.data), width=DocxInches(6))
-                    image_count += 1
-                except Exception:
-                    continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
+                leftover = []
+        for name in leftover:
+            _emit_image(page, page_idx, name)
 
         if unmatched_links:
             # A link that never matched any reconstructed paragraph text
@@ -3462,17 +3871,168 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
 
 
 # ---------------------------------------------------------------- PDF -> PPTX
+def _add_fitted_picture(prs, slide, img_path, top=0):
+    """Adds a picture scaled to fit the slide (below `top`) and centred,
+    keeping its proportions."""
+    from PIL import Image
+    with Image.open(img_path) as im:
+        iw, ih = im.size
+    W, H = prs.slide_width, prs.slide_height - top
+    scale = min(W / iw, H / ih)
+    pw, ph = int(iw * scale), int(ih * scale)
+    return slide.shapes.add_picture(img_path, (W - pw) // 2, top + (H - ph) // 2, pw, ph)
+
+
+def _ocr_page_with_headings(img_path):
+    """OCR one page image using tesseract's word boxes, so a scan — which
+    carries no font information — still yields headings. Plain OCR text made
+    every heading look like body text (one byline ended up titling six
+    slides in a row). Two clues, measured on each line:
+      - size: its tallest word against a typical body line (catches titles);
+      - spacing: extra white space above it and a normal gap below — how
+        headings sit in almost every document, and the clue that survives
+        scanning (at scan resolution a 14pt heading and 11pt text can measure
+        the same height).
+    Also turns the bullet marks OCR tends to misread ("¢", "«", "°") back
+    into bullets. Returns (text, {line_text: level})."""
+    try:
+        r = subprocess.run(["tesseract", img_path, "-", "--psm", "3", "tsv"],
+                           capture_output=True, text=True, timeout=45)
+    except Exception:
+        return "", {}
+    lines, order = {}, []
+    for row in (r.stdout or "").splitlines()[1:]:
+        parts = row.split("\t")
+        if len(parts) < 12 or parts[0] != "5" or not parts[11].strip():
+            continue
+        try:
+            if float(parts[10]) < 0:
+                continue
+            key = (int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4]))
+            top, h = int(parts[7]), int(parts[9])
+        except ValueError:
+            continue
+        if key not in lines:
+            lines[key] = []
+            order.append(key)
+        lines[key].append((parts[11].strip(), top, h))
+    if not order:
+        return "", {}
+    info = []
+    for k in order:
+        ws = lines[k]
+        info.append({
+            "words": [w for w, _t, _h in ws],
+            "tall": max(h for _w, _t, h in ws),
+            "top": min(t for _w, t, _h in ws),
+            "bottom": max(t + h for _w, t, h in ws),
+        })
+    body_tall = sorted(i["tall"] for i in info if len(i["words"]) >= 5) or sorted(i["tall"] for i in info)
+    body = body_tall[len(body_tall) // 2] or 1
+    gaps = [None] + [max(0, info[j]["top"] - info[j - 1]["bottom"]) for j in range(1, len(info))]
+    normal_gaps = sorted(g for g in gaps[1:] if g is not None) or [0]
+    gap_typ = normal_gaps[len(normal_gaps) // 2] or 1
+    BULLET_MISREADS = {"¢", "«", "»", "°", "©", "*", "e", "o", "+"}
+    text_lines, headings = [], {}
+    big_line_before = False
+    for j, i in enumerate(info):
+        words = list(i["words"])
+        if len(words) > 3 and words[0] in BULLET_MISREADS and words[1][:1].isupper():
+            words[0] = "\u2022"
+        t = " ".join(words)
+        text_lines.append(t)
+        letters = sum(ch.isalpha() for ch in t)
+        looks_like_words = (letters >= 0.6 * len(t.replace(" ", ""))
+                            and any(len(w) >= 3 and w[:1].isalpha() for w in words)
+                            and words[0] != "\u2022")
+        if not looks_like_words or len(words) > 12:
+            continue
+        if i["tall"] >= 1.2 * body and (t[:1].isupper() or big_line_before):
+            # Large type starting in lowercase only counts when it directly
+            # continues a large heading line — the second line of a wrapped
+            # title ("and Supply"), joined back up later — never on its own,
+            # where it's usually stray OCR from inside a picture.
+            headings[t] = 1 if i["tall"] >= 1.7 * body else 2
+            big_line_before = True
+            continue
+        big_line_before = False
+        if not t[:1].isupper():
+            continue
+        nxt = info[j + 1]["words"] if j + 1 < len(info) else []
+        nxt_text = "".join(nxt)
+        if nxt_text and sum(ch.isdigit() for ch in nxt_text) >= 0.5 * len(nxt_text):
+            continue   # a line followed by rows of numbers is a table's header row, not a heading
+        gap_above = gaps[j] if gaps[j] is not None else 0
+        gap_below = gaps[j + 1] if j + 1 < len(gaps) else gap_typ
+        if (len(words) <= 10 and gap_above >= 1.8 * gap_typ + 4 and gap_below <= 1.3 * gap_typ + 2
+                and not t.rstrip().endswith((".", ",", ";", ":"))):
+            headings[t] = 2
+    return "\n".join(text_lines), headings
+
+def _pdf_pages_to_editable_deck(src_path, out_dir, page_images, style):
+    """Text per page (the PDF's own text, else OCR of the rendered page) → a
+    structured Word document → the Notes → Slides engine. Returns the .pptx
+    path, or None when there isn't enough readable text for it to be worth it."""
+    reader = _safe_load(pypdf.PdfReader, src_path)
+    try:   # real font sizes for pages that have a text layer
+        with pdfplumber.open(src_path) as ppdf:
+            font_headings_by_page, _body = _extract_pdf_font_size_headings(ppdf)
+    except Exception:
+        font_headings_by_page = {}
+    MAX_OCR = 15
+    ocr_used, page_items = 0, []
+    for idx, img_name in enumerate(page_images):
+        text, headings = "", font_headings_by_page.get(idx, {})
+        if idx < len(reader.pages):
+            try:
+                text = reader.pages[idx].extract_text() or ""
+            except Exception:
+                text = ""
+        if len(text.strip()) < 25 and ocr_used < MAX_OCR:
+            ocr_used += 1
+            text, headings = _ocr_page_with_headings(os.path.join(out_dir, img_name))
+        text = _sanitize_xml_text(text)
+        page_items.append(_merge_wrapped_headings(_reconstruct_paragraphs(text, headings)) if text.strip() else [])
+    if sum(len(t) for items in page_items for t, _k in items) < 80:
+        return None
+    notes = Document()
+    title_done = False
+    for items in page_items:
+        for text, kind in items:
+            if not text:
+                continue
+            if kind.startswith("heading"):
+                if not title_done:
+                    notes.add_heading(text, 0)
+                    title_done = True
+                else:
+                    tail = kind[len("heading"):]
+                    notes.add_heading(text, min(int(tail), 3) if tail.isdigit() else 2)
+            elif kind == "bullet":
+                notes.add_paragraph(text, style="List Bullet")
+            elif kind == "number":
+                notes.add_paragraph(text, style="List Number")
+            else:
+                notes.add_paragraph(text)
+    notes_path = os.path.join(out_dir, "_page_text.docx")
+    notes.save(notes_path)
+    deck_path = docx_to_pptx(notes_path, out_dir, style=style or "minimal")
+    prs = Presentation(deck_path)
+    layout = prs.slide_layouts[5] if len(prs.slide_layouts) > 5 else prs.slide_layouts[-1]
+    for n, img_name in enumerate(page_images, 1):
+        s = prs.slides.add_slide(layout)
+        if s.shapes.title is not None:
+            s.shapes.title.text = f"Original page {n}"
+        _add_fitted_picture(prs, s, os.path.join(out_dir, img_name), top=PptxInches(1.3))
+    prs.save(deck_path)
+    return deck_path
+
+
 def pdf_to_pptx(src_path, out_dir, style=None):
-    # Checked upfront, before rasterization — each page needs rendering
-    # plus roughly 1.2s of sequential OCR (measured directly), so an
-    # unbounded page count could push total processing well past what
-    # typical web infrastructure allows before timing out silently with
-    # no useful error. Reading the page count via pypdf first is fast
-    # (no rendering involved) and avoids wasting the rasterization work
-    # entirely on a file that's going to be rejected anyway.
     MAX_PDF_PPTX_PAGES = 50
     try:
-        page_count = len(_safe_load(pypdf.PdfReader, src_path).pages)
+        reader = _safe_load(pypdf.PdfReader, src_path)
+        page_count = len(reader.pages)
     except ConversionError:
         raise
     if page_count > MAX_PDF_PPTX_PAGES:
@@ -3481,7 +4041,6 @@ def pdf_to_pptx(src_path, out_dir, style=None):
             f"individually for this conversion, which isn't practical past "
             f"{MAX_PDF_PPTX_PAGES} pages. Try splitting it into smaller sections first."
         )
-
     page_prefix = os.path.join(out_dir, "page")
     try:
         subprocess.run(
@@ -3500,19 +4059,40 @@ def pdf_to_pptx(src_path, out_dir, style=None):
     if not page_images:
         raise ConversionError("Could not rasterize PDF pages")
 
+    # ---- Document pages (portrait: notes, handouts, scans) become real,
+    # editable slides. Each page used to become a picture forced to the
+    # slide's exact width and height — a portrait page squashed into a wide
+    # slide, distorting the text — with nothing editable. The text is read
+    # (straight from the PDF, or by OCR for a scan), rebuilt into headings,
+    # bullets and numbered steps, and laid out by the same engine as Notes →
+    # Slides. The original pages follow at the end, undistorted, so nothing
+    # on them (diagrams, handwriting) is lost.
+    try:
+        first = reader.pages[0]
+        portrait = float(first.mediabox.height) >= float(first.mediabox.width)
+    except Exception:
+        portrait = False
+    if portrait:
+        try:
+            deck_path = _pdf_pages_to_editable_deck(src_path, out_dir, page_images, style)
+        except ConversionError:
+            raise
+        except Exception:
+            deck_path = None
+        if deck_path:
+            return deck_path
+
+    # ---- Slide-deck PDFs (landscape pages), or pages with no readable
+    # text: one picture per slide, scaled to fit rather than stretched, with
+    # the page's OCR text in the speaker notes.
     prs = Presentation()
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
+    _fit_layouts_to_widescreen(prs)  # same off-centre, 29%-empty-slide fix as Notes → Slides
     blank_layout = prs.slide_layouts[6]
-
     from PIL import Image
-
     for img_name in page_images:
         png_path = os.path.join(out_dir, img_name)
-        # Rendered PDF pages are usually flat text/line-art, which PNG often
-        # compresses better than JPEG's photo-oriented compression — but a
-        # photo-heavy page can go the other way. Keep whichever is smaller
-        # rather than assuming either format always wins.
         img_path = png_path
         try:
             jpeg_path = png_path[:-4] + ".jpg"
@@ -3524,10 +4104,8 @@ def pdf_to_pptx(src_path, out_dir, style=None):
                 os.remove(jpeg_path)
         except Exception:
             pass  # fall back to the original PNG if re-encoding fails for any reason
-
         slide = prs.slides.add_slide(blank_layout)
-        slide.shapes.add_picture(img_path, 0, 0, width=prs.slide_width, height=prs.slide_height)
-
+        _add_fitted_picture(prs, slide, img_path)
         ocr_text = ""
         try:
             ocr = subprocess.run(
@@ -3541,14 +4119,12 @@ def pdf_to_pptx(src_path, out_dir, style=None):
         notes.notes_text_frame.text = (
             ocr_text if ocr_text else "(No text detected by OCR on this page.)"
         )
-
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.pptx")
     prs.save(out_path)
     return out_path
 
 
-# --------------------------------------------------------------- XLSX -> DOCX
 def _count_format_decimals(fmt):
     """Counts decimal placeholder digits (0 or #) after the last '.' in an
     Excel number format string, e.g. '0.00' -> 2, '#,##0' -> 0. Stops at
@@ -3646,7 +4222,67 @@ def _format_cell_value(val, number_format=None):
     return str(val)
 
 
+def _xlsx_with_computed_values(src_path, out_dir):
+    """A spreadsheet only carries formula *results* if the program that saved
+    it calculated and stored them. Excel does; files made by scripts, some
+    web tools and exports often don't — and the report then showed the
+    formula itself ("=ROUND(AVERAGE(C2:E2),1)") where the number belonged.
+    When any result is missing, LibreOffice opens the file, calculates it,
+    and saves a copy with every result stored; otherwise the file is used
+    as it is."""
+    try:
+        wb_f = openpyxl.load_workbook(src_path, data_only=False)
+        wb_v = openpyxl.load_workbook(src_path, data_only=True)
+    except Exception:
+        return src_path
+    missing = any(
+        c.data_type == "f" and wb_v[ws.title][c.coordinate].value is None
+        for ws in wb_f.worksheets for row in ws.iter_rows() for c in row
+    )
+    if not missing:
+        return src_path
+    recalc_dir = os.path.join(out_dir, "recalculated")
+    os.makedirs(recalc_dir, exist_ok=True)
+    try:
+        return _soffice_convert(src_path, "xlsx", recalc_dir)
+    except Exception:
+        return src_path   # still convertible — formulas are shown, as before
+
+
+_ID_LIKE_HEADER = re.compile(r"\b(id|no\.?|number|num|#|phone|tel|code|year|index)\b", re.I)
+
+
+def _xlsx_numeric_column_stats(rows):
+    """[(header, average, lowest, highest, is_whole_numbers)] for each column
+    of numbers under a text header — skipping ID-like columns (student number,
+    phone, year), where an average means nothing."""
+    if len(rows) < 6:   # a header and at least 5 rows — a 3-line summary needs no summary
+        return []
+    header = rows[0]
+    stats = []
+    for c in range(max(len(r) for r in rows)):
+        h = header[c].value if c < len(header) and header[c] is not None else None
+        if not isinstance(h, str) or not h.strip() or _ID_LIKE_HEADER.search(h):
+            continue
+        vals = []
+        for row in rows[1:]:
+            v = row[c].value if c < len(row) and row[c] is not None else None
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                vals.append(v)
+        if len(vals) >= 3:
+            whole = all(float(v).is_integer() for v in vals)
+            stats.append((h.strip(), sum(vals) / len(vals), min(vals), max(vals), whole))
+    return stats
+
+
+def _fmt_stat(v, whole):
+    if whole and float(v).is_integer():
+        return f"{int(v):,}"
+    return f"{v:,.1f}" if abs(v) >= 1 else f"{v:,.2f}"
+
+
 def xlsx_to_docx(src_path, out_dir, style="clean"):
+    src_path = _xlsx_with_computed_values(src_path, out_dir)
     wb = _safe_load(openpyxl.load_workbook, src_path, data_only=True)
     # A formula cell in a workbook that's never been opened in a real
     # spreadsheet app (generated by a script, exported from a database) has
@@ -3689,9 +4325,28 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
         section.orientation = WD_ORIENT.LANDSCAPE
         section.page_width, section.page_height = section.page_height, section.page_width
 
-    doc.add_heading("Converted from Excel", 0)
+    # Titled after the spreadsheet itself — it used to read "Converted from
+    # Excel". Its own title property if it has one, else its sheet names.
+    names = [s[0] for s in sheet_rows]
+    wb_title = ""
+    try:
+        wb_title = (wb.properties.title or "").strip()
+    except Exception:
+        pass
+    if wb_title:
+        doc_title = _sanitize_xml_text(wb_title)
+    elif len(names) == 1:
+        doc_title = names[0]
+    elif 1 < len(names) <= 3:
+        doc_title = ", ".join(names[:-1]) + " and " + names[-1]
+    elif names:
+        doc_title = f"{names[0]} and {len(names) - 1} other sheets"
+    else:
+        doc_title = "Spreadsheet report"
+    doc.add_heading(doc_title, 0)
     for sheet_name, rows, formula_rows, merged_ranges, ws in sheet_rows:
-        doc.add_heading(sheet_name, level=1)
+        if not (len(names) == 1 and doc_title == sheet_name):
+            doc.add_heading(sheet_name, level=1)
         if not rows:
             doc.add_paragraph("(Empty sheet)")
             continue
@@ -3736,6 +4391,24 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
             for coord, author, note_text in cell_comments:
                 doc.add_paragraph(f"{coord} ({author}): {note_text}", style="List Bullet")
 
+        # "At a glance": average, lowest and highest for each column of
+        # numbers — what turns a copied table into a report someone can read
+        # in ten seconds.
+        col_stats = _xlsx_numeric_column_stats(rows)
+        if col_stats:
+            doc.add_heading("At a glance", level=2)
+            doc.add_paragraph(f"{len(rows) - 1} rows of data.")
+            st = doc.add_table(rows=1 + len(col_stats), cols=4)
+            st.style = "Light Grid Accent 1"
+            for c_idx, head in enumerate(["Column", "Average", "Lowest", "Highest"]):
+                st.rows[0].cells[c_idx].text = head
+                for p in st.rows[0].cells[c_idx].paragraphs:
+                    for run in p.runs:
+                        run.bold = True
+            for r_idx, (h, avg, lo, hi, whole) in enumerate(col_stats, start=1):
+                vals = [_sanitize_xml_text(h), f"{avg:,.1f}", _fmt_stat(lo, whole), _fmt_stat(hi, whole)]
+                for c_idx, v in enumerate(vals):
+                    st.rows[r_idx].cells[c_idx].text = v
         charts = getattr(ws, "_charts", None) or []
         for chart in charts:
             chart_title = _xlsx_chart_title(chart)
@@ -3985,6 +4658,7 @@ def summary_slides_to_pptx(slides, out_dir, style="visual", filename="Summary.pp
     prs = Presentation()
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
+    _fit_layouts_to_widescreen(prs)  # same off-centre, 29%-empty-slide fix as Notes → Slides
     blank_layout = prs.slide_layouts[6]
 
     # Deliberately generous, fixed margins on every slide — combined with
@@ -4107,6 +4781,7 @@ def text_to_pptx(raw_text, out_dir):
     prs = Presentation()
     prs.slide_width = PptxInches(13.333)
     prs.slide_height = PptxInches(7.5)
+    _fit_layouts_to_widescreen(prs)  # same off-centre, 29%-empty-slide fix as Notes → Slides
     title_layout = prs.slide_layouts[1]
     MAX_BULLETS_PER_SLIDE = 8
 
@@ -4458,6 +5133,64 @@ def academic_essay_to_docx(payload, out_dir):
             run.italic = True
         return p
 
+    def add_list_item(text, numbered):
+        p = doc.add_paragraph(style="List Number" if numbered else "List Bullet")
+        p.paragraph_format.line_spacing = 2.0
+        _add_markdown_aware_text(p, text)
+        return p
+
+    _MD_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+    _MD_BOLD_LINE = re.compile(r"^\*\*([^*].{0,110}?)\*\*:?\s*$")
+    _MD_BULLET = re.compile(r"^\s*[-*\u2022]\s+(.+)$")
+    _MD_NUMBER = re.compile(r"^\s*\d{1,3}[.)]\s+(.+)$")
+
+    def add_markdown_blocks(text, skip_heading=None):
+        """The AI writes in markdown. Splitting only on blank lines used to
+        glue a "## Heading" to the paragraph under it as one justified
+        paragraph — the "##" printed literally and Word stretched the heading
+        line across the page — and flattened "- item" lists into text. This
+        reads it line by line: "#" headings become APA headings, a line that
+        is entirely bold becomes a heading too, "- " and "1." lines become
+        real lists, and consecutive plain lines are joined into paragraphs."""
+        buf = []
+        def flush():
+            if buf:
+                add_body_paragraph(" ".join(buf))
+                buf.clear()
+        skip = (skip_heading or "").strip().lower()
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                flush()
+                continue
+            m = _MD_HEADING.match(line)
+            if m:
+                flush()
+                h = m.group(2).strip()
+                if h.lower() == skip:
+                    skip = ""      # the title repeated as a heading — already at the top
+                    continue
+                n = len(m.group(1))
+                add_section_heading(h, level=1 if n <= 2 else (2 if n == 3 else 3))
+                continue
+            m = _MD_BOLD_LINE.match(line)
+            if m and len(m.group(1).split()) <= 12:
+                flush()
+                add_section_heading(m.group(1).strip(), level=1)
+                continue
+            m = _MD_BULLET.match(raw)
+            if m:
+                flush()
+                add_list_item(m.group(1).strip(), numbered=False)
+                continue
+            m = _MD_NUMBER.match(raw)
+            if m:
+                flush()
+                add_list_item(m.group(1).strip(), numbered=True)
+                continue
+            buf.append(line)
+        flush()
+
     sections = payload.get("sections")
     if sections and isinstance(sections, list) and any(isinstance(s, dict) for s in sections):
         for sec in sections:
@@ -4466,12 +5199,9 @@ def academic_essay_to_docx(payload, out_dir):
             heading_text = f"{sec.get('number', '')} {sec.get('heading', '')}".strip()
             if heading_text:
                 add_section_heading(heading_text, level=sec.get("level", 1))
-            add_body_paragraph(sec.get("text") or "")
+            add_markdown_blocks(sec.get("text") or "")
     else:
-        text = (payload.get("text") or "").strip()
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-        for para in paragraphs or [text]:
-            add_body_paragraph(para)
+        add_markdown_blocks((payload.get("text") or "").strip(), skip_heading=title)
 
     references = payload.get("references") or []
     if references and isinstance(references, list):
