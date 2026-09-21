@@ -59,7 +59,34 @@ Compress(app)
 # sync with. If this ever moves to multiple instances, this needs a shared
 # backend (e.g. Redis) instead, or each instance enforces its own limit
 # independently and the effective limit multiplies by instance count.
+# The same applies within this one instance: gunicorn runs 2 worker
+# processes, each keeping its own count, so a limit here can let through
+# up to twice its number. That's fine for what these limits are for —
+# stopping scripts making hundreds or thousands of requests — not precise
+# quotas (Remy's monthly allowance is exact; it's counted in the database).
 limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
+
+
+def _account_or_ip_key():
+    """Counts requests per signed-in account rather than per network, so a
+    whole school computer lab sharing one internet connection isn't treated
+    as one person. Falls back to the IP address when there's no valid login."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        uid = verify_token(auth[7:])
+        if uid:
+            return f"user:{uid}"
+    return get_remote_address()
+
+
+# Per-account ceilings for the features that cost real money or heavy
+# server time. They sit far above what a person uses — they're there to
+# stop a script on one free account from running up the AI bill (Evidence-
+# Based Writing makes up to three AI calls per message) or tying up the
+# half-CPU server's LibreOffice conversions for everyone else.
+AI_LIMIT = "30 per hour;100 per day"
+HEAVY_LIMIT = "60 per hour"
+BATCH_LIMIT = "10 per hour"   # each batch can be up to 20 files
 
 
 @limiter.request_filter
@@ -810,6 +837,15 @@ def add_cors_headers(resp):
 def handle_too_large(e):
     max_mb = app.config.get("MAX_CONTENT_LENGTH", 0) // (1024 * 1024)
     return jsonify({"error": f"That file is too large — the limit is {max_mb}MB."}), 413
+
+
+@app.errorhandler(429)
+def handle_rate_limited(e):
+    # Flask-Limiter's default reply is an HTML page; the app reads replies
+    # as JSON, so without this a limited user saw a parsing error ("Unexpected
+    # token '<'") instead of an explanation. Remy's monthly allowance returns
+    # its own 429 message directly and never reaches this handler.
+    return jsonify({"error": "You've made a lot of requests in a short time. Please wait a few minutes, then try again."}), 429
 
 
 @app.errorhandler(404)
@@ -1585,6 +1621,7 @@ def _log_sage_message_and_consume(user_row):
 
 
 @app.route("/api/convert", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def convert_endpoint():
     if "file" not in request.files:
@@ -1676,6 +1713,7 @@ def convert_endpoint():
 
 
 @app.route("/api/preview-file", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def preview_file_endpoint():
     """Takes a file the frontend already has in hand — one it just
@@ -1718,6 +1756,7 @@ def preview_file_endpoint():
 
 
 @app.route("/api/convert-batch", methods=["POST", "OPTIONS"])
+@limiter.limit(BATCH_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def convert_batch_endpoint():
     files = request.files.getlist("files")
@@ -1795,6 +1834,7 @@ def convert_batch_endpoint():
 
 
 @app.route("/api/pdf/edit", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def pdf_edit_endpoint():
     """Runs a chain of PDF edit operations (merge, reorder, delete/
@@ -1864,6 +1904,7 @@ def pdf_edit_endpoint():
 
 
 @app.route("/api/pdf/thumbnails", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def pdf_thumbnails_endpoint():
     """Returns a base64-encoded JPEG thumbnail per page, for a
@@ -1900,6 +1941,7 @@ def pdf_thumbnails_endpoint():
 
 
 @app.route("/api/pdf/split", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def pdf_split_endpoint():
     """Splits a PDF and returns the parts as a zip. With no 'ranges'
@@ -1949,6 +1991,7 @@ def pdf_split_endpoint():
 
 
 @app.route("/api/pdf/images-to-pdf", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def images_to_pdf_endpoint():
     """Combines multiple uploaded images (in the order given) into one
@@ -2245,6 +2288,7 @@ def sage_endpoint():
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def summarize_endpoint():
     data = request.get_json(silent=True) or {}
@@ -2485,6 +2529,7 @@ def _parse_quiz_json(raw_text):
 
 
 @app.route("/api/quiz/generate", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def quiz_generate_endpoint():
     data = request.get_json(silent=True) or {}
@@ -2669,6 +2714,7 @@ def split_memory_note(text):
 
 
 @app.route("/api/write", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def write_endpoint():
     data = request.get_json(silent=True) or {}
