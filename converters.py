@@ -5533,10 +5533,91 @@ def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
 
 
 # --------------------------------------------------------- extract raw text
+_PHOTO_EXTS = {"jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "heic", "heif"}
+
+
+def _prepare_photo_for_ocr(src_path, out_path):
+    """Phone photos read far better after a little preparation: turned
+    upright using the camera's orientation tag (a sideways photo reads as
+    gibberish), greyscale, contrast stretched, and scaled down to at most
+    2200px — a 12-megapixel photo takes several times longer to read and
+    isn't read any better."""
+    from PIL import Image, ImageOps
+    with Image.open(src_path) as im:
+        im = ImageOps.exif_transpose(im).convert("L")
+        w, h = im.size
+        scale = 2200 / max(w, h)
+        if scale < 1:
+            im = im.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        im = ImageOps.autocontrast(im, cutoff=1)
+        im.save(out_path, "PNG")
+    # The camera's orientation tag is often missing — WhatsApp strips it
+    # from forwarded photos, which is how a lot of study material travels —
+    # so the text direction is also checked directly, and the page turned
+    # if it's sideways or upside down (a sideways page reads as gibberish).
+    # If the check can't run, the photo is simply read as it is.
+    try:
+        r = subprocess.run(["tesseract", out_path, "-", "--psm", "0"], capture_output=True, text=True, timeout=20)
+        info = dict(l.split(":", 1) for l in r.stdout.splitlines() if ":" in l)
+        turn = int(info.get("Rotate", "0").strip())
+        confidence = float(info.get("Orientation confidence", "0").strip())
+        if turn in (90, 180, 270) and confidence >= 1.0:
+            with Image.open(out_path) as im2:
+                im2.rotate(-turn, expand=True).save(out_path, "PNG")
+    except Exception:
+        pass
+    return out_path
+
+
+def _ocr_photo_text(src_path):
+    work = tempfile.mkdtemp(prefix="ocr_")
+    try:
+        try:
+            prepared = _prepare_photo_for_ocr(src_path, os.path.join(work, "page.png"))
+        except Exception:
+            raise ConversionError(
+                "That photo couldn't be opened. JPG or PNG photos work best — on an iPhone, "
+                "Settings › Camera › Formats › Most Compatible saves photos that way."
+            )
+        text, _headings = _ocr_page_with_headings(prepared)
+        return text
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _ocr_scanned_pdf_text(src_path, max_pages=10):
+    """Text from a scanned PDF (pages that are pictures, with no text layer),
+    by rendering each page and reading it — the first `max_pages` pages,
+    to keep the wait reasonable."""
+    work = tempfile.mkdtemp(prefix="ocrpdf_")
+    try:
+        subprocess.run(["pdftoppm", "-png", "-r", "150", "-l", str(max_pages), src_path, os.path.join(work, "p")],
+                       capture_output=True, timeout=90)
+        texts = []
+        for name in sorted(os.listdir(work)):
+            if name.endswith(".png"):
+                t, _h = _ocr_page_with_headings(os.path.join(work, name))
+                if t.strip():
+                    texts.append(t.strip())
+        return "\n\n".join(texts)
+    except Exception:
+        return ""
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def extract_text(src_path, ext):
     """Pull plain text out of an uploaded file for use in the AI tools.
     Supports the same four formats the converter already handles, plus .txt."""
     ext = ext.lower()
+    if ext in _PHOTO_EXTS:
+        # Photos of textbook pages, handwritten or printed notes, the
+        # whiteboard, past questions — the most common "document" a
+        # student has, and the AI tools used to refuse them outright.
+        text = _ocr_photo_text(src_path)
+        if len(text.strip()) < 3:
+            raise ConversionError("No readable text was found in that photo. A sharp, well-lit photo taken straight on works best.")
+        return text
     if ext == "txt":
         with open(src_path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
@@ -5580,7 +5661,12 @@ def extract_text(src_path, ext):
         reader = _safe_load(pypdf.PdfReader, src_path)
         if reader.is_encrypted:
             raise ConversionError("This PDF is password-protected and can't be read until it's unlocked.")
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        if len(text.strip()) < 40:
+            # A scan: pages that are pictures with no text layer. This used
+            # to hand the AI an empty document; now the pages are read.
+            text = _ocr_scanned_pdf_text(src_path) or text
+        return text
     if ext == "pptx":
         prs = _safe_load(Presentation, src_path)
         parts = []

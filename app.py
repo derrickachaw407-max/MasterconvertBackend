@@ -2073,6 +2073,7 @@ def text_to_pptx_endpoint():
 
 
 @app.route("/api/extract-text", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)   # reading photos (OCR) is heavy work
 @auth_required
 def extract_text_endpoint():
     if "file" not in request.files:
