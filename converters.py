@@ -12,6 +12,7 @@ import re
 import copy
 import subprocess
 import signal
+import threading
 import tempfile
 import shutil
 import statistics
@@ -589,23 +590,34 @@ def _add_docx_page_number_footer(doc):
     run._r.append(fld_end)
 
 
+_LO_PROFILE_ROOT = os.path.join(tempfile.gettempdir(), "docente_lo_profiles")
+
+
+def _lo_profile_dir():
+    """This worker thread's own LibreOffice profile. Building a brand-new
+    profile for every call (the earlier safeguard) added start-up time to
+    every conversion and preview; one reusable profile per thread keeps the
+    same safeguard — no two conversions ever share a profile, so none can
+    wait on another's lock — without paying that cost each time."""
+    d = os.path.join(_LO_PROFILE_ROOT, f"{os.getpid()}-{threading.get_ident()}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _soffice_convert(src_path, target_format, out_dir):
     """Use headless LibreOffice for true rendering-based conversions
-    (currently: docx->pdf, and any supported format -> pdf for preview).
-    Raises ConversionError on failure.
+    (docx->pdf, any supported format -> pdf for preview, recalculating
+    spreadsheets). Raises ConversionError on failure.
 
-    Each call gets its own throwaway LibreOffice user-profile dir and
-    its own OS process group. Two real production failure modes this
-    closes: (1) overlapping calls sharing the default profile can
-    contend on LibreOffice's profile lock; (2) a plain subprocess
-    timeout only kills the `soffice` launcher, not the `soffice.bin`
-    renderer it spawns — so one slow conversion can leave a zombie
-    process holding that lock and silently wedge every conversion
-    after it (preview and regular convert alike) until the whole
-    service is restarted. 180s leaves headroom under the app's 240s
-    request timeout for upload/response overhead on top of the render."""
-    profile_dir = tempfile.mkdtemp(prefix="lo_profile_")
+    Runs in its own process group with this thread's own profile. If a
+    conversion hangs, the whole group is killed (a plain timeout only kills
+    the `soffice` launcher and leaves the `soffice.bin` renderer running),
+    and that profile is deleted so a stale lock from the killed process
+    can't wedge the next conversion on this thread. 180s leaves headroom
+    under the app's 240s request timeout."""
+    profile_dir = _lo_profile_dir()
     stdout, stderr = "", ""
+    failed = True
     try:
         proc = subprocess.Popen(
             ["soffice", "--headless", "--nologo", "--nofirststartwizard",
@@ -626,18 +638,36 @@ def _soffice_convert(src_path, target_format, out_dir):
                 "That file took too long to render. Please try again — "
                 "if it keeps happening, the file may be unusually large or complex."
             )
+        failed = proc.returncode != 0
     finally:
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        if failed:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
     base = os.path.splitext(os.path.basename(src_path))[0]
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{base}.{target_format}")
     if not os.path.exists(out_path):
+        shutil.rmtree(profile_dir, ignore_errors=True)
         raise ConversionError(f"LibreOffice conversion failed: {stderr or stdout}")
     return out_path
 
 
-# ---------------------------------------------------------------- DOCX -> PDF
+def warm_up_libreoffice():
+    """Runs one tiny conversion when the server starts, so LibreOffice's
+    program files are already loaded into memory — otherwise the first
+    student after every deploy or restart waits for them to be read from a
+    cold disk. Meant for a background thread; any failure is ignored."""
+    work = tempfile.mkdtemp(prefix="lo_warm_")
+    try:
+        src = os.path.join(work, "warm.txt")
+        with open(src, "w") as fh:
+            fh.write("warm-up")
+        _soffice_convert(src, "pdf", work)
+    except Exception:
+        pass
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
 def docx_to_pdf(src_path, out_dir, style=None):
     return _soffice_convert(src_path, "pdf", out_dir)
 
@@ -4142,6 +4172,101 @@ def _count_format_decimals(fmt):
     return count
 
 
+_XL_LOCALE_RE = re.compile(r"\[\$([^\]-]*)(?:-[0-9A-Fa-f]+)?\]")
+
+
+def _xl_literal_text(part):
+    """The literal text of an Excel number-format fragment, as Excel shows
+    it: quoted text ("GH¢"), backslash-escaped characters, and currency from
+    locale codes ([$€-2] → €) kept; colour/condition codes ([Red]), spacing
+    (_)) and fill (*-) codes removed."""
+    part = _XL_LOCALE_RE.sub(lambda m: m.group(1), part)
+    part = re.sub(r"\[[^\]]*\]", "", part)
+    part = re.sub(r"_.", "", part)
+    part = re.sub(r"\*.", "", part)
+    out, i = [], 0
+    while i < len(part):
+        ch = part[i]
+        if ch == '"':
+            j = part.find('"', i + 1)
+            j = len(part) if j == -1 else j
+            out.append(part[i + 1:j])
+            i = j + 1
+            continue
+        if ch == "\\" and i + 1 < len(part):
+            out.append(part[i + 1])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _xl_split_number_format(fmt):
+    """(prefix, digits, suffix) around a format's digit placeholders,
+    ignoring anything inside quotes or [brackets]."""
+    in_q = in_b = False
+    first = last = None
+    i = 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if in_q:
+            in_q = ch != '"'
+        elif in_b:
+            in_b = ch != "]"
+        elif ch == '"':
+            in_q = True
+        elif ch == "[":
+            in_b = True
+        elif ch == "\\":
+            i += 1
+        elif ch in "0#?":
+            first = i if first is None else first
+            last = i
+        i += 1
+    if first is None:
+        return fmt, "", ""
+    return fmt[:first], fmt[first:last + 1], fmt[last + 1:]
+
+
+_XL_DATE_TOKENS = re.compile(r'"[^"]*"|\\.|yyyy|yy|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|am/pm|a/p|.', re.I)
+
+
+def _excel_date_format_to_strftime(fmt):
+    """Translates an Excel date/time display format into a strftime pattern,
+    or None when it isn't one. Reports used to print every date as
+    2026-09-05 whatever the sheet said; now "dd mmm yyyy" gives 05 Sep 2026
+    and "dd/mm/yyyy hh:mm" gives 30/08/2026 14:05. "m"/"mm" means minutes
+    right after an hour or right before seconds, months everywhere else —
+    the same rule Excel uses."""
+    if not fmt or fmt == "General":
+        return None
+    f = re.sub(r"\[[^\]]*\]", "", fmt.split(";")[0])
+    if not re.search(r"[dmyhs]", re.sub(r'"[^"]*"', "", f), re.I):
+        return None
+    tokens = _XL_DATE_TOKENS.findall(f)
+    has_ampm = bool(re.search(r"am/pm|a/p", f, re.I))
+    is_code = lambda t: bool(re.fullmatch(r"yyyy|yy|mmmmm|mmmm|mmm|mm|m|dddd|ddd|dd|d|hh|h|ss|s|am/pm|a/p", t, re.I))
+    table = {"yyyy": "%Y", "yy": "%y", "mmmmm": "%b", "mmmm": "%B", "mmm": "%b", "mm": "%m", "m": "%-m",
+             "dddd": "%A", "ddd": "%a", "dd": "%d", "d": "%-d", "ss": "%S", "s": "%-S", "am/pm": "%p", "a/p": "%p",
+             "hh": "%I" if has_ampm else "%H", "h": "%-I" if has_ampm else "%-H"}
+    out = []
+    for idx, tok in enumerate(tokens):
+        t = tok.lower()
+        if not is_code(tok):
+            lit = tok[1:-1] if tok.startswith('"') else (tok[1:] if tok.startswith("\\") else tok)
+            out.append(lit.replace("%", "%%"))
+            continue
+        if t in ("m", "mm"):
+            prev = next((x.lower() for x in reversed(tokens[:idx]) if is_code(x)), "")
+            nxt = next((x.lower() for x in tokens[idx + 1:] if is_code(x)), "")
+            if prev in ("h", "hh") or nxt in ("s", "ss"):
+                out.append("%M")
+                continue
+        out.append(table[t])
+    return "".join(out)
+
+
 def _format_cell_value(val, number_format=None):
     """openpyxl hands back raw Python values — a date becomes a datetime
     object, and floating-point arithmetic in the sheet often leaves noise
@@ -4156,11 +4281,15 @@ def _format_cell_value(val, number_format=None):
         return ""
     if isinstance(val, bool):
         return "TRUE" if val else "FALSE"
-    if isinstance(val, datetime.datetime):
-        if val.hour or val.minute or val.second:
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        pattern = _excel_date_format_to_strftime(number_format)
+        if pattern:
+            try:
+                return val.strftime(pattern)
+            except (ValueError, TypeError):
+                pass   # an unusual pattern — fall back to the unambiguous form below
+        if isinstance(val, datetime.datetime) and (val.hour or val.minute or val.second):
             return val.strftime("%Y-%m-%d %H:%M")
-        return val.strftime("%Y-%m-%d")
-    if isinstance(val, datetime.date):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, (int, float)) and number_format and number_format != "General":
         # Excel format strings can have up to 4 semicolon-separated
@@ -4204,15 +4333,16 @@ def _format_cell_value(val, number_format=None):
         elif "%" in fmt:
             result = f"{work_val * 100:.{decimals}f}%"
         else:
-            for symbol in ("$", "£", "€", "¥"):
-                if symbol in fmt:
-                    if work_val < 0:
-                        result = f"-{symbol}{-work_val:,.{decimals}f}"
-                    else:
-                        result = f"{symbol}{work_val:,.{decimals}f}"
-                    break
-            if result is None and ("0" in fmt or "#" in fmt):
-                result = f"{work_val:,.{decimals}f}" if "," in fmt else f"{work_val:.{decimals}f}"
+            # Whatever the format puts around the digits — a currency in
+            # quotes ("GH¢"), a code ([$€-2]), a unit (" kg") — is shown as
+            # the sheet shows it. Only $, £, € and ¥ used to be recognised,
+            # so a cedi amount lost its "GH¢".
+            prefix, core, suffix = _xl_split_number_format(fmt)
+            if core:
+                decimals = _count_format_decimals(core)
+                digits = f"{abs(work_val):,.{decimals}f}" if "," in core else f"{abs(work_val):.{decimals}f}"
+                sign = "-" if work_val < 0 else ""
+                result = f"{sign}{_xl_literal_text(prefix)}{digits}{_xl_literal_text(suffix)}"
         if result is not None:
             return f"({result})" if use_parens else result
     if isinstance(val, float):
@@ -4264,14 +4394,16 @@ def _xlsx_numeric_column_stats(rows):
         h = header[c].value if c < len(header) and header[c] is not None else None
         if not isinstance(h, str) or not h.strip() or _ID_LIKE_HEADER.search(h):
             continue
-        vals = []
+        vals, fmt = [], None
         for row in rows[1:]:
-            v = row[c].value if c < len(row) and row[c] is not None else None
+            cell = row[c] if c < len(row) else None
+            v = cell.value if cell is not None else None
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 vals.append(v)
+                fmt = fmt or getattr(cell, "number_format", None)
         if len(vals) >= 3:
             whole = all(float(v).is_integer() for v in vals)
-            stats.append((h.strip(), sum(vals) / len(vals), min(vals), max(vals), whole))
+            stats.append((h.strip(), sum(vals) / len(vals), min(vals), max(vals), whole, fmt))
     return stats
 
 
@@ -4405,8 +4537,11 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                 for p in st.rows[0].cells[c_idx].paragraphs:
                     for run in p.runs:
                         run.bold = True
-            for r_idx, (h, avg, lo, hi, whole) in enumerate(col_stats, start=1):
-                vals = [_sanitize_xml_text(h), f"{avg:,.1f}", _fmt_stat(lo, whole), _fmt_stat(hi, whole)]
+            for r_idx, (h, avg, lo, hi, whole, fmt) in enumerate(col_stats, start=1):
+                if fmt and fmt != "General":   # money stays money (GH¢1,288.58), percentages stay %
+                    vals = [_sanitize_xml_text(h)] + [_format_cell_value(v, fmt) for v in (avg, lo, hi)]
+                else:
+                    vals = [_sanitize_xml_text(h), f"{avg:,.1f}", _fmt_stat(lo, whole), _fmt_stat(hi, whole)]
                 for c_idx, v in enumerate(vals):
                     st.rows[r_idx].cells[c_idx].text = v
         charts = getattr(ws, "_charts", None) or []
@@ -4453,6 +4588,44 @@ def docx_to_xlsx(src_path, out_dir):
             return float(cleaned)
         return text
 
+    _CUR = r"GH¢|GH₵|GHS|GHC|₵|¢|\$|€|£|¥|₦|NGN|USD|EUR|GBP"
+    _NUM_RE = re.compile(
+        r"(?P<s1>-)?\s*(?P<pre>" + _CUR + r")?\s*(?P<s2>-)?\s*(?P<int>\d{1,3}(?:,\d{3})+|\d+)"
+        r"(?P<frac>\.\d+)?\s*(?P<post>" + _CUR + r")?")
+
+    def coerce_value(text):
+        """(value, number_format) for a table cell. Money in any common
+        form (GH¢1,450.50, ₵9,800, GHS 200, $12, 1,200 USD), percentages
+        (64%, 92.5%) and accounting negatives ((1,200)) become real numbers
+        that still display exactly as written — they used to stay text,
+        which Excel can't add up or chart and flags with a green warning on
+        every cell. Anything that isn't clearly a number stays as written."""
+        s = text.strip()
+        m = re.fullmatch(r"(-)?\s*(\d+(?:\.\d+)?)\s*%", s)
+        if m:
+            frac = m.group(2).split(".")[1] if "." in m.group(2) else ""
+            val = float(m.group(2)) / 100 * (-1 if m.group(1) else 1)
+            return val, "0%" if not frac else "0." + "0" * len(frac) + "%"
+        bracketed = bool(re.fullmatch(r"\(\s*[^()]+\s*\)", s))
+        inner = s[1:-1].strip() if bracketed else s
+        m = _NUM_RE.fullmatch(inner)
+        if not m or (m.group("pre") and m.group("post")):
+            return coerce_numeric(text), None
+        symbol = m.group("pre") or m.group("post")
+        if not symbol and not bracketed:
+            return coerce_numeric(text), None
+        number = float(m.group("int").replace(",", "") + (m.group("frac") or ""))
+        if m.group("s1") or m.group("s2") or bracketed:
+            number = -number
+        decimals = len(m.group("frac")) - 1 if m.group("frac") else 0
+        num_fmt = "#,##0" + ("." + "0" * decimals if decimals else "")
+        if symbol:
+            num_fmt = f'"{symbol}"{num_fmt}' if m.group("pre") else f'{num_fmt} "{symbol}"'
+        if bracketed:
+            num_fmt = f"{num_fmt};({num_fmt})"
+        value = int(number) if not decimals and float(number).is_integer() else number
+        return value, num_fmt
+
     for i, table in enumerate(doc.tables, 1):
         ws = wb.create_sheet(title=f"Table {i}"[:31])
         src_rows = [list(row.cells) for row in table.rows]
@@ -4466,8 +4639,10 @@ def docx_to_xlsx(src_path, out_dir):
                 if (r_idx - 1, c_idx - 1) in skip_cells:
                     continue  # covered by a merge origin elsewhere — left blank, filled via the merge below
                 text = _full_cell_text(cell).strip()
-                value = text if r_idx == 1 else coerce_numeric(text)
+                value, num_fmt = (text, None) if r_idx == 1 else coerce_value(text)
                 xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                if num_fmt:
+                    xlsx_cell.number_format = num_fmt
                 shade = _get_docx_cell_shading(cell)
                 if shade:
                     xlsx_cell.fill = XlsxPatternFill(start_color=shade, end_color=shade, fill_type="solid")

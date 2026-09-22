@@ -32,7 +32,13 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from converters import (
     convert, text_to_pptx, summary_slides_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
+    warm_up_libreoffice,
 )
+
+# Load LibreOffice into memory in the background as each worker starts, so
+# the first conversion after a deploy or restart isn't the slow one.
+import threading as _threading
+_threading.Thread(target=warm_up_libreoffice, daemon=True).start()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB upload cap — raised from 25MB: confirmed directly that scanned/image-heavy PDFs (the PDF editor's primary use case) routinely exceed 25MB in ways a plain text document never would, and 25MB was rejecting genuinely legitimate files.
