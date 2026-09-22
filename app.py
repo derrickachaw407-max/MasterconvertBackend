@@ -162,7 +162,17 @@ def safe_download_name(original_filename, fallback="download"):
 # root plus either ending, covering both brand generations at once. That
 # way neither a future suffix change nor another rebrand locks everyone
 # out again.
-_ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://docent(e|ly)[a-z0-9-]*\.vercel\.app$")
+# Any *.vercel.app address is accepted. Every Vercel upload can land on a new
+# address — docently-1, docente-1-dusky, and "manifest-2"/"manifest-3" when a
+# project got named after the first file dragged in — and each time the old
+# name-based rule refused it, so logins failed with "Couldn't connect" until
+# the permanent link was re-pointed. This is safe for this app: sign-in
+# travels as a token in the Authorization header (never a cookie) and a site
+# can only read its own stored token, so another website can't act as a
+# student even when its requests are accepted — the name rule was never
+# guarding accounts, only blocking our own new uploads. A future custom
+# domain can be added with EXTRA_ALLOWED_ORIGINS.
+_ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$")
 ALLOWED_ORIGINS = {
     "https://docently.vercel.app",
     "https://masterconvert-tau.vercel.app",
