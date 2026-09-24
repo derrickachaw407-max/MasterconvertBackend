@@ -2280,6 +2280,19 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         return _cont(state["section_title"]) if state["section_title"] else "Overview"
 
     def new_slide(title_text):
+        # A heading that produced nothing (common when a document is really a
+        # handout of an earlier deck) used to leave an empty slide behind, and
+        # a repeated heading produced the same title two or three times in a
+        # row with nothing between them. An empty slide is reused instead: a
+        # lone section heading still gets its divider slide, but the title
+        # never repeats over consecutive empty ones.
+        current = state["slide"]
+        if current is not None and state["bullet_count"] == 0 and len(current.shapes) <= 2:
+            existing = (current.shapes.title.text if current.shapes.title is not None else "").strip().lower()
+            if existing == (title_text or "").strip().lower() or not existing:
+                if current.shapes.title is not None:
+                    current.shapes.title.text = title_text or "Untitled"
+                return current, state["body_tf"]
         s = prs.slides.add_slide(title_layout)
         s.shapes.title.text = title_text or "Untitled"
         _style_pptx_slide(s, template_style)
@@ -2715,6 +2728,14 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
         return True
 
+    _SLIDE_LABEL_RE = re.compile(r"^slide\s*\d{1,3}$", re.I)
+
+    def _is_handout_artefact(text):
+        """"Slide 4" on a line of its own: the small labels the app's own
+        handouts print under each heading. Converting a handout back into
+        slides used to put them on the new slides as the only content."""
+        return bool(_SLIDE_LABEL_RE.match((text or "").strip()))
+
     def _is_lead_in(text):
         t = text.strip()
         return t.endswith(":") and 2 <= len(t.split()) <= 14
@@ -2754,7 +2775,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         for chart_title, chart_cats, chart_series, chart_type in _iter_docx_charts(para, doc):
             add_chart_slide(chart_title, chart_cats, chart_series, chart_type)
         text = _full_paragraph_text(para).strip()
-        if not text:
+        if not text or _is_handout_artefact(text):
             continue
         para_style_name = (para.style.name or "").lower()
         heading_match = re.match(r"heading (\d+)", para_style_name)
