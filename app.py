@@ -34,6 +34,7 @@ from converters import (
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
     warm_up_libreoffice,
 )
+from slide_studio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -3062,6 +3063,62 @@ def write_export_docx_endpoint():
     except Exception as e:
         logger.error(f"Document export failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": "Export failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# ------------------------------------------------------------- Slide Studio
+# The in-app slide editor: the Student and Tutor templates, reading an
+# existing PowerPoint into editable slides (Fix Slides), and building the
+# edited slides into a finished .pptx.
+@app.route("/api/slides/templates", methods=["GET", "OPTIONS"])
+def slides_templates_endpoint():
+    return jsonify({"templates": template_catalog()})
+
+
+@app.route("/api/slides/import", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def slides_import_endpoint():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "Choose a PowerPoint file first."}), 400
+    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    if ext != "pptx":
+        return jsonify({"error": "Choose a PowerPoint (.pptx) file — older .ppt files need saving as .pptx first."}), 400
+    work_dir = tempfile.mkdtemp(prefix=f"mc_slides_{uuid.uuid4().hex[:8]}_")
+    try:
+        path = os.path.join(work_dir, "deck.pptx")
+        f.save(path)
+        deck = parse_pptx_to_deck(path)
+        deck["filename"] = safe_download_name(f.filename)
+        return jsonify({"deck": deck})
+    except StudioError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        logger.error(f"Slide import failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "That file couldn't be read. Please try another."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/slides/build", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def slides_build_endpoint():
+    deck = request.get_json(silent=True)
+    if not isinstance(deck, dict):
+        return jsonify({"error": "The slides couldn't be read — please try again."}), 400
+    work_dir = tempfile.mkdtemp(prefix=f"mc_build_{uuid.uuid4().hex[:8]}_")
+    try:
+        path = build_template_deck(deck, work_dir, str(deck.get("filename") or "Presentation.pptx"))
+        return send_file(path, mimetype=MIME_TYPES["pptx"], as_attachment=True,
+                         download_name=os.path.basename(path))
+    except StudioError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        logger.error(f"Slide build failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "The slides couldn't be built. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 

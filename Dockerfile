@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY converters.py app.py ./
+COPY converters.py app.py slide_studio.py ./
 
 EXPOSE 8000
 # gthread + threads instead of just adding more sync workers: this box is
