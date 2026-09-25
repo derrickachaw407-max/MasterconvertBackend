@@ -10,7 +10,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY converters.py app.py slide_studio.py ./
+# Every Python file in the repository, so adding a module can never break
+# the build by being missing from this list.
+COPY *.py ./
 
 EXPOSE 8000
 # gthread + threads instead of just adding more sync workers: this box is

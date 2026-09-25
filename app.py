@@ -34,7 +34,7 @@ from converters import (
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
     warm_up_libreoffice,
 )
-from slide_studio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError
+from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
