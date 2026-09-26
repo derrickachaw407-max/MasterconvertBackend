@@ -1,6 +1,7 @@
 import json
 import logging
 import base64
+import hmac
 import os
 import random
 import re
@@ -1498,6 +1499,14 @@ def plan_upgrade():
                 cur.execute("UPDATE users SET plan = %s, plan_expires_at = NULL WHERE id = %s RETURNING *",
                             (plan, request.current_user["id"]))
             row = cur.fetchone()
+            if transaction_key and plan in ("monthly", "yearly"):
+                # Which account owns this subscription: the stores' renewal,
+                # cancellation and refund notices find the account by it.
+                cur.execute(
+                    "INSERT INTO store_purchases (transaction_key, user_id, product) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (transaction_key) DO UPDATE SET user_id = EXCLUDED.user_id, product = EXCLUDED.product",
+                    (transaction_key, request.current_user["id"], plan),
+                )
 
             if referral_code and plan in ("monthly", "yearly"):
                 cur.execute(
@@ -3309,6 +3318,189 @@ def slides_assist_endpoint():
     except Exception as e:
         logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
+
+
+# ------------------------------------------- the stores' notices to this server
+# When a subscription renews, lapses, is cancelled or refunded, Apple and
+# Google tell this server. A notice is never trusted on its own word: it
+# only says which purchase to look at, and the server then asks the store
+# itself — over the same authenticated APIs used to verify purchases — what
+# that purchase's state is now. A forged notice can at most cause a harmless
+# re-check. When the store can't be reached, nothing is changed and the
+# notice is answered 503, so the store sends it again later.
+#   Apple:  App Store Connect -> App Information -> App Store Server
+#           Notifications (Version 2): https://<server>/api/store/apple/notifications
+#   Google: Play Console -> Monetisation setup -> Real-time developer
+#           notifications, through a Pub/Sub push subscription to
+#           https://<server>/api/store/google/notifications?token=<GOOGLE_RTDN_TOKEN>
+GOOGLE_RTDN_TOKEN = os.environ.get("GOOGLE_RTDN_TOKEN", "").strip()
+
+
+def _apple_api_token():
+    now = int(time.time())
+    return pyjwt.encode(
+        {"iss": APPLE_APP_STORE_ISSUER_ID, "iat": now, "exp": now + 300, "aud": "appstoreconnect-v1", "bid": APPLE_BUNDLE_ID},
+        APPLE_APP_STORE_PRIVATE_KEY, algorithm="ES256", headers={"kid": APPLE_APP_STORE_KEY_ID, "typ": "JWT"},
+    )
+
+
+def _apple_subscription_entitled(original_transaction_id):
+    """True while Apple says the subscription is active or in its billing
+    grace period; False once it has expired, is stuck in billing retry, or
+    was revoked (refunded); None when Apple can't be asked right now."""
+    if not (APPLE_APP_STORE_KEY_ID and APPLE_APP_STORE_ISSUER_ID and APPLE_APP_STORE_PRIVATE_KEY):
+        return None
+    host = ("https://api.storekit-sandbox.itunes.apple.com" if APPLE_APP_STORE_ENVIRONMENT == "sandbox"
+            else "https://api.storekit.itunes.apple.com")
+    try:
+        resp = requests.get(f"{host}/inApps/v1/subscriptions/{original_transaction_id}",
+                            headers={"Authorization": f"Bearer {_apple_api_token()}"}, timeout=15)
+    except requests.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    statuses = []
+    for group in (resp.json().get("data") or []):
+        for tx in (group.get("lastTransactions") or []):
+            if str(tx.get("originalTransactionId")) == str(original_transaction_id):
+                statuses.append(tx.get("status"))
+    if not statuses:
+        return None
+    return any(s in (1, 4) for s in statuses)   # 1 active, 4 grace period; 2 expired, 3 billing retry, 5 revoked
+
+
+def _google_access_token():
+    service_account = json.loads(GOOGLE_PLAY_SERVICE_ACCOUNT_JSON)
+    now = int(time.time())
+    assertion = pyjwt.encode(
+        {"iss": service_account["client_email"], "scope": "https://www.googleapis.com/auth/androidpublisher",
+         "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
+        service_account["private_key"], algorithm="RS256",
+    )
+    token_resp = requests.post("https://oauth2.googleapis.com/token",
+                               data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+                               timeout=15)
+    token_resp.raise_for_status()
+    return token_resp.json()["access_token"]
+
+
+def _google_subscription_entitled(purchase_token):
+    """True while Google says the subscription gives access — active, in its
+    grace period, or cancelled but still inside the period already paid for;
+    False once it has lapsed; None when Google can't be asked right now."""
+    if not (GOOGLE_PLAY_SERVICE_ACCOUNT_JSON and GOOGLE_PLAY_PACKAGE_NAME):
+        return None
+    try:
+        token = _google_access_token()
+        resp = requests.get(
+            f"https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{GOOGLE_PLAY_PACKAGE_NAME}"
+            f"/purchases/subscriptionsv2/tokens/{purchase_token}",
+            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    except (requests.RequestException, KeyError, ValueError):
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    state = data.get("subscriptionState")
+    if state in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD"):
+        return True
+    if state == "SUBSCRIPTION_STATE_CANCELED":
+        # Cancelled means "won't renew" — access continues until the paid period ends.
+        for item in (data.get("lineItems") or []):
+            try:
+                expiry = datetime.fromisoformat(str(item.get("expiryTime", "")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if expiry > datetime.now(timezone.utc):
+                return True
+        return False
+    if state in ("SUBSCRIPTION_STATE_EXPIRED", "SUBSCRIPTION_STATE_ON_HOLD", "SUBSCRIPTION_STATE_PAUSED"):
+        return False
+    return None   # pending, unknown: leave things as they are
+
+
+def _store_purchase_owner(keys):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id, product FROM store_purchases WHERE transaction_key = ANY(%s) LIMIT 1", (list(keys),))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _apply_store_state(owner, entitled=None, refunded_pass=False):
+    """Brings one account in line with what the store said. Only the plan the
+    notice is about is touched: a lapsed Monthly never downgrades someone who
+    has since moved to Yearly, and access returns only to an account that
+    lost it (it's on Free), never overriding a different plan."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            if refunded_pass:
+                cur.execute("UPDATE users SET remy_credits = GREATEST(COALESCE(remy_credits, 0) - %s, 0) WHERE id = %s",
+                            (PAYPERUSE_MESSAGES, owner["user_id"]))
+            elif entitled is False:
+                cur.execute("UPDATE users SET plan = 'free' WHERE id = %s AND plan = %s", (owner["user_id"], owner["product"]))
+            elif entitled is True:
+                cur.execute("UPDATE users SET plan = %s WHERE id = %s AND plan = 'free'", (owner["product"], owner["user_id"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.route("/api/store/apple/notifications", methods=["POST"])
+@limiter.limit("120 per minute")
+def apple_store_notification():
+    body = request.get_json(silent=True) or {}
+    try:
+        payload = pyjwt.decode(body.get("signedPayload", ""), options={"verify_signature": False})
+        tx = pyjwt.decode((payload.get("data") or {}).get("signedTransactionInfo", ""), options={"verify_signature": False})
+    except Exception:
+        return jsonify({"ok": True, "ignored": "unreadable notification"}), 200
+    original, current = str(tx.get("originalTransactionId") or ""), str(tx.get("transactionId") or "")
+    owner = _store_purchase_owner([k for k in ("ios:" + original, "ios:" + current) if k != "ios:"])
+    if not owner:
+        return jsonify({"ok": True, "ignored": "unknown purchase"}), 200
+    if owner["product"] == "payperuse":
+        if payload.get("notificationType") == "REFUND":
+            _apply_store_state(owner, refunded_pass=True)
+        return jsonify({"ok": True}), 200
+    entitled = _apple_subscription_entitled(original or current)   # asked of Apple, never taken from the notice
+    if entitled is None:
+        return jsonify({"error": "Couldn't check with Apple right now."}), 503
+    _apply_store_state(owner, entitled=entitled)
+    return jsonify({"ok": True, "entitled": entitled}), 200
+
+
+@app.route("/api/store/google/notifications", methods=["POST"])
+@limiter.limit("120 per minute")
+def google_store_notification():
+    if not GOOGLE_RTDN_TOKEN:
+        return jsonify({"error": "Google Play notifications aren't configured (GOOGLE_RTDN_TOKEN)."}), 503
+    if not hmac.compare_digest(request.args.get("token", ""), GOOGLE_RTDN_TOKEN):
+        return jsonify({"error": "Not allowed."}), 403
+    try:
+        message = (request.get_json(silent=True) or {}).get("message") or {}
+        note = json.loads(base64.b64decode(message.get("data", "")).decode("utf-8"))
+    except Exception:
+        return jsonify({"ok": True, "ignored": "unreadable notification"}), 200
+    sub_note, voided = note.get("subscriptionNotification"), note.get("voidedPurchaseNotification")
+    token = (sub_note or voided or {}).get("purchaseToken")
+    if not token:
+        return jsonify({"ok": True, "ignored": "nothing to act on"}), 200   # e.g. a test notification
+    owner = _store_purchase_owner(["android:" + token])
+    if not owner:
+        return jsonify({"ok": True, "ignored": "unknown purchase"}), 200
+    if owner["product"] == "payperuse":
+        if voided:
+            _apply_store_state(owner, refunded_pass=True)
+        return jsonify({"ok": True}), 200
+    entitled = False if voided else _google_subscription_entitled(token)   # asked of Google, never taken from the notice
+    if entitled is None:
+        return jsonify({"error": "Couldn't check with Google Play right now."}), 503
+    _apply_store_state(owner, entitled=entitled)
+    return jsonify({"ok": True, "entitled": entitled}), 200
 
 
 init_db()

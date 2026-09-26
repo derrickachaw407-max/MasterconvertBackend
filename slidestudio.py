@@ -2376,6 +2376,159 @@ def _closing_slide(prs, deck, sd, number, tpl):
     return s
 
 
+# ------------------------------------------------ section, quote, picture
+def _section_slide(prs, deck, sd, number, tpl):
+    """A divider between parts of a talk, on each template's own Section
+    Header layout: the student's title sits in its blue band (made larger
+    than the layout's timid default); the tutor's is a big serif title over
+    a rule with a small-capitals subtitle."""
+    group = tpl["group"]
+    lay = _layout(prs, "Section Header")
+    s = prs.slides.add_slide(lay)
+    title = str(sd.get("title") or "").strip()[:120] or " "
+    sub_text = str(sd.get("sub") or "").strip()[:200]
+    for ph in list(s.placeholders):
+        t = ph.placeholder_format.type
+        if t in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+            tf = ph.text_frame
+            tf.text = ""
+            r = tf.paragraphs[0].add_run()
+            r.text = title
+            if group == "student":
+                r.font.size = Pt(32 if len(title) <= 34 else 26)
+                r.font.bold = True
+            else:
+                r.font.size = Pt(54 if len(title) <= 24 else 44 if len(title) <= 40 else 36)
+        elif t == PP_PLACEHOLDER.BODY:
+            if sub_text:
+                ph.text_frame.text = sub_text
+                for p in ph.text_frame.paragraphs:
+                    for r in p.runs:
+                        r.font.size = Pt(20)
+            else:
+                _remove(ph)
+        elif t not in (PP_PLACEHOLDER.SLIDE_NUMBER,):
+            _remove(ph)
+    if deck.get("slide_numbers", True):
+        _add_slide_number(s, lay, number, group)
+    if group == "tutor":
+        _add_footer(s, lay, _tutor_footer(deck))
+    return s
+
+
+def _quote_slide(prs, deck, sd, number, tpl):
+    """A quotation on the template's plain layout: a large opening quote mark
+    in the template's accent, the quote centred, the attribution beneath."""
+    group = tpl["group"]
+    # Student: "Title Only" keeps the signature band and its numbered chip
+    # (the plain layout hides them); tutor: the plain layout keeps its band.
+    lay = _layout(prs, "Title Only" if group == "student" else "Blank")
+    s = prs.slides.add_slide(lay)
+    for ph in list(s.placeholders):
+        _remove(ph)
+    quote = str(sd.get("quote") or "").strip().strip('"“”')[:400] or " "
+    by = str(sd.get("by") or "").strip()[:120]
+    top = Inches(2.05) if group == "student" else Inches(0.9)
+    height = Inches(4.2) if group == "student" else Inches(5.2)
+    mark = s.shapes.add_textbox(Inches(0.9), top - Inches(0.35), Inches(1.6), Inches(1.6))
+    mr = mark.text_frame.paragraphs[0].add_run()
+    mr.text = "“"
+    mr.font.size = Pt(120)
+    mr.font.bold = True
+    if group == "student":
+        mr.font.color.theme_color = MSO_THEME_COLOR.ACCENT_2
+    else:
+        mr.font.color.rgb = RGBColor.from_string(tpl.get("frame") or "FF6D17")
+        mr.font.name = "Bookman Old Style"
+    box = s.shapes.add_textbox(Inches(1.6), top, Inches(10.1), height)
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    n = len(quote)
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER
+    r = p.add_run()
+    r.text = quote
+    r.font.size = Pt(40 if n <= 70 else 32 if n <= 140 else 26 if n <= 240 else 22)
+    r.font.italic = True
+    if group == "tutor":
+        r.font.name = "Bookman Old Style"
+    r.font.color.theme_color = MSO_THEME_COLOR.TEXT_1
+    r.font.color.brightness = 0.15
+    if by:
+        bp = tf.add_paragraph()
+        bp.alignment = PP_ALIGN.CENTER
+        bp.space_before = Pt(18)
+        br = bp.add_run()
+        br.text = "— " + by
+        br.font.size = Pt(20)
+        br.font.bold = True
+        if group == "student":
+            br.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
+            br.font.color.brightness = -0.25
+        else:
+            br.font.color.theme_color = MSO_THEME_COLOR.TEXT_1
+            br.font.color.brightness = 0.25
+    if deck.get("slide_numbers", True):
+        _add_slide_number(s, lay, number, group)
+    if group == "tutor":
+        _add_footer(s, lay, _tutor_footer(deck))
+    _notes(s, sd)
+    return s
+
+
+def _picture_slide(prs, deck, sd, number, tpl):
+    """A photo with a caption, on each template's own Picture with Caption
+    layout. The photo is fitted whole in the layout's picture area — never
+    cropped, so nobody's photo loses a head or a label."""
+    group = tpl["group"]
+    lay = _layout(prs, "Picture with Caption")
+    s = prs.slides.add_slide(lay)
+    title = str(sd.get("title") or "").strip()[:120]
+    caption = str(sd.get("caption") or "").strip()[:300]
+    media = sd.get("media") if isinstance(sd.get("media"), dict) else {}
+    data = _image_bytes(media.get("data")) if media.get("type") == "image" else None
+    area = None
+    for ph in list(s.placeholders):
+        t = ph.placeholder_format.type
+        if t == PP_PLACEHOLDER.PICTURE:
+            area = (ph.left, ph.top, ph.width, ph.height)
+            _remove(ph)
+        elif t in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
+            if title:
+                ph.text_frame.text = title
+            else:
+                _remove(ph)
+        elif t == PP_PLACEHOLDER.BODY:
+            if caption:
+                ph.text_frame.text = caption
+            else:
+                _remove(ph)
+        elif t not in (PP_PLACEHOLDER.SLIDE_NUMBER,):
+            _remove(ph)
+    if area is None:
+        area = (Inches(0.9), Inches(0.4), Inches(11.5), Inches(4.6))
+    if group == "tutor":
+        backdrop = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, area[0], area[1], area[2], area[3])
+        backdrop.fill.solid()
+        backdrop.fill.fore_color.rgb = RGBColor.from_string(tpl.get("panel") or "3A4245")
+        backdrop.line.fill.background()
+        backdrop.shadow.inherit = False
+        _to_back(backdrop)
+    if data:
+        pad = Inches(0.15)
+        _fit_picture(s, data, area[0] + pad, area[1] + pad, area[2] - 2 * pad, area[3] - 2 * pad)
+    _notes(s, sd)
+    return s
+
+
+def _notes(s, sd):
+    notes = str(sd.get("notes") or "").strip()
+    if notes:
+        s.notes_slide.notes_text_frame.text = notes[:4000]
+
+
+
 def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
     """deck: {
         template: one of TEMPLATES (or "student"/"tutor"),
@@ -2384,13 +2537,13 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
             student: {lines: [institution, department, programme], main, sub, tag}
             tutor:   {course, code, subtitle, lecturer, date, picture (data URL)},
         footer: tutor slides' footer text (defaults to "CODE · Course"),
-        slides: [{kind: "content" | "columns" | "end", title,
+        slides: [{kind: "content" | "columns" | "section" | "quote" | "picture" | "end", title,
                   bullets: [{text, level}], list_style: "bullets" | "numbers",
                   media: {type: "image", data} | {type: "table", rows}
                          | {type: "chart", chart_type, categories, series, title},
                   media_position: "right" | "below" | "full",
                   left/right (bullets) and left_heading/right_heading (columns),
-                  big (end), notes}]
+                  big (end), sub (section), quote/by (quote), caption + media image (picture), notes}]
     }  →  path of the saved .pptx"""
     if not isinstance(deck, dict) or not isinstance(deck.get("slides") or [], list):
         raise StudioError("The slides couldn't be read — please try again.")
@@ -2406,8 +2559,15 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
             _tutor_title_slide(prs, deck, tpl)
     for sd in slides:
         number = len(prs.slides) + 1
-        if (sd.get("kind") or "content") == "end":
+        kind = sd.get("kind") or "content"
+        if kind == "end":
             _closing_slide(prs, deck, sd, number, tpl)
+        elif kind == "section":
+            _section_slide(prs, deck, sd, number, tpl)
+        elif kind == "quote":
+            _quote_slide(prs, deck, sd, number, tpl)
+        elif kind == "picture":
+            _picture_slide(prs, deck, sd, number, tpl)
         else:
             _content_slide(prs, deck, sd, number, logo, tpl)
     if not len(prs.slides):
@@ -2520,6 +2680,17 @@ def parse_pptx_to_deck(path, max_pictures=30):
         bodies = sorted([ph for ph in s.placeholders if ph.placeholder_format.idx in (1, 2) and ph.has_text_frame and ph.text_frame.text.strip()],
                         key=lambda ph: ph.placeholder_format.idx)
         sd = {"kind": "content", "title": title[:140]}
+        layout_name = (s.slide_layout.name or "").lower()
+        if "section" in layout_name:
+            others = [re.sub(r"\s+", " ", sh.text_frame.text).strip() for sh in texts]
+            slides.append({"kind": "section", "title": title[:120], "sub": (others[0] if others else "")[:200]})
+            continue
+        all_text = " ".join(re.sub(r"\s+", " ", sh.text_frame.text).strip() for sh in texts).strip()
+        if not title and re.match(r'^["\u201c].{10,380}["\u201d]', all_text):
+            m = re.match(r'^["\u201c](.+?)["\u201d]\s*(?:[-\u2013\u2014~]+\s*(.+))?$', all_text)
+            if m:
+                slides.append({"kind": "quote", "quote": m.group(1).strip()[:400], "by": (m.group(2) or "").strip()[:120]})
+                continue
         if len(bodies) == 2:
             sd.update(kind="columns", left=_paragraph_bullets(bodies[0].text_frame), right=_paragraph_bullets(bodies[1].text_frame))
         else:
