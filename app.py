@@ -248,10 +248,21 @@ GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")
 # App Store Connect and Play Console, which is console configuration,
 # not something settable from here.
 STORE_PRODUCT_TO_PLAN = {
+    # The ids to register in App Store Connect and Play Console:
+    #   Pay-per-Use — a 30-day pass that doesn't renew (Apple: Non-Renewing
+    #   Subscription; Google Play: one-time product). Its 30 days are
+    #   counted here, by the server (PASS_DAYS).
+    #   Monthly / Yearly — auto-renewable subscriptions in one group
+    #   ("Docente Pro"); renewal and cancellation are handled by the stores.
+    "com.docente.app.pass30": "payperuse",
+    "com.docente.app.pro.monthly": "monthly",
+    "com.docente.app.pro.yearly": "yearly",
+    # Earlier placeholder ids, still accepted.
     "com.docently.app.payperuse": "payperuse",
     "com.docently.app.monthly": "monthly",
     "com.docently.app.yearly": "yearly",
 }
+PASS_DAYS = 30   # how long one Pay-per-Use pass lasts
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
@@ -328,6 +339,9 @@ def init_db():
             # on every startup, whether the columns already exist or not.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sage_messages_used INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS sage_messages_reset_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+            # When a Pay-per-Use pass ends. NULL for Free and for store
+            # subscriptions (the stores handle their renewals).
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversions (
@@ -465,12 +479,25 @@ def send_email(to_email, subject, body):
         server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
 
 
+def _pass_expired(row):
+    exp = row.get("plan_expires_at") if hasattr(row, "get") else None
+    return bool(exp and row.get("plan") != "free" and exp <= datetime.now(timezone.utc))
+
+
+def effective_plan(row):
+    """The plan an account really has now: a Pay-per-Use pass whose 30 days
+    have run out counts as Free, even before the database is corrected."""
+    return "free" if _pass_expired(row) else row["plan"]
+
+
 def user_row_to_dict(row):
+    exp = row.get("plan_expires_at") if hasattr(row, "get") else None
     return {
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
-        "plan": row["plan"],
+        "plan": effective_plan(row),
+        "plan_expires_at": exp.isoformat() if exp and not _pass_expired(row) else None,
         "referral_code": row["referral_code"],
         "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
         # File conversions are free and unlimited on every plan now — no
@@ -500,6 +527,20 @@ def auth_required(fn):
             conn.close()
         if not row:
             return jsonify({"error": "Not authenticated"}), 401
+        if _pass_expired(row):
+            # A Pay-per-Use pass has run out: back to Free, in the database
+            # and for this request (allowances included).
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
+            finally:
+                conn.close()
+            row = dict(row)
+            row["plan"], row["plan_expires_at"] = "free", None
         request.current_user = row
         return fn(*args, **kwargs)
 
@@ -1419,7 +1460,15 @@ def plan_upgrade():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET plan = %s WHERE id = %s RETURNING *", (plan, request.current_user["id"]))
+            expires_at = None
+            if plan == "payperuse":
+                # 30 days from now — or, bought while a pass is still active,
+                # 30 more days on top of what's left.
+                now = datetime.now(timezone.utc)
+                current = request.current_user.get("plan_expires_at") if request.current_user.get("plan") == "payperuse" else None
+                expires_at = (current if current and current > now else now) + timedelta(days=PASS_DAYS)
+            cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s WHERE id = %s RETURNING *",
+                        (plan, expires_at, request.current_user["id"]))
             row = cur.fetchone()
 
             if referral_code and plan in ("monthly", "yearly"):
@@ -3121,6 +3170,106 @@ def slides_build_endpoint():
         return jsonify({"error": "The slides couldn't be built. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# Remy inside Slide Studio: one tap to tighten a slide's points, put them in
+# simpler words, draft points from its title, or write its speaker notes.
+# Like Smart Summarize it's a slide tool, free on every plan, so it doesn't
+# use the Remy message allowance — only the per-account AI rate limit.
+_ASSIST_ACTIONS = {
+    "tighten": ("Rewrite the slide's points so each is short and punchy — ideally under 12 words — keeping every idea "
+                "and its meaning. Keep sub-points as sub-points (level 1). Use at most 7 points.", 700),
+    "simplify": ("Rewrite the slide's points in plain, simple words a first-year student understands at once, keeping "
+                 "the meaning. Keep roughly the same points and their levels.", 700),
+    "expand": ("Write 3 to 5 clear, accurate points for this slide from its title, keeping and improving any points "
+               "already there. Suitable for a class presentation or lecture.", 700),
+    "notes": ("Write speaker notes for this slide: what the presenter says while it is shown — 2 to 4 short paragraphs "
+              "of natural spoken English, about 80 to 150 words, covering each point.", 900),
+}
+_ASSIST_SYSTEM = (
+    "You are Remy, the study assistant in Docente, improving one slide of a student's or lecturer's presentation. "
+    "Reply with one JSON object only — no preamble and no code fences. For points reply "
+    '{"bullets": [{"text": "...", "level": 0}]} (level 0 for main points, 1 for sub-points); for speaker notes reply '
+    '{"notes": "..."}. Only rework what the slide already says or clearly implies: never invent statistics, dates, '
+    "citations or facts. Write in the slide's own language."
+)
+
+
+def _parse_assist_json(raw, action):
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        raise ConversionError("Remy couldn't improve this slide — please try again.")
+    if not isinstance(data, dict):
+        raise ConversionError("Remy couldn't improve this slide — please try again.")
+    if action == "notes":
+        notes = data.get("notes")
+        if not isinstance(notes, str) or not notes.strip():
+            raise ConversionError("Remy couldn't write notes for this slide — please try again.")
+        return {"notes": notes.strip()[:2000]}
+    points = []
+    for b in data.get("bullets") or []:
+        if isinstance(b, str):
+            b = {"text": b, "level": 0}
+        if not isinstance(b, dict):
+            continue
+        text = str(b.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            level = max(0, min(int(b.get("level") or 0), 3))
+        except (TypeError, ValueError):
+            level = 0
+        points.append({"text": text[:400], "level": level})
+        if len(points) >= 10:
+            break
+    if not points:
+        raise ConversionError("Remy couldn't improve this slide — please try again.")
+    return {"bullets": points}
+
+
+@app.route("/api/slides/assist", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def slides_assist_endpoint():
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "")
+    if action not in _ASSIST_ACTIONS:
+        return jsonify({"error": "Unknown request for Remy."}), 400
+    slide = data.get("slide") if isinstance(data.get("slide"), dict) else {}
+    title = str(slide.get("title") or "").strip()[:200]
+    points = []
+    for b in (slide.get("bullets") or [])[:40]:
+        if isinstance(b, dict) and str(b.get("text") or "").strip():
+            try:
+                level = max(0, min(int(b.get("level") or 0), 3))
+            except (TypeError, ValueError):
+                level = 0
+            points.append(("  " * level) + "- " + str(b["text"]).strip()[:600])
+    if action in ("tighten", "simplify") and not points:
+        return jsonify({"error": "Add some points to this slide first."}), 400
+    if not title and not points:
+        return jsonify({"error": "Give this slide a title first."}), 400
+    deck = str((data.get("context") or {}).get("deck_title") or "").strip()[:160]
+    instruction, max_tokens = _ASSIST_ACTIONS[action]
+    user_message = (
+        (f"Presentation: {deck}\n" if deck else "")
+        + f"Slide title: {title or '(none)'}\n"
+        + ("Points:\n" + "\n".join(points) + "\n" if points else "Points: (none yet)\n")
+        + f"\nTask: {instruction}"
+    )
+    try:
+        raw = call_claude(_ASSIST_SYSTEM, user_message, max_tokens=max_tokens)
+        return jsonify(_parse_assist_json(raw, action))
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
 
 
 init_db()
