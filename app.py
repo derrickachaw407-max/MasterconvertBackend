@@ -249,11 +249,13 @@ GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")
 # not something settable from here.
 STORE_PRODUCT_TO_PLAN = {
     # The ids to register in App Store Connect and Play Console:
-    #   Pay-per-Use — a 30-day pass that doesn't renew (Apple: Non-Renewing
-    #   Subscription; Google Play: one-time product). Its 30 days are
-    #   counted here, by the server (PASS_DAYS).
+    #   Pay-per-Use — one full use of Pro: PAYPERUSE_MESSAGES Remy messages
+    #   that never expire (Apple: Consumable; Google Play: one-time product,
+    #   consumed after it's granted). Each store transaction is credited
+    #   once only (store_purchases).
     #   Monthly / Yearly — auto-renewable subscriptions in one group
     #   ("Docente Pro"); renewal and cancellation are handled by the stores.
+    "com.docente.app.payperuse": "payperuse",
     "com.docente.app.pass30": "payperuse",
     "com.docente.app.pro.monthly": "monthly",
     "com.docente.app.pro.yearly": "yearly",
@@ -262,7 +264,8 @@ STORE_PRODUCT_TO_PLAN = {
     "com.docently.app.monthly": "monthly",
     "com.docently.app.yearly": "yearly",
 }
-PASS_DAYS = 30   # how long one Pay-per-Use pass lasts
+PASS_DAYS = 30   # kept for any account on the earlier 30-day pass
+PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: Remy messages that never expire
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
@@ -342,6 +345,18 @@ def init_db():
             # When a Pay-per-Use pass ends. NULL for Free and for store
             # subscriptions (the stores handle their renewals).
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ")
+            # Pay-per-Use: Remy messages bought once, used after the monthly
+            # allowance, never expiring — and every store transaction that
+            # granted them, so the same purchase is never credited twice.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS store_purchases (
+                    transaction_key TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    product TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversions (
@@ -498,6 +513,7 @@ def user_row_to_dict(row):
         "email": row["email"],
         "plan": effective_plan(row),
         "plan_expires_at": exp.isoformat() if exp and not _pass_expired(row) else None,
+        "remy_credits": (row.get("remy_credits") or 0) if hasattr(row, "get") else 0,
         "referral_code": row["referral_code"],
         "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
         # File conversions are free and unlimited on every plan now — no
@@ -1433,6 +1449,7 @@ def plan_upgrade():
     platform = (data.get("platform") or "").strip().lower()
     referral_code = (data.get("referral_code") or "").strip().upper() or None
 
+    transaction_key = None
     if platform == "free":
         plan = "free"
     elif platform == "ios":
@@ -1441,6 +1458,7 @@ def plan_upgrade():
             return jsonify({"error": "Missing transaction_id."}), 400
         try:
             plan = _apple_verify_transaction(transaction_id)
+            transaction_key = "ios:" + transaction_id
         except PurchaseVerificationError as e:
             return jsonify({"error": str(e)}), 402
     elif platform == "android":
@@ -1451,6 +1469,7 @@ def plan_upgrade():
             return jsonify({"error": "Missing product_id or purchase_token."}), 400
         try:
             plan = _google_verify_purchase(product_id, purchase_token, is_subscription)
+            transaction_key = "android:" + purchase_token
         except PurchaseVerificationError as e:
             return jsonify({"error": str(e)}), 402
     else:
@@ -1460,15 +1479,24 @@ def plan_upgrade():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            expires_at = None
             if plan == "payperuse":
-                # 30 days from now — or, bought while a pass is still active,
-                # 30 more days on top of what's left.
-                now = datetime.now(timezone.utc)
-                current = request.current_user.get("plan_expires_at") if request.current_user.get("plan") == "payperuse" else None
-                expires_at = (current if current and current > now else now) + timedelta(days=PASS_DAYS)
-            cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s WHERE id = %s RETURNING *",
-                        (plan, expires_at, request.current_user["id"]))
+                # One full use of Pro: Remy messages that never expire, on top
+                # of the monthly allowance; the plan itself doesn't change.
+                # A transaction already credited (a retried or replayed
+                # request) adds nothing the second time.
+                cur.execute(
+                    "INSERT INTO store_purchases (transaction_key, user_id, product) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (transaction_key) DO NOTHING RETURNING transaction_key",
+                    (transaction_key, request.current_user["id"], "payperuse"),
+                )
+                if cur.fetchone():
+                    cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s RETURNING *",
+                                (PAYPERUSE_MESSAGES, request.current_user["id"]))
+                else:
+                    cur.execute("SELECT * FROM users WHERE id = %s", (request.current_user["id"],))
+            else:
+                cur.execute("UPDATE users SET plan = %s, plan_expires_at = NULL WHERE id = %s RETURNING *",
+                            (plan, request.current_user["id"]))
             row = cur.fetchone()
 
             if referral_code and plan in ("monthly", "yearly"):
@@ -1613,7 +1641,7 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
-def _refund_sage_message(user_row):
+def _refund_sage_message(user_row, source="allowance"):
     """Returns one Remy message to the user's monthly allowance, for a
     request that was counted but never got a reply. Never goes below zero
     (the allowance may have reset in between). Best-effort: a failure here
@@ -1622,10 +1650,14 @@ def _refund_sage_message(user_row):
     try:
         conn = get_db()
         with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s",
-                (user_row["id"],),
-            )
+            if source == "credit":
+                # It came from a Pay-per-Use purchase: back to the purchase.
+                cur.execute("UPDATE users SET remy_credits = remy_credits + 1 WHERE id = %s", (user_row["id"],))
+            else:
+                cur.execute(
+                    "UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s",
+                    (user_row["id"],),
+                )
         conn.commit()
     except Exception as e:
         logger.error("Couldn't refund a Remy message for user %s: %s", user_row.get("id"), e)
@@ -1659,23 +1691,30 @@ def _log_sage_message_and_consume(user_row):
                 reset_at = now
 
             limit = SAGE_FREE_MESSAGES_LIMIT if row["plan"] == "free" else SAGE_PAID_MESSAGES_LIMIT
+            source = "allowance"
             if used >= limit:
-                conn.rollback()
-                if row["plan"] == "free":
+                if (row.get("remy_credits") or 0) > 0:
+                    # The month's allowance is used up: a Pay-per-Use message.
+                    source = "credit"
+                    cur.execute("UPDATE users SET remy_credits = remy_credits - 1 WHERE id = %s", (row["id"],))
+                else:
+                    conn.rollback()
+                    if row["plan"] == "free":
+                        raise ConversionError(
+                            f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
+                            f"Get Pro for {SAGE_PAID_MESSAGES_LIMIT} a month, or Pay-per-Use for {PAYPERUSE_MESSAGES} more."
+                        )
                     raise ConversionError(
-                        f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
-                        "Upgrade for a much higher limit."
+                        f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
+                        f"account. It resets next month — or Pay-per-Use adds {PAYPERUSE_MESSAGES} more now."
                     )
-                raise ConversionError(
-                    f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
-                    "account. It resets next month."
+            if source == "allowance":
+                cur.execute(
+                    "UPDATE users SET sage_messages_used = %s, sage_messages_reset_at = %s WHERE id = %s",
+                    (used + 1, reset_at, row["id"]),
                 )
-
-            cur.execute(
-                "UPDATE users SET sage_messages_used = %s, sage_messages_reset_at = %s WHERE id = %s",
-                (used + 1, reset_at, row["id"]),
-            )
         conn.commit()
+        return source
     except Exception:
         conn.rollback()
         raise
@@ -2330,7 +2369,7 @@ def sage_endpoint():
     # the whole point is to never spend the API cost on a request that
     # was already over its limit.
     try:
-        _log_sage_message_and_consume(request.current_user)
+        charged_from = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return jsonify({"error": str(e)}), 429
 
@@ -2347,7 +2386,7 @@ def sage_endpoint():
         # arrived, so give it back. Otherwise a timeout or AI outage quietly
         # spent one of a free user's 10 monthly messages, and tapping Retry
         # spent another.
-        _refund_sage_message(request.current_user)
+        _refund_sage_message(request.current_user, charged_from)
         if isinstance(e, ConversionError):
             return jsonify({"error": str(e)}), 502
         raise

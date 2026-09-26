@@ -2617,11 +2617,53 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
         return True
 
+    def _only_title_on(s):
+        """True when a slide holds nothing yet but its title."""
+        for sh in s.shapes:
+            if sh.is_placeholder and sh.placeholder_format.idx == 0:
+                continue
+            if sh.is_placeholder and sh.has_text_frame and not sh.text_frame.text.strip():
+                continue
+            return False
+        return True
+
+    def _add_scaled_picture(s, image_bytes, px, area):
+        """The picture as large as the area allows, proportions kept, centred.
+        The area is in EMU and the picture's size in pixels, so the cap on
+        enlarging is in EMU per pixel: twice natural size (96 dpi = 9525
+        EMU/px), enough to fill a slide without small pictures turning
+        blocky. The old cap was 1 EMU per pixel, which shrank a 1200-pixel
+        photo to a speck about a thousandth of an inch wide."""
+        aL, aT, aW, aH = area
+        iw, ih = px
+        if iw and ih:
+            scale = min(aW / iw, aH / ih, 2 * 9525)
+            pw, ph_ = int(iw * scale), int(ih * scale)
+        else:
+            pw, ph_ = aW, aH
+        s.shapes.add_picture(io.BytesIO(image_bytes), aL + (aW - pw) // 2, aT + (aH - ph_) // 2, pw, ph_)
+
     def add_image_slide(image_bytes):
         px = _picture_size(image_bytes)
         if px is None:
             return  # a malformed/unsupported embedded image shouldn't sink the whole conversion
         if _place_image_beside_text(image_bytes, px):
+            return
+        # The section's heading already made a slide and nothing has filled
+        # it yet (a handout section that is just a picture): the picture
+        # goes on that slide. It used to start another one, leaving the
+        # heading's slide behind empty — a blank title-only slide before
+        # every picture.
+        s = state["slide"]
+        if s is not None and state["bullet_count"] == 0 and _only_title_on(s):
+            body_ph = s.placeholders[1] if len(s.placeholders) > 1 else None
+            if body_ph is not None:
+                area = (body_ph.left, body_ph.top, body_ph.width, body_ph.height)
+                body_ph._element.getparent().remove(body_ph._element)
+            else:
+                area = (PptxInches(0.6), PptxInches(1.7), prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3))
+            _add_scaled_picture(s, image_bytes, px, area)
+            state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
             return
         # Otherwise a slide of its own — now titled with its section, where
         # it used to be an untitled full-bleed picture cut off from the topic
@@ -2639,11 +2681,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
                 area = (PptxInches(0.6), PptxInches(1.7), prs.slide_width - PptxInches(1.2), prs.slide_height - PptxInches(2.3))
         else:
             area = (0, 0, prs.slide_width, prs.slide_height)
-        aL, aT, aW, aH = area
-        iw, ih = px
-        scale = min(aW / iw, aH / ih, 1) if iw and ih else 1
-        pw, ph_ = int(iw * scale) if iw else aW, int(ih * scale) if ih else aH
-        s.shapes.add_picture(io.BytesIO(image_bytes), aL + (aW - pw) // 2, aT + (aH - ph_) // 2, pw, ph_)
+        _add_scaled_picture(s, image_bytes, px, area)
         # A loose paragraph appearing right after an image should land on a
         # fresh slide rather than silently reusing the image slide.
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = None, None, 0, 0
