@@ -3557,6 +3557,29 @@ def delete_account_endpoint():
     return jsonify({"ok": True})
 
 
+# ------------------------------------------------------------ app error reports
+# When the app hits an unexpected error on someone's phone, it sends a short
+# technical report here so problems on real devices get noticed and fixed.
+# Only technical facts are accepted: the error message, where in the app it
+# happened, the app version and the browser type — no names, emails or file
+# content (the privacy policy's "basic technical logs"). Reports are written
+# to the server log, capped per phone, and trimmed to fixed lengths.
+@app.route("/api/client-error", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per hour")
+def client_error_report():
+    data = request.get_json(silent=True) or {}
+    clip = lambda v, n: re.sub(r"\s+", " ", str(v or ""))[:n]
+    message = clip(data.get("message"), 300)
+    if not message:
+        return jsonify({"ok": True})
+    where = clip(data.get("where"), 200)
+    stack = clip(data.get("stack"), 900)
+    version = clip(data.get("version"), 20)
+    agent = clip(request.headers.get("User-Agent"), 160)
+    logger.warning(f"[app error] v{version} | {message} | at {where} | {stack} | {agent}")
+    return jsonify({"ok": True})
+
+
 init_db()
 
 if __name__ == "__main__":
