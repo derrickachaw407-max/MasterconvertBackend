@@ -111,7 +111,7 @@ def _exempt_cors_preflight():
 
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("docently")
+logger = logging.getLogger("docente")
 
 MIME_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -176,13 +176,16 @@ def safe_download_name(original_filename, fallback="download"):
 # domain can be added with EXTRA_ALLOWED_ORIGINS.
 _ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$")
 ALLOWED_ORIGINS = {
+    "https://getdocente.vercel.app",
     "https://docently.vercel.app",
     "https://masterconvert-tau.vercel.app",
 }
 # Additional origins can be added without a code change via this env var
 # (comma-separated) — set on Render if a custom domain is added later.
 ALLOWED_ORIGINS |= {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()}
-FRONTEND_URL = "https://docently.vercel.app"
+# The app's address, used in password-reset emails. getdocente.vercel.app
+# is the current name; the old addresses still open the same app.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://getdocente.vercel.app").rstrip("/")
 
 
 def _origin_is_allowed(origin):
@@ -1792,6 +1795,15 @@ def convert_endpoint():
                 return jsonify({"error": "'title_align' must be left, center, or right"}), 400
             pptx_options["title_align"] = title_align
 
+    # Quick automatic fix into one of Docente's templates: the deck is read
+    # and rebuilt by the same engine as Slide Studio (slides, pictures, logo
+    # and notes kept). Without this field the original tidy-up runs as before.
+    studio_template = None
+    if from_fmt == "pptx" and to_fmt == "pptx":
+        studio_template = (request.form.get("studio_template") or "").strip() or None
+        if studio_template and studio_template not in {t["id"] for t in template_catalog()}:
+            return jsonify({"error": "Unknown template — please choose one from the list."}), 400
+
     try:
         _log_conversion_and_consume(request.current_user, from_fmt, to_fmt)
     except ConversionError as e:
@@ -1804,8 +1816,13 @@ def convert_endpoint():
         file.save(src_path)
 
         try:
-            result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style, pptx_options=pptx_options)
-        except ConversionError as e:
+            if studio_template:
+                deck = parse_pptx_to_deck(src_path)
+                deck["template"] = studio_template
+                result_path = build_template_deck(deck, work_dir, "fixed.pptx")
+            else:
+                result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style, pptx_options=pptx_options)
+        except (ConversionError, StudioError) as e:
             return jsonify({"error": str(e)}), 422
         except FileNotFoundError as e:
             return jsonify({"error": f"Required conversion tool missing on server: {e}"}), 500
@@ -3501,6 +3518,43 @@ def google_store_notification():
         return jsonify({"error": "Couldn't check with Google Play right now."}), 503
     _apply_store_state(owner, entitled=entitled)
     return jsonify({"ok": True, "entitled": entitled}), 200
+
+
+# ------------------------------------------------------------ deleting an account
+# Required by the App Store and Google Play for any app where people create
+# an account: deleting it from inside the app. Everything stored with the
+# account goes with it — conversion history and Remy's memory notes (removed
+# by the database with the account), and the store purchase records; promo
+# codes someone created stay usable but no longer point at them. The
+# password is asked again, so a borrowed phone that's already signed in
+# can't do it by accident. (Store subscriptions are billed by Apple or
+# Google, so the app reminds people to cancel those in the store.)
+@app.route("/api/account", methods=["DELETE", "OPTIONS"])
+@limiter.limit("5 per hour", key_func=_account_or_ip_key)
+@auth_required
+def delete_account_endpoint():
+    data = request.get_json(silent=True) or {}
+    user = request.current_user
+    stored = user.get("password_hash") if hasattr(user, "get") else None
+    if stored:
+        if not check_password_hash(stored, str(data.get("password") or "")):
+            return jsonify({"error": "That password isn't right — your account hasn't been deleted."}), 403
+    elif str(data.get("confirm") or "").strip().upper() != "DELETE":
+        return jsonify({"error": "Type DELETE to confirm."}), 400
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM store_purchases WHERE user_id = %s", (user["id"],))
+            cur.execute("DELETE FROM users WHERE id = %s", (user["id"],))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Account deletion failed for user {user['id']}: {e}", exc_info=True)
+        return jsonify({"error": "Your account couldn't be deleted just now — please try again."}), 500
+    finally:
+        conn.close()
+    logger.info(f"Account {user['id']} deleted at the user's request")
+    return jsonify({"ok": True})
 
 
 init_db()
