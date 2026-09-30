@@ -511,6 +511,7 @@ def effective_plan(row):
 
 def user_row_to_dict(row):
     exp = row.get("plan_expires_at") if hasattr(row, "get") else None
+    msgs_used, msgs_limit, msgs_reset = _sage_status(row)
     return {
         "id": row["id"],
         "name": row["name"],
@@ -518,6 +519,11 @@ def user_row_to_dict(row):
         "plan": effective_plan(row),
         "plan_expires_at": exp.isoformat() if exp and not _pass_expired(row) else None,
         "remy_credits": (row.get("remy_credits") or 0) if hasattr(row, "get") else 0,
+        # The Remy message meter: this window's allowance, used so far, and
+        # when it renews (30 days after it began).
+        "remy_messages_used": msgs_used,
+        "remy_messages_limit": msgs_limit,
+        "remy_messages_resets_at": (msgs_reset + timedelta(days=SAGE_WINDOW_DAYS)).isoformat() if msgs_reset else None,
         "referral_code": row["referral_code"],
         "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
         # File conversions are free and unlimited on every plan now — no
@@ -1680,6 +1686,23 @@ def _refund_sage_message(user_row, source="allowance"):
             conn.close()
 
 
+def _sage_status(row):
+    """(messages used in the current window, the plan's monthly limit, when
+    the window started) for a user row — computed, never written. The one
+    rule shared by _log_sage_message_and_consume (which enforces the limit)
+    and the meter shown to the person (which displays it), so the number on
+    screen is always exactly what the next real message would find. A window
+    that has run out counts as fresh here even before the database row is
+    reset by the next message."""
+    now = datetime.now(timezone.utc)
+    used = row["sage_messages_used"]
+    reset_at = row["sage_messages_reset_at"]
+    if reset_at and now - reset_at > timedelta(days=SAGE_WINDOW_DAYS):
+        used, reset_at = 0, now
+    limit = SAGE_FREE_MESSAGES_LIMIT if row["plan"] == "free" else SAGE_PAID_MESSAGES_LIMIT
+    return used, limit, reset_at
+
+
 def _log_sage_message_and_consume(user_row):
     """Enforce Sage's own monthly message cap and record the message —
     same row-locking pattern as _log_conversion_and_consume above, for
@@ -1695,14 +1718,7 @@ def _log_sage_message_and_consume(user_row):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
             row = cur.fetchone()
-            now = datetime.now(timezone.utc)
-            used = row["sage_messages_used"]
-            reset_at = row["sage_messages_reset_at"]
-            if reset_at and now - reset_at > timedelta(days=SAGE_WINDOW_DAYS):
-                used = 0
-                reset_at = now
-
-            limit = SAGE_FREE_MESSAGES_LIMIT if row["plan"] == "free" else SAGE_PAID_MESSAGES_LIMIT
+            used, limit, reset_at = _sage_status(row)
             source = "allowance"
             if used >= limit:
                 if (row.get("remy_credits") or 0) > 0:
@@ -3334,6 +3350,150 @@ def slides_assist_endpoint():
         return jsonify({"error": str(e)}), 502
     except Exception as e:
         logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
+
+
+# --------------------------------------------------------- drafting a whole deck
+# Starting a new deck in Slide Studio no longer has to mean a blank slide:
+# given a topic, Remy drafts a full outline (title slide plus content slides)
+# that opens straight into the editor to fix up. It uses one Remy message per
+# draft (the same allowance and Pay-per-Use messages as Remy chat), since a
+# whole deck is a substantial AI request; editing the deck afterwards, and
+# Remy's per-slide help, stay free.
+_DRAFT_MAX_SLIDES = 10
+_DRAFT_SYSTEM = (
+    "You are Remy, the study assistant in Docente, drafting a full slide-deck outline from a short topic someone "
+    "gives you, for a {group} to open and edit. Reply with one JSON object only — no preamble, no code fences: "
+    '{{"title_slide": {{...}}, "slides": [...]}}.\n'
+    "{title_fields}"
+    "slides: a JSON array, {min_slides} to " + str(_DRAFT_MAX_SLIDES - 1) + ' items, each one '
+    '{{"kind": "content"|"columns"|"section", "title": "...", ...}} — '
+    'for "content": "bullets": [{{"text": "...", "level": 0}}] (3 to 6 per slide, each under about 18 words, level 1 for '
+    'a sub-point); for "columns": "left_heading", "left": [...same shape...], "right_heading", "right": [...]; for '
+    '"section": a divider between parts of the talk, plus optional "sub". The LAST item in the array must be '
+    '{{"kind": "end", "title": "Any questions" or "End", "big": "Thank you"}}.\n'
+    "Rules: only develop what the topic already says or clearly implies — never invent statistics, dates, named "
+    "studies, or quotations attributed to a real person; never use a \"quote\" or \"picture\" slide, since this tool "
+    "has no real quotation or photo to put there; leave a title-slide field blank rather than inventing a course "
+    "name, code, lecturer, or institution the person didn't mention; write in the topic's own language."
+)
+_DRAFT_TITLE_FIELDS = {
+    "student": ('title_slide: {"lines": [up to 3 short strings — institution, department, programme; empty strings '
+                'if not mentioned], "main": "the topic, as a slide title", "sub": "" (leave blank unless a '
+                'presenter name was given)}.\n'),
+    "tutor": ('title_slide: {"course": "the subject", "code": "" (leave blank unless given), "subtitle": "the '
+              'lecture title", "lecturer": "" (leave blank unless given), "date": ""}.\n'),
+}
+
+
+def _clip_bullets(raw, limit=6):
+    out = []
+    for b in (raw or [])[:limit]:
+        if isinstance(b, str):
+            b = {"text": b, "level": 0}
+        if not isinstance(b, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(b.get("text") or "")).strip()
+        if not text:
+            continue
+        try:
+            level = max(0, min(int(b.get("level") or 0), 1))
+        except (TypeError, ValueError):
+            level = 0
+        out.append({"text": text[:220], "level": level})
+    return out
+
+
+def _parse_draft_deck_json(raw, group):
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        raise ConversionError("Remy couldn't draft this topic — please try again, or add a bit more detail.")
+
+    ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
+    clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+    if group == "tutor":
+        title_slide = {
+            "course": clip(ts_raw.get("course"), 80), "code": clip(ts_raw.get("code"), 30),
+            "subtitle": clip(ts_raw.get("subtitle"), 120), "lecturer": clip(ts_raw.get("lecturer"), 80),
+            "date": clip(ts_raw.get("date"), 40),
+        }
+    else:
+        lines = [clip(l, 120) for l in (ts_raw.get("lines") or []) if clip(l, 120)][:3]
+        title_slide = {"lines": lines, "main": clip(ts_raw.get("main"), 200), "sub": clip(ts_raw.get("sub"), 200)}
+
+    slides = []
+    for sd in (data.get("slides") or [])[: _DRAFT_MAX_SLIDES]:
+        if not isinstance(sd, dict):
+            continue
+        kind_raw = sd.get("kind")
+        if kind_raw in ("quote", "picture"):
+            continue  # never let these through — not even as an empty filler slide
+        kind = kind_raw if kind_raw in ("content", "columns", "section", "end") else "content"
+        title = clip(sd.get("title"), 140)
+        if kind == "end":
+            slides.append({"kind": "end", "title": title or ("Any questions" if group == "tutor" else "End"),
+                            "big": clip(sd.get("big"), 60) or "Thank you"})
+        elif kind == "section":
+            slides.append({"kind": "section", "title": title, "sub": clip(sd.get("sub"), 200)})
+        elif kind == "columns":
+            slides.append({"kind": "columns", "title": title, "list_style": "bullets",
+                            "left_heading": clip(sd.get("left_heading"), 60), "left": _clip_bullets(sd.get("left")),
+                            "right_heading": clip(sd.get("right_heading"), 60), "right": _clip_bullets(sd.get("right"))})
+        else:
+            slides.append({"kind": "content", "title": title, "list_style": "bullets", "bullets": _clip_bullets(sd.get("bullets"))})
+
+    if slides and slides[-1]["kind"] == "end":
+        body, end = slides[:-1], slides[-1]
+    else:
+        body, end = slides, {"kind": "end", "title": "Any questions" if group == "tutor" else "End", "big": "Thank you"}
+    if not body:
+        raise ConversionError("Remy couldn't draft this topic — please try again, or add a bit more detail.")
+    return {
+        "template": ("tutor" if group == "tutor" else "student") + "-classic",
+        "title_slide": title_slide, "slide_numbers": True, "slides": body[: _DRAFT_MAX_SLIDES - 1] + [end],
+    }
+
+
+@app.route("/api/slides/draft", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def slides_draft_endpoint():
+    data = request.get_json(silent=True) or {}
+    group = "tutor" if data.get("group") == "tutor" else "student"
+    topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
+    if not topic:
+        return jsonify({"error": "Tell Remy what the deck is about first."}), 400
+    system = _DRAFT_SYSTEM.format(
+        group="tutor preparing a lecture" if group == "tutor" else "student preparing a presentation or report",
+        title_fields=_DRAFT_TITLE_FIELDS[group], min_slides=4,
+    )
+    # A whole drafted deck is real AI work, so it draws on the same Remy
+    # messages as chatting with Remy: the month's allowance first, then any
+    # Pay-per-Use messages. Checked before the AI call (never spend on a
+    # request already over its limit), and given back below if no usable
+    # deck arrives — a message only counts when the answer does.
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 429
+    try:
+        raw = call_claude(system, f"Topic: {topic}", max_tokens=3000)
+        deck = _parse_draft_deck_json(raw, group)
+        deck["filename"] = (re.sub(r"[^\w \-]+", "", topic).strip()[:60] or ("Lecture" if group == "tutor" else "Presentation"))
+        return jsonify({"deck": deck})
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from)
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        _refund_sage_message(request.current_user, charged_from)
+        logger.error(f"Slide draft failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
 
 
