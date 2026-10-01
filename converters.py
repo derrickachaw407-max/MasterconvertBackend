@@ -322,38 +322,42 @@ def _ocr_pdf_page(pdf_path, page_num, work_dir):
 
 # ---------------------------------------------------------- PPTX templates
 PPTX_TEMPLATES = {
+    # Modern versions of the four Notes -> Slides looks (same names). No bold
+    # anywhere: titles stand out by size and colour. "chrome" adds each
+    # look's design elements (see _modern_pptx_chrome); "marker" colours the
+    # bullet markers. Uploaded corporate templates have neither and keep
+    # their own design untouched.
     "minimal": {
-        "bg": None, "title_fill": None,
-        "title_font": "Calibri", "title_size": Pt(40), "title_bold": True,
-        "title_color": PptxRGBColor(0x1A, 0x1A, 0x1A),
+        "bg": None, "title_fill": None, "chrome": "block", "accent": PptxRGBColor(0x4F, 0x46, 0xE5),
+        "marker": PptxRGBColor(0x4F, 0x46, 0xE5),
+        "title_font": "Calibri Light", "title_size": Pt(40), "title_bold": False,
+        "title_color": PptxRGBColor(0x11, 0x18, 0x27),
         "body_font": "Calibri", "body_size": Pt(26),
-        "body_color": PptxRGBColor(0x33, 0x33, 0x33),
+        "body_color": PptxRGBColor(0x37, 0x41, 0x51),
         "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "academic": {
-        # Georgia (serif) replaced with a clean sans-serif — modern
-        # presentation-design standards call for sans-serif body/title
-        # text specifically because it reads better projected at a
-        # distance; the academic template keeps its distinct navy color
-        # identity, just not a serif face.
-        "bg": None, "title_fill": None,
-        "title_font": "Calibri", "title_size": Pt(40), "title_bold": True,
+        "bg": None, "title_fill": None, "chrome": "rail", "accent": PptxRGBColor(0x1F, 0x3A, 0x5F),
+        "marker": PptxRGBColor(0x1F, 0x3A, 0x5F),
+        "title_font": "Calibri Light", "title_size": Pt(40), "title_bold": False,
         "title_color": PptxRGBColor(0x1F, 0x3A, 0x5F),
         "body_font": "Calibri", "body_size": Pt(26),
         "body_color": PptxRGBColor(0x22, 0x22, 0x22),
         "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "bold": {
-        "bg": PptxRGBColor(0x0A, 0x0A, 0x0A), "title_fill": None,
-        "title_font": "Arial", "title_size": Pt(44), "title_bold": True,
+        "bg": PptxRGBColor(0x0B, 0x0B, 0x0F), "title_fill": None, "chrome": "editorial", "accent": PptxRGBColor(0xF5, 0x9E, 0x0B),
+        "marker": PptxRGBColor(0xF5, 0x9E, 0x0B),
+        "title_font": "Calibri Light", "title_size": Pt(46), "title_bold": False,
         "title_color": PptxRGBColor(0xFF, 0xFF, 0xFF),
-        "body_font": "Arial", "body_size": Pt(26),
-        "body_color": PptxRGBColor(0xE8, 0xE8, 0xE8),
+        "body_font": "Calibri", "body_size": Pt(26),
+        "body_color": PptxRGBColor(0xE5, 0xE7, 0xEB),
         "subhead_size": Pt(30), "caption_size": Pt(15),
     },
     "classic": {
-        "bg": None, "title_fill": PptxRGBColor(0x1F, 0x38, 0x64),
-        "title_font": "Calibri", "title_size": Pt(38), "title_bold": True,
+        "bg": None, "title_fill": None, "chrome": "band", "band": PptxRGBColor(0x1F, 0x38, 0x64), "accent": PptxRGBColor(0x38, 0xBD, 0xF8),
+        "marker": PptxRGBColor(0x1F, 0x38, 0x64),
+        "title_font": "Calibri Light", "title_size": Pt(38), "title_bold": False,
         "title_color": PptxRGBColor(0xFF, 0xFF, 0xFF),
         "body_font": "Calibri", "body_size": Pt(26),
         "body_color": PptxRGBColor(0x22, 0x22, 0x22),
@@ -484,6 +488,56 @@ def _style_pptx_slide(slide, style):
             # rather than overwritten with an extracted snapshot color.
             if style["title_color"] is not None:
                 run.font.color.rgb = style["title_color"]
+    if style.get("chrome"):
+        _modern_pptx_chrome(slide, style)
+
+
+def _modern_pptx_chrome(slide, style):
+    """Each built-in look's design elements, placed around the slide's real
+    title: Minimal's accent block beside it, Academic's side rail, Bold
+    Editorial's accent bar above it, Classic Outline's full-width band."""
+    from pptx.enum.shapes import MSO_SHAPE as _SHAPE
+    t = slide.shapes.title
+    if t is None:
+        return
+    W, H = slide.part.package.presentation_part.presentation.slide_width, slide.part.package.presentation_part.presentation.slide_height
+
+    def rect(x, y, w, h, rgb, back=False):
+        shp = slide.shapes.add_shape(_SHAPE.RECTANGLE, int(x), int(y), int(w), int(h))
+        shp.fill.solid()
+        shp.fill.fore_color.rgb = rgb
+        shp.line.fill.background()
+        shp.shadow.inherit = False
+        if back:
+            el = shp._element
+            el.getparent().remove(el)
+            slide.shapes._spTree.insert(2, el)
+        return shp
+
+    kind, inch = style["chrome"], 914400
+    # Modern looks read left-aligned, so each accent sits with its title.
+    from pptx.enum.text import PP_ALIGN as _ALIGN, MSO_ANCHOR as _ANCHOR
+    t.text_frame.vertical_anchor = _ANCHOR.MIDDLE
+    for para in t.text_frame.paragraphs:
+        para.alignment = _ALIGN.LEFT
+    if kind == "block":
+        rect(max(t.left - int(0.3 * inch), 0), t.top + t.height // 2 - int(0.38 * inch), int(0.1 * inch), int(0.76 * inch), style["accent"])
+    elif kind == "rail":
+        rect(0, 0, int(0.22 * inch), H, style["accent"], back=True)
+    elif kind == "editorial":
+        rect(t.left + int(0.08 * inch), max(t.top - int(0.05 * inch), int(0.12 * inch)), int(0.9 * inch), int(0.08 * inch), style["accent"])
+    elif kind == "band":
+        bottom = t.top + t.height
+        rect(0, 0, W, bottom, style["band"], back=True)
+        rect(0, bottom, int(2.6 * inch), int(0.06 * inch), style["accent"])
+        # breathing room between the band and the text below it
+        for ph in slide.placeholders:
+            if ph.placeholder_format.idx == 1 and ph.top < bottom + int(0.3 * inch):
+                # Set all four: a placeholder that inherits its position gets
+                # a zero left and width if only top and height are written.
+                left, top, width, height = ph.left, ph.top, ph.width, ph.height
+                shift = bottom + int(0.3 * inch) - top
+                ph.left, ph.top, ph.width, ph.height = left, top + shift, width, max(height - shift, int(1.0 * inch))
 
 
 def _style_pptx_body_paragraph(p, style, size=None):
@@ -491,6 +545,15 @@ def _style_pptx_body_paragraph(p, style, size=None):
     p.font.size = size if size is not None else style["body_size"]
     if style["body_color"] is not None:
         p.font.color.rgb = style["body_color"]
+    if style.get("marker") is not None:
+        pPr = p._p.get_or_add_pPr()
+        if pPr.find(pptx_qn("a:buNone")) is None:
+            for old in pPr.findall(pptx_qn("a:buClr")):
+                pPr.remove(old)
+            clr = etree.SubElement(pPr, pptx_qn("a:buClr"))
+            etree.SubElement(clr, pptx_qn("a:srgbClr")).set("val", str(style["marker"]))
+            pPr.remove(clr)
+            pPr.insert(0, clr)
 
 
 # ---------------------------------------------------------- DOCX styles

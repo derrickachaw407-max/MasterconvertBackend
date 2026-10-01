@@ -2126,9 +2126,13 @@ def _student_title_slide(prs, deck):
     for ph in list(s.placeholders):
         if ph.placeholder_format.type not in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
             _remove(ph)
+    # The topic is the headline: the institution is a small spaced-out line
+    # at the top, a short accent bar leads down to the topic, and "presented
+    # by" sits under it in the accent colour. (Measurements match the app's
+    # preview.)
     lines = [str(l).strip()[:120] for l in (ts.get("lines") or []) if str(l).strip()][:4] or ["Your institution"]
     t = s.shapes.title
-    t.left, t.top, t.width, t.height = 0, Inches(0.35), SLIDE_W, Inches(2.15)
+    t.left, t.top, t.width, t.height = 0, Inches(0.45), SLIDE_W, Inches(1.5)
     tf = t.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -2140,26 +2144,43 @@ def _student_title_slide(prs, deck):
         r.text = line.upper()
         r.font.name = "Arial Black"
         r.font.bold = False
-        r.font.size = Pt(22 if len(lines) <= 3 else 18)
-        r.font.color.rgb = WHITE
+        r.font.size = Pt(16 if len(lines) <= 2 else 14)
+        r.font.color.rgb = RGBColor(0xD9, 0xDE, 0xE8)
+        r._r.get_or_add_rPr().set("spc", "150")
     logo = _image_bytes(deck.get("logo"))
+    top = 3.45 if logo else 2.45
     if logo:
-        _fit_picture(s, logo, SLIDE_W // 2 - Inches(0.65), Inches(2.62), Inches(1.3), Inches(1.3))
-    y = Inches(4.05) if logo else Inches(3.1)
-    for key, size, bold in (("main", 26, True), ("sub", 20, False)):
-        text = str(ts.get(key) or "").strip()[:200]
-        if not text:
-            continue
-        box = s.shapes.add_textbox(Inches(0.79), y, Inches(11.75), Inches(1.0))
-        box.text_frame.word_wrap = True
-        p = box.text_frame.paragraphs[0]
+        _fit_picture(s, logo, SLIDE_W // 2 - Inches(0.65), Inches(2.15), Inches(1.3), Inches(1.1))
+    bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(6.215), Inches(top), Inches(0.9), Inches(0.08))
+    bar.fill.solid()
+    bar.fill.fore_color.theme_color = MSO_THEME_COLOR.ACCENT_2
+    bar.line.fill.background()
+    bar.shadow.inherit = False
+    main = str(ts.get("main") or "").strip()[:200]
+    if main:
+        box = s.shapes.add_textbox(Inches(0.79), Inches(top + 0.2), Inches(11.75), Inches(1.7 if logo else 2.2))
+        tfm = box.text_frame
+        tfm.word_wrap = True
+        tfm.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = tfm.paragraphs[0]
         p.alignment = PP_ALIGN.CENTER
         r = p.add_run()
-        r.text = text
-        r.font.size = Pt(size)
-        r.font.bold = False   # no bold in slides: size makes the main line the headline
+        r.text = main
+        r.font.size = Pt(40 if len(main) <= 40 else 34 if len(main) <= 70 else 28)
+        r.font.bold = False
         r.font.color.rgb = WHITE
-        y += Inches(1.1)
+    sub = str(ts.get("sub") or "").strip()[:200]
+    if sub:
+        box = s.shapes.add_textbox(Inches(0.79), Inches(top + (2.0 if logo else 2.5)), Inches(11.75), Inches(0.8))
+        tfs = box.text_frame
+        tfs.word_wrap = True
+        p = tfs.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        r = p.add_run()
+        r.text = sub
+        r.font.size = Pt(20)
+        r.font.bold = False
+        r.font.color.theme_color = MSO_THEME_COLOR.ACCENT_2
     tag = str(ts.get("tag") or "").strip()[:40]
     if tag:
         box = s.shapes.add_textbox(Inches(10.4), Inches(0.08), Inches(2.8), Inches(0.36))
