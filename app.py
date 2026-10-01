@@ -800,6 +800,79 @@ def search_for_sources(topic, max_results=8):
     return sources[:max_results], None
 
 
+# ------------------------------------------------ searching by topic
+# Real use (server logs) showed students' whole instructions being searched —
+# "Write a paragraph on vital signs" instead of "vital signs" — and a plain
+# "Hi" running the full source search, spending the shared academic-search
+# allowance for nothing. These turn a message into its topic, skip the search
+# for small talk, and put any search failure into plain words for the student
+# (the technical detail stays in the server log).
+_INSTRUCTION_PREFIX = re.compile(
+    r"^(?:(?:please|kindly|can you|could you|help me|i need|i want)\s+(?:to\s+)?)*"
+    r"(?:(?:write|draft|give|generate|prepare|compose|create|produce|do|make)\s+(?:me\s+)?"
+    r"(?:(?:a|an|the|one|two|three|\d+)\s+)?(?:(?:short|brief|detailed|long|full|simple|good|one[- ]page|\d+[- ]words?)\s+)*"
+    r"(?:literature review|page|paragraph|essay|report|summary|note|review|introduction|conclusion|discussion|abstract|"
+    r"assignment|article|section|write-?up|piece|answer|explanation)s?\s+"
+    r"(?:of\s+\d+\s+words\s+)?(?:on|about|regarding|of|for|explaining)\s+"
+    r"|(?:explain|describe|discuss|define|summari[sz]e|outline|tell me about|what (?:is|are)|write (?:on|about))\s+)",
+    re.IGNORECASE)
+_SMALL_TALK = re.compile(
+    r"^(?:hi+|hello|hey|good (?:morning|afternoon|evening|night)|thanks?|thank you|ok(?:ay)?|yes|no|bye|goodbye|"
+    r"how are you|good|great|cool|nice)\b[\s!.?,]*(?:remy|docente)?[\s!.?]*$", re.IGNORECASE)
+
+
+def _search_topic(text):
+    original = re.sub(r"\s+", " ", str(text or "")).strip()
+    topic = original
+    for _ in range(2):
+        shorter = _INSTRUCTION_PREFIX.sub("", topic, count=1).strip()
+        if shorter == topic:
+            break
+        topic = shorter
+    topic = re.sub(r"^(?:the|a|an)\s+", "", topic, flags=re.IGNORECASE).strip(" .?!:;,")
+    return (topic or original)[:200]
+
+
+def _worth_searching(query):
+    q = (query or "").strip()
+    return len(q) >= 3 and not _SMALL_TALK.match(q) and bool(re.search(r"[A-Za-z]{2,}", q))
+
+
+def _topic_search(text, max_results=8):
+    """search_for_sources for a student's message: by its topic, and not at all
+    for small talk. Returns (sources, diagnostic) like search_for_sources."""
+    query = _search_topic(text)
+    if not _worth_searching(query):
+        return [], "not a topic"
+    return search_for_sources(query, max_results=max_results)
+
+
+def _no_sources_note(diag, subject):
+    """What the writing model is told when no sources are available — in plain
+    words, never the technical diagnostic (which named HTTP codes, service
+    messages and "API key is invalid" for students to read)."""
+    if diag == "not a topic":
+        return ("No source search was needed: the student's latest message isn't a writing topic (a greeting or "
+                "a quick remark). Reply naturally and briefly — if they haven't said what they'd like written yet, "
+                "ask for the topic, how long it should be and which course it's for.")
+    d = (diag or "").lower()
+    if "429" in d or "rate-limit" in d or "too many requests" in d:
+        reason = "the academic database is busy right now, so trying again in a minute or two usually works"
+    elif "401" in d or "403" in d or "authentication" in d:
+        reason = "the source search isn't available at the moment"
+    elif "timeout" in d or "timed out" in d or "connection" in d:
+        reason = "the source search didn't respond in time, so trying again usually works"
+    else:
+        reason = "no matching academic sources turned up for this topic, so a more specific topic may help"
+    return (f"Source search ran for {subject} and came back with nothing usable — the reason, in plain words: "
+            f"\"{reason}\". Write from your own well-informed general knowledge instead — but do NOT insert any "
+            "placeholder in place of a citation, in any form: no [Author, Year], no [Citation needed], no [source], "
+            "no blank brackets, nothing standing in for a reference that isn't there. If the topic genuinely calls "
+            "for citation-backed evidence you don't have, say so plainly to the student in a sentence or two, giving "
+            "that plain-words reason so they know what to do next — never technical details such as error codes, "
+            "service names or error messages. Write as much as the task genuinely needs.")
+
+
 def _format_author_apa(full_name):
     """'John Smith' -> 'Smith, J.' for a References-list author entry."""
     parts = full_name.strip().split()
@@ -3033,7 +3106,7 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-            raw_sources, search_diag = search_for_sources(search_query)
+            raw_sources, search_diag = _topic_search(search_query)
             sources = enrich_sources_for_apa(raw_sources)
 
             if sources:
@@ -3067,22 +3140,13 @@ def write_endpoint():
                 )
             else:
                 system_prompt = (
-                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Source search ran for "
-                    "the student's latest message and came back with nothing usable — here's "
-                    f"exactly why, verbatim: \"{search_diag}\". Write from your own "
-                    "well-informed general knowledge instead — but do NOT insert any "
-                    "placeholder in place of a citation, in any form: no [Author, Year], no "
-                    "[Citation needed], no [source], no blank brackets, nothing standing in "
-                    "for a reference that isn't there. If the topic genuinely calls for "
-                    "citation-backed evidence you don't have, say so plainly to the student in "
-                    "a sentence or two — and include the verbatim search-failure reason above "
-                    "so they know exactly what to check next, rather than a vague 'no sources "
-                    "found'. Write as much as the task genuinely needs.\n\n"
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} "
+                    + _no_sources_note(search_diag, "the student's latest message") + "\n\n"
                     f"CONVERSATION SO FAR:\n{history_block}"
 
                 )
         else:
-            raw_sources2, search_diag2 = search_for_sources(topic)
+            raw_sources2, search_diag2 = _topic_search(topic)
             sources = enrich_sources_for_apa(raw_sources2)
 
             if sources:
@@ -3112,17 +3176,8 @@ def write_endpoint():
                 )
             else:
                 system_prompt = (
-                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Source search ran for "
-                    "this exact topic and came back with nothing usable — here's exactly why, "
-                    f"verbatim: \"{search_diag2}\". Write from your own well-informed general "
-                    "knowledge instead — but do NOT insert any placeholder in place of a "
-                    "citation, in any form: no [Author, Year], no [Citation needed], no "
-                    "[source], no blank brackets, nothing standing in for a reference that "
-                    "isn't there. If the topic genuinely calls for citation-backed evidence "
-                    "you don't have, say so plainly to the student in a sentence or two — and "
-                    "include the verbatim search-failure reason above so they know exactly "
-                    "what to check next, rather than a vague 'no sources found'. Write as "
-                    "much as the task genuinely needs."
+                    f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} "
+                    + _no_sources_note(search_diag2, "this exact topic")
                 )
 
         user_message = (
