@@ -1596,6 +1596,14 @@ def plan_upgrade():
                     (referral_code, row["id"]),
                 )
                 referrer = cur.fetchone()
+                if not referrer:
+                    # A referral code someone generated (valid for 14 days).
+                    cur.execute(
+                        "SELECT u.* FROM promo_codes p JOIN users u ON u.id = p.created_by "
+                        "WHERE p.code = %s AND p.expires_at > now() AND u.id != %s",
+                        (referral_code, row["id"]),
+                    )
+                    referrer = cur.fetchone()
                 if referrer:
                     cur.execute(
                         "UPDATE users SET bonus_credit_months = bonus_credit_months + 1 WHERE id = %s",
@@ -1613,34 +1621,75 @@ def plan_upgrade():
     return jsonify({"user": user_row_to_dict(row), "result": {"referral_bonus_applied": bonus_applied}})
 
 
-@app.route("/api/promo/generate", methods=["POST", "OPTIONS"])
+# ------------------------------------------------------------ referral codes
+# A person can make one referral code a month; each lasts 14 days. When a
+# friend subscribes with it, both get a bonus month — the same reward as a
+# personal referral code. Kept in promo_codes (created_by = the referrer).
+# The old /api/promo/generate address does the same, for older app versions.
+REFERRAL_CODE_DAYS = 14
+REFERRAL_CODE_EVERY_DAYS = 30
+
+
+def _referral_state(last):
+    now = datetime.now(timezone.utc)
+    if not last:
+        return {"code": None, "expires_at": None, "next_allowed_at": None, "can_generate": True}
+    next_at = last["created_at"] + timedelta(days=REFERRAL_CODE_EVERY_DAYS)
+    active = last["expires_at"] > now
+    return {
+        "code": last["code"] if active else None,
+        "expires_at": last["expires_at"].isoformat() if active else None,
+        "next_allowed_at": next_at.isoformat() if next_at > now else None,
+        "can_generate": next_at <= now,
+    }
+
+
+def _latest_referral(cur, user_id):
+    cur.execute("SELECT code, expires_at, created_at FROM promo_codes WHERE created_by = %s ORDER BY created_at DESC LIMIT 1", (user_id,))
+    return cur.fetchone()
+
+
+@app.route("/api/referral", methods=["GET", "OPTIONS"])
 @auth_required
-def promo_generate():
-    data = request.get_json(silent=True) or {}
-    discount_desc = (data.get("discount_desc") or "").strip() or "1 free month"
-    try:
-        valid_days = int(data.get("valid_days") or 7)
-    except (TypeError, ValueError):
-        valid_days = 7
-    valid_days = max(1, min(valid_days, 90))
-
-    code = generate_promo_code()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
-
+def referral_current():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO promo_codes (code, created_by, discount_desc, expires_at)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (code, request.current_user["id"], discount_desc, expires_at),
-            )
+            return jsonify(_referral_state(_latest_referral(cur, request.current_user["id"])))
     finally:
         conn.close()
 
-    return jsonify({"code": code, "expires_at": expires_at.isoformat()})
+
+@app.route("/api/referral/generate", methods=["POST", "OPTIONS"])
+@app.route("/api/promo/generate", methods=["POST", "OPTIONS"], endpoint="promo_generate_legacy")
+@limiter.limit("10 per hour", key_func=_account_or_ip_key)
+@auth_required
+def referral_generate():
+    user_id = request.current_user["id"]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            # Lock the person's row so two quick taps can't both make a code.
+            cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            state = _referral_state(_latest_referral(cur, user_id))
+            if not state["can_generate"]:
+                conn.rollback()
+                when = datetime.fromisoformat(state["next_allowed_at"]).strftime("%d %B %Y")
+                return jsonify(dict(state, error=f"You can make one referral code a month — your next one is ready on {when}.")), 429
+            now = datetime.now(timezone.utc)
+            code, expires_at = generate_promo_code(), now + timedelta(days=REFERRAL_CODE_DAYS)
+            cur.execute(
+                "INSERT INTO promo_codes (code, created_by, discount_desc, expires_at) VALUES (%s, %s, %s, %s)",
+                (code, user_id, "Referral", expires_at),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return jsonify({"code": code, "expires_at": expires_at.isoformat(),
+                    "next_allowed_at": (now + timedelta(days=REFERRAL_CODE_EVERY_DAYS)).isoformat(), "can_generate": False})
 
 
 @app.route("/api/conversions/history", methods=["GET", "OPTIONS"])
@@ -1915,6 +1964,12 @@ def convert_endpoint():
             return jsonify({"error": str(e)}), 422
         except FileNotFoundError as e:
             return jsonify({"error": f"Required conversion tool missing on server: {e}"}), 500
+
+        if to_fmt == "pptx":
+            try:
+                _colour_not_bold(result_path)
+            except Exception as e:   # a finished deck is never lost to this tidy-up
+                logger.warning(f"Colour-not-bold pass skipped: {e}")
 
         base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
         download_name = f"{base_name}.{to_fmt}"
@@ -2590,6 +2645,10 @@ def summary_to_pptx_endpoint():
     work_dir = tempfile.mkdtemp(prefix=f"mc_sum_{uuid.uuid4().hex[:8]}_")
     try:
         result_path = summary_slides_to_pptx(slides, work_dir, style=style)
+        try:
+            _colour_not_bold(result_path)
+        except Exception as e:
+            logger.warning(f"Colour-not-bold pass skipped: {e}")
         return send_file(
             result_path,
             mimetype=MIME_TYPES["pptx"],
@@ -3733,6 +3792,63 @@ def google_store_notification():
         return jsonify({"error": "Couldn't check with Google Play right now."}), 503
     _apply_store_state(owner, entitled=entitled)
     return jsonify({"ok": True, "entitled": entitled}), 200
+
+
+# ------------------------------------------------ colour, not bold, in slides
+def _slide_is_dark(slide):
+    """Whether a slide's background is dark (its own, else its layout's or
+    master's solid fill); white when it can't be told."""
+    for owner in (slide, slide.slide_layout, slide.slide_layout.slide_master):
+        try:
+            fill = owner.background.fill
+            if fill.type == 1:   # solid
+                rgb = fill.fore_color.rgb
+                r, g, b = int(str(rgb)[0:2], 16), int(str(rgb)[2:4], 16), int(str(rgb)[4:6], 16)
+                return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.45
+        except Exception:
+            continue
+    return False
+
+
+def _colour_not_bold(pptx_path):
+    """Presentations never use bold for emphasis — it reads heavily and is
+    hard to make out from the back of a room. Every bold run in a finished
+    deck becomes regular weight and, unless it already has its own colour,
+    takes a clear emphasis colour picked against its slide's background: a
+    strong blue on light slides, a soft gold on dark ones. Titles keep the
+    colours they have."""
+    from pptx import Presentation as _Prs
+    from pptx.dml.color import RGBColor as _RGB
+    from pptx.enum.shapes import PP_PLACEHOLDER as _PH
+    prs = _Prs(pptx_path)
+    changed = False
+
+    def text_shapes(shapes):
+        for sh in shapes:
+            if getattr(sh, "shape_type", None) == 6 and hasattr(sh, "shapes"):   # group
+                yield from text_shapes(sh.shapes)
+            elif getattr(sh, "has_text_frame", False):
+                yield sh
+            elif getattr(sh, "has_table", False):
+                for row in sh.table.rows:
+                    for cell in row.cells:
+                        yield cell
+
+    for slide in prs.slides:
+        emph = _RGB(0xFD, 0xE6, 0x8A) if _slide_is_dark(slide) else _RGB(0x1D, 0x4E, 0xD8)
+        for sh in text_shapes(slide.shapes):
+            is_title = bool(getattr(sh, "is_placeholder", False) and sh.placeholder_format.type in (_PH.TITLE, _PH.CENTER_TITLE))
+            in_table = not hasattr(sh, "shape_id")
+            for p in sh.text_frame.paragraphs:
+                for r in p.runs:
+                    if r.font.bold:
+                        r.font.bold = False
+                        changed = True
+                        if not is_title and not in_table and r.font.color.type is None:
+                            r.font.color.rgb = emph
+    if changed:
+        prs.save(pptx_path)
+    return changed
 
 
 # ------------------------------------------------------------ deleting an account

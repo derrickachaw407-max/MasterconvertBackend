@@ -1758,16 +1758,23 @@ TEMPLATES = {
                    "band": "1E2B30", "panel": "22393F", "frame": "18A5A5"},
     "tutor-navy": {"group": "tutor", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
                    "band": "1B2340", "panel": "25305A", "frame": "D9A21B"},
-    # From two real lecture decks (Posture Assessment; Electrophysical &
-    # Thermal Principles): a colour band across the top holding the title in
-    # serif capitals, a white body, and a base bar or rule. "style": "band"
-    # builds them with the _band_* functions below.
-    "tutor-clinical-navy": {"group": "tutor", "style": "band", "name": "Clinical Navy",
-                            "band": "0A2342", "accent": "2196A4", "stripe": "1B6CA8", "slate": "44546A",
-                            "soft": "A8C4D8", "align": "center", "band_h": 1.0, "footer": "bar", "cover": "slate"},
-    "tutor-clinical-blue": {"group": "tutor", "style": "band", "name": "Clinical Blue",
-                            "band": "1B3A6B", "accent": "2E7BB8", "soft": "BFD4EA",
-                            "align": "left", "band_h": 1.2, "footer": "rule", "cover": "split"},
+    # Four modern tutor templates, each taking its colour identity from a real
+    # lecture deck (Posture Assessment; Electrophysical & Thermal Principles;
+    # Manual Muscle Testing; Food Handling & Hygiene). Calibri throughout, no
+    # bold — titles stand out by size and colour — and an "emph" colour dark
+    # enough to read from the back of a room for highlighted words.
+    "tutor-clinical-navy": {"group": "tutor", "style": "modern", "name": "Clinical Navy", "cover": "arc",
+                            "ink": "0B1F3A", "accent": "14B8A6", "emph": "0F766E", "soft": "99F6E4",
+                            "bg": "FFFFFF", "text": "1F2937", "muted": "64748B", "chrome": "rail"},
+    "tutor-clinical-blue": {"group": "tutor", "style": "modern", "name": "Clinical Blue", "cover": "gradient",
+                            "ink": "1E3A8A", "ink2": "2563EB", "accent": "38BDF8", "emph": "1D4ED8", "soft": "BFDBFE",
+                            "bg": "F1F5FB", "text": "1E293B", "muted": "64748B", "chrome": "card"},
+    "tutor-clean-white": {"group": "tutor", "style": "modern", "name": "Clean White", "cover": "block",
+                          "ink": "111827", "accent": "F43F5E", "emph": "BE123C", "soft": "FECDD3",
+                          "bg": "FFFFFF", "text": "374151", "muted": "9CA3AF", "chrome": "block"},
+    "tutor-fresh-photo": {"group": "tutor", "style": "modern", "name": "Fresh Photo", "cover": "photo",
+                          "ink": "14532D", "accent": "22C55E", "emph": "15803D", "soft": "BBF7D0",
+                          "bg": "FBF8F2", "text": "1F2937", "muted": "6B7280", "chrome": "topbar"},
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
@@ -1799,8 +1806,8 @@ def _resolve(key):
 
 def _open_template(key):
     key, tpl = _resolve(key)
-    if tpl.get("style") == "band":
-        return _band_base(tpl), key, tpl
+    if tpl.get("style") == "modern":
+        return _modern_base(tpl), key, tpl
     prs = Presentation(io.BytesIO(base64.b64decode("".join(_BASES[tpl["group"]]))))
     if tpl.get("theme"):
         theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
@@ -2046,7 +2053,7 @@ def _add_table(slide, spec, left, top, width, height):
             for p in cell.text_frame.paragraphs:
                 for run in p.runs:
                     run.font.size = size
-                    run.font.bold = r_i == 0
+                    run.font.bold = False   # the header row stands out by its fill and white text
                     if r_i == 0:
                         run.font.color.rgb = WHITE
                     else:
@@ -2132,7 +2139,7 @@ def _student_title_slide(prs, deck):
         r = p.add_run()
         r.text = line.upper()
         r.font.name = "Arial Black"
-        r.font.bold = True
+        r.font.bold = False
         r.font.size = Pt(22 if len(lines) <= 3 else 18)
         r.font.color.rgb = WHITE
     logo = _image_bytes(deck.get("logo"))
@@ -2150,7 +2157,7 @@ def _student_title_slide(prs, deck):
         r = p.add_run()
         r.text = text
         r.font.size = Pt(size)
-        r.font.bold = bold
+        r.font.bold = False   # no bold in slides: size makes the main line the headline
         r.font.color.rgb = WHITE
         y += Inches(1.1)
     tag = str(ts.get("tag") or "").strip()[:40]
@@ -2245,7 +2252,7 @@ def _set_title(slide, text, group):
     if group == "student":
         p.alignment = PP_ALIGN.CENTER
         r.font.name = "Arial Black"
-        r.font.bold = True
+        r.font.bold = False
         r.font.size = Pt(36 if n <= 28 else 32 if n <= 40 else 28 if n <= 56 else 24)
     else:
         r.font.size = Pt(44 if n <= 24 else 38 if n <= 34 else 32 if n <= 48 else 28)
@@ -2284,7 +2291,8 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
                 for run in list(hpara.runs)[1:]:
                     run._r.getparent().remove(run._r)
                 hpara.runs[0].text = heading
-                hpara.runs[0].font.bold = True
+                hpara.runs[0].font.bold = False   # no bold in slides: the heading's colour sets it apart
+                hpara.runs[0].font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
                 hppr = hp.get_or_add_pPr()
                 etree.SubElement(hppr, qn("a:buNone"))
     else:
@@ -2348,7 +2356,7 @@ def _closing_slide(prs, deck, sd, number, tpl):
         r = p.add_run()
         r.text = big.upper()
         r.font.name = "Arial Black"
-        r.font.bold = True
+        r.font.bold = False
         r.font.size = Pt(72 if len(big) <= 14 else 54)
         r.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
         r.font.color.brightness = -0.25
@@ -2408,7 +2416,7 @@ def _section_slide(prs, deck, sd, number, tpl):
             r.text = title
             if group == "student":
                 r.font.size = Pt(32 if len(title) <= 34 else 26)
-                r.font.bold = True
+                r.font.bold = False
             else:
                 r.font.size = Pt(54 if len(title) <= 24 else 44 if len(title) <= 40 else 36)
         elif t == PP_PLACEHOLDER.BODY:
@@ -2446,7 +2454,7 @@ def _quote_slide(prs, deck, sd, number, tpl):
     mr = mark.text_frame.paragraphs[0].add_run()
     mr.text = "“"
     mr.font.size = Pt(120)
-    mr.font.bold = True
+    mr.font.bold = False
     if group == "student":
         mr.font.color.theme_color = MSO_THEME_COLOR.ACCENT_2
     else:
@@ -2474,7 +2482,7 @@ def _quote_slide(prs, deck, sd, number, tpl):
         br = bp.add_run()
         br.text = "— " + by
         br.font.size = Pt(20)
-        br.font.bold = True
+        br.font.bold = False
         if group == "student":
             br.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
             br.font.color.brightness = -0.25
@@ -2564,10 +2572,10 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
         raise StudioError(f"A deck can have up to {MAX_SLIDES} slides.")
     prs, key, tpl = _open_template(deck.get("template") or "student")
     logo = _image_bytes(deck.get("logo"))
-    band = tpl.get("style") == "band"
+    band = tpl.get("style") == "modern"
     if deck.get("include_title_slide", True):
         if band:
-            _band_title_slide(prs, deck, tpl)
+            _modern_title_slide(prs, deck, tpl)
         elif tpl["group"] == "student":
             _student_title_slide(prs, deck)
         else:
@@ -2576,7 +2584,7 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
         number = len(prs.slides) + 1
         kind = sd.get("kind") or "content"
         if band:
-            _band_slide(prs, deck, sd, number, logo, tpl)
+            _modern_slide(prs, deck, sd, number, logo, tpl)
         elif kind == "end":
             _closing_slide(prs, deck, sd, number, tpl)
         elif kind == "section":
@@ -2598,43 +2606,58 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
     return out_path
 
 
-# ------------------------------------------------ the "band" lecture style
-BAND_FONT = "Times New Roman"
-BAND_W = 13.333
+# ------------------------------------------------ the modern tutor style
+MODERN_TITLE_FONT, MODERN_BODY_FONT = "Calibri Light", "Calibri"
+MW = 13.333
 
 
-def _band_base(tpl):
-    """The two band templates' designs are drawn on the slides themselves, as
-    in the decks they come from (whose masters are plain Office), so they
-    start from python-pptx's own blank Office presentation — widescreen,
-    with the theme's fonts set to the design's serif so anything typed later
-    in PowerPoint matches."""
+def _modern_base(tpl):
+    """Python-pptx's own blank Office presentation, widescreen, with the
+    template's fonts and colours as the theme — so tables, list numbers and
+    anything added later in PowerPoint follow the design."""
     prs = Presentation()
     prs.slide_width, prs.slide_height = SLIDE_W, SLIDE_H
     theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
     xml = theme_part.blob.decode("utf-8")
-    xml = re.sub(r'(<a:(?:major|minor)Font>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + BAND_FONT + r"\g<2>", xml)
-    # The design's own colours as the theme's, so tables, list numbers and
-    # anything added later in PowerPoint follow the design, not Office's
-    # default blue and orange.
-    for slot, hex_ in (("dk2", tpl["band"]), ("accent1", tpl["band"]), ("accent2", tpl["accent"])):
+    xml = re.sub(r'(<a:majorFont>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + MODERN_TITLE_FONT + r"\g<2>", xml)
+    xml = re.sub(r'(<a:minorFont>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + MODERN_BODY_FONT + r"\g<2>", xml)
+    for slot, hex_ in (("dk2", tpl["ink"]), ("accent1", tpl["ink"]), ("accent2", tpl["emph"])):
         xml = re.sub(r'(<a:%s>\s*<a:srgbClr val=")[0-9A-Fa-f]{6}(")' % slot, r"\g<1>%s\g<2>" % hex_, xml)
     theme_part._blob = xml.encode("utf-8")
     return prs
 
 
-def _band_rect(slide, x, y, w, h, hex_, back=True):
-    r = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
-    r.fill.solid()
-    r.fill.fore_color.rgb = RGBColor.from_string(hex_)
-    r.line.fill.background()
-    r.shadow.inherit = False
+def _m_shape(slide, kind, x, y, w, h, hex_, alpha=None, back=True, line=None):
+    shp = slide.shapes.add_shape(kind, Inches(x), Inches(y), Inches(w), Inches(h))
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = RGBColor.from_string(hex_)
+    if alpha is not None:
+        clr = shp.fill._xPr.find(".//" + qn("a:srgbClr"))
+        etree.SubElement(clr, qn("a:alpha")).set("val", str(alpha))
+    if line:
+        shp.line.color.rgb = RGBColor.from_string(line)
+        shp.line.width = Pt(1)
+    else:
+        shp.line.fill.background()
+    shp.shadow.inherit = False
     if back:
-        _to_back(r)
-    return r
+        _to_back(shp)
+    return shp
 
 
-def _band_text(slide, x, y, w, h, text, size, hex_, bold=False, italic=False, align="left", caps=False, anchor=None):
+def _m_gradient(slide, x, y, w, h, hex_a, hex_b):
+    shp = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    shp.fill.gradient()
+    shp.fill.gradient_angle = 0
+    stops = shp.fill.gradient_stops
+    stops[0].color.rgb, stops[1].color.rgb = RGBColor.from_string(hex_a), RGBColor.from_string(hex_b)
+    shp.line.fill.background()
+    shp.shadow.inherit = False
+    _to_back(shp)
+    return shp
+
+
+def _m_text(slide, x, y, w, h, text, size, hex_, font=None, italic=False, align="left", anchor=None, spacing=None):
     box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
     tf = box.text_frame
     tf.word_wrap = True
@@ -2643,218 +2666,265 @@ def _band_text(slide, x, y, w, h, text, size, hex_, bold=False, italic=False, al
     for i, line in enumerate(str(text).split("\n")):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.alignment = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}[align]
+        if spacing:
+            p.line_spacing = spacing
         r = p.add_run()
         r.text = line
-        r.font.size, r.font.bold, r.font.italic, r.font.name = Pt(size), bold, italic, BAND_FONT
+        r.font.size, r.font.italic, r.font.bold = Pt(size), italic, False
+        r.font.name = font or MODERN_BODY_FONT
         r.font.color.rgb = RGBColor.from_string(hex_)
-        if caps:
-            r._r.get_or_add_rPr().set("cap", "all")
     return box
 
 
-def _band_number(slide, x, y, w, h, number, hex_):
-    """A real slide-number field, so the numbers stay right when slides are
-    moved around in PowerPoint."""
+def _m_number(slide, number, tpl, on_colour=False):
+    """A real slide-number field inside a small rounded badge."""
     import uuid
-    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
-    tf = box.text_frame
+    fill = "FFFFFF" if on_colour else tpl["ink"]
+    text_hex = tpl["ink"] if on_colour else "FFFFFF"
+    badge = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 12.15, 6.88, 0.62, 0.38, fill, back=False)
+    badge.adjustments[0] = 0.5
+    tf = badge.text_frame
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.RIGHT
+    p.alignment = PP_ALIGN.CENTER
     fld = etree.SubElement(p._p, qn("a:fld"))
     fld.set("id", "{%s}" % str(uuid.uuid4()).upper())
     fld.set("type", "slidenum")
     rpr = etree.SubElement(fld, qn("a:rPr"))
     rpr.set("lang", "en-US")
     rpr.set("sz", "1200")
-    rpr.set("b", "1")
-    fill = etree.SubElement(rpr, qn("a:solidFill"))
-    etree.SubElement(fill, qn("a:srgbClr")).set("val", hex_)
-    etree.SubElement(rpr, qn("a:latin")).set("typeface", BAND_FONT)
+    sf = etree.SubElement(rpr, qn("a:solidFill"))
+    etree.SubElement(sf, qn("a:srgbClr")).set("val", text_hex)
+    etree.SubElement(rpr, qn("a:latin")).set("typeface", MODERN_BODY_FONT)
     etree.SubElement(fld, qn("a:t")).text = str(number)
 
 
-def _band_faded_picture(slide, data, x, y, w, h, alpha=20000):
-    pic = _fill_picture(slide, data, Inches(x), Inches(y), Inches(w), Inches(h))
-    if pic is not None:
-        blip = pic._element.find(".//" + qn("a:blip"))
-        if blip is not None:
-            etree.SubElement(blip, qn("a:alphaModFix")).set("amt", str(alpha))
-        _to_back(pic)
-    return pic
+def _m_footer(slide, tpl, deck, number, on_colour=False):
+    foot = _tutor_footer(deck)
+    if foot and not on_colour:
+        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"])
+    if deck.get("slide_numbers", True):
+        _m_number(slide, number, tpl, on_colour)
 
 
-def _band_geo(tpl):
-    top = tpl["band_h"] + 0.3
-    height = 6.9 - top
-    return {"body": (0.7, top, 11.93, height), "right_text_w": 6.3, "right_media": (7.25, top + 0.05, 5.4, height - 0.1),
-            "below_text_h": 1.6, "below_media": (0.7, top + 1.75, 11.93, height - 1.8), "full_media": (0.7, top, 11.93, height)}
+def _m_chrome(slide, tpl):
+    """The template's frame on an ordinary slide."""
+    # The tinted background goes in first (furthest back) — except under a
+    # card, where it's added after the card is sent back, so it lands behind
+    # the card instead of covering it.
+    if tpl["bg"] != "FFFFFF" and tpl["chrome"] != "card":
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["bg"])
+    if tpl["chrome"] == "rail":
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, 0.24, 7.5, tpl["ink"], back=False)
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0.55, 0.24, 0.9, tpl["accent"], back=False)
+    elif tpl["chrome"] == "card":
+        card = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 0.6, 1.62, 12.13, 5.08, "FFFFFF", back=False, line="DCE4F0")
+        card.adjustments[0] = 0.04
+        _to_back(card)
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["bg"])   # the tint behind the card
+        _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 0.62, 0.42, 0.75, 0.09, tpl["accent"], back=False).adjustments[0] = 0.5
+    elif tpl["chrome"] == "block":
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0.9, 0.55, 0.11, 0.85, tpl["accent"], back=False)
+    elif tpl["chrome"] == "topbar":
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, MW, 0.14, tpl["ink"], back=False)
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0.14, 2.6, 0.06, tpl["accent"], back=False)
 
 
-def _band_title(slide, tpl, title, room_for_logo=False):
-    """The title sits in the band: the slide's real title placeholder (so
-    PowerPoint's outline and screen readers see it), shown in capitals —
-    the design's look — while the text keeps the case it was typed in."""
+def _m_geo(tpl):
+    if tpl["chrome"] == "card":
+        title = (0.6, 0.55, 12.13, 0.95)
+        body = (0.95, 1.85, 11.43, 4.6)
+    elif tpl["chrome"] == "block":
+        title = (1.2, 0.5, 11.2, 0.95)
+        body = (1.2, 1.75, 11.2, 4.85)
+    else:
+        title = (0.9, 0.5, 11.5, 0.95)
+        body = (0.9, 1.75, 11.5, 4.85)
+    L, T, W, H = body
+    return {"title": title, "body": body, "right_text_w": W * 0.52, "right_media": (L + W * 0.55, T + 0.05, W * 0.45, H - 0.1),
+            "below_text_h": 1.6, "below_media": (L, T + 1.75, W, H - 1.8), "full_media": (L, T, W, H)}
+
+
+def _m_title(slide, tpl, title, box, room_for_logo=False):
+    """The slide's real title placeholder (PowerPoint's outline and screen
+    readers see it): large, in the template's colour, never bold."""
     t = slide.shapes.title
     if t is None:
         return
     if not title:
         _remove(t)
         return
-    t.left, t.top = Inches(0.5), Inches(0)
-    t.width, t.height = Inches(12.33 - (1.1 if room_for_logo else 0)), Inches(tpl["band_h"])
+    x, y, w, h = box
+    t.left, t.top, t.width, t.height = Inches(x), Inches(y), Inches(w - (1.1 if room_for_logo else 0)), Inches(h)
     tf = t.text_frame
     tf.word_wrap = True
     tf.auto_size = MSO_AUTO_SIZE.NONE
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     tf.text = ""
     p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER if tpl["align"] == "center" else PP_ALIGN.LEFT
+    p.alignment = PP_ALIGN.LEFT
     r = p.add_run()
     r.text = title
-    r.font.size = Pt(28 if len(title) <= 48 else 24 if len(title) <= 72 else 20)
-    r.font.bold, r.font.name = True, BAND_FONT
-    r.font.color.rgb = WHITE
-    r._r.get_or_add_rPr().set("cap", "all")
+    r.font.size = Pt(36 if len(title) <= 40 else 30 if len(title) <= 64 else 24)
+    r.font.bold, r.font.name = False, MODERN_TITLE_FONT
+    r.font.color.rgb = RGBColor.from_string(tpl["ink"])
 
 
-def _band_chrome(slide, tpl, deck, number, on_colour=False):
-    """The band's base bar or rule, footer text and slide number."""
-    if on_colour:
-        text_hex, y, h = tpl["soft"], 7.05, 0.4
-    elif tpl["footer"] == "bar":
-        _band_rect(slide, 0, 7.2, BAND_W, 0.3, tpl["band"])
-        text_hex, y, h = "FFFFFF", 7.2, 0.3
-    else:
-        _band_rect(slide, 0, 7.07, BAND_W, 0.07, tpl["accent"])
-        text_hex, y, h = "5A6472", 7.14, 0.34
-    foot = _tutor_footer(deck)
-    if foot and not on_colour:
-        _band_text(slide, 0.6, y, 9.5, h, foot, 11, text_hex)
-    if deck.get("slide_numbers", True):
-        _band_number(slide, 11.93, y, 0.8, h, number, text_hex)
-
-
-def _band_title_slide(prs, deck, tpl):
+def _modern_title_slide(prs, deck, tpl):
     ts = deck.get("title_slide") or {}
     s = prs.slides.add_slide(_layout(prs, "Blank"))
     course = str(ts.get("course") or "").strip()[:80] or " "
     subtitle = str(ts.get("subtitle") or "").strip()[:120]
-    small = "  ·  ".join(x for x in (str(ts.get(k) or "").strip() for k in ("code", "lecturer", "date")) if x)
+    small = "  \u00b7  ".join(x for x in (str(ts.get(k) or "").strip() for k in ("code", "lecturer", "date")) if x)
     picture, logo = _image_bytes(ts.get("picture")), _image_bytes(deck.get("logo"))
-    size = 44 if len(course) <= 30 else 38 if len(course) <= 50 else 32
-    if tpl["cover"] == "slate":
+    size = 50 if len(course) <= 26 else 42 if len(course) <= 44 else 34
+    cover = tpl["cover"]
+    if cover == "arc":
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
+        _m_shape(s, MSO_SHAPE.OVAL, 8.3, -1.6, 7.2, 7.2, tpl["accent"], alpha=22000, back=False)
+        _m_shape(s, MSO_SHAPE.OVAL, 10.2, 4.6, 3.6, 3.6, tpl["accent"], alpha=12000, back=False)
         if picture:
-            _band_faded_picture(s, picture, 0, 0, BAND_W, 7.5, alpha=16000)
-        _band_rect(s, 0, 0, BAND_W, 7.5, tpl["slate"])
-        _band_rect(s, 0, 0, BAND_W, 0.165, tpl["accent"], back=False)
-        _band_rect(s, 0, 7.335, BAND_W, 0.165, tpl["accent"], back=False)
-        _band_rect(s, 0, 0.07, 0.47, 7.23, tpl["stripe"], back=False)
-        _band_text(s, 0.9, 1.9, 11.63, 2.6, course, size, "FFFFFF", bold=True, align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+            pic = _fill_picture(s, picture, Inches(8.75), Inches(1.45), Inches(4.0), Inches(4.0))
+            if pic is not None:
+                pic._element.spPr.find(qn("a:prstGeom")).set("prst", "ellipse")
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0.9, 2.2, 0.09, 2.9, tpl["accent"], back=False)
+        _m_text(s, 1.25, 1.6, 6.9, 2.5, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
         if subtitle:
-            _band_text(s, 0.9, 4.65, 11.63, 0.9, subtitle, 24, tpl["soft"], italic=True, align="center")
+            _m_text(s, 1.25, 4.2, 6.9, 0.8, subtitle, 24, tpl["soft"])
         if small:
-            _band_text(s, 0.9, 5.55, 11.63, 0.7, small, 16, "D5DEE8", align="center")
+            _m_text(s, 1.25, 4.95, 6.9, 0.6, small, 15, "A9B8CC")
         if logo:
-            _fit_picture(s, logo, Inches(0.9), Inches(0.45), Inches(1.1), Inches(1.1))
-    else:
-        _band_rect(s, 0, 0, BAND_W, 3.2, tpl["band"])
-        _band_rect(s, 0, 3.2, BAND_W, 0.16, tpl["accent"])
-        _band_rect(s, 0, 7.07, BAND_W, 0.43, tpl["accent"])
+            _fit_picture(s, logo, Inches(1.25), Inches(0.6), Inches(1.0), Inches(1.0))
+    elif cover == "gradient":
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 4.3, MW, 3.2, tpl["bg"])
+        _m_gradient(s, 0, 0, MW, 4.3, tpl["ink"], tpl["ink2"])
+        _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.92, 1.05, 0.9, 0.09, tpl["accent"], back=False).adjustments[0] = 0.5
+        _m_text(s, 0.9, 1.25, 7.7, 2.75, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        if subtitle:
+            _m_text(s, 0.9, 4.6, 7.7, 0.8, subtitle, 24, tpl["ink"])
+        if small:
+            _m_text(s, 0.9, 5.4, 7.7, 0.6, small, 15, tpl["muted"])
         if picture:
-            _band_faded_picture(s, picture, 0, 3.36, BAND_W, 3.71, alpha=22000)
-            _band_rect(s, 0, 3.36, BAND_W, 3.71, "FFFFFF")
-        _band_text(s, 0.67, 0.25, 12.0, 2.7, course, size - 2, "FFFFFF", bold=True, align="center", caps=True)
-        if subtitle:
-            _band_text(s, 0.67, 3.75, 12.0, 1.3, subtitle, 26, "3A3A3A", align="center")
-        if small:
-            _band_text(s, 0.67, 5.15, 12.0, 0.8, small, 18, "5A6472", align="center")
+            frame = _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 8.95, 2.55, 3.75, 3.75, "FFFFFF", back=False)
+            frame.adjustments[0] = 0.06
+            _fill_picture(s, picture, Inches(9.07), Inches(2.67), Inches(3.51), Inches(3.51))
         if logo:
-            _fit_picture(s, logo, Inches(0.55), Inches(0.3), Inches(1.0), Inches(1.0))
+            _fit_picture(s, logo, Inches(11.5), Inches(0.45), Inches(1.0), Inches(1.0))
+    elif cover == "block":
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0.9, 2.15, 0.14, 2.75, tpl["accent"], back=False)
+        _m_text(s, 1.35, 1.55, 7.2, 2.6, course, size + 4, tpl["ink"], font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        if subtitle:
+            _m_text(s, 1.35, 4.2, 7.2, 0.8, subtitle, 24, tpl["text"])
+        if small:
+            _m_text(s, 1.35, 4.95, 7.2, 0.6, small, 15, tpl["muted"])
+        if picture:
+            _fit_picture(s, picture, Inches(8.9), Inches(1.0), Inches(3.9), Inches(5.5))
+        else:
+            _m_shape(s, MSO_SHAPE.OVAL, 9.6, 1.3, 3.2, 3.2, tpl["soft"], alpha=60000, back=False)
+            _m_shape(s, MSO_SHAPE.OVAL, 10.9, 3.6, 2.0, 2.0, tpl["accent"], alpha=30000, back=False)
+        if logo:
+            _fit_picture(s, logo, Inches(1.35), Inches(0.6), Inches(1.0), Inches(1.0))
+    else:   # photo
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["bg"])
+        if picture:
+            _fill_picture(s, picture, Inches(0), Inches(0), Inches(6.2), Inches(7.5))
+        else:
+            _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, 6.2, 7.5, tpl["ink"], back=False)
+            _m_shape(s, MSO_SHAPE.OVAL, 2.1, 2.2, 3.2, 3.2, tpl["accent"], alpha=35000, back=False)
+            _m_shape(s, MSO_SHAPE.OVAL, 0.6, 4.6, 1.8, 1.8, tpl["soft"], alpha=30000, back=False)
+        _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 6.85, 1.75, 0.9, 0.09, tpl["accent"], back=False).adjustments[0] = 0.5
+        _m_text(s, 6.8, 1.9, 5.9, 2.45, course, size - 4, tpl["ink"], font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        if subtitle:
+            _m_text(s, 6.8, 4.45, 5.9, 0.8, subtitle, 22, tpl["text"])
+        if small:
+            _m_text(s, 6.8, 5.2, 5.9, 0.6, small, 15, tpl["muted"])
+        if logo:
+            _fit_picture(s, logo, Inches(6.85), Inches(0.5), Inches(1.0), Inches(1.0))
     return s
 
 
-def _band_slide(prs, deck, sd, number, logo, tpl):
+def _modern_slide(prs, deck, sd, number, logo, tpl):
     kind = sd.get("kind") or "content"
     title = str(sd.get("title") or "").strip()[:140]
     if kind in ("section", "end"):
         s = prs.slides.add_slide(_layout(prs, "Blank"))
-        _band_rect(s, 0, 0, BAND_W, 7.5, tpl["band"])
-        _band_rect(s, 0, 7.35, BAND_W, 0.15, tpl["accent"], back=False)
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
+        _m_shape(s, MSO_SHAPE.OVAL, 9.4, -1.2, 5.6, 5.6, tpl["accent"], alpha=18000, back=False)
+        _m_shape(s, MSO_SHAPE.RECTANGLE, 0.9, 2.45, 0.09, 2.3, tpl["accent"], back=False)
         if kind == "section":
-            _band_text(s, 0.9, 2.2, 11.53, 2.0, title or " ", 40 if len(title) <= 40 else 32, "FFFFFF", bold=True,
-                       align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+            _m_text(s, 1.25, 1.9, 9.5, 2.2, title or " ", 44 if len(title) <= 36 else 34, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM)
             sub = str(sd.get("sub") or "").strip()[:200]
             if sub:
-                _band_text(s, 0.9, 4.35, 11.53, 1.0, sub, 24, tpl["soft"], italic=True, align="center", anchor=MSO_ANCHOR.TOP)
+                _m_text(s, 1.25, 4.2, 9.5, 0.9, sub, 24, tpl["soft"], anchor=MSO_ANCHOR.TOP)
         else:
             big = str(sd.get("big") or "Thank you").strip()[:60]
-            _band_text(s, 0.9, 2.0, 11.53, 2.2, big, 60 if len(big) <= 16 else 44, "FFFFFF", bold=True,
-                       align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+            _m_text(s, 1.25, 1.7, 10.5, 2.4, big, 64 if len(big) <= 14 else 46, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM)
             if title:
-                _band_text(s, 0.9, 4.35, 11.53, 1.0, title, 26, tpl["soft"], italic=True, align="center", anchor=MSO_ANCHOR.TOP)
-        _band_chrome(s, tpl, deck, number, on_colour=True)
+                _m_text(s, 1.25, 4.2, 9.5, 0.9, title, 26, tpl["soft"], anchor=MSO_ANCHOR.TOP)
+        _m_footer(s, tpl, deck, number, on_colour=True)
         _notes(s, sd)
         return s
-
     if kind == "quote":
         s = prs.slides.add_slide(_layout(prs, "Blank"))
+        _m_chrome(s, tpl)
         quote = str(sd.get("quote") or "").strip().strip('"\u201c\u201d')[:400] or " "
         by = str(sd.get("by") or "").strip()[:120]
-        _band_text(s, 0.8, 0.5, 1.6, 1.6, "\u201c", 120, tpl["accent"], bold=True, anchor=MSO_ANCHOR.TOP)
+        _m_text(s, 1.1, 0.7, 1.8, 1.8, "\u201c", 140, tpl["accent"], font="Georgia", anchor=MSO_ANCHOR.TOP)
         n = len(quote)
-        box = _band_text(s, 1.5, 1.2, 10.33, 4.6, quote, 40 if n <= 70 else 32 if n <= 140 else 26 if n <= 240 else 22,
-                         "1A1A1A", italic=True, align="center")
+        box = _m_text(s, 1.6, 1.4, 10.1, 4.3, quote, 38 if n <= 70 else 30 if n <= 140 else 24 if n <= 240 else 20,
+                      tpl["ink"], font=MODERN_TITLE_FONT, italic=True, align="center")
         if by:
             p = box.text_frame.add_paragraph()
             p.alignment = PP_ALIGN.CENTER
             p.space_before = Pt(18)
             r = p.add_run()
             r.text = "\u2014 " + by
-            r.font.size, r.font.bold, r.font.name = Pt(20), True, BAND_FONT
-            r.font.color.rgb = RGBColor.from_string(tpl["band"])
-        _band_chrome(s, tpl, deck, number)
+            r.font.size, r.font.bold, r.font.name = Pt(20), False, MODERN_BODY_FONT
+            r.font.color.rgb = RGBColor.from_string(tpl["emph"])
+        _m_footer(s, tpl, deck, number)
         _notes(s, sd)
         return s
-
-    geo = _band_geo(tpl)
+    geo = _m_geo(tpl)
     if kind == "picture":
         s = prs.slides.add_slide(_layout(prs, "Title Only"))
+        _m_chrome(s, tpl)
         caption = str(sd.get("caption") or "").strip()[:300]
-        if title:
-            _band_rect(s, 0, 0, BAND_W, tpl["band_h"], tpl["band"])
-        _band_title(s, tpl, title)
+        _m_title(s, tpl, title, geo["title"])
         media = sd.get("media") if isinstance(sd.get("media"), dict) else {}
         data = _image_bytes(media.get("data")) if media.get("type") == "image" else None
-        top = geo["body"][1] if title else 0.45
-        bottom = 6.9 - (0.75 if caption else 0)
+        L, T, W, H = geo["body"]
+        top = T if title else 0.6
+        bottom = T + H - (0.7 if caption else 0)
         if data:
-            _fit_picture(s, data, Inches(0.7), Inches(top), Inches(11.93), Inches(bottom - top))
+            _fit_picture(s, data, Inches(L), Inches(top), Inches(W), Inches(bottom - top))
         if caption:
-            _band_text(s, 0.7, bottom + 0.05, 11.93, 0.65, caption, 18, "3A3A3A", italic=True, align="center")
-        _band_chrome(s, tpl, deck, number)
+            _m_text(s, L, bottom + 0.05, W, 0.6, caption, 18, tpl["muted"], italic=True, align="center")
+        _m_footer(s, tpl, deck, number)
         _notes(s, sd)
         return s
 
     s = prs.slides.add_slide(_layout(prs, "Two Content" if kind == "columns" else "Title and Content"))
-    _band_rect(s, 0, 0, BAND_W, tpl["band_h"], tpl["band"])
+    _m_chrome(s, tpl)
     show_logo = bool(logo and deck.get("logo_on_all_slides"))
-    _band_title(s, tpl, title, room_for_logo=show_logo)
+    _m_title(s, tpl, title, geo["title"], room_for_logo=show_logo)
     if show_logo:
-        _fit_picture(s, logo, Inches(12.25), Inches(0.1), Inches(0.9), Inches(tpl["band_h"] - 0.2))
+        tx, ty, tw, th = geo["title"]
+        _fit_picture(s, logo, Inches(tx + tw - 1.0), Inches(ty), Inches(1.0), Inches(th))
     bodies = sorted((ph for ph in s.placeholders if ph.placeholder_format.idx in (1, 2)), key=lambda ph: ph.placeholder_format.idx)
     numbered = sd.get("list_style") == "numbers"
     L, T, W, H = geo["body"]
     if kind == "columns":
-        for ph, key, head_key, x in zip(bodies, ("left", "right"), ("left_heading", "right_heading"), (L, L + W / 2 + 0.15)):
+        for ph, key, head_key, x in zip(bodies, ("left", "right"), ("left_heading", "right_heading"), (L, L + W / 2 + 0.2)):
             bullets = _clean_bullets(sd.get(key))
             heading = str(sd.get(head_key) or "").strip()[:80]
             if not bullets and not heading:
                 _remove(ph)
                 continue
-            box = (x, T, W / 2 - 0.15, H)
+            box = (x, T, W / 2 - 0.2, H)
             ph.left, ph.top, ph.width, ph.height = (Inches(v) for v in box)
             _write_bullets(ph, bullets or [{"text": " ", "level": 0}], box, numbered)
+            _m_body_colours(ph, tpl)
             if heading:
                 first = ph.text_frame.paragraphs[0]
                 hp = copy.deepcopy(first._p)
@@ -2864,8 +2934,9 @@ def _band_slide(prs, deck, sd, number, logo, tpl):
                 for run in list(hpara.runs)[1:]:
                     run._r.getparent().remove(run._r)
                 hpara.runs[0].text = heading
-                hpara.runs[0].font.bold = True
-                hpara.runs[0].font.color.rgb = RGBColor.from_string(tpl["band"])
+                hpara.runs[0].font.bold = False
+                hpara.runs[0].font.name = MODERN_TITLE_FONT
+                hpara.runs[0].font.color.rgb = RGBColor.from_string(tpl["emph"])
                 etree.SubElement(hp.get_or_add_pPr(), qn("a:buNone"))
     else:
         body = bodies[0] if bodies else None
@@ -2886,14 +2957,29 @@ def _band_slide(prs, deck, sd, number, logo, tpl):
             if bullets and body_box:
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
                 _write_bullets(body, bullets, body_box, numbered)
+                _m_body_colours(body, tpl)
             else:
                 _remove(body)
         if media and media_box:
             _add_media(s, media, tuple(Inches(v) for v in media_box))
-    _band_chrome(s, tpl, deck, number)
+    _m_footer(s, tpl, deck, number)
     _notes(s, sd)
     return s
 
+
+def _m_body_colours(ph, tpl):
+    """Body text in the template's text colour; bullet markers in its accent."""
+    for p in ph.text_frame.paragraphs:
+        for r in p.runs:
+            if r.font.color is None or r.font.color.type is None:
+                r.font.color.rgb = RGBColor.from_string(tpl["text"])
+        pPr = p._p.get_or_add_pPr()
+        if pPr.find(qn("a:buNone")) is None and pPr.find(qn("a:buAutoNum")) is None:
+            for old in pPr.findall(qn("a:buClr")):
+                pPr.remove(old)
+            clr = etree.Element(qn("a:buClr"))
+            etree.SubElement(clr, qn("a:srgbClr")).set("val", tpl["emph"])
+            pPr.insert(0, clr)
 
 # ---------------------------------------------------------------- reading
 def _flat_shapes(shapes):
