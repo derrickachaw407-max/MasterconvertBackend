@@ -1758,6 +1758,16 @@ TEMPLATES = {
                    "band": "1E2B30", "panel": "22393F", "frame": "18A5A5"},
     "tutor-navy": {"group": "tutor", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
                    "band": "1B2340", "panel": "25305A", "frame": "D9A21B"},
+    # From two real lecture decks (Posture Assessment; Electrophysical &
+    # Thermal Principles): a colour band across the top holding the title in
+    # serif capitals, a white body, and a base bar or rule. "style": "band"
+    # builds them with the _band_* functions below.
+    "tutor-clinical-navy": {"group": "tutor", "style": "band", "name": "Clinical Navy",
+                            "band": "0A2342", "accent": "2196A4", "stripe": "1B6CA8", "slate": "44546A",
+                            "soft": "A8C4D8", "align": "center", "band_h": 1.0, "footer": "bar", "cover": "slate"},
+    "tutor-clinical-blue": {"group": "tutor", "style": "band", "name": "Clinical Blue",
+                            "band": "1B3A6B", "accent": "2E7BB8", "soft": "BFD4EA",
+                            "align": "left", "band_h": 1.2, "footer": "rule", "cover": "split"},
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
@@ -1789,6 +1799,8 @@ def _resolve(key):
 
 def _open_template(key):
     key, tpl = _resolve(key)
+    if tpl.get("style") == "band":
+        return _band_base(tpl), key, tpl
     prs = Presentation(io.BytesIO(base64.b64decode("".join(_BASES[tpl["group"]]))))
     if tpl.get("theme"):
         theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
@@ -2552,15 +2564,20 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
         raise StudioError(f"A deck can have up to {MAX_SLIDES} slides.")
     prs, key, tpl = _open_template(deck.get("template") or "student")
     logo = _image_bytes(deck.get("logo"))
+    band = tpl.get("style") == "band"
     if deck.get("include_title_slide", True):
-        if tpl["group"] == "student":
+        if band:
+            _band_title_slide(prs, deck, tpl)
+        elif tpl["group"] == "student":
             _student_title_slide(prs, deck)
         else:
             _tutor_title_slide(prs, deck, tpl)
     for sd in slides:
         number = len(prs.slides) + 1
         kind = sd.get("kind") or "content"
-        if kind == "end":
+        if band:
+            _band_slide(prs, deck, sd, number, logo, tpl)
+        elif kind == "end":
             _closing_slide(prs, deck, sd, number, tpl)
         elif kind == "section":
             _section_slide(prs, deck, sd, number, tpl)
@@ -2579,6 +2596,303 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
     out_path = os.path.join(out_dir, safe)
     prs.save(out_path)
     return out_path
+
+
+# ------------------------------------------------ the "band" lecture style
+BAND_FONT = "Times New Roman"
+BAND_W = 13.333
+
+
+def _band_base(tpl):
+    """The two band templates' designs are drawn on the slides themselves, as
+    in the decks they come from (whose masters are plain Office), so they
+    start from python-pptx's own blank Office presentation — widescreen,
+    with the theme's fonts set to the design's serif so anything typed later
+    in PowerPoint matches."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = SLIDE_W, SLIDE_H
+    theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
+    xml = theme_part.blob.decode("utf-8")
+    xml = re.sub(r'(<a:(?:major|minor)Font>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + BAND_FONT + r"\g<2>", xml)
+    # The design's own colours as the theme's, so tables, list numbers and
+    # anything added later in PowerPoint follow the design, not Office's
+    # default blue and orange.
+    for slot, hex_ in (("dk2", tpl["band"]), ("accent1", tpl["band"]), ("accent2", tpl["accent"])):
+        xml = re.sub(r'(<a:%s>\s*<a:srgbClr val=")[0-9A-Fa-f]{6}(")' % slot, r"\g<1>%s\g<2>" % hex_, xml)
+    theme_part._blob = xml.encode("utf-8")
+    return prs
+
+
+def _band_rect(slide, x, y, w, h, hex_, back=True):
+    r = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    r.fill.solid()
+    r.fill.fore_color.rgb = RGBColor.from_string(hex_)
+    r.line.fill.background()
+    r.shadow.inherit = False
+    if back:
+        _to_back(r)
+    return r
+
+
+def _band_text(slide, x, y, w, h, text, size, hex_, bold=False, italic=False, align="left", caps=False, anchor=None):
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.vertical_anchor = anchor or MSO_ANCHOR.MIDDLE
+    for i, line in enumerate(str(text).split("\n")):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.alignment = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT}[align]
+        r = p.add_run()
+        r.text = line
+        r.font.size, r.font.bold, r.font.italic, r.font.name = Pt(size), bold, italic, BAND_FONT
+        r.font.color.rgb = RGBColor.from_string(hex_)
+        if caps:
+            r._r.get_or_add_rPr().set("cap", "all")
+    return box
+
+
+def _band_number(slide, x, y, w, h, number, hex_):
+    """A real slide-number field, so the numbers stay right when slides are
+    moved around in PowerPoint."""
+    import uuid
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = box.text_frame
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.RIGHT
+    fld = etree.SubElement(p._p, qn("a:fld"))
+    fld.set("id", "{%s}" % str(uuid.uuid4()).upper())
+    fld.set("type", "slidenum")
+    rpr = etree.SubElement(fld, qn("a:rPr"))
+    rpr.set("lang", "en-US")
+    rpr.set("sz", "1200")
+    rpr.set("b", "1")
+    fill = etree.SubElement(rpr, qn("a:solidFill"))
+    etree.SubElement(fill, qn("a:srgbClr")).set("val", hex_)
+    etree.SubElement(rpr, qn("a:latin")).set("typeface", BAND_FONT)
+    etree.SubElement(fld, qn("a:t")).text = str(number)
+
+
+def _band_faded_picture(slide, data, x, y, w, h, alpha=20000):
+    pic = _fill_picture(slide, data, Inches(x), Inches(y), Inches(w), Inches(h))
+    if pic is not None:
+        blip = pic._element.find(".//" + qn("a:blip"))
+        if blip is not None:
+            etree.SubElement(blip, qn("a:alphaModFix")).set("amt", str(alpha))
+        _to_back(pic)
+    return pic
+
+
+def _band_geo(tpl):
+    top = tpl["band_h"] + 0.3
+    height = 6.9 - top
+    return {"body": (0.7, top, 11.93, height), "right_text_w": 6.3, "right_media": (7.25, top + 0.05, 5.4, height - 0.1),
+            "below_text_h": 1.6, "below_media": (0.7, top + 1.75, 11.93, height - 1.8), "full_media": (0.7, top, 11.93, height)}
+
+
+def _band_title(slide, tpl, title, room_for_logo=False):
+    """The title sits in the band: the slide's real title placeholder (so
+    PowerPoint's outline and screen readers see it), shown in capitals —
+    the design's look — while the text keeps the case it was typed in."""
+    t = slide.shapes.title
+    if t is None:
+        return
+    if not title:
+        _remove(t)
+        return
+    t.left, t.top = Inches(0.5), Inches(0)
+    t.width, t.height = Inches(12.33 - (1.1 if room_for_logo else 0)), Inches(tpl["band_h"])
+    tf = t.text_frame
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    tf.text = ""
+    p = tf.paragraphs[0]
+    p.alignment = PP_ALIGN.CENTER if tpl["align"] == "center" else PP_ALIGN.LEFT
+    r = p.add_run()
+    r.text = title
+    r.font.size = Pt(28 if len(title) <= 48 else 24 if len(title) <= 72 else 20)
+    r.font.bold, r.font.name = True, BAND_FONT
+    r.font.color.rgb = WHITE
+    r._r.get_or_add_rPr().set("cap", "all")
+
+
+def _band_chrome(slide, tpl, deck, number, on_colour=False):
+    """The band's base bar or rule, footer text and slide number."""
+    if on_colour:
+        text_hex, y, h = tpl["soft"], 7.05, 0.4
+    elif tpl["footer"] == "bar":
+        _band_rect(slide, 0, 7.2, BAND_W, 0.3, tpl["band"])
+        text_hex, y, h = "FFFFFF", 7.2, 0.3
+    else:
+        _band_rect(slide, 0, 7.07, BAND_W, 0.07, tpl["accent"])
+        text_hex, y, h = "5A6472", 7.14, 0.34
+    foot = _tutor_footer(deck)
+    if foot and not on_colour:
+        _band_text(slide, 0.6, y, 9.5, h, foot, 11, text_hex)
+    if deck.get("slide_numbers", True):
+        _band_number(slide, 11.93, y, 0.8, h, number, text_hex)
+
+
+def _band_title_slide(prs, deck, tpl):
+    ts = deck.get("title_slide") or {}
+    s = prs.slides.add_slide(_layout(prs, "Blank"))
+    course = str(ts.get("course") or "").strip()[:80] or " "
+    subtitle = str(ts.get("subtitle") or "").strip()[:120]
+    small = "  ·  ".join(x for x in (str(ts.get(k) or "").strip() for k in ("code", "lecturer", "date")) if x)
+    picture, logo = _image_bytes(ts.get("picture")), _image_bytes(deck.get("logo"))
+    size = 44 if len(course) <= 30 else 38 if len(course) <= 50 else 32
+    if tpl["cover"] == "slate":
+        if picture:
+            _band_faded_picture(s, picture, 0, 0, BAND_W, 7.5, alpha=16000)
+        _band_rect(s, 0, 0, BAND_W, 7.5, tpl["slate"])
+        _band_rect(s, 0, 0, BAND_W, 0.165, tpl["accent"], back=False)
+        _band_rect(s, 0, 7.335, BAND_W, 0.165, tpl["accent"], back=False)
+        _band_rect(s, 0, 0.07, 0.47, 7.23, tpl["stripe"], back=False)
+        _band_text(s, 0.9, 1.9, 11.63, 2.6, course, size, "FFFFFF", bold=True, align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+        if subtitle:
+            _band_text(s, 0.9, 4.65, 11.63, 0.9, subtitle, 24, tpl["soft"], italic=True, align="center")
+        if small:
+            _band_text(s, 0.9, 5.55, 11.63, 0.7, small, 16, "D5DEE8", align="center")
+        if logo:
+            _fit_picture(s, logo, Inches(0.9), Inches(0.45), Inches(1.1), Inches(1.1))
+    else:
+        _band_rect(s, 0, 0, BAND_W, 3.2, tpl["band"])
+        _band_rect(s, 0, 3.2, BAND_W, 0.16, tpl["accent"])
+        _band_rect(s, 0, 7.07, BAND_W, 0.43, tpl["accent"])
+        if picture:
+            _band_faded_picture(s, picture, 0, 3.36, BAND_W, 3.71, alpha=22000)
+            _band_rect(s, 0, 3.36, BAND_W, 3.71, "FFFFFF")
+        _band_text(s, 0.67, 0.25, 12.0, 2.7, course, size - 2, "FFFFFF", bold=True, align="center", caps=True)
+        if subtitle:
+            _band_text(s, 0.67, 3.75, 12.0, 1.3, subtitle, 26, "3A3A3A", align="center")
+        if small:
+            _band_text(s, 0.67, 5.15, 12.0, 0.8, small, 18, "5A6472", align="center")
+        if logo:
+            _fit_picture(s, logo, Inches(0.55), Inches(0.3), Inches(1.0), Inches(1.0))
+    return s
+
+
+def _band_slide(prs, deck, sd, number, logo, tpl):
+    kind = sd.get("kind") or "content"
+    title = str(sd.get("title") or "").strip()[:140]
+    if kind in ("section", "end"):
+        s = prs.slides.add_slide(_layout(prs, "Blank"))
+        _band_rect(s, 0, 0, BAND_W, 7.5, tpl["band"])
+        _band_rect(s, 0, 7.35, BAND_W, 0.15, tpl["accent"], back=False)
+        if kind == "section":
+            _band_text(s, 0.9, 2.2, 11.53, 2.0, title or " ", 40 if len(title) <= 40 else 32, "FFFFFF", bold=True,
+                       align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+            sub = str(sd.get("sub") or "").strip()[:200]
+            if sub:
+                _band_text(s, 0.9, 4.35, 11.53, 1.0, sub, 24, tpl["soft"], italic=True, align="center", anchor=MSO_ANCHOR.TOP)
+        else:
+            big = str(sd.get("big") or "Thank you").strip()[:60]
+            _band_text(s, 0.9, 2.0, 11.53, 2.2, big, 60 if len(big) <= 16 else 44, "FFFFFF", bold=True,
+                       align="center", caps=True, anchor=MSO_ANCHOR.BOTTOM)
+            if title:
+                _band_text(s, 0.9, 4.35, 11.53, 1.0, title, 26, tpl["soft"], italic=True, align="center", anchor=MSO_ANCHOR.TOP)
+        _band_chrome(s, tpl, deck, number, on_colour=True)
+        _notes(s, sd)
+        return s
+
+    if kind == "quote":
+        s = prs.slides.add_slide(_layout(prs, "Blank"))
+        quote = str(sd.get("quote") or "").strip().strip('"\u201c\u201d')[:400] or " "
+        by = str(sd.get("by") or "").strip()[:120]
+        _band_text(s, 0.8, 0.5, 1.6, 1.6, "\u201c", 120, tpl["accent"], bold=True, anchor=MSO_ANCHOR.TOP)
+        n = len(quote)
+        box = _band_text(s, 1.5, 1.2, 10.33, 4.6, quote, 40 if n <= 70 else 32 if n <= 140 else 26 if n <= 240 else 22,
+                         "1A1A1A", italic=True, align="center")
+        if by:
+            p = box.text_frame.add_paragraph()
+            p.alignment = PP_ALIGN.CENTER
+            p.space_before = Pt(18)
+            r = p.add_run()
+            r.text = "\u2014 " + by
+            r.font.size, r.font.bold, r.font.name = Pt(20), True, BAND_FONT
+            r.font.color.rgb = RGBColor.from_string(tpl["band"])
+        _band_chrome(s, tpl, deck, number)
+        _notes(s, sd)
+        return s
+
+    geo = _band_geo(tpl)
+    if kind == "picture":
+        s = prs.slides.add_slide(_layout(prs, "Title Only"))
+        caption = str(sd.get("caption") or "").strip()[:300]
+        if title:
+            _band_rect(s, 0, 0, BAND_W, tpl["band_h"], tpl["band"])
+        _band_title(s, tpl, title)
+        media = sd.get("media") if isinstance(sd.get("media"), dict) else {}
+        data = _image_bytes(media.get("data")) if media.get("type") == "image" else None
+        top = geo["body"][1] if title else 0.45
+        bottom = 6.9 - (0.75 if caption else 0)
+        if data:
+            _fit_picture(s, data, Inches(0.7), Inches(top), Inches(11.93), Inches(bottom - top))
+        if caption:
+            _band_text(s, 0.7, bottom + 0.05, 11.93, 0.65, caption, 18, "3A3A3A", italic=True, align="center")
+        _band_chrome(s, tpl, deck, number)
+        _notes(s, sd)
+        return s
+
+    s = prs.slides.add_slide(_layout(prs, "Two Content" if kind == "columns" else "Title and Content"))
+    _band_rect(s, 0, 0, BAND_W, tpl["band_h"], tpl["band"])
+    show_logo = bool(logo and deck.get("logo_on_all_slides"))
+    _band_title(s, tpl, title, room_for_logo=show_logo)
+    if show_logo:
+        _fit_picture(s, logo, Inches(12.25), Inches(0.1), Inches(0.9), Inches(tpl["band_h"] - 0.2))
+    bodies = sorted((ph for ph in s.placeholders if ph.placeholder_format.idx in (1, 2)), key=lambda ph: ph.placeholder_format.idx)
+    numbered = sd.get("list_style") == "numbers"
+    L, T, W, H = geo["body"]
+    if kind == "columns":
+        for ph, key, head_key, x in zip(bodies, ("left", "right"), ("left_heading", "right_heading"), (L, L + W / 2 + 0.15)):
+            bullets = _clean_bullets(sd.get(key))
+            heading = str(sd.get(head_key) or "").strip()[:80]
+            if not bullets and not heading:
+                _remove(ph)
+                continue
+            box = (x, T, W / 2 - 0.15, H)
+            ph.left, ph.top, ph.width, ph.height = (Inches(v) for v in box)
+            _write_bullets(ph, bullets or [{"text": " ", "level": 0}], box, numbered)
+            if heading:
+                first = ph.text_frame.paragraphs[0]
+                hp = copy.deepcopy(first._p)
+                first._p.addprevious(hp)
+                from pptx.text.text import _Paragraph
+                hpara = _Paragraph(hp, first._parent)
+                for run in list(hpara.runs)[1:]:
+                    run._r.getparent().remove(run._r)
+                hpara.runs[0].text = heading
+                hpara.runs[0].font.bold = True
+                hpara.runs[0].font.color.rgb = RGBColor.from_string(tpl["band"])
+                etree.SubElement(hp.get_or_add_pPr(), qn("a:buNone"))
+    else:
+        body = bodies[0] if bodies else None
+        bullets = _clean_bullets(sd.get("bullets"))
+        media = sd.get("media") if isinstance(sd.get("media"), dict) else None
+        pos = sd.get("media_position") if sd.get("media_position") in ("right", "below", "full") else "right"
+        if media and not bullets:
+            pos = "full"
+        if media and pos == "right":
+            body_box, media_box = (L, T, geo["right_text_w"], H), geo["right_media"]
+        elif media and pos == "below":
+            body_box, media_box = (L, T, W, geo["below_text_h"]), geo["below_media"]
+        elif media:
+            body_box, media_box = None, geo["full_media"]
+        else:
+            body_box, media_box = (L, T, W, H), None
+        if body is not None:
+            if bullets and body_box:
+                body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
+                _write_bullets(body, bullets, body_box, numbered)
+            else:
+                _remove(body)
+        if media and media_box:
+            _add_media(s, media, tuple(Inches(v) for v in media_box))
+    _band_chrome(s, tpl, deck, number)
+    _notes(s, sd)
+    return s
 
 
 # ---------------------------------------------------------------- reading
@@ -2624,6 +2938,87 @@ def _paragraph_bullets(text_frame):
     return out
 
 
+# Bullet characters typed into the text itself (common in decks made by
+# generators) — only when followed by a space, so "−5 °C" or "a–b" is kept.
+_TYPED_BULLET = re.compile(r"^[\u2022\u25AA\u25CF\u25E6\u2023\u2043\u25A0\u25A1\u2219\u27A2\u27A4\u25BA\u2713\u2714\u2756\u00B7*\-\u2013\u2014]+\s+")
+_TYPED_NUMBER = re.compile(r"^(\d{1,2})[.)]\s+")
+
+
+def _tidy_bullets(bullets):
+    """Cleans imported bullets: removes typed bullet characters (which showed
+    as "• • item"), joins a lone mnemonic letter to the heading after it
+    ("H" + "History" -> "H: History"), and turns numbering typed into every
+    main point, in sequence, into a real numbered list. Returns (bullets,
+    numbered)."""
+    out = []
+    for b in bullets:
+        text = _TYPED_BULLET.sub("", b["text"]).strip()
+        if text:
+            out.append(dict(b, text=text))
+    merged, i = [], 0
+    while i < len(out):
+        b = out[i]
+        nxt = out[i + 1] if i + 1 < len(out) else None
+        if len(b["text"]) == 1 and b["text"].isalnum() and nxt and len(nxt["text"]) <= 40 and nxt["level"] == b["level"]:
+            merged.append(dict(nxt, text=b["text"] + ": " + nxt["text"]))
+            i += 2
+            continue
+        merged.append(b)
+        i += 1
+    tops = [b for b in merged if b["level"] == 0]
+    nums = [_TYPED_NUMBER.match(b["text"]) for b in tops]
+    numbered = False
+    if len(tops) >= 3 and all(nums):
+        seq = [int(m.group(1)) for m in nums]
+        if seq == list(range(seq[0], seq[0] + len(seq))) and seq[0] in (0, 1):
+            numbered = True
+            merged = [dict(b, text=_TYPED_NUMBER.sub("", b["text"])) if b["level"] == 0 else b for b in merged]
+    return merged, numbered
+
+
+def _shape_image_blob(sh):
+    """The picture a shape shows: a free-standing picture, or one placed
+    inside a placeholder (PowerPoint's usual "click the icon to add a
+    picture" box). The placeholder kind used to be missed entirely, so those
+    pictures were lost on import. None for anything else, including an
+    empty picture placeholder."""
+    try:
+        if sh.shape_type is not None and int(sh.shape_type) == 13:
+            return sh.image.blob
+        if getattr(sh, "is_placeholder", False) and hasattr(sh, "image"):
+            return sh.image.blob
+    except Exception:
+        return None
+    return None
+
+
+def _prominent_title_shape(texts, slide_h, max_top=0.28):
+    """Decks made by online generators and AI tools often put each slide's
+    title in an ordinary text box instead of PowerPoint's title placeholder,
+    which made every heading read in as the first bullet. Used only when a
+    slide has no title placeholder text: the text box that looks like a
+    title — near the top (a cover slide allows more of the slide), a short
+    text of its own of one or two paragraphs (never the opening line of a
+    multi-paragraph body), and the most prominent by size, weight and
+    capitals."""
+    best, best_score = None, None
+    for sh in texts:
+        top = sh.top
+        if top is None or slide_h <= 0 or top > slide_h * max_top:
+            continue
+        paras = [p for p in sh.text_frame.paragraphs if "".join(r.text for r in p.runs).strip()]
+        text = re.sub(r"\s+", " ", sh.text_frame.text.replace("\v", " ")).strip()
+        if not paras or len(paras) > 2 or not text or len(text) > 120:
+            continue
+        sizes = [r.font.size.pt for p in paras for r in p.runs if r.font.size is not None]
+        bold = any(r.font.bold for p in paras for r in p.runs)
+        caps = text.upper() == text and any(c.isalpha() for c in text)
+        score = (max(sizes) if sizes else 18) + (6 if bold else 0) + (4 if caps else 0) - (top / slide_h) * 10
+        if best is None or score > best_score:
+            best, best_score = sh, score
+    return best
+
+
 def parse_pptx_to_deck(path, max_pictures=30):
     """Reads an existing presentation into the deck model, so it can be
     reopened in the editor and rebuilt in any template: the title slide's
@@ -2649,8 +3044,19 @@ def parse_pptx_to_deck(path, max_pictures=30):
         texts = [sh for sh in shapes if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip()
                  and (title_shape is None or sh.shape_id != title_shape.shape_id)
                  and not (sh.is_placeholder and sh.placeholder_format.type in furniture)]
+        # No title placeholder text: find the text box acting as the title.
+        cover_text = title_shape.text_frame.text if (title_shape is not None and title_shape.has_text_frame) else ""
+        if not title:
+            found = _prominent_title_shape(texts, prs.slide_height, max_top=0.75 if i == 0 else 0.28)
+            if found is not None:
+                title = re.sub(r"\s+", " ", found.text_frame.text.replace("\v", " ")).strip()
+                cover_text = found.text_frame.text
+                texts = [sh for sh in texts if sh.shape_id != found.shape_id]
+                # An unmarked first slide with only a few short texts is the cover.
+                if i == 0 and not is_title_slide and len(texts) <= 3 and sum(len(sh.text_frame.text) for sh in texts) <= 300:
+                    is_title_slide = True
         if is_title_slide:
-            raw_lines = [l.strip() for l in (title_shape.text_frame.text if title_shape is not None else "").replace("\v", "\n").split("\n") if l.strip()]
+            raw_lines = [l.strip() for l in cover_text.replace("\v", "\n").split("\n") if l.strip()]
             others = [re.sub(r"\s+", " ", sh.text_frame.text.replace("\v", " ")).strip() for sh in texts]
             code = next((m.group(1) for l in raw_lines for m in [re.match(r"^\((.+)\)$", l)] if m), "")
             course_lines = [l for l in raw_lines if not re.match(r"^\(.+\)$", l)]
@@ -2665,10 +3071,11 @@ def parse_pptx_to_deck(path, max_pictures=30):
             # audience sees (the lecture deck hides a staircase graphic under
             # its title photo).
             for sh in reversed(shapes):
-                if sh.shape_type is None or int(sh.shape_type) != 13 or _mostly_transparent(sh.image.blob):
+                shown = _shape_image_blob(sh)
+                if shown is None or _mostly_transparent(shown):
                     continue
                 w_in, h_in = sh.width / 914400, sh.height / 914400
-                blob = sh.image.blob if max(w_in, h_in) <= 2.5 else _trim_card_border(sh.image.blob)
+                blob = shown if max(w_in, h_in) <= 2.5 else _trim_card_border(shown)
                 url = _picture_data_url(blob)
                 if not url:
                     continue
@@ -2692,12 +3099,16 @@ def parse_pptx_to_deck(path, max_pictures=30):
                 slides.append({"kind": "quote", "quote": m.group(1).strip()[:400], "by": (m.group(2) or "").strip()[:120]})
                 continue
         if len(bodies) == 2:
-            sd.update(kind="columns", left=_paragraph_bullets(bodies[0].text_frame), right=_paragraph_bullets(bodies[1].text_frame))
+            sd.update(kind="columns", left=_tidy_bullets(_paragraph_bullets(bodies[0].text_frame))[0],
+                      right=_tidy_bullets(_paragraph_bullets(bodies[1].text_frame))[0])
         else:
             bullets = []
             for sh in texts:
                 bullets.extend(_paragraph_bullets(sh.text_frame))
-            sd["bullets"] = bullets[:40]
+            bullets, typed_numbers = _tidy_bullets(bullets[:40])
+            sd["bullets"] = bullets
+            if typed_numbers:
+                sd["list_style"] = "numbers"
         media = None
         for sh in shapes:
             if getattr(sh, "has_table", False) and sh.has_table:
@@ -2712,8 +3123,9 @@ def parse_pptx_to_deck(path, max_pictures=30):
                     media = None
                 if media:
                     break
-            if sh.shape_type is not None and int(sh.shape_type) == 13 and pictures < max_pictures:
-                url = _picture_data_url(sh.image.blob)
+            shown = _shape_image_blob(sh)
+            if shown is not None and pictures < max_pictures:
+                url = _picture_data_url(shown)
                 if url:
                     media = {"type": "image", "data": url}
                     pictures += 1
@@ -2721,6 +3133,12 @@ def parse_pptx_to_deck(path, max_pictures=30):
         if media:
             sd["media"] = media
             sd["media_position"] = "right" if (sd.get("bullets") or sd.get("left")) else "full"
+            # One picture with no title and at most a short caption is a
+            # picture slide (e.g. a diagram with its label underneath).
+            if media.get("type") == "image" and not title and len(texts) <= 1:
+                caption = re.sub(r"\s+", " ", texts[0].text_frame.text.replace("\v", " ")).strip() if texts else ""
+                if len(caption) <= 160:
+                    sd = {"kind": "picture", "title": "", "caption": caption, "media": media}
         if s.has_notes_slide:
             notes = s.notes_slide.notes_text_frame.text.strip()
             if notes:
