@@ -3252,10 +3252,15 @@ def parse_pptx_to_deck(path, max_pictures=30):
                 sd["notes"] = notes[:4000]
         joined = (title + " " + " ".join(b["text"] for b in sd.get("bullets", []))).lower()
         if i == len(all_slides) - 1 and re.search(r"\b(thank you|thanks|questions?)\b", joined) and len(joined) < 80:
-            sd = {"kind": "end", "title": title[:80] if "question" in title.lower() else "", "big": "Thank you"}
+            # A closing slide keeps its own words exactly ("Questions?",
+            # "Thanks!", "Thank you for listening") — never rewritten.
+            words_on_slide = [w for w in [title] + [b["text"] for b in sd.get("bullets", [])] if w]
+            sd = {"kind": "end", "big": words_on_slide[0][:60], "title": " ".join(words_on_slide[1:])[:80]}
         slides.append(sd)
     logo = title_slide.pop("logo", None)
-    return {"title_slide": title_slide, "slides": slides[:MAX_SLIDES], "slide_numbers": True, "logo": logo}
+    # Slide numbers only if the original had them — an import mirrors it.
+    had_numbers = any('type="slidenum"' in etree.tostring(s._element).decode("utf-8", "ignore") for s in all_slides)
+    return {"title_slide": title_slide, "slides": slides[:MAX_SLIDES], "slide_numbers": had_numbers, "logo": logo}
 
 
 def _trim_card_border(blob):

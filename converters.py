@@ -1691,6 +1691,9 @@ def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font
     skipped (rather than spilling onto a second agenda slide) once there
     are more sections than a single overview slide can usefully list —
     an agenda that itself needs "(cont.)" defeats its own purpose."""
+    # Conversions mirror the original: Docente never adds a slide — not
+    # even an agenda built from the deck's own titles.
+    return
     slides = list(prs.slides)
     if len(slides) < 2:
         return
@@ -2118,12 +2121,8 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None,
             continue
         title_shape = slide.shapes.title
         base_title = title_shape.text.strip() if title_shape and title_shape.has_text_frame else ""
-        # Avoid "Title (cont.) (cont.)" when the slide being split was
-        # itself already a manually-made continuation slide in the source
-        # deck — the new continuation slides this produces use the same
-        # base title suffix, not a doubled one.
-        if base_title.endswith("(cont.)"):
-            base_title = base_title[: -len("(cont.)")].strip()
+        # Continuation slides reuse this title exactly as written (nothing
+        # added to it, nothing taken from it).
         bullets = _pptx_fix_extract_bullets(body_shape)
         expanded = []
         for level, runs, numbered in bullets:
@@ -2229,7 +2228,7 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None,
         for gi, group in enumerate(groups[1:], 1):
             new_slide = prs.slides.add_slide(layout)
             if new_slide.shapes.title is not None:
-                new_slide.shapes.title.text = group_titles[gi] or f"{base_title} (cont.)"
+                new_slide.shapes.title.text = group_titles[gi] or base_title   # the original title, nothing added
                 align_value = _PPTX_FIX_ALIGN_MAP.get(title_align)
                 for p in new_slide.shapes.title.text_frame.paragraphs:
                     if align_value is not None:
@@ -2331,16 +2330,15 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     state = {"slide": None, "body_tf": None, "bullet_count": 0, "lines_used": 0, "section_title": None}
 
     def _cont(title):
-        """"X (cont.)" — without stacking into "X (cont.) (cont.)" when a long
-        section runs over more than one continuation slide."""
-        base = re.sub(r"(\s*\(cont\.\))+$", "", title or "").strip() or "Overview"
-        return base + " (cont.)"
+        """A continuation slide repeats its section's own title exactly as
+        written — nothing added, nothing taken away."""
+        return (title or "").strip()
 
     def _continuation_title():
         # Bullets that arrive with no slide open (right after a picture or a
         # table) used to get a generic "Overview" title, which told the
         # audience nothing. They continue the current section instead.
-        return _cont(state["section_title"]) if state["section_title"] else "Overview"
+        return _cont(state["section_title"]) if state["section_title"] else ""
 
     def new_slide(title_text):
         # A heading that produced nothing (common when a document is really a
@@ -2354,10 +2352,10 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             existing = (current.shapes.title.text if current.shapes.title is not None else "").strip().lower()
             if existing == (title_text or "").strip().lower() or not existing:
                 if current.shapes.title is not None:
-                    current.shapes.title.text = title_text or "Untitled"
+                    current.shapes.title.text = title_text or ""
                 return current, state["body_tf"]
         s = prs.slides.add_slide(title_layout)
-        s.shapes.title.text = title_text or "Untitled"
+        s.shapes.title.text = title_text or ""
         _style_pptx_slide(s, template_style)
         tf = s.placeholders[1].text_frame
         tf.clear()
@@ -2419,7 +2417,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             # couple of long ones are both handled correctly rather than
             # just counted the same.
             if state["bullet_count"] > 0 and state["lines_used"] + group_lines > MAX_LINES_PER_SLIDE:
-                current_title = state["slide"].shapes.title.text or "Overview"
+                current_title = state["slide"].shapes.title.text or ""
                 new_slide(_cont(current_title))
             body_tf = state["body_tf"]
             if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
@@ -2482,7 +2480,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # a bit heavier than a plain estimated-line count would give it.
         subhead_lines = _estimate_line_count(text) + 1
         if state["bullet_count"] > 0 and state["lines_used"] + subhead_lines > MAX_LINES_PER_SLIDE:
-            current_title = state["slide"].shapes.title.text or "Overview"
+            current_title = state["slide"].shapes.title.text or ""
             new_slide(_cont(current_title))
         body_tf = state["body_tf"]
         if body_tf.paragraphs[0].text == "" and len(body_tf.paragraphs) == 1 and state["bullet_count"] == 0:
@@ -2931,11 +2929,11 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     # anyway produced a pointless empty trailing slide a user would have
     # to notice and delete themselves.
     if state["slide"] is None and len(prs.slides) == 0:
-        new_slide("Untitled Document")
+        new_slide("")
 
     footnotes = _get_docx_footnotes(doc)
     if footnotes:
-        new_slide("Footnotes")
+        new_slide("")   # the footnotes themselves, no added title
         for i, note in enumerate(footnotes, 1):
             add_bullet_text = f"{i}. {note}"
             body_tf = state["body_tf"]
@@ -2946,7 +2944,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
 
     endnotes = _get_docx_endnotes(doc)
     if endnotes:
-        new_slide("Endnotes")
+        new_slide("")   # the endnotes themselves, no added title
         for i, note in enumerate(endnotes, 1):
             body_tf = state["body_tf"]
             p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
@@ -2956,7 +2954,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
 
     comments = _get_docx_comments(doc)
     if comments:
-        new_slide("Comments")
+        new_slide("")   # the comments themselves, no added title
         for author, comment_text in comments:
             body_tf = state["body_tf"]
             p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
@@ -3279,6 +3277,19 @@ def _iter_flat_shapes(shapes):
             yield shape
 
 
+def _docx_divider(doc):
+    """A thin grey line between items — structure without any words."""
+    p = doc.add_paragraph()
+    p_pr = p._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    for k, v in (("w:val", "single"), ("w:sz", "6"), ("w:space", "1"), ("w:color", "BFBFBF")):
+        bottom.set(qn(k), v)
+    borders.append(bottom)
+    p_pr.append(borders)
+    return p
+
+
 def _handout_title(prs, slides):
     """The handout's title comes from the deck itself: its title slide, with
     that slide's subtitle (course, date, presenter) underneath — else the
@@ -3301,7 +3312,7 @@ def _handout_title(prs, slides):
             return (_sanitize_xml_text(ttext), _sanitize_xml_text(stext) or None,
                     not other and not has_notes)
     core = (prs.core_properties.title or "").strip()
-    return (_sanitize_xml_text(core) if core else "Slide handout"), None, False
+    return (_sanitize_xml_text(core) if core else None), None, False
 
 
 def pptx_to_docx(src_path, out_dir, style="clean"):
@@ -3317,7 +3328,8 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
         zoom_el.set(qn("w:percent"), "100")
     doc_title, doc_subtitle, skip_title_slide = _handout_title(prs, list(prs.slides))
-    doc.add_heading(doc_title, 0)
+    if doc_title:
+        doc.add_heading(doc_title, 0)
     if doc_subtitle:
         doc.add_paragraph(doc_subtitle, style="Subtitle")
     BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
@@ -3339,13 +3351,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
     real_titles = [t for t in slide_titles if t]
     # A contents page only earns its space on a long deck — a 5-slide deck
     # used to get a whole page listing its handful of headings.
-    if len(real_titles) >= 10:
-        toc_heading = doc.add_paragraph()
-        toc_heading_run = toc_heading.add_run("Contents")
-        toc_heading_run.bold = True
-        toc_heading_run.font.size = DocxPt(14)
-        _add_docx_toc_field(doc, real_titles)
-        doc.add_page_break()
+    # (No contents page: a handout mirrors the slides and adds nothing.)
 
     for i, slide in enumerate(prs.slides, 1):
         if skip_title_slide and i == 1:
@@ -3379,19 +3385,12 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
             else:
                 text_shapes.append(shape)
 
-        doc.add_heading(title or f"Slide {i}", level=1)
+        # The slide's own title, or — for a slide without one — a thin
+        # divider line, never an invented "Slide N".
         if title:
-            # A small, secondary "Slide N" label lets a reader cross-
-            # reference back to the exact slide in the original
-            # presentation — only shown when the heading itself is a
-            # real title, since it would just repeat the heading's own
-            # text for a slide that has no title of its own.
-            slide_num_p = doc.add_paragraph()
-            slide_num_run = slide_num_p.add_run(f"Slide {i}")
-            slide_num_run.italic = True
-            slide_num_run.font.size = DocxPt(9)
-            slide_num_run.font.color.rgb = DocxRGBColor(0x80, 0x80, 0x80)
-            slide_num_p.paragraph_format.space_after = DocxPt(2)
+            doc.add_heading(title, level=1)
+        else:
+            _docx_divider(doc)
 
         for shape in image_shapes:
             try:
@@ -3546,11 +3545,11 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         if slide.has_notes_slide:
             notes_text = _sanitize_xml_text(slide.notes_slide.notes_text_frame.text.strip())
             if notes_text:
+                # The notes, set apart by indent and italics rather than an
+                # added "Speaker Notes" label.
                 note_p = doc.add_paragraph()
                 note_p.paragraph_format.space_before = DocxPt(8)
-                label_run = note_p.add_run("Speaker Notes\n")
-                label_run.bold = True
-                label_run.font.size = DocxPt(10)
+                note_p.paragraph_format.left_indent = DocxInches(0.3)
                 text_run = note_p.add_run(notes_text)
                 text_run.italic = True
                 text_run.font.size = DocxPt(10)
@@ -3903,13 +3902,7 @@ def pdf_to_docx(src_path, out_dir, style="clean"):
         for text, lvl in font_headings_by_page[page_idx].items():
             if lvl == 1:
                 level1_headings.append(text)
-    if len(level1_headings) >= 4:
-        toc_heading = doc.add_paragraph()
-        toc_heading_run = toc_heading.add_run("Contents")
-        toc_heading_run.bold = True
-        toc_heading_run.font.size = DocxPt(14)
-        _add_docx_toc_field(doc, level1_headings)
-        doc.add_page_break()
+    # (No contents page: the Word file mirrors the PDF and adds nothing.)
 
     MAX_IMAGES = 30
     image_count = 0
@@ -4173,9 +4166,10 @@ def _pdf_pages_to_editable_deck(src_path, out_dir, page_images, style):
     layout = prs.slide_layouts[5] if len(prs.slide_layouts) > 5 else prs.slide_layouts[-1]
     for n, img_name in enumerate(page_images, 1):
         s = prs.slides.add_slide(layout)
-        if s.shapes.title is not None:
-            s.shapes.title.text = f"Original page {n}"
-        _add_fitted_picture(prs, s, os.path.join(out_dir, img_name), top=PptxInches(1.3))
+        if s.shapes.title is not None:   # no invented "Original page N" title
+            title_el = s.shapes.title._element
+            title_el.getparent().remove(title_el)
+        _add_fitted_picture(prs, s, os.path.join(out_dir, img_name), top=PptxInches(0.35))
     prs.save(deck_path)
     return deck_path
 
@@ -4683,6 +4677,24 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
 
 
 # --------------------------------------------------------------- DOCX -> XLSX
+def _xlsx_sheet_title(wb, text, fallback):
+    """A valid, unique sheet-tab name taken from the document's own words
+    (Excel's own "SheetN" only when there are none) — never added labels."""
+    name = re.sub(r"[:\\/?*\[\]]", " ", str(text or ""))
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > 31:   # Excel's limit: cut at a whole word, never mid-word
+        cut = name[:31]
+        name = (cut.rsplit(" ", 1)[0] if " " in cut else cut).strip()
+    name = name or fallback
+    taken = {w.title.lower() for w in wb.worksheets}
+    base, n = name, 2
+    while name.lower() in taken:
+        suffix = f" {n}"
+        name = base[:31 - len(suffix)].rstrip() + suffix
+        n += 1
+    return name
+
+
 def docx_to_xlsx(src_path, out_dir):
     doc = _safe_load(Document, src_path)
     wb = openpyxl.Workbook()
@@ -4749,7 +4761,8 @@ def docx_to_xlsx(src_path, out_dir):
         return value, num_fmt
 
     for i, table in enumerate(doc.tables, 1):
-        ws = wb.create_sheet(title=f"Table {i}"[:31])
+        first_cell = next((c.text.strip() for row in table.rows for c in row.cells if c.text.strip()), "")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, first_cell, f"Sheet{len(wb.worksheets) + 1}"))
         src_rows = [list(row.cells) for row in table.rows]
         n_cols = len(table.columns)
         merges = _find_docx_merges(src_rows, n_cols)
@@ -4794,14 +4807,13 @@ def docx_to_xlsx(src_path, out_dir):
         for chart_title, chart_cats, chart_series, _chart_type in _iter_docx_charts(p, doc):
             chart_data_list.append((chart_title, chart_cats, chart_series))
     if text_rows:
-        ws = wb.create_sheet(title="Document Text")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, text_rows[0], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 100
         for r, line in enumerate(text_rows, 1):
             ws.cell(row=r, column=1, value=line)
 
     for i, (chart_title, chart_cats, chart_series) in enumerate(chart_data_list, 1):
-        sheet_title = (chart_title or f"Chart {i}")[:31]
-        ws = wb.create_sheet(title=sheet_title)
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, chart_title or (chart_cats[0] if chart_cats else ""), f"Sheet{len(wb.worksheets) + 1}"))
         ws.cell(row=1, column=1, value="")
         for s_idx, (name, _values) in enumerate(chart_series, 2):
             ws.cell(row=1, column=s_idx, value=name).font = XlsxFont(bold=True)
@@ -4818,39 +4830,36 @@ def docx_to_xlsx(src_path, out_dir):
 
     footnotes = _get_docx_footnotes(doc)
     if footnotes:
-        ws = wb.create_sheet(title="Footnotes")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, footnotes[0], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 100
         for r, note in enumerate(footnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
     endnotes = _get_docx_endnotes(doc)
     if endnotes:
-        ws = wb.create_sheet(title="Endnotes")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, endnotes[0], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 100
         for r, note in enumerate(endnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
     comments = _get_docx_comments(doc)
     if comments:
-        ws = wb.create_sheet(title="Comments")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, comments[0][1], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 25
         ws.column_dimensions["B"].width = 90
-        ws.cell(row=1, column=1, value="Author").font = XlsxFont(bold=True)
-        ws.cell(row=1, column=2, value="Comment").font = XlsxFont(bold=True)
-        for r, (author, comment_text) in enumerate(comments, 2):
+        for r, (author, comment_text) in enumerate(comments, 1):   # no added header words
             ws.cell(row=r, column=1, value=author)
             ws.cell(row=r, column=2, value=comment_text)
 
     header_footer = _get_docx_header_footer_text(doc)
     if header_footer:
-        ws = wb.create_sheet(title="Header-Footer")
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, header_footer[0], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 100
         for r, line in enumerate(header_footer, 1):
             ws.cell(row=r, column=1, value=line)
 
     if not wb.sheetnames:
-        ws = wb.create_sheet(title="Sheet1")
-        ws["A1"] = "(No content found in document)"
+        wb.create_sheet(title="Sheet1")   # Excel's own default; nothing written into it
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.xlsx")
@@ -5099,7 +5108,7 @@ def text_to_pptx(raw_text, out_dir):
         count = 0
         for i, line in enumerate(body_lines):
             if slide is None or count >= MAX_BULLETS_PER_SLIDE:
-                slide_title = title if slide is None else title + " (cont.)"
+                slide_title = title   # continuation slides keep the original title, nothing added
                 slide = prs.slides.add_slide(title_layout)
                 set_slide_title(slide, slide_title)
                 tf = slide.placeholders[1].text_frame

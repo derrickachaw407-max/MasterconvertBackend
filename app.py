@@ -452,6 +452,30 @@ def _memory_on(user_row):
         return True
 
 
+def _owns_store_plan(user_id):
+    """Whether this account holds a verified App Store / Google Play
+    subscription (Monthly or Yearly)."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok FROM store_purchases WHERE user_id = %s AND product IN ('monthly', 'yearly') LIMIT 1", (user_id,))
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _unpaid_plan(row):
+    """True for a Monthly or Yearly plan that has no end date (so it isn't a
+    Paystack pass or a dated store plan) and no verified store purchase on
+    record — Pro that was never paid for."""
+    if row.get("plan") not in ("monthly", "yearly") or row.get("plan_expires_at"):
+        return False
+    return not _owns_store_plan(row["id"])
+
+
 def get_user_memory(user_id, limit=12):
     """Returns this student's most recent accumulated notes, oldest first, so
     later context reads as a running history rather than a jumbled list."""
@@ -596,6 +620,21 @@ def auth_required(fn):
                 conn.commit()
             except Exception as e:
                 logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
+            finally:
+                conn.close()
+            row = dict(row)
+            row["plan"], row["plan_expires_at"] = "free", None
+        elif _unpaid_plan(row):
+            # Monthly/Yearly with no end date and no verified store purchase
+            # behind it was never paid for: back to Free.
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan IN ('monthly', 'yearly') AND plan_expires_at IS NULL", (user_id,))
+                conn.commit()
+                logger.warning(f"Removed a Monthly/Yearly plan with no payment behind it from user {user_id}")
+            except Exception as e:
+                logger.warning(f"Couldn't remove an unpaid plan from user {user_id}: {e}")
             finally:
                 conn.close()
             row = dict(row)
@@ -1381,6 +1420,14 @@ class PurchaseVerificationError(Exception):
     pass
 
 
+class _VerifiedPlan(str):
+    """A verified plan name that also carries what the store said about it:
+    when the paid period ends, and (Apple) the subscription's original
+    transaction id, which stays the same across renewals."""
+    expires_at = None
+    original_id = None
+
+
 def _apple_verify_transaction(transaction_id):
     """Verifies one In-App Purchase transaction against Apple's App
     Store Server API and returns its product id — the modern
@@ -1462,7 +1509,10 @@ def _apple_verify_transaction(transaction_id):
     product_id = payload.get("productId")
     if product_id not in STORE_PRODUCT_TO_PLAN:
         raise PurchaseVerificationError(f"Unrecognized product id '{product_id}'.")
-    return STORE_PRODUCT_TO_PLAN[product_id]
+    verified = _VerifiedPlan(STORE_PRODUCT_TO_PLAN[product_id])
+    verified.expires_at = datetime.fromtimestamp(expires_ms / 1000, timezone.utc) if expires_ms else None
+    verified.original_id = str(payload.get("originalTransactionId") or "") or None
+    return verified
 
 
 def _google_verify_purchase(product_id, purchase_token, is_subscription):
@@ -1543,7 +1593,16 @@ def _google_verify_purchase(product_id, purchase_token, is_subscription):
 
     if product_id not in STORE_PRODUCT_TO_PLAN:
         raise PurchaseVerificationError(f"Unrecognized product id '{product_id}'.")
-    return STORE_PRODUCT_TO_PLAN[product_id]
+    verified = _VerifiedPlan(STORE_PRODUCT_TO_PLAN[product_id])
+    if is_subscription:
+        ends = []
+        for item in (data.get("lineItems") or []):
+            try:
+                ends.append(datetime.fromisoformat(str(item.get("expiryTime", "")).replace("Z", "+00:00")))
+            except ValueError:
+                pass
+        verified.expires_at = max(ends) if ends else None
+    return verified
 
 
 @app.route("/api/plan/upgrade", methods=["POST", "OPTIONS"])
@@ -1574,7 +1633,9 @@ def plan_upgrade():
             return jsonify({"error": "Missing transaction_id."}), 400
         try:
             plan = _apple_verify_transaction(transaction_id)
-            transaction_key = "ios:" + transaction_id
+            # Keyed by the original transaction id, which every renewal shares —
+            # so a renewal can't be claimed again as if it were a new purchase.
+            transaction_key = "ios:" + (getattr(plan, "original_id", None) or transaction_id)
         except PurchaseVerificationError as e:
             return jsonify({"error": str(e)}), 402
     elif platform == "android":
@@ -1591,10 +1652,25 @@ def plan_upgrade():
     else:
         return jsonify({"error": "platform must be 'free', 'ios', or 'android'."}), 400
 
+    # Store plans end when the store's paid period ends (plus a day's grace);
+    # renewals move the date on (notices or a fresh restore), so cancelling or
+    # a refund never leaves Pro running for free.
+    store_end = getattr(plan, "expires_at", None)
+    plan_until = (store_end + timedelta(days=1)) if store_end else None
+    plan = str(plan)
     bonus_applied = False
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            if transaction_key and plan in ("monthly", "yearly"):
+                # One purchase, one account: if another account held this
+                # subscription, it moves here and leaves that account.
+                cur.execute("SELECT user_id, product FROM store_purchases WHERE transaction_key = %s", (transaction_key,))
+                holder = cur.fetchone()
+                if holder and holder["user_id"] and holder["user_id"] != request.current_user["id"]:
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan = %s",
+                                (holder["user_id"], holder["product"]))
+                    logger.info(f"Store purchase {transaction_key} moved from user {holder['user_id']} to {request.current_user['id']}")
             if plan == "payperuse":
                 # One full use of Pro: Remy messages that never expire, on top
                 # of the monthly allowance; the plan itself doesn't change.
@@ -1611,8 +1687,8 @@ def plan_upgrade():
                 else:
                     cur.execute("SELECT * FROM users WHERE id = %s", (request.current_user["id"],))
             else:
-                cur.execute("UPDATE users SET plan = %s, plan_expires_at = NULL WHERE id = %s RETURNING *",
-                            (plan, request.current_user["id"]))
+                cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s WHERE id = %s RETURNING *",
+                            (plan, plan_until, request.current_user["id"]))
             row = cur.fetchone()
             if transaction_key and plan in ("monthly", "yearly"):
                 # Which account owns this subscription: the stores' renewal,
@@ -1681,8 +1757,8 @@ def _from_store_app():
     return "DocenteApp" in ua or request.headers.get("X-Docente-Store-App") == "1"
 
 
-def _paystack_call(method, path, payload=None):
-    resp = requests.request(method, PAYSTACK_API + path, json=payload, timeout=20,
+def _paystack_call(method, path, payload=None, timeout=20):
+    resp = requests.request(method, PAYSTACK_API + path, json=payload, timeout=timeout,
                             headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"})
     try:
         body = resp.json()
@@ -1750,7 +1826,7 @@ def paystack_initialize():
     if plan not in PAYSTACK_PLANS:
         return jsonify({"error": "Choose Monthly, Yearly or Pay-per-Use."}), 400
     user = request.current_user
-    if plan in ("monthly", "yearly") and user.get("plan") in ("monthly", "yearly") and not user.get("plan_expires_at"):
+    if plan in ("monthly", "yearly") and user.get("plan") in ("monthly", "yearly") and _owns_store_plan(user["id"]):
         return jsonify({"error": "You already have Pro through the App Store or Google Play — manage it there."}), 409
     amount = PAYSTACK_PLANS[plan][0]
     reference = f"dct_{user['id']}_{secrets.token_hex(6)}"
@@ -1831,6 +1907,64 @@ def paystack_webhook():
             logger.warning(f"Paystack webhook apply failed: {e}")
             return jsonify({"ok": False}), 500
     return jsonify({"ok": True})
+
+
+@app.route("/api/paystack/payments", methods=["GET", "OPTIONS"])
+@auth_required
+def paystack_payments():
+    """The person's last ten web payments, for the Payment history sheet."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reference, plan, amount, status, created_at FROM paystack_payments WHERE user_id = %s ORDER BY created_at DESC LIMIT 10",
+                        (request.current_user["id"],))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return jsonify({"payments": [{
+        "reference": r["reference"], "plan": r["plan"], "amount_ghs": r["amount"] / 100, "status": r["status"],
+        "created_at": r["created_at"].isoformat() if r["created_at"] else None} for r in rows]})
+
+
+@app.route("/api/paystack/sync", methods=["POST", "OPTIONS"])
+@limiter.limit("30 per hour", key_func=_account_or_ip_key)
+@auth_required
+def paystack_sync():
+    """Checks this person's unfinished payments (from the last 3 days) with
+    Paystack and gives them what they paid for — so a payment still counts
+    when they closed the page before coming back, even before the webhook is
+    set up. Each payment is applied at most once."""
+    user = request.current_user
+    applied = 0
+    if _paystack_on():
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT reference FROM paystack_payments WHERE user_id = %s AND status = 'pending' AND created_at > now() - interval '3 days' ORDER BY created_at DESC LIMIT 3",
+                            (user["id"],))
+                refs = [r["reference"] for r in cur.fetchall()]
+        finally:
+            conn.close()
+        for ref in refs:
+            try:
+                data = _paystack_call("GET", f"/transaction/verify/{ref}", timeout=8)
+            except Exception as e:
+                logger.warning(f"Paystack sync couldn't check {ref}: {e}")
+                continue
+            if data.get("status") == "success" and data.get("reference") == ref:
+                _, outcome = _paystack_apply(ref, data.get("amount"), data.get("currency"))
+                if outcome == "applied":
+                    applied += 1
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user["id"],))
+            row = cur.fetchone()
+            cur.execute("SELECT COUNT(*) AS n FROM paystack_payments WHERE user_id = %s AND status = 'pending' AND created_at > now() - interval '3 days'", (user["id"],))
+            pending = (cur.fetchone() or {}).get("n", 0)
+    finally:
+        conn.close()
+    return jsonify({"applied": applied, "pending": int(pending or 0), "user": user_row_to_dict(row)})
 
 
 # ------------------------------------------------------------ Remy's memory
@@ -3961,7 +4095,23 @@ def _apple_subscription_entitled(original_transaction_id):
                 statuses.append(tx.get("status"))
     if not statuses:
         return None
+    ends = []
+    for group in (resp.json().get("data") or []):
+        for tx in (group.get("lastTransactions") or []):
+            if str(tx.get("originalTransactionId")) == str(original_transaction_id):
+                try:
+                    info = pyjwt.decode(tx.get("signedTransactionInfo", ""), options={"verify_signature": False})
+                    if info.get("expiresDate"):
+                        ends.append(datetime.fromtimestamp(info["expiresDate"] / 1000, timezone.utc))
+                except Exception:
+                    pass
+    _STORE_PERIOD_END[str(original_transaction_id)] = max(ends) if ends else None
     return any(s in (1, 4) for s in statuses)   # 1 active, 4 grace period; 2 expired, 3 billing retry, 5 revoked
+
+
+# The end of the paid period the store reported on its last check, by original
+# transaction id (Apple) or purchase token (Google).
+_STORE_PERIOD_END = {}
 
 
 def _google_access_token():
@@ -3997,6 +4147,13 @@ def _google_subscription_entitled(purchase_token):
         return None
     data = resp.json()
     state = data.get("subscriptionState")
+    ends = []
+    for item in (data.get("lineItems") or []):
+        try:
+            ends.append(datetime.fromisoformat(str(item.get("expiryTime", "")).replace("Z", "+00:00")))
+        except ValueError:
+            pass
+    _STORE_PERIOD_END[str(purchase_token)] = max(ends) if ends else None
     if state in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD"):
         return True
     if state == "SUBSCRIPTION_STATE_CANCELED":
@@ -4024,7 +4181,7 @@ def _store_purchase_owner(keys):
         conn.close()
 
 
-def _apply_store_state(owner, entitled=None, refunded_pass=False):
+def _apply_store_state(owner, entitled=None, refunded_pass=False, period_end=None):
     """Brings one account in line with what the store said. Only the plan the
     notice is about is touched: a lapsed Monthly never downgrades someone who
     has since moved to Yearly, and access returns only to an account that
@@ -4036,9 +4193,14 @@ def _apply_store_state(owner, entitled=None, refunded_pass=False):
                 cur.execute("UPDATE users SET remy_credits = GREATEST(COALESCE(remy_credits, 0) - %s, 0) WHERE id = %s",
                             (PAYPERUSE_MESSAGES, owner["user_id"]))
             elif entitled is False:
-                cur.execute("UPDATE users SET plan = 'free' WHERE id = %s AND plan = %s", (owner["user_id"], owner["product"]))
+                cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan = %s", (owner["user_id"], owner["product"]))
             elif entitled is True:
-                cur.execute("UPDATE users SET plan = %s WHERE id = %s AND plan = 'free'", (owner["product"], owner["user_id"]))
+                # Renewed: the plan runs to the store's new period end (plus a
+                # day), never shortening a later date already there.
+                until = (period_end + timedelta(days=1)) if period_end else (datetime.now(timezone.utc) + timedelta(days=2))
+                cur.execute("UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, %s), %s) "
+                            "WHERE id = %s AND (plan = 'free' OR plan = %s)",
+                            (owner["product"], until, until, owner["user_id"], owner["product"]))
         conn.commit()
     finally:
         conn.close()
@@ -4064,7 +4226,7 @@ def apple_store_notification():
     entitled = _apple_subscription_entitled(original or current)   # asked of Apple, never taken from the notice
     if entitled is None:
         return jsonify({"error": "Couldn't check with Apple right now."}), 503
-    _apply_store_state(owner, entitled=entitled)
+    _apply_store_state(owner, entitled=entitled, period_end=_STORE_PERIOD_END.pop(str(original or current), None))
     return jsonify({"ok": True, "entitled": entitled}), 200
 
 
@@ -4094,7 +4256,7 @@ def google_store_notification():
     entitled = False if voided else _google_subscription_entitled(token)   # asked of Google, never taken from the notice
     if entitled is None:
         return jsonify({"error": "Couldn't check with Google Play right now."}), 503
-    _apply_store_state(owner, entitled=entitled)
+    _apply_store_state(owner, entitled=entitled, period_end=_STORE_PERIOD_END.pop(str(token), None))
     return jsonify({"ok": True, "entitled": entitled}), 200
 
 
