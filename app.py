@@ -355,6 +355,7 @@ def init_db():
             # granted them, so the same purchase is never credited twice.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT TRUE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_source TEXT")   # 'store', 'paystack' or 'bonus'
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS paystack_payments (
                     reference TEXT PRIMARY KEY,
@@ -576,6 +577,9 @@ def user_row_to_dict(row):
         "plan_expires_at": exp.isoformat() if exp and not _pass_expired(row) else None,
         "remy_credits": (row.get("remy_credits") or 0) if hasattr(row, "get") else 0,
         "memory_enabled": _memory_on(row),
+        # Where Pro came from — the app describes it truthfully: a store plan
+        # renews, a Paystack pass or a bonus month runs to its date.
+        "plan_source": (row.get("plan_source") if hasattr(row, "get") else None) if (row.get("plan") if hasattr(row, "get") else None) != "free" else None,
         # The Remy message meter: this window's allowance, used so far, and
         # when it renews (30 days after it began).
         "remy_messages_used": msgs_used,
@@ -639,6 +643,25 @@ def auth_required(fn):
                 conn.close()
             row = dict(row)
             row["plan"], row["plan_expires_at"] = "free", None
+        if row.get("plan") == "free" and (row.get("bonus_credit_months") or 0) > 0:
+            # A referral bonus month: kept in the bank while paid Pro runs (so
+            # it never overlaps paid time) and started whenever the account is
+            # on Free — straight away, or the moment paid time ends. The WHERE
+            # clause lets each bonus month start exactly once.
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE users SET plan = 'monthly', plan_expires_at = now() + interval '30 days', plan_source = 'bonus', "
+                                "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *", (user_id,))
+                    started = cur.fetchone()
+                conn.commit()
+                if started:
+                    row = started
+                    logger.info(f"Bonus month started for user {user_id}")
+            except Exception as e:
+                logger.warning(f"Couldn't start a bonus month for user {user_id}: {e}")
+            finally:
+                conn.close()
         request.current_user = row
         return fn(*args, **kwargs)
 
@@ -1687,7 +1710,7 @@ def plan_upgrade():
                 else:
                     cur.execute("SELECT * FROM users WHERE id = %s", (request.current_user["id"],))
             else:
-                cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s WHERE id = %s RETURNING *",
+                cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s, plan_source = 'store' WHERE id = %s RETURNING *",
                             (plan, plan_until, request.current_user["id"]))
             row = cur.fetchone()
             if transaction_key and plan in ("monthly", "yearly"):
@@ -1792,7 +1815,7 @@ def _paystack_apply(reference, paid_amount, currency):
             _, days, credits = PAYSTACK_PLANS[pay["plan"]]
             if days:
                 cur.execute(
-                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + make_interval(days => %s) WHERE id = %s",
+                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + make_interval(days => %s), plan_source = 'paystack' WHERE id = %s",
                     (pay["plan"], days, pay["user_id"]))
             if credits:
                 cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
@@ -1810,6 +1833,8 @@ def _paystack_apply(reference, paid_amount, currency):
 def paystack_config():
     return jsonify({
         "enabled": _paystack_on(), "public_key": PAYSTACK_PUBLIC_KEY if _paystack_on() else None, "currency": "GHS",
+        # live or test keys — never the key itself — so the setup can be checked at a glance
+        "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test") if _paystack_on() else None,
         "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2]} for k, v in PAYSTACK_PLANS.items()},
     })
 
@@ -1846,7 +1871,8 @@ def paystack_initialize():
         })
     except Exception as e:
         logger.warning(f"Paystack initialize failed for {reference}: {e}")
-        return jsonify({"error": "Paystack couldn't start the payment — please try again in a moment."}), 502
+        reason = str(e)[:120]
+        return jsonify({"error": "Paystack couldn't start the payment" + (f" ({reason})" if reason else "") + " — please try again in a moment."}), 502
     return jsonify({"authorization_url": data.get("authorization_url"), "access_code": data.get("access_code"), "reference": reference})
 
 
@@ -4193,12 +4219,12 @@ def _apply_store_state(owner, entitled=None, refunded_pass=False, period_end=Non
                 cur.execute("UPDATE users SET remy_credits = GREATEST(COALESCE(remy_credits, 0) - %s, 0) WHERE id = %s",
                             (PAYPERUSE_MESSAGES, owner["user_id"]))
             elif entitled is False:
-                cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan = %s", (owner["user_id"], owner["product"]))
+                cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, plan_source = NULL WHERE id = %s AND plan = %s", (owner["user_id"], owner["product"]))
             elif entitled is True:
                 # Renewed: the plan runs to the store's new period end (plus a
                 # day), never shortening a later date already there.
                 until = (period_end + timedelta(days=1)) if period_end else (datetime.now(timezone.utc) + timedelta(days=2))
-                cur.execute("UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, %s), %s) "
+                cur.execute("UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, %s), %s), plan_source = 'store' "
                             "WHERE id = %s AND (plan = 'free' OR plan = %s)",
                             (owner["product"], until, until, owner["user_id"], owner["product"]))
         conn.commit()
