@@ -3,6 +3,7 @@ import logging
 import base64
 import hmac
 import os
+import hashlib
 import random
 import re
 import secrets
@@ -355,6 +356,20 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS paystack_payments (
+                    reference TEXT PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    plan TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    currency TEXT NOT NULL DEFAULT 'GHS',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    applied_at TIMESTAMPTZ
+                )
+                """
+            )
+            cur.execute(
+                """
                 CREATE TABLE IF NOT EXISTS store_purchases (
                     transaction_key TEXT PRIMARY KEY,
                     user_id INTEGER NOT NULL,
@@ -1637,6 +1652,185 @@ def plan_upgrade():
         conn.close()
 
     return jsonify({"user": user_row_to_dict(row), "result": {"referral_bonus_applied": bonus_applied}})
+
+
+# ------------------------------------------------------------ Paystack (web only)
+# On the web (getdocente.vercel.app) Pro is bought with Paystack — card or
+# mobile money, charged in Ghana cedis — as a one-time pass: 30 or 365 days of
+# Pro, or 30 Remy messages. The App Store and Google Play apps must use the
+# stores' own purchases (their rules), so requests from the store apps are
+# refused here and the app hides Paystack there too. The secret key is read
+# only from the server's environment — never from code or the app.
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
+PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY", "").strip()
+PAYSTACK_API = "https://api.paystack.co"
+PAYSTACK_PLANS = {
+    # plan: (price in pesewas, days of Pro, Remy messages added)
+    "monthly": (10000, 30, 0),
+    "yearly": (30000, 365, 0),
+    "payperuse": (3000, 0, 30),
+}
+
+
+def _paystack_on():
+    return bool(PAYSTACK_SECRET_KEY and PAYSTACK_PUBLIC_KEY)
+
+
+def _from_store_app():
+    ua = request.headers.get("User-Agent", "")
+    return "DocenteApp" in ua or request.headers.get("X-Docente-Store-App") == "1"
+
+
+def _paystack_call(method, path, payload=None):
+    resp = requests.request(method, PAYSTACK_API + path, json=payload, timeout=20,
+                            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"})
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {}
+    if resp.status_code >= 400 or not body.get("status"):
+        raise ConversionError(body.get("message") or f"Paystack answered {resp.status_code}")
+    return body.get("data") or {}
+
+
+def _paystack_apply(reference, paid_amount, currency):
+    """Give the person what they paid for — exactly once per payment, however
+    many times it's confirmed (the browser coming back, and the webhook)."""
+    conn = get_db()
+    conn.autocommit = False   # hold the row lock until the commit
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM paystack_payments WHERE reference = %s FOR UPDATE", (reference,))
+            pay = cur.fetchone()
+            if not pay:
+                conn.rollback()
+                return None, "unknown"
+            if pay["applied_at"]:
+                conn.rollback()
+                return pay["user_id"], "already"
+            if str(currency).upper() != "GHS" or int(paid_amount or 0) < int(pay["amount"]):
+                cur.execute("UPDATE paystack_payments SET status = 'mismatch' WHERE reference = %s", (reference,))
+                conn.commit()
+                logger.warning(f"Paystack {reference}: paid {paid_amount} {currency}, expected {pay['amount']} GHS — not applied")
+                return pay["user_id"], "mismatch"
+            _, days, credits = PAYSTACK_PLANS[pay["plan"]]
+            if days:
+                cur.execute(
+                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + make_interval(days => %s) WHERE id = %s",
+                    (pay["plan"], days, pay["user_id"]))
+            if credits:
+                cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
+            cur.execute("UPDATE paystack_payments SET status = 'success', applied_at = now() WHERE reference = %s", (reference,))
+        conn.commit()
+        return pay["user_id"], "applied"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.route("/api/paystack/config", methods=["GET", "OPTIONS"])
+def paystack_config():
+    return jsonify({
+        "enabled": _paystack_on(), "public_key": PAYSTACK_PUBLIC_KEY if _paystack_on() else None, "currency": "GHS",
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2]} for k, v in PAYSTACK_PLANS.items()},
+    })
+
+
+@app.route("/api/paystack/initialize", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per hour", key_func=_account_or_ip_key)
+@auth_required
+def paystack_initialize():
+    if not _paystack_on():
+        return jsonify({"error": "Payments aren't set up yet — please try again later."}), 503
+    if _from_store_app():
+        return jsonify({"error": "In the Docente app, Pro is bought through the App Store or Google Play."}), 403
+    plan = str((request.get_json(silent=True) or {}).get("plan") or "")
+    if plan not in PAYSTACK_PLANS:
+        return jsonify({"error": "Choose Monthly, Yearly or Pay-per-Use."}), 400
+    user = request.current_user
+    if plan in ("monthly", "yearly") and user.get("plan") in ("monthly", "yearly") and not user.get("plan_expires_at"):
+        return jsonify({"error": "You already have Pro through the App Store or Google Play — manage it there."}), 409
+    amount = PAYSTACK_PLANS[plan][0]
+    reference = f"dct_{user['id']}_{secrets.token_hex(6)}"
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount) VALUES (%s, %s, %s, %s)",
+                        (reference, user["id"], plan, amount))
+    finally:
+        conn.close()
+    try:
+        data = _paystack_call("POST", "/transaction/initialize", {
+            "email": user["email"], "amount": amount, "currency": "GHS", "reference": reference,
+            "callback_url": f"{FRONTEND_URL.rstrip('/')}/?paystack=return",
+            "metadata": {"user_id": user["id"], "plan": plan,
+                         "custom_fields": [{"display_name": "Docente plan", "variable_name": "plan", "value": plan}]},
+        })
+    except Exception as e:
+        logger.warning(f"Paystack initialize failed for {reference}: {e}")
+        return jsonify({"error": "Paystack couldn't start the payment — please try again in a moment."}), 502
+    return jsonify({"authorization_url": data.get("authorization_url"), "access_code": data.get("access_code"), "reference": reference})
+
+
+@app.route("/api/paystack/verify", methods=["POST", "OPTIONS"])
+@limiter.limit("60 per hour", key_func=_account_or_ip_key)
+@auth_required
+def paystack_verify():
+    if not _paystack_on():
+        return jsonify({"error": "Payments aren't set up yet."}), 503
+    reference = str((request.get_json(silent=True) or {}).get("reference") or "").strip()[:80]
+    user = request.current_user
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM paystack_payments WHERE reference = %s", (reference,))
+            pay = cur.fetchone()
+    finally:
+        conn.close()
+    if not pay or pay["user_id"] != user["id"]:
+        return jsonify({"error": "That payment wasn't found on your account."}), 404
+    try:
+        data = _paystack_call("GET", f"/transaction/verify/{reference}")
+    except Exception as e:
+        logger.warning(f"Paystack verify failed for {reference}: {e}")
+        return jsonify({"error": "Couldn't check the payment with Paystack — please try again in a moment."}), 502
+    status = data.get("status")
+    if status != "success" or data.get("reference") != reference:
+        return jsonify({"status": status or "unknown"})
+    _, outcome = _paystack_apply(reference, data.get("amount"), data.get("currency"))
+    if outcome == "mismatch":
+        return jsonify({"status": "mismatch", "error": "The amount paid didn't match the plan — contact support.docente@gmail.com and we'll sort it out."}), 409
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user["id"],))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return jsonify({"status": "success", "user": user_row_to_dict(row)})
+
+
+@app.route("/api/paystack/webhook", methods=["POST"])
+def paystack_webhook():
+    """Paystack's own confirmation, signed with the secret key — it covers
+    anyone who pays and closes the page before coming back."""
+    if not _paystack_on():
+        return jsonify({"ok": False}), 503
+    raw = request.get_data() or b""
+    expected = hmac.new(PAYSTACK_SECRET_KEY.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(expected, request.headers.get("x-paystack-signature", "")):
+        return jsonify({"error": "bad signature"}), 401
+    event = request.get_json(silent=True) or {}
+    if event.get("event") == "charge.success":
+        data = event.get("data") or {}
+        try:
+            _paystack_apply(str(data.get("reference") or ""), data.get("amount"), data.get("currency"))
+        except Exception as e:
+            logger.warning(f"Paystack webhook apply failed: {e}")
+            return jsonify({"ok": False}), 500
+    return jsonify({"ok": True})
 
 
 # ------------------------------------------------------------ Remy's memory
