@@ -353,6 +353,7 @@ def init_db():
             # allowance, never expiring — and every store transaction that
             # granted them, so the same purchase is never credited twice.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS store_purchases (
                     transaction_key TEXT PRIMARY KEY,
@@ -410,6 +411,11 @@ def add_user_memory(user_id, note):
         conn = get_db()
         try:
             with conn.cursor() as cur:
+                # No duplicates, and at most MEMORY_LIMIT notes per person.
+                cur.execute("SELECT note FROM user_memory WHERE user_id = %s", (user_id,))
+                existing = [r["note"].strip().lower() for r in cur.fetchall()]
+                if note.lower() in existing or len(existing) >= MEMORY_LIMIT:
+                    return
                 cur.execute(
                     "INSERT INTO user_memory (user_id, note) VALUES (%s, %s)",
                     (user_id, note),
@@ -418,6 +424,17 @@ def add_user_memory(user_id, note):
             conn.close()
     except Exception:
         pass  # memory is a nice-to-have — never let it break the actual response
+
+
+MEMORY_LIMIT = 50
+
+
+def _memory_on(user_row):
+    """Whether this person lets Remy remember (Profile -> Remy's memory)."""
+    try:
+        return user_row.get("memory_enabled", True) is not False
+    except Exception:
+        return True
 
 
 def get_user_memory(user_id, limit=12):
@@ -519,6 +536,7 @@ def user_row_to_dict(row):
         "plan": effective_plan(row),
         "plan_expires_at": exp.isoformat() if exp and not _pass_expired(row) else None,
         "remy_credits": (row.get("remy_credits") or 0) if hasattr(row, "get") else 0,
+        "memory_enabled": _memory_on(row),
         # The Remy message meter: this window's allowance, used so far, and
         # when it renews (30 days after it began).
         "remy_messages_used": msgs_used,
@@ -1621,6 +1639,77 @@ def plan_upgrade():
     return jsonify({"user": user_row_to_dict(row), "result": {"referral_bonus_applied": bonus_applied}})
 
 
+# ------------------------------------------------------------ Remy's memory
+# What Remy remembers about a person is theirs to see and control: list it,
+# add a note, edit or delete one, clear everything, or switch memory off
+# (then nothing is read or saved). Every change is limited to the person's
+# own notes.
+def _memory_state(cur, user_id, enabled):
+    cur.execute("SELECT id, note, created_at FROM user_memory WHERE user_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
+                (user_id, MEMORY_LIMIT))
+    notes = [{"id": r["id"], "note": r["note"], "created_at": r["created_at"].isoformat() if r["created_at"] else None} for r in cur.fetchall()]
+    return {"enabled": enabled, "notes": notes, "limit": MEMORY_LIMIT}
+
+
+@app.route("/api/memory", methods=["GET", "POST", "DELETE", "OPTIONS"])
+@auth_required
+def memory_endpoint():
+    user = request.current_user
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            if request.method == "POST":
+                note = re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("note") or "")).strip()[:300]
+                if not note:
+                    return jsonify({"error": "Write something for Remy to remember."}), 400
+                cur.execute("SELECT note FROM user_memory WHERE user_id = %s", (user["id"],))
+                existing = [r["note"].strip().lower() for r in cur.fetchall()]
+                if len(existing) >= MEMORY_LIMIT:
+                    return jsonify({"error": f"Remy can remember up to {MEMORY_LIMIT} notes — delete one first."}), 400
+                if note.lower() not in existing:
+                    cur.execute("INSERT INTO user_memory (user_id, note) VALUES (%s, %s)", (user["id"], note))
+            elif request.method == "DELETE":
+                cur.execute("DELETE FROM user_memory WHERE user_id = %s", (user["id"],))
+            return jsonify(_memory_state(cur, user["id"], _memory_on(user)))
+    finally:
+        conn.close()
+
+
+@app.route("/api/memory/<int:note_id>", methods=["PATCH", "DELETE", "OPTIONS"])
+@auth_required
+def memory_note_endpoint(note_id):
+    user = request.current_user
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            if request.method == "PATCH":
+                note = re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("note") or "")).strip()[:300]
+                if not note:
+                    return jsonify({"error": "A note can't be empty — delete it instead."}), 400
+                cur.execute("UPDATE user_memory SET note = %s WHERE id = %s AND user_id = %s RETURNING id", (note, note_id, user["id"]))
+            else:
+                cur.execute("DELETE FROM user_memory WHERE id = %s AND user_id = %s RETURNING id", (note_id, user["id"]))
+            if not cur.fetchone():
+                return jsonify({"error": "That note wasn't found."}), 404
+            return jsonify(_memory_state(cur, user["id"], _memory_on(user)))
+    finally:
+        conn.close()
+
+
+@app.route("/api/memory/settings", methods=["PUT", "OPTIONS"])
+@auth_required
+def memory_settings_endpoint():
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    user = request.current_user
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET memory_enabled = %s WHERE id = %s", (enabled, user["id"]))
+            return jsonify(_memory_state(cur, user["id"], enabled))
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------ referral codes
 # A person can make one referral code a month; each lasts 14 days. When a
 # friend subscribes with it, both get a bonus month — the same reward as a
@@ -1667,6 +1756,10 @@ def referral_current():
 def referral_generate():
     user_id = request.current_user["id"]
     conn = get_db()
+    # One transaction, so the row lock below is held until the commit —
+    # get_db() connections commit every statement (and release the lock)
+    # immediately otherwise.
+    conn.autocommit = False
     try:
         with conn.cursor() as cur:
             # Lock the person's row so two quick taps can't both make a code.
@@ -2543,9 +2636,20 @@ def sage_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 429
 
+    # Remy's memory (when the person allows it): what Remy noted before, and
+    # permission to note one new durable thing — taken out of the reply below.
+    memory_on = _memory_on(request.current_user)
+    system_prompt = SAGE_SYSTEM_PROMPT
+    if memory_on:
+        notes = get_user_memory(request.current_user["id"])
+        if notes:
+            system_prompt += (
+                "\n\nWhat you remember about this student from earlier — use it naturally where it "
+                "genuinely helps; don't recite it back: " + "; ".join(notes))
+        system_prompt += "\n\n" + MEMORY_INSTRUCTION
     try:
         result = call_claude(
-            system_prompt=SAGE_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             messages=turns,
             max_tokens=4000,
             use_search=True,
@@ -2560,7 +2664,10 @@ def sage_endpoint():
         if isinstance(e, ConversionError):
             return jsonify({"error": str(e)}), 502
         raise
-    return jsonify({"reply": result})
+    note, reply = split_memory_note(result or "")
+    if note and memory_on:
+        add_user_memory(request.current_user["id"], note)
+    return jsonify({"reply": (reply or "").strip() or result})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
@@ -2975,7 +3082,9 @@ MEMORY_INSTRUCTION = (
     f"{MEMORY_START} and {MEMORY_END}, placed after your full answer and any references. "
     "Only include this when you've learned something genuinely new and worth remembering for "
     "next time — omit it entirely otherwise, and never repeat something you already noted "
-    "before. This is saved privately for future context and never shown to the student."
+    "before. Never note sensitive personal details (health, money, religion, relationships, "
+    "passwords or anything they'd keep private). The student can see, edit and delete these notes "
+    "in Profile -> Remy's memory."
 )
 
 
@@ -3147,7 +3256,8 @@ def write_endpoint():
         # yet) share the same citation and clarify-guardrail logic below — they
         # differ only in whether prior turns are folded into the prompt.
         user_id = request.current_user["id"] if getattr(request, "current_user", None) else None
-        memory_notes = get_user_memory(user_id)
+        memory_on = _memory_on(request.current_user)
+        memory_notes = get_user_memory(user_id) if memory_on else []
         role_with_memory = ROLE_DESCRIPTION + (
             " Here's what you've picked up about this student from past work together — use "
             "it naturally where it's actually relevant, don't just recite it back: "
@@ -3257,7 +3367,7 @@ def write_endpoint():
         thinking, after_thinking = split_thinking(raw_text)
         is_clarify, text = split_clarify(after_thinking)
         memory_note, text = split_memory_note(text)
-        if memory_note:
+        if memory_note and memory_on:
             add_user_memory(user_id, memory_note)
 
         if not text:
