@@ -2120,8 +2120,10 @@ def _paystack_reconcile_once():
 def _paystack_explain_recent():
     """Once at start-up: log why recent payments didn't go through — the
     method tried and Paystack's own reason, never any personal details.
-    Takes the same lock as the payment check, so only one server worker
-    does it (they used to log every reason twice)."""
+    The lock is held for the WHOLE explanation (and briefly after), so the
+    other server worker, starting at the same moment, can't repeat it.
+    (Releasing it straight after reading the list let both workers log
+    every reason twice.)"""
     if not _paystack_on():
         return
     conn = get_db()
@@ -2133,15 +2135,16 @@ def _paystack_explain_recent():
             cur.execute("SELECT reference, plan FROM paystack_payments WHERE status IN ('failed', 'abandoned', 'pending') "
                         "AND created_at > now() - interval '3 days' ORDER BY created_at DESC LIMIT 12")
             rows = cur.fetchall()
+            for r in rows:
+                try:
+                    d = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
+                except Exception as e:
+                    logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> Paystack couldn't say: {e}")
+                    continue
+                logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> {d.get('status')} | channel: {d.get('channel') or '-'} | Paystack says: {d.get('gateway_response') or '-'}")
+            time.sleep(20)       # keep the lock a little longer, past the other worker's start
     finally:
-        conn.close()     # closing the connection releases the lock
-    for r in rows:
-        try:
-            d = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
-        except Exception as e:
-            logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> Paystack couldn't say: {e}")
-            continue
-        logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> {d.get('status')} | channel: {d.get('channel') or '-'} | Paystack says: {d.get('gateway_response') or '-'}")
+        conn.close()             # closing the connection releases the lock
 
 
 def _paystack_reconcile_loop():
