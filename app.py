@@ -3316,10 +3316,13 @@ def summarize_endpoint():
     # For a student's or a tutor's presentation, the deck follows a fixed order
     # (see _structure_summary); without an audience, the original behaviour.
     audience = data.get("audience") if data.get("audience") in ("student", "tutor") else None
+    reqs = str(data.get("requirements") or "").strip()[:1200]
+    reqs_block = ("\n\nTHE PRESENTER'S REQUIREMENTS \u2014 follow them exactly (number of slides, sections to include, focus, "
+                  "level of language), while keeping the JSON format described above:\n<<<\n" + reqs + "\n>>>") if reqs else ""
     presenters = [str(x).strip()[:80] for x in (data.get("presenters") or []) if str(x).strip()][:10] if audience == "student" else []
     try:
         result = call_claude(
-            system_prompt=_summary_structure_prompt(audience) if audience else SUMMARIZE_SYSTEM_PROMPT,
+            system_prompt=(_summary_structure_prompt(audience) if audience else SUMMARIZE_SYSTEM_PROMPT) + reqs_block,
             user_message=user_message,
             max_tokens=max_tokens + (900 if audience else 0),
         )
@@ -3756,6 +3759,34 @@ def write_endpoint():
                 note["text"] = (f"Only {len(fresh)} source{'' if len(fresh) == 1 else 's'} from the last {recent_years} years came up, "
                                 "so older ones were kept to support the writing properly.")
         return enrich_sources(srcs, style)
+
+    # The student's own brief (word count, sections, focus…) and a target
+    # length, added to EVERY writing call below — including continuations —
+    # by this local wrapper, so no path can miss them. They never override
+    # the real-sources and exact-citation rules.
+    reqs = str(data.get("requirements") or "").strip()[:1500]
+    try:
+        length_words = int(data.get("length_words") or 0)
+    except (TypeError, ValueError):
+        length_words = 0
+    length_words = length_words if length_words in (500, 800, 1000, 1500, 2000, 3000) else 0
+    extra = ""
+    if reqs:
+        extra += ("\n\nTHE STUDENT'S REQUIREMENTS (from their assignment brief) \u2014 follow them exactly: structure, sections, "
+                  "focus, tone, audience and any word count. They never override the rules above about using only the "
+                  "listed real sources with their exact citations.\n<<<\n" + reqs + "\n>>>")
+    if length_words:
+        extra += (f"\n\nLENGTH: write about {length_words} words in total (within 10%), not counting the reference list. "
+                  "If the piece needs more room than one answer allows, stop at a natural break \u2014 it will be continued.")
+    _call_claude = globals()["call_claude"]
+
+    def call_claude(*args, **kw):
+        if extra:
+            if "system_prompt" in kw:
+                kw["system_prompt"] = kw["system_prompt"] + extra
+            elif args:
+                args = (args[0] + extra,) + tuple(args[1:])
+        return _call_claude(*args, **kw)
 
     # Continuation of a truncated previous answer — a distinct, simpler path:
     # no clarify/thinking/outline logic, just pick the citation-bearing
