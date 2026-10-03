@@ -1754,9 +1754,9 @@ TEMPLATES = {
                         "theme": {"dk2": "3A1321", "lt2": "F6DDE3", "accent1": "A3243F", "accent2": "F2B33D"}},
     "tutor-classic": {"group": "tutor", "name": "Lecture Orange", "theme": None,
                       "band": "262626", "panel": "3A4245", "frame": "FF6D17"},
-    "tutor-teal": {"group": "tutor", "name": "Lecture Teal", "theme": {"accent1": "1C9C9C"},
+    "tutor-teal": {"group": "tutor", "look": "banner", "name": "Lecture Teal", "theme": {"accent1": "1C9C9C"},
                    "band": "1E2B30", "panel": "22393F", "frame": "18A5A5"},
-    "tutor-navy": {"group": "tutor", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
+    "tutor-navy": {"group": "tutor", "look": "split", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
                    "band": "1B2340", "panel": "25305A", "frame": "D9A21B"},
     # Four modern tutor templates, each taking its colour identity from a real
     # lecture deck (Posture Assessment; Electrophysical & Thermal Principles;
@@ -1804,10 +1804,10 @@ TEMPLATES = {
     "tutor-modern-terracotta": {"group": "tutor", "style": "modern", "name": "Terracotta", "cover": "block", "chrome": "topbar", "media": "large", "ink": "7C2D12", "accent": "F97316", "emph": "C2410C", "soft": "FFEDD5", "bg": "FFFAF5", "text": "292524", "muted": "78716C"},
     "tutor-modern-sky-minimal": {"group": "tutor", "style": "modern", "name": "Sky Minimal", "cover": "gradient", "chrome": "block", "media": "large", "ink": "075985", "ink2": "0284C7", "accent": "7DD3FC", "emph": "0369A1", "soft": "E0F2FE", "bg": "FFFFFF", "text": "1E293B", "muted": "64748B"},
     "tutor-modern-berry-plum": {"group": "tutor", "style": "modern", "name": "Berry Plum", "cover": "photo", "chrome": "rail", "media": "large", "ink": "581C87", "accent": "E879F9", "emph": "A21CAF", "soft": "F5D0FE", "bg": "FDF8FF", "text": "1F2937", "muted": "6B7280"},
-    "tutor-lecture-maroon": {"group": "tutor", "name": "Lecture Maroon", "media": "large", "theme": {"accent1": "9B2C2C"}, "band": "2B0F12", "panel": "4A1C20", "frame": "E0A04B"},
-    "tutor-lecture-forest": {"group": "tutor", "name": "Lecture Forest", "media": "large", "theme": {"accent1": "2F855A"}, "band": "13261C", "panel": "1F3B2C", "frame": "68D391"},
-    "tutor-lecture-purple": {"group": "tutor", "name": "Lecture Purple", "media": "large", "theme": {"accent1": "6B46C1"}, "band": "1E1433", "panel": "2F2150", "frame": "B794F4"},
-    "tutor-lecture-slate": {"group": "tutor", "name": "Lecture Slate", "media": "large", "theme": {"accent1": "4A5568"}, "band": "1A202C", "panel": "2D3748", "frame": "63B3ED"},
+    "tutor-lecture-maroon": {"group": "tutor", "look": "centered", "name": "Lecture Maroon", "media": "large", "theme": {"accent1": "9B2C2C"}, "band": "2B0F12", "panel": "4A1C20", "frame": "E0A04B"},
+    "tutor-lecture-forest": {"group": "tutor", "look": "banner", "name": "Lecture Forest", "media": "large", "theme": {"accent1": "2F855A"}, "band": "13261C", "panel": "1F3B2C", "frame": "68D391"},
+    "tutor-lecture-purple": {"group": "tutor", "look": "split", "name": "Lecture Purple", "media": "large", "theme": {"accent1": "6B46C1"}, "band": "1E1433", "panel": "2F2150", "frame": "B794F4"},
+    "tutor-lecture-slate": {"group": "tutor", "look": "centered", "name": "Lecture Slate", "media": "large", "theme": {"accent1": "4A5568"}, "band": "1A202C", "panel": "2D3748", "frame": "63B3ED"},
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
@@ -2239,6 +2239,25 @@ def _student_title_slide(prs, deck):
         r.font.color.rgb = WHITE
 
 
+# Classic lecture covers in four styles ("look"), each with one accent carried
+# onto its content slides. The editor uses the very same numbers.
+TUTOR_LOOKS = {
+    "brackets": {"bars": [(0.08, 0.45, 2.97, 0.1), (0.08, 0.45, 0.1, 5.42), (1.52, 6.70, 2.95, 0.1), (4.37, 1.38, 0.1, 5.42)],
+                 "panel": None, "pic": (0.47, 1.3, 3.53, 4.33), "logo": (0.85, 2.3, 2.8, 2.4), "title": (4.55, 0.7, 8.07, 4.03),
+                 "rule": (5.94, 4.92, 12.1), "sub": (4.69, 5.11, 7.95, 0.8), "meta": (4.69, 6.0, 7.95, 0.5),
+                 "align": "left", "light_title": False, "light_details": False, "accent": None},
+    "banner": {"bars": [(0.9, 3.72, 2.2, 0.1)], "panel": (0, 0, 13.333, 3.45), "pic": (8.75, 3.95, 3.85, 3.05), "logo": (9.2, 4.2, 3.0, 2.5),
+               "title": (0.9, 0.35, 11.5, 2.85), "rule": None, "sub": (0.9, 4.05, 7.5, 0.9), "meta": (0.9, 5.05, 7.5, 0.5),
+               "align": "left", "light_title": True, "light_details": False, "accent": ("frame", (0.55, 0.75, 0.12, 1.25))},
+    "split": {"bars": [(0.75, 4.85, 1.6, 0.1)], "panel": (0, 0, 6.0, 7.5), "pic": (6.55, 0.75, 6.1, 6.0), "logo": (7.6, 2.2, 4.0, 3.0),
+              "title": (0.75, 0.8, 4.85, 3.85), "rule": None, "sub": (0.75, 5.1, 4.85, 0.9), "meta": (0.75, 6.1, 4.85, 0.5),
+              "align": "left", "light_title": True, "light_details": True, "accent": ("panel", (0, 0, 0.32, 7.0))},
+    "centered": {"bars": [(3.17, 1.55, 7.0, 0.06), (3.17, 5.25, 7.0, 0.06)], "panel": None, "pic": (5.42, 5.5, 2.5, 1.7), "logo": (5.67, 0.3, 2.0, 1.0),
+                 "title": (1.0, 1.75, 11.33, 2.45), "rule": None, "sub": (1.0, 4.25, 11.33, 0.6), "meta": (1.0, 4.75, 11.33, 0.45),
+                 "align": "center", "light_title": False, "light_details": False, "accent": ("frame", (5.92, 0.42, 1.5, 0.06))},
+}
+
+
 def _tutor_title_slide(prs, deck, tpl):
     """Mirrors the lecture deck: a white slide; on the left a picture held in
     two corner brackets (redrawn as shapes — the original's frame was a
@@ -2257,8 +2276,18 @@ def _tutor_title_slide(prs, deck, tpl):
     cover.line.fill.background()
     cover.shadow.inherit = False
     _to_back(cover)
+    look = TUTOR_LOOKS.get(tpl.get("look") or "brackets", TUTOR_LOOKS["brackets"])
     frame = RGBColor.from_string(tpl.get("frame") or "FF6D17")
-    for x, y, w, h in ((0.08, 0.45, 2.97, 0.1), (0.08, 0.45, 0.1, 5.42), (1.52, 6.70, 2.95, 0.1), (4.37, 1.38, 0.1, 5.42)):
+    if look["panel"]:
+        px, py, pw, ph = look["panel"]
+        panel = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(px), Inches(py), Inches(pw), Inches(ph))
+        panel.fill.solid()
+        panel.fill.fore_color.rgb = RGBColor.from_string(tpl.get("panel") or tpl.get("band") or "262626")
+        panel.line.fill.background()
+        panel.shadow.inherit = False
+        _to_back(panel)      # behind the title and details…
+        _to_back(cover)      # …but in front of the white background
+    for x, y, w, h in look["bars"]:
         bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
         bar.fill.solid()
         bar.fill.fore_color.rgb = frame
@@ -2269,13 +2298,14 @@ def _tutor_title_slide(prs, deck, tpl):
     if picture:
         # Fitted whole, never cropped: a landscape photo in this portrait frame
         # would otherwise lose its sides.
-        _fit_picture(s, picture, Inches(0.47), Inches(1.3), Inches(3.53), Inches(4.33))
+        _fit_picture(s, picture, *(Inches(v) for v in look["pic"]))
     elif logo:
-        _fit_picture(s, logo, Inches(0.85), Inches(2.3), Inches(2.8), Inches(2.4))
+        _fit_picture(s, logo, *(Inches(v) for v in look["logo"]))
     course = str(ts.get("course") or "").strip()[:80] or "Course title"
     code = str(ts.get("code") or "").strip()[:30]
     t = s.shapes.title
-    t.left, t.top, t.width, t.height = Inches(4.55), Inches(0.7), Inches(8.07), Inches(4.03)
+    t.left, t.top, t.width, t.height = (Inches(v) for v in look["title"])
+    align = PP_ALIGN.CENTER if look["align"] == "center" else PP_ALIGN.LEFT
     tf = t.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.BOTTOM
@@ -2283,30 +2313,41 @@ def _tutor_title_slide(prs, deck, tpl):
     size = Pt(54 if len(course) <= 16 else 44 if len(course) <= 26 else 36)
     for i, text in enumerate([course] + ([f"({code})"] if code else [])):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.alignment = PP_ALIGN.LEFT
+        p.alignment = align
         r = p.add_run()
         r.text = text
         r.font.size = size
-    rule = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(5.94), Inches(4.92), Inches(12.1), Inches(4.92))
-    rule.line.width = Pt(0.75)
-    rule.line.color.theme_color = MSO_THEME_COLOR.TEXT_1
+        if look["light_title"]:
+            r.font.color.rgb = WHITE
+    if look["rule"]:
+        x1, ry, x2 = look["rule"]
+        rule = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x1), Inches(ry), Inches(x2), Inches(ry))
+        rule.line.width = Pt(0.75)
+        rule.line.color.theme_color = MSO_THEME_COLOR.TEXT_1
     sub = next((ph for ph in s.placeholders if ph.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
     subtitle = str(ts.get("subtitle") or "").strip()[:120]
     if sub is not None:
         if subtitle:
-            sub.left, sub.top, sub.width, sub.height = Inches(4.69), Inches(5.11), Inches(7.95), Inches(0.8)
+            sub.left, sub.top, sub.width, sub.height = (Inches(v) for v in look["sub"])
             sub.text_frame.text = subtitle
-            sub.text_frame.paragraphs[0].alignment = PP_ALIGN.LEFT
+            sub.text_frame.paragraphs[0].alignment = align
+            if look["light_details"]:
+                for rr in sub.text_frame.paragraphs[0].runs:
+                    rr.font.color.rgb = WHITE
         else:
             _remove(sub)
     meta = "  ·  ".join(x for x in (str(ts.get("lecturer") or "").strip()[:80], str(ts.get("date") or "").strip()[:40]) if x)
     if meta:
-        box = s.shapes.add_textbox(Inches(4.69), Inches(6.0), Inches(7.95), Inches(0.5))
+        box = s.shapes.add_textbox(*(Inches(v) for v in look["meta"]))
+        box.text_frame.paragraphs[0].alignment = align
         r = box.text_frame.paragraphs[0].add_run()
         r.text = meta
         r.font.size = Pt(16)
-        r.font.color.theme_color = MSO_THEME_COLOR.TEXT_1
-        r.font.color.brightness = 0.25
+        if look["light_details"]:
+            r.font.color.rgb = RGBColor(0xE6, 0xE6, 0xE6)
+        else:
+            r.font.color.theme_color = MSO_THEME_COLOR.TEXT_1
+            r.font.color.brightness = 0.25
 
 
 def _set_title(slide, text, group):
@@ -2327,12 +2368,26 @@ def _set_title(slide, text, group):
     # No colour here: titles inherit each template's own title style.
 
 
+def _look_accent(slide, tpl):
+    """A classic lecture look's one accent on its content slides."""
+    look = TUTOR_LOOKS.get(tpl.get("look") or "brackets")
+    if tpl.get("group") != "tutor" or tpl.get("style") == "modern" or not look or not look["accent"]:
+        return
+    which, (x, y, w, h) = look["accent"]
+    bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(x), Inches(y), Inches(w), Inches(h))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = RGBColor.from_string((tpl.get("panel") or tpl.get("band") or "262626") if which == "panel" else (tpl.get("frame") or "FF6D17"))
+    bar.line.fill.background()
+    bar.shadow.inherit = False
+
+
 def _content_slide(prs, deck, sd, number, logo, tpl):
     group = tpl["group"]
     geo = _geometry(tpl)
     kind = sd.get("kind") or "content"
     lay = _layout(prs, "Two Content" if kind == "columns" else "Title and Content")
     s = prs.slides.add_slide(lay)
+    _look_accent(s, tpl)
     title = str(sd.get("title") or "").strip()[:140]
     _set_title(s, title, group)
     if logo and deck.get("logo_on_all_slides"):
