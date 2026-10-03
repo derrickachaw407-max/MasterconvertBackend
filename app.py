@@ -1045,8 +1045,81 @@ def enrich_sources_for_apa(sources):
     return enriched
 
 
+# Citation styles for Evidence-Based Writing. Every style is built from the
+# same real metadata (authors, year, title, venue, link) as APA — nothing is
+# invented — and keeps the same a/b suffixes when one author has two works
+# in the same year, so the in-text keys and the references always agree.
+CITE_STYLES = {
+    "apa": {"name": "APA 7", "heading": "References", "example": "(Smith, 2023)"},
+    "harvard": {"name": "Harvard", "heading": "Reference list", "example": "(Smith 2023)"},
+    "mla": {"name": "MLA 9", "heading": "Works Cited", "example": "(Smith)"},
+    "chicago": {"name": "Chicago (author-date)", "heading": "References", "example": "(Smith 2023)"},
+}
+
+
+def enrich_sources(sources, style="apa"):
+    enriched = enrich_sources_for_apa(sources)
+    if style not in CITE_STYLES or style == "apa":
+        return enriched
+    for e in enriched:
+        names = [a.split() for a in (e.get("authors") or []) if a.split()]
+        surn = [n[-1] for n in names]
+        org = e["author_intext"]
+        yd = e["year_display"]
+        title = e["title"].rstrip(".")
+        venue = e.get("venue")
+        if not surn:
+            au = org
+        elif len(surn) == 1:
+            au = surn[0]
+        elif len(surn) == 2:
+            au = f"{surn[0]} and {surn[1]}"
+        elif style == "chicago" and len(surn) == 3:
+            au = f"{surn[0]}, {surn[1]}, and {surn[2]}"
+        elif style == "harvard" and len(surn) == 3:
+            au = f"{surn[0]}, {surn[1]} and {surn[2]}"
+        else:
+            au = f"{surn[0]} et al."
+        e["citation_key"] = f"({au})" if style == "mla" else f"({au} {yd})"
+        inverted = (f"{names[0][-1]}, {' '.join(names[0][:-1])}".strip().rstrip(",")) if names else org
+        if style == "harvard":
+            if names:
+                parts = [(f"{n[-1]}, " + " ".join(p[0] + "." for p in n[:-1])).strip().rstrip(",") for n in names]
+                auth = parts[0] + " et al." if len(parts) > 3 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+            else:
+                auth = org
+            e["ref_text"] = f"{auth} ({yd}) " + (f"\u2018{title}\u2019, {venue}." if venue else f"{title}.")
+        elif style == "chicago":
+            full = [" ".join(n) for n in names]
+            if not names:
+                auth = org
+            elif len(full) == 1:
+                auth = inverted
+            elif len(full) > 10:
+                auth = inverted + ", " + ", ".join(full[1:7]) + ", et al."
+            elif len(full) == 2:
+                auth = f"{inverted}, and {full[1]}"
+            else:
+                auth = inverted + ", " + ", ".join(full[1:-1]) + ", and " + full[-1]
+            e["ref_text"] = f"{auth}. {yd}. \u201c{title}.\u201d" + (f" {venue}." if venue else "")
+        else:   # MLA 9
+            year = str(e.get("year") or "n.d.")
+            if names:
+                auth = inverted if len(names) == 1 else f"{inverted}, and {' '.join(names[1])}" if len(names) == 2 else f"{inverted}, et al"
+                e["ref_text"] = f"{auth}. \u201c{title}.\u201d " + (f"{venue}, " if venue else "") + f"{year}."
+            else:
+                e["ref_text"] = f"\u201c{title}.\u201d {venue or org}, {year}."
+    if style == "mla":     # two works by one author: MLA tells them apart by a short title
+        counts = Counter(e["citation_key"] for e in enriched)
+        for e in enriched:
+            if counts[e["citation_key"]] > 1:
+                short = " ".join(e["title"].split()[:3]).rstrip(".,:;")
+                e["citation_key"] = e["citation_key"][:-1] + f", \u201c{short}\u201d)"
+    return enriched
+
+
 def build_sources_block(sources):
-    """Source list for the writing prompt, keyed by the exact APA citation
+    """Source list for the writing prompt, keyed by the exact citation (in the chosen style)
     the model must copy verbatim. Sources with an abstract (from Semantic
     Scholar) include a short excerpt, so the model can cite what the paper
     actually found instead of guessing from the title alone."""
@@ -2945,6 +3018,72 @@ SUMMARIZE_SYSTEM_PROMPT = (
 )
 
 
+
+# Smart Summarize for a student's or a tutor's presentation: the AI writes only
+# the content (and the tutor's objectives and discussion questions, and any
+# references that appear IN the material); the server then lays the deck out in
+# a fixed order, so the structure is guaranteed rather than hoped for.
+SUMMARY_STRUCTURE = {
+    "student": "",
+    "tutor": (
+        '\n  "objectives": 3 to 5 learning objectives for this session, each beginning with a verb '
+        '("Explain…", "Identify…", "Compare…"), drawn only from the material\n'
+        '  "discussion": 2 or 3 short discussion questions about the material, for the end of the session\n'),
+}
+
+
+def _summary_structure_prompt(audience):
+    return (SUMMARIZE_SYSTEM_PROMPT + "\n\nTHIS TIME, RETURN ONE JSON OBJECT INSTEAD OF A BARE ARRAY — nothing before or after it, "
+            "starting with { and ending with } — with these keys:\n"
+            '  "title": the presentation\'s title, taken from the material (its title or main topic), at most 12 words\n'
+            '  "slides": the slide array exactly as described above, where the FIRST slide is an introduction / overview '
+            'of the topic (its header begins "Introduction" or "Overview"), then the content in the order the material '
+            'presents it. Do NOT include a cover, outline, references, objectives, discussion or thank-you slide — those '
+            'are added separately — and no slide has is_cta true.\n'
+            '  "references": every reference or citation that appears in the material, copied exactly as written there. '
+            "Never invent, complete or add a reference; if the material cites nothing, return [].\n"
+            + SUMMARY_STRUCTURE[audience])
+
+
+def _json_object(raw_text):
+    t = str(raw_text or "")
+    a, b = t.find("{"), t.rfind("}")
+    if a < 0 or b <= a:
+        raise ConversionError("The summary came back in an unexpected format — please try again.")
+    try:
+        return json.loads(t[a:b + 1])
+    except ValueError:
+        raise ConversionError("The summary came back in an unexpected format — please try again.")
+
+
+def _structure_summary(audience, obj, slides, presenters):
+    """Lays the deck out in the fixed order for a student or a tutor."""
+    clean = lambda xs, n, cap=300: [str(x).strip()[:cap] for x in (xs or []) if str(x).strip()][:n]
+    title = str(obj.get("title") or (slides[0]["header"] if slides else "") or "Presentation").strip()[:120]
+    refs = clean(obj.get("references"), 30)
+    for s in slides:
+        s["is_cta"] = False
+    plain = lambda header, items, icon: [{"header": header, "bullets": items[i:i + 6], "icon": icon, "chart": None, "is_cta": False}
+                                         for i in range(0, len(items), 6)]
+    outline = [re.sub(r"\*\*", "", s["header"]) for s in slides]
+    out = [{"kind": "cover", "header": title, "bullets": [], "icon": "", "chart": None, "is_cta": False}]
+    if audience == "student":
+        out += plain("Presented by", presenters or ["Name \u2014 Index number"], "\U0001F465")
+        out += plain("Presentation Outline", outline, "\U0001F5C2\ufe0f")
+        out += slides
+        out += plain("References", refs or [f"Source material: {title}"], "\U0001F4DA")
+    else:
+        objectives = clean(obj.get("objectives"), 6, 160) or [f"Describe the key ideas in: {h}" for h in outline[:4]]
+        questions = clean(obj.get("discussion"), 4, 200) or ["What stood out to you most in this session, and why?"]
+        out += plain("References & Recommended Books", refs or [f"Main source: {title}"], "\U0001F4DA")
+        out += plain("Learning Objectives", objectives, "\U0001F3AF")
+        out += plain("Presentation Outline", outline, "\U0001F5C2\ufe0f")
+        out += slides
+        out += plain("Discussion", questions, "\U0001F4AC")
+        out.append({"kind": "thanks", "header": "Thank you", "bullets": [], "icon": "", "chart": None, "is_cta": False})
+    return title, out
+
+
 def _parse_summary_json(raw_text):
     """Parses and validates the summarize AI's slide-plan JSON, the same
     defensive-parsing approach as _parse_quiz_json: an AI's raw JSON output
@@ -3166,14 +3305,22 @@ def summarize_endpoint():
     # reasonably warrant many slides even without an explicit request.
     max_tokens = min(8000, max(4000, (slide_count or 12) * 300 + 500))
 
+    # For a student's or a tutor's presentation, the deck follows a fixed order
+    # (see _structure_summary); without an audience, the original behaviour.
+    audience = data.get("audience") if data.get("audience") in ("student", "tutor") else None
+    presenters = [str(x).strip()[:80] for x in (data.get("presenters") or []) if str(x).strip()][:10] if audience == "student" else []
     try:
         result = call_claude(
-            system_prompt=SUMMARIZE_SYSTEM_PROMPT,
+            system_prompt=_summary_structure_prompt(audience) if audience else SUMMARIZE_SYSTEM_PROMPT,
             user_message=user_message,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens + (900 if audience else 0),
         )
-        slides = _parse_summary_json(result)
-        return jsonify({"slides": slides})
+        if not audience:
+            return jsonify({"slides": _parse_summary_json(result)})
+        obj = _json_object(result)
+        slides = _parse_summary_json(json.dumps(obj.get("slides") or []))
+        title, deck = _structure_summary(audience, obj, slides, presenters)
+        return jsonify({"slides": deck, "title": title, "audience": audience})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
@@ -3580,6 +3727,28 @@ def write_endpoint():
 
     outline = parse_outline(topic)
 
+    # Citation style and how recent the sources must be (both optional).
+    style = str(data.get("style") or "apa").lower()
+    style = style if style in CITE_STYLES else "apa"
+    CS = CITE_STYLES[style]
+    try:
+        recent_years = int(data.get("recent_years") or 0)
+    except (TypeError, ValueError):
+        recent_years = 0
+    recent_years = recent_years if recent_years in (5, 10) else 0
+    note = {"text": ""}
+
+    def _prep(srcs):
+        if recent_years and srcs:
+            cutoff = datetime.now(timezone.utc).year - recent_years
+            fresh = [s for s in srcs if (s.get("year") or 0) >= cutoff]
+            if len(fresh) >= 3:
+                srcs = fresh
+            else:
+                note["text"] = (f"Only {len(fresh)} source{'' if len(fresh) == 1 else 's'} from the last {recent_years} years came up, "
+                                "so older ones were kept to support the writing properly.")
+        return enrich_sources(srcs, style)
+
     # Continuation of a truncated previous answer — a distinct, simpler path:
     # no clarify/thinking/outline logic, just pick the citation-bearing
     # writing back up exactly where it stopped.
@@ -3589,14 +3758,14 @@ def write_endpoint():
             return jsonify({"error": "Nothing to continue"}), 400
         try:
             cont_sources, cont_diag = search_for_sources(topic)
-            cont_sources = enrich_sources_for_apa(cont_sources)
+            cont_sources = _prep(cont_sources)
             if cont_sources:
                 cont_sources_block = build_sources_block(cont_sources)
                 cont_system_prompt = (
                     f"{ROLE_DESCRIPTION} You are continuing your own previous response, which "
                     "was cut off partway through. Below is a list of real sources for this "
-                    "topic, each labeled with its exact APA in-text citation, e.g. "
-                    "(Smith, 2023), listed most-recent-first. Continue writing directly from "
+                    f"topic, each labeled with its exact {CS['name']} in-text citation, e.g. "
+                    f"{CS['example']}, listed most-recent-first. Continue writing directly from "
                     "where the previous text left off — do not repeat, restate, or summarize "
                     "anything already written. Keep citing EVERY sentence that makes a claim "
                     "using the EXACT citation key next to its supporting source, copied "
@@ -3629,7 +3798,7 @@ def write_endpoint():
             return jsonify({
                 "type": "result",
                 "text": cont_text,
-                "references": build_references_list(cont_sources),
+                "references": build_references_list(cont_sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
                 "truncated": cont_result["stop_reason"] == "max_tokens",
             })
         except ConversionError as e:
@@ -3646,7 +3815,7 @@ def write_endpoint():
             # of real sources every section draws from, instead of one search per
             # section (slower and more likely to fragment/duplicate sources).
             sources, sources_diag = search_for_sources(combined_headings, max_results=8)
-            sources = enrich_sources_for_apa(sources)
+            sources = _prep(sources)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -3655,7 +3824,7 @@ def write_endpoint():
                     f"\"{combined_headings}\". Write ONLY the subsection given below as the "
                     "user message — 100-160 words, formal academic prose. Below is a list of "
                     "real sources relevant to the overall piece, each labeled with its exact "
-                    "APA in-text citation, e.g. (Smith, 2023), listed most-recent-first. Write "
+                    f"{CS['name']} in-text citation, e.g. {CS['example']}, listed most-recent-first. Write "
                     "the way you actually would — ground every factual or evidentiary claim in "
                     "one of these sources, using the EXACT key next to it, copied exactly — "
                     "never alter an author name or year, and never invent a citation not in "
@@ -3694,7 +3863,7 @@ def write_endpoint():
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
                     for s in outline
                 ],
-                "references": build_references_list(sources),
+                "references": build_references_list(sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             })
 
         # Chat mode (history present) and simple mode (first message, no history
@@ -3721,7 +3890,7 @@ def write_endpoint():
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
             raw_sources, search_diag = _topic_search(search_query)
-            sources = enrich_sources_for_apa(raw_sources)
+            sources = _prep(raw_sources)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -3729,7 +3898,7 @@ def write_endpoint():
                     f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} You're in an ongoing "
                     "conversation with the student — below is the conversation so far, then "
                     "a list of real sources found for their latest message, each labeled "
-                    "with its exact APA in-text citation, e.g. (Smith, 2023), listed "
+                    f"with its exact {CS['name']} in-text citation, e.g. {CS['example']}, listed "
                     "most-recent-first. When your response is generating written academic "
                     "content (a draft, an explanation, a literature summary, an argument), "
                     "write the way you actually would — ground every factual or evidentiary "
@@ -3761,14 +3930,14 @@ def write_endpoint():
                 )
         else:
             raw_sources2, search_diag2 = _topic_search(topic)
-            sources = enrich_sources_for_apa(raw_sources2)
+            sources = _prep(raw_sources2)
 
             if sources:
                 sources_block = build_sources_block(sources)
                 system_prompt = (
                     f"{role_with_memory} {THINKING_INSTRUCTION} {MEMORY_INSTRUCTION} {CLARIFY_INSTRUCTION} Below is a list of real "
-                    "sources found for this exact topic, each labeled with its exact APA "
-                    "in-text citation, e.g. (Smith, 2023), listed most-recent-first. When "
+                    f"sources found for this exact topic, each labeled with its exact {CS['name']} "
+                    f"in-text citation, e.g. {CS['example']}, listed most-recent-first. When "
                     "your response is generating written academic content (a draft, an "
                     "explanation, a literature summary, an argument), write the way you "
                     "actually would — ground every factual or evidentiary claim in one of "
@@ -3827,7 +3996,7 @@ def write_endpoint():
             "type": "result",
             "text": text,
             "thinking": thinking,
-            "references": build_references_list(sources),
+            "references": build_references_list(sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             "truncated": truncated,
         })
     except ConversionError as e:
@@ -3848,7 +4017,7 @@ def write_export_docx_endpoint():
     work_dir = tempfile.mkdtemp(prefix=f"mc_docx_{uuid.uuid4().hex[:8]}_")
     try:
         result_path = academic_essay_to_docx(
-            {"title": title, "text": text, "sections": sections, "references": references},
+            {"title": title, "text": text, "sections": sections, "references": references, "references_title": str(data.get("references_title") or "References")[:40]},
             work_dir,
         )
         return send_file(

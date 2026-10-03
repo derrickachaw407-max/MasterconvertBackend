@@ -4985,6 +4985,33 @@ def summary_slides_to_pptx(slides, out_dir, style="visual", filename="Summary.pp
 
     for slide_data in slides:
         slide = prs.slides.add_slide(blank_layout)
+        if slide_data.get("kind") in ("cover", "thanks"):
+            # A real cover (and closing "Thank you"): a large centred title with
+            # its lines beneath — dark in the visual style, white in the plain one.
+            dark = bool(style_conf["show_icon"])
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = PptxRGBColor(0x14, 0x2B, 0x4A) if dark else PptxRGBColor(0xFF, 0xFF, 0xFF)
+            ink = PptxRGBColor(0xFF, 0xFF, 0xFF) if dark else HEADER_COLOR
+            head = re.sub(r"\*\*", "", str(slide_data.get("header") or "")).strip()
+            lines = [re.sub(r"\*\*", "", str(b)).strip() for b in (slide_data.get("bullets") or []) if str(b).strip()][:4]
+            box = slide.shapes.add_textbox(margin_x, PptxInches(2.2 if lines else 2.8), content_width, PptxInches(3.2))
+            tf = box.text_frame
+            tf.word_wrap = True
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            r = p.add_run()
+            r.text = head
+            r.font.size = Pt(48 if len(head) <= 34 else 38 if len(head) <= 60 else 30)
+            r.font.color.rgb = ink
+            for line in lines:
+                q = tf.add_paragraph()
+                q.alignment = PP_ALIGN.CENTER
+                q.space_before = Pt(12)
+                rr = q.add_run()
+                rr.text = line
+                rr.font.size = Pt(22)
+                rr.font.color.rgb = PptxRGBColor(0xC9, 0xD6, 0xEA) if dark else BODY_COLOR
+            continue
         is_cta = bool(slide_data.get("is_cta")) and style_conf["cta_accent"]
         if is_cta:
             slide.background.fill.solid()
@@ -5522,7 +5549,7 @@ def academic_essay_to_docx(payload, out_dir):
         ref_heading = doc.add_paragraph()
         ref_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
         ref_heading.paragraph_format.line_spacing = 2.0
-        _set_run_font(ref_heading.add_run("References"), bold=True)
+        _set_run_font(ref_heading.add_run(str(payload.get("references_title") or "References")[:40]), bold=True)   # e.g. "Works Cited" for MLA
 
         for ref in references:
             p = doc.add_paragraph()

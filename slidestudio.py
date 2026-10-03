@@ -1775,6 +1775,39 @@ TEMPLATES = {
     "tutor-fresh-photo": {"group": "tutor", "style": "modern", "name": "Fresh Photo", "cover": "photo",
                           "ink": "14532D", "accent": "22C55E", "emph": "15803D", "soft": "BBF7D0",
                           "bg": "FBF8F2", "text": "1F2937", "muted": "6B7280", "chrome": "topbar"},
+    # ---- 30 more: 17 for students (9 classic, 8 modern) and 13 for tutors
+    # (9 modern, 4 classic lecture). All use the large-picture layout, so a
+    # picture beside the points gets well over half the slide.
+    "student-ocean": {"group": "student", "name": "Ocean", "media": "large", "theme": {"dk2": "0B3954", "lt2": "D6EAF5", "accent1": "087E8B", "accent2": "FFB703"}},
+    "student-sunset": {"group": "student", "name": "Sunset", "media": "large", "theme": {"dk2": "3D1308", "lt2": "FDE4D8", "accent1": "D9480F", "accent2": "FFBA08"}},
+    "student-lavender": {"group": "student", "name": "Lavender", "media": "large", "theme": {"dk2": "2E1A47", "lt2": "EDE4F7", "accent1": "7B4FB8", "accent2": "F9C74F"}},
+    "student-forest": {"group": "student", "name": "Forest", "media": "large", "theme": {"dk2": "1B3A2B", "lt2": "DDEFE3", "accent1": "2D6A4F", "accent2": "E9C46A"}},
+    "student-golden": {"group": "student", "name": "Golden", "media": "large", "theme": {"dk2": "3B2F0B", "lt2": "FBF1D3", "accent1": "A16207", "accent2": "2A9D8F"}},
+    "student-berry": {"group": "student", "name": "Berry", "media": "large", "theme": {"dk2": "3B0D2C", "lt2": "F8DDEA", "accent1": "9D174D", "accent2": "FCD34D"}},
+    "student-sky": {"group": "student", "name": "Sky", "media": "large", "theme": {"dk2": "0C2D57", "lt2": "E0F0FF", "accent1": "2563EB", "accent2": "56CCF2"}},
+    "student-charcoal": {"group": "student", "name": "Charcoal", "media": "large", "theme": {"dk2": "1F2328", "lt2": "E6E8EB", "accent1": "495057", "accent2": "F4A261"}},
+    "student-rose": {"group": "student", "name": "Rose", "media": "large", "theme": {"dk2": "4A1C2E", "lt2": "FCE7EE", "accent1": "BE185D", "accent2": "FFD166"}},
+    "student-modern-neon-mint": {"group": "student", "style": "modern", "name": "Neon Mint", "cover": "gradient", "chrome": "card", "media": "large", "ink": "0F3D3E", "ink2": "14706F", "accent": "34D399", "emph": "047857", "soft": "A7F3D0", "bg": "F0FDF9", "text": "1F2937", "muted": "6B7280"},
+    "student-modern-violet-pop": {"group": "student", "style": "modern", "name": "Violet Pop", "cover": "block", "chrome": "block", "media": "large", "ink": "2E1065", "accent": "A855F7", "emph": "7E22CE", "soft": "E9D5FF", "bg": "FFFFFF", "text": "1F2937", "muted": "6B7280"},
+    "student-modern-coral-wave": {"group": "student", "style": "modern", "name": "Coral Wave", "cover": "arc", "chrome": "topbar", "media": "large", "ink": "7C2D12", "accent": "FB7185", "emph": "BE123C", "soft": "FECDD3", "bg": "FFF7F5", "text": "292524", "muted": "78716C"},
+    "student-modern-midnight-study": {"group": "student", "style": "modern", "name": "Midnight Study", "cover": "arc", "chrome": "rail", "media": "large", "ink": "0F172A", "accent": "6366F1", "emph": "4338CA", "soft": "C7D2FE", "bg": "FFFFFF", "text": "1E293B", "muted": "64748B"},
+    "student-modern-sunrise": {"group": "student", "style": "modern", "name": "Sunrise", "cover": "gradient", "chrome": "card", "media": "large", "ink": "C2410C", "ink2": "D97706", "accent": "F59E0B", "emph": "B45309", "soft": "FED7AA", "bg": "FFFBF5", "text": "292524", "muted": "78716C"},
+    "student-modern-aqua-photo": {"group": "student", "style": "modern", "name": "Aqua Photo", "cover": "photo", "chrome": "topbar", "media": "large", "ink": "0E7490", "accent": "22D3EE", "emph": "0E7490", "soft": "A5F3FC", "bg": "F5FEFF", "text": "1F2937", "muted": "64748B"},
+    "student-modern-mono-bold": {"group": "student", "style": "modern", "name": "Mono Bold", "cover": "block", "chrome": "block", "media": "large", "ink": "18181B", "accent": "FACC15", "emph": "A16207", "soft": "FEF08A", "bg": "FFFFFF", "text": "27272A", "muted": "71717A"},
+    "student-modern-rosewood": {"group": "student", "style": "modern", "name": "Rosewood", "cover": "gradient", "chrome": "rail", "media": "large", "ink": "4C0519", "ink2": "881337", "accent": "F472B6", "emph": "BE185D", "soft": "FBCFE8", "bg": "FFF5F8", "text": "1F2937", "muted": "6B7280"},
+    "tutor-modern-royal-purple": {"group": "tutor", "style": "modern", "name": "Royal Purple", "cover": "arc", "chrome": "rail", "media": "large", "ink": "3B0764", "accent": "A78BFA", "emph": "6D28D9", "soft": "DDD6FE", "bg": "FFFFFF", "text": "1F2937", "muted": "6B7280"},
+    "tutor-modern-sunset-coral": {"group": "tutor", "style": "modern", "name": "Sunset Coral", "cover": "gradient", "chrome": "card", "media": "large", "ink": "9A3412", "ink2": "EA580C", "accent": "FDBA74", "emph": "C2410C", "soft": "FFEDD5", "bg": "FFF8F3", "text": "292524", "muted": "78716C"},
+    "tutor-modern-ocean-teal": {"group": "tutor", "style": "modern", "name": "Ocean Teal", "cover": "photo", "chrome": "topbar", "media": "large", "ink": "134E4A", "accent": "2DD4BF", "emph": "0F766E", "soft": "99F6E4", "bg": "F7FBFA", "text": "1F2937", "muted": "6B7280"},
+    "tutor-modern-graphite-gold": {"group": "tutor", "style": "modern", "name": "Graphite Gold", "cover": "block", "chrome": "block", "media": "large", "ink": "1C1917", "accent": "EAB308", "emph": "A16207", "soft": "FEF3C7", "bg": "FFFFFF", "text": "292524", "muted": "78716C"},
+    "tutor-modern-forest-sage": {"group": "tutor", "style": "modern", "name": "Forest Sage", "cover": "gradient", "chrome": "rail", "media": "large", "ink": "14532D", "ink2": "166534", "accent": "86EFAC", "emph": "15803D", "soft": "DCFCE7", "bg": "F7FBF7", "text": "1F2937", "muted": "6B7280"},
+    "tutor-modern-midnight-indigo": {"group": "tutor", "style": "modern", "name": "Midnight Indigo", "cover": "arc", "chrome": "card", "media": "large", "ink": "1E1B4B", "accent": "818CF8", "emph": "4338CA", "soft": "E0E7FF", "bg": "F5F7FF", "text": "1E293B", "muted": "64748B"},
+    "tutor-modern-terracotta": {"group": "tutor", "style": "modern", "name": "Terracotta", "cover": "block", "chrome": "topbar", "media": "large", "ink": "7C2D12", "accent": "F97316", "emph": "C2410C", "soft": "FFEDD5", "bg": "FFFAF5", "text": "292524", "muted": "78716C"},
+    "tutor-modern-sky-minimal": {"group": "tutor", "style": "modern", "name": "Sky Minimal", "cover": "gradient", "chrome": "block", "media": "large", "ink": "075985", "ink2": "0284C7", "accent": "7DD3FC", "emph": "0369A1", "soft": "E0F2FE", "bg": "FFFFFF", "text": "1E293B", "muted": "64748B"},
+    "tutor-modern-berry-plum": {"group": "tutor", "style": "modern", "name": "Berry Plum", "cover": "photo", "chrome": "rail", "media": "large", "ink": "581C87", "accent": "E879F9", "emph": "A21CAF", "soft": "F5D0FE", "bg": "FDF8FF", "text": "1F2937", "muted": "6B7280"},
+    "tutor-lecture-maroon": {"group": "tutor", "name": "Lecture Maroon", "media": "large", "theme": {"accent1": "9B2C2C"}, "band": "2B0F12", "panel": "4A1C20", "frame": "E0A04B"},
+    "tutor-lecture-forest": {"group": "tutor", "name": "Lecture Forest", "media": "large", "theme": {"accent1": "2F855A"}, "band": "13261C", "panel": "1F3B2C", "frame": "68D391"},
+    "tutor-lecture-purple": {"group": "tutor", "name": "Lecture Purple", "media": "large", "theme": {"accent1": "6B46C1"}, "band": "1E1433", "panel": "2F2150", "frame": "B794F4"},
+    "tutor-lecture-slate": {"group": "tutor", "name": "Lecture Slate", "media": "large", "theme": {"accent1": "4A5568"}, "band": "1A202C", "panel": "2D3748", "frame": "63B3ED"},
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
@@ -1785,6 +1818,20 @@ GEOMETRY = {
     "tutor": {"body": (1.2, 2.3, 11.0, 4.5), "right_text_w": 5.8, "right_media": (7.25, 2.4, 5.1, 4.35),
               "below_text_h": 1.6, "below_media": (1.2, 4.05, 11.0, 2.75), "full_media": (1.2, 2.35, 11.0, 4.45)},
 }
+
+# The large-picture layout (templates with "media": "large"): a picture beside
+# the points takes over half the slide; below or alone, nearly all of it.
+GEOMETRY_LARGE = {
+    "student": {"body": (0.89, 1.9, 11.89, 4.8), "right_text_w": 4.9, "right_media": (6.05, 1.75, 6.75, 5.2),
+                "below_text_h": 1.3, "below_media": (0.89, 3.3, 11.89, 3.65), "full_media": (0.6, 1.7, 12.13, 5.35)},
+    "tutor": {"body": (1.2, 2.3, 11.0, 4.5), "right_text_w": 4.6, "right_media": (6.0, 2.2, 6.4, 4.6),
+              "below_text_h": 1.3, "below_media": (1.2, 3.65, 11.0, 3.15), "full_media": (1.0, 2.2, 11.35, 4.6)},
+}
+
+
+def _geometry(tpl):
+    return (GEOMETRY_LARGE if tpl.get("media") == "large" else GEOMETRY)[tpl["group"]]
+
 
 MAX_SLIDES = 60
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
@@ -2282,7 +2329,7 @@ def _set_title(slide, text, group):
 
 def _content_slide(prs, deck, sd, number, logo, tpl):
     group = tpl["group"]
-    geo = GEOMETRY[group]
+    geo = _geometry(tpl)
     kind = sd.get("kind") or "content"
     lay = _layout(prs, "Two Content" if kind == "columns" else "Title and Content")
     s = prs.slides.add_slide(lay)
@@ -2763,6 +2810,9 @@ def _m_geo(tpl):
         title = (0.9, 0.5, 11.5, 0.95)
         body = (0.9, 1.75, 11.5, 4.85)
     L, T, W, H = body
+    if tpl.get("media") == "large":     # pictures get well over half the slide
+        return {"title": title, "body": body, "right_text_w": W * 0.40, "right_media": (L + W * 0.42, T - 0.15, W * 0.58, H + 0.25),
+                "below_text_h": 1.25, "below_media": (L, T + 1.35, W, H - 1.3), "full_media": (L - 0.15, T - 0.15, W + 0.3, H + 0.3)}
     return {"title": title, "body": body, "right_text_w": W * 0.52, "right_media": (L + W * 0.55, T + 0.05, W * 0.45, H - 0.1),
             "below_text_h": 1.6, "below_media": (L, T + 1.75, W, H - 1.8), "full_media": (L, T, W, H)}
 
@@ -2794,6 +2844,12 @@ def _m_title(slide, tpl, title, box, room_for_logo=False):
 
 def _modern_title_slide(prs, deck, tpl):
     ts = deck.get("title_slide") or {}
+    if tpl.get("group") == "student":
+        # A student's cover keeps the student's own words: the topic as the big
+        # title, the presenter line beneath, institution lines small.
+        lines = [str(x).strip() for x in (ts.get("lines") or []) if str(x).strip()]
+        ts = {"course": ts.get("main") or "", "subtitle": ts.get("sub") or "", "code": "  \u00b7  ".join(lines[:3]),
+              "lecturer": ts.get("tag") or "", "picture": ts.get("picture")}
     s = prs.slides.add_slide(_layout(prs, "Blank"))
     course = str(ts.get("course") or "").strip()[:80] or " "
     subtitle = str(ts.get("subtitle") or "").strip()[:120]
