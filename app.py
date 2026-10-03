@@ -1993,6 +1993,65 @@ def paystack_sync():
     return jsonify({"applied": applied, "pending": int(pending or 0), "user": user_row_to_dict(row)})
 
 
+# ---- Paystack: the server confirms payments itself ----
+# A payment used to be confirmed only when the student's browser came back
+# from Paystack (or by Paystack's webhook, if set up). If that return got lost,
+# a payment could be taken and never credited. So the server also checks
+# unfinished payments with Paystack every few minutes and credits any that
+# were paid (exactly once — _paystack_apply guards that). Payments Paystack
+# reports as abandoned or failed are marked so, once they're 6 hours old.
+def _paystack_reconcile_once():
+    if not _paystack_on():
+        return 0
+    credited = 0
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(735001) AS ok")      # one server copy at a time
+            if not (cur.fetchone() or {}).get("ok"):
+                return 0
+            try:
+                cur.execute("SELECT reference, created_at FROM paystack_payments WHERE status = 'pending' "
+                            "AND created_at > now() - interval '3 days' AND created_at < now() - interval '90 seconds' "
+                            "ORDER BY created_at DESC LIMIT 20")
+                rows = cur.fetchall()
+                for r in rows:
+                    try:
+                        data = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
+                    except Exception as e:
+                        logger.warning(f"Paystack check couldn't reach {r['reference']}: {e}")
+                        continue
+                    st = data.get("status")
+                    if st == "success" and data.get("reference") == r["reference"]:
+                        _, outcome = _paystack_apply(r["reference"], data.get("amount"), data.get("currency"))
+                        logger.info(f"Paystack check: {r['reference']} was paid -> {outcome}")
+                        if outcome == "applied":
+                            credited += 1
+                    elif st in ("abandoned", "failed", "reversed") and r["created_at"] < datetime.now(timezone.utc) - timedelta(hours=6):
+                        cur.execute("UPDATE paystack_payments SET status = %s WHERE reference = %s AND status = 'pending'",
+                                    ("abandoned" if st == "abandoned" else "failed", r["reference"]))
+                        conn.commit()
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(735001)")
+    finally:
+        conn.close()
+    return credited
+
+
+def _paystack_reconcile_loop():
+    time.sleep(45)
+    while True:
+        try:
+            _paystack_reconcile_once()
+        except Exception as e:
+            logger.warning(f"Paystack check pass failed: {e}")
+        time.sleep(300)
+
+
+if _paystack_on() and "fake" not in os.environ.get("DATABASE_URL", "fake"):
+    _threading.Thread(target=_paystack_reconcile_loop, daemon=True, name="paystack-check").start()
+
+
 # ------------------------------------------------------------ Remy's memory
 # What Remy remembers about a person is theirs to see and control: list it,
 # add a note, edit or delete one, clear everything, or switch memory off
