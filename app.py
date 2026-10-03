@@ -2119,17 +2119,22 @@ def _paystack_reconcile_once():
 
 def _paystack_explain_recent():
     """Once at start-up: log why recent payments didn't go through — the
-    method tried and Paystack's own reason, never any personal details."""
+    method tried and Paystack's own reason, never any personal details.
+    Takes the same lock as the payment check, so only one server worker
+    does it (they used to log every reason twice)."""
     if not _paystack_on():
         return
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(735002) AS ok")
+            if not (cur.fetchone() or {}).get("ok"):
+                return
             cur.execute("SELECT reference, plan FROM paystack_payments WHERE status IN ('failed', 'abandoned', 'pending') "
                         "AND created_at > now() - interval '3 days' ORDER BY created_at DESC LIMIT 12")
             rows = cur.fetchall()
     finally:
-        conn.close()
+        conn.close()     # closing the connection releases the lock
     for r in rows:
         try:
             d = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
