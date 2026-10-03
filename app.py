@@ -1900,7 +1900,12 @@ def paystack_verify():
         return jsonify({"error": "Couldn't check the payment with Paystack — please try again in a moment."}), 502
     status = data.get("status")
     if status != "success" or data.get("reference") != reference:
-        return jsonify({"status": status or "unknown"})
+        # Paystack's own reason ("Declined", "Insufficient funds", …) and the
+        # method tried — shown to the student and logged (no personal details).
+        reason = str(data.get("gateway_response") or "")[:140]
+        if status in ("failed", "abandoned", "reversed"):
+            logger.warning(f"Paystack: {reference} {status} | channel: {data.get('channel') or '-'} | Paystack says: {reason or '-'}")
+        return jsonify({"status": status or "unknown", "reason": reason, "channel": data.get("channel")})
     _, outcome = _paystack_apply(reference, data.get("amount"), data.get("currency"))
     if outcome == "mismatch":
         return jsonify({"status": "mismatch", "error": "The amount paid didn't match the plan — contact support.docente@gmail.com and we'll sort it out."}), 409
@@ -2028,6 +2033,7 @@ def _paystack_reconcile_once():
                         if outcome == "applied":
                             credited += 1
                     elif st in ("abandoned", "failed", "reversed") and r["created_at"] < datetime.now(timezone.utc) - timedelta(hours=6):
+                        logger.warning(f"Paystack check: {r['reference']} {st} | channel: {data.get('channel') or '-'} | Paystack says: {data.get('gateway_response') or '-'}")
                         cur.execute("UPDATE paystack_payments SET status = %s WHERE reference = %s AND status = 'pending'",
                                     ("abandoned" if st == "abandoned" else "failed", r["reference"]))
                         conn.commit()
@@ -2038,8 +2044,34 @@ def _paystack_reconcile_once():
     return credited
 
 
+def _paystack_explain_recent():
+    """Once at start-up: log why recent payments didn't go through — the
+    method tried and Paystack's own reason, never any personal details."""
+    if not _paystack_on():
+        return
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT reference, plan FROM paystack_payments WHERE status IN ('failed', 'abandoned', 'pending') "
+                        "AND created_at > now() - interval '3 days' ORDER BY created_at DESC LIMIT 12")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        try:
+            d = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
+        except Exception as e:
+            logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> Paystack couldn't say: {e}")
+            continue
+        logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> {d.get('status')} | channel: {d.get('channel') or '-'} | Paystack says: {d.get('gateway_response') or '-'}")
+
+
 def _paystack_reconcile_loop():
     time.sleep(45)
+    try:
+        _paystack_explain_recent()
+    except Exception as e:
+        logger.warning(f"Paystack reason check failed: {e}")
     while True:
         try:
             _paystack_reconcile_once()
