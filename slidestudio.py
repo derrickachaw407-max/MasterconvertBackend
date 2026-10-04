@@ -1754,9 +1754,9 @@ TEMPLATES = {
                         "theme": {"dk2": "3A1321", "lt2": "F6DDE3", "accent1": "A3243F", "accent2": "F2B33D"}},
     "tutor-classic": {"group": "tutor", "name": "Lecture Orange", "theme": None,
                       "band": "262626", "panel": "3A4245", "frame": "FF6D17"},
-    "tutor-teal": {"group": "tutor", "look": "banner", "name": "Lecture Teal", "theme": {"accent1": "1C9C9C"},
+    "tutor-teal": {"group": "tutor", "look": "left", "name": "Lecture Teal", "theme": {"accent1": "1C9C9C"},
                    "band": "1E2B30", "panel": "22393F", "frame": "18A5A5"},
-    "tutor-navy": {"group": "tutor", "look": "split", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
+    "tutor-navy": {"group": "tutor", "look": "centered", "name": "Lecture Navy", "theme": {"accent1": "3F5DAB"},
                    "band": "1B2340", "panel": "25305A", "frame": "D9A21B"},
     # Four modern tutor templates, each taking its colour identity from a real
     # lecture deck (Posture Assessment; Electrophysical & Thermal Principles;
@@ -1804,10 +1804,10 @@ TEMPLATES = {
     "tutor-modern-terracotta": {"group": "tutor", "style": "modern", "name": "Terracotta", "cover": "block", "chrome": "topbar", "media": "large", "ink": "7C2D12", "accent": "F97316", "emph": "C2410C", "soft": "FFEDD5", "bg": "FFFAF5", "text": "292524", "muted": "78716C"},
     "tutor-modern-sky-minimal": {"group": "tutor", "style": "modern", "name": "Sky Minimal", "cover": "gradient", "chrome": "block", "media": "large", "ink": "075985", "ink2": "0284C7", "accent": "7DD3FC", "emph": "0369A1", "soft": "E0F2FE", "bg": "FFFFFF", "text": "1E293B", "muted": "64748B"},
     "tutor-modern-berry-plum": {"group": "tutor", "style": "modern", "name": "Berry Plum", "cover": "photo", "chrome": "rail", "media": "large", "ink": "581C87", "accent": "E879F9", "emph": "A21CAF", "soft": "F5D0FE", "bg": "FDF8FF", "text": "1F2937", "muted": "6B7280"},
-    "tutor-lecture-maroon": {"group": "tutor", "look": "centered", "name": "Lecture Maroon", "media": "large", "theme": {"accent1": "9B2C2C"}, "band": "2B0F12", "panel": "4A1C20", "frame": "E0A04B"},
-    "tutor-lecture-forest": {"group": "tutor", "look": "banner", "name": "Lecture Forest", "media": "large", "theme": {"accent1": "2F855A"}, "band": "13261C", "panel": "1F3B2C", "frame": "68D391"},
-    "tutor-lecture-purple": {"group": "tutor", "look": "split", "name": "Lecture Purple", "media": "large", "theme": {"accent1": "6B46C1"}, "band": "1E1433", "panel": "2F2150", "frame": "B794F4"},
-    "tutor-lecture-slate": {"group": "tutor", "look": "centered", "name": "Lecture Slate", "media": "large", "theme": {"accent1": "4A5568"}, "band": "1A202C", "panel": "2D3748", "frame": "63B3ED"},
+    "tutor-lecture-maroon": {"group": "tutor", "look": "brackets", "name": "Lecture Maroon", "media": "large", "theme": {"accent1": "9B2C2C"}, "band": "2B0F12", "panel": "4A1C20", "frame": "E0A04B"},
+    "tutor-lecture-forest": {"group": "tutor", "look": "left", "name": "Lecture Forest", "media": "large", "theme": {"accent1": "2F855A"}, "band": "13261C", "panel": "1F3B2C", "frame": "68D391"},
+    "tutor-lecture-purple": {"group": "tutor", "look": "centered", "name": "Lecture Purple", "media": "large", "theme": {"accent1": "6B46C1"}, "band": "1E1433", "panel": "2F2150", "frame": "B794F4"},
+    "tutor-lecture-slate": {"group": "tutor", "look": "left", "name": "Lecture Slate", "media": "large", "theme": {"accent1": "4A5568"}, "band": "1A202C", "panel": "2D3748", "frame": "63B3ED"},
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
@@ -2242,19 +2242,19 @@ def _student_title_slide(prs, deck):
 # Classic lecture covers in four styles ("look"), each with one accent carried
 # onto its content slides. The editor uses the very same numbers.
 TUTOR_LOOKS = {
-    "brackets": {"bars": [(0.08, 0.45, 2.97, 0.1), (0.08, 0.45, 0.1, 5.42), (1.52, 6.70, 2.95, 0.1), (4.37, 1.38, 0.1, 5.42)],
-                 "panel": None, "pic": (0.47, 1.3, 3.53, 4.33), "logo": (0.85, 2.3, 2.8, 2.4), "title": (4.55, 0.7, 8.07, 4.03),
-                 "rule": (5.94, 4.92, 12.1), "sub": (4.69, 5.11, 7.95, 0.8), "meta": (4.69, 6.0, 7.95, 0.5),
+    # The original: the picture held in corner brackets (now larger), title on the right.
+    "brackets": {"bars": [(0.08, 0.35, 3.6, 0.1), (0.08, 0.35, 0.1, 6.0), (1.75, 6.95, 3.4, 0.1), (5.05, 1.15, 0.1, 5.9)],
+                 "panel": None, "pic": (0.45, 1.05, 4.3, 5.15), "logo": None, "title": (5.4, 0.7, 7.3, 4.03),
+                 "rules": [(6.0, 4.92, 12.6)], "sub": (5.5, 5.11, 7.2, 0.8), "meta": (5.5, 6.0, 7.2, 0.5),
                  "align": "left", "light_title": False, "light_details": False, "accent": None},
-    "banner": {"bars": [(0.9, 3.72, 2.2, 0.1)], "panel": (0, 0, 13.333, 3.45), "pic": (8.75, 3.95, 3.85, 3.05), "logo": (9.2, 4.2, 3.0, 2.5),
-               "title": (0.9, 0.35, 11.5, 2.85), "rule": None, "sub": (0.9, 4.05, 7.5, 0.9), "meta": (0.9, 5.05, 7.5, 0.5),
-               "align": "left", "light_title": True, "light_details": False, "accent": ("frame", (0.55, 0.75, 0.12, 1.25))},
-    "split": {"bars": [(0.75, 4.85, 1.6, 0.1)], "panel": (0, 0, 6.0, 7.5), "pic": (6.55, 0.75, 6.1, 6.0), "logo": (7.6, 2.2, 4.0, 3.0),
-              "title": (0.75, 0.8, 4.85, 3.85), "rule": None, "sub": (0.75, 5.1, 4.85, 0.9), "meta": (0.75, 6.1, 4.85, 0.5),
-              "align": "left", "light_title": True, "light_details": True, "accent": ("panel", (0, 0, 0.32, 7.0))},
-    "centered": {"bars": [(3.17, 1.55, 7.0, 0.06), (3.17, 5.25, 7.0, 0.06)], "panel": None, "pic": (5.42, 5.5, 2.5, 1.7), "logo": (5.67, 0.3, 2.0, 1.0),
-                 "title": (1.0, 1.75, 11.33, 2.45), "rule": None, "sub": (1.0, 4.25, 11.33, 0.6), "meta": (1.0, 4.75, 11.33, 0.45),
-                 "align": "center", "light_title": False, "light_details": False, "accent": ("frame", (5.92, 0.42, 1.5, 0.06))},
+    # Title on the left over a fine rule; a large picture filling the right half.
+    "left": {"bars": [], "panel": None, "pic": (6.95, 0.6, 5.95, 6.3), "logo": None, "title": (0.8, 0.9, 5.8, 3.35),
+             "rules": [(0.85, 4.45, 6.4)], "sub": (0.8, 4.65, 5.8, 0.8), "meta": (0.8, 5.55, 5.8, 0.5),
+             "align": "left", "light_title": False, "light_details": False, "accent": None},
+    # Title centred between two fine rules; a wide picture below.
+    "centered": {"bars": [], "panel": None, "pic": (2.17, 3.55, 9.0, 3.65), "logo": None, "title": (1.0, 0.65, 11.33, 1.5),
+                 "rules": [(3.67, 0.55, 9.67), (3.67, 3.3, 9.67)], "sub": (1.0, 2.2, 11.33, 0.45), "meta": (1.0, 2.75, 11.33, 0.4),
+                 "align": "center", "light_title": False, "light_details": False, "accent": None},
 }
 
 
@@ -2294,11 +2294,11 @@ def _tutor_title_slide(prs, deck, tpl):
         bar.line.fill.background()
         bar.shadow.inherit = False
     picture = _image_bytes(ts.get("picture"))
-    logo = _image_bytes(deck.get("logo"))
+    logo = None   # only classic student templates carry a logo; here the picture is the star
     if picture:
         # Fitted whole, never cropped: a landscape photo in this portrait frame
         # would otherwise lose its sides.
-        _fit_picture(s, picture, *(Inches(v) for v in look["pic"]))
+        _fill_picture(s, picture, *(Inches(v) for v in look["pic"]))      # fills its frame, so the picture is big and clear
     elif logo:
         _fit_picture(s, logo, *(Inches(v) for v in look["logo"]))
     course = str(ts.get("course") or "").strip()[:80] or "Course title"
@@ -2319,8 +2319,7 @@ def _tutor_title_slide(prs, deck, tpl):
         r.font.size = size
         if look["light_title"]:
             r.font.color.rgb = WHITE
-    if look["rule"]:
-        x1, ry, x2 = look["rule"]
+    for x1, ry, x2 in look["rules"]:
         rule = s.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x1), Inches(ry), Inches(x2), Inches(ry))
         rule.line.width = Pt(0.75)
         rule.line.color.theme_color = MSO_THEME_COLOR.TEXT_1
@@ -2695,6 +2694,8 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
         raise StudioError(f"A deck can have up to {MAX_SLIDES} slides.")
     prs, key, tpl = _open_template(deck.get("template") or "student")
     logo = _image_bytes(deck.get("logo"))
+    if TEMPLATES.get(deck.get("template") or "", {}).get("group") != "student" or TEMPLATES.get(deck.get("template") or "", {}).get("style") == "modern":
+        logo = None   # only classic student templates carry a logo
     band = tpl.get("style") == "modern"
     if deck.get("include_title_slide", True):
         if band:
@@ -2838,9 +2839,8 @@ def _m_chrome(slide, tpl):
     # the card instead of covering it.
     if tpl["bg"] != "FFFFFF" and tpl["chrome"] != "card":
         _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["bg"])
-    if tpl["chrome"] == "rail":
-        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, 0.24, 7.5, tpl["ink"], back=False)
-        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0.55, 0.24, 0.9, tpl["accent"], back=False)
+    if tpl["chrome"] == "rail":     # a short accent beside the title — nothing along the edge
+        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0.55, 0.62, 0.1, 0.75, tpl["accent"], back=False)
     elif tpl["chrome"] == "card":
         card = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 0.6, 1.62, 12.13, 5.08, "FFFFFF", back=False, line="DCE4F0")
         card.adjustments[0] = 0.04
@@ -2849,9 +2849,8 @@ def _m_chrome(slide, tpl):
         _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 0.62, 0.42, 0.75, 0.09, tpl["accent"], back=False).adjustments[0] = 0.5
     elif tpl["chrome"] == "block":
         _m_shape(slide, MSO_SHAPE.RECTANGLE, 0.9, 0.55, 0.11, 0.85, tpl["accent"], back=False)
-    elif tpl["chrome"] == "topbar":
-        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0, MW, 0.14, tpl["ink"], back=False)
-        _m_shape(slide, MSO_SHAPE.RECTANGLE, 0, 0.14, 2.6, 0.06, tpl["accent"], back=False)
+    elif tpl["chrome"] == "topbar":   # a short accent above the title — nothing along the edge
+        _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 0.9, 0.34, 0.9, 0.08, tpl["accent"], back=False).adjustments[0] = 0.5
 
 
 def _m_geo(tpl):
@@ -2909,49 +2908,47 @@ def _modern_title_slide(prs, deck, tpl):
     course = str(ts.get("course") or "").strip()[:80] or " "
     subtitle = str(ts.get("subtitle") or "").strip()[:120]
     small = "  \u00b7  ".join(x for x in (str(ts.get(k) or "").strip() for k in ("code", "lecturer", "date")) if x)
-    picture, logo = _image_bytes(ts.get("picture")), _image_bytes(deck.get("logo"))
+    picture, logo = _image_bytes(ts.get("picture")), None   # no logo: the picture is the star
     size = 50 if len(course) <= 26 else 42 if len(course) <= 44 else 34
     cover = tpl["cover"]
     if cover == "arc":
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
-        _m_shape(s, MSO_SHAPE.OVAL, 8.3, -1.6, 7.2, 7.2, tpl["accent"], alpha=22000, back=False)
-        _m_shape(s, MSO_SHAPE.OVAL, 10.2, 4.6, 3.6, 3.6, tpl["accent"], alpha=12000, back=False)
         if picture:
-            pic = _fill_picture(s, picture, Inches(8.75), Inches(1.45), Inches(4.0), Inches(4.0))
+            pic = _fill_picture(s, picture, Inches(7.55), Inches(0.9), Inches(5.2), Inches(5.7))
             if pic is not None:
-                pic._element.spPr.find(qn("a:prstGeom")).set("prst", "ellipse")
+                pic._element.spPr.find(qn("a:prstGeom")).set("prst", "roundRect")
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0.9, 2.2, 0.09, 2.9, tpl["accent"], back=False)
-        _m_text(s, 1.25, 1.6, 6.9, 2.5, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        _m_text(s, 1.25, 1.6, 5.9, 2.5, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
         if subtitle:
-            _m_text(s, 1.25, 4.2, 6.9, 0.8, subtitle, 24, tpl["soft"])
+            _m_text(s, 1.25, 4.2, 5.9, 0.8, subtitle, 24, tpl["soft"])
         if small:
-            _m_text(s, 1.25, 4.95, 6.9, 0.6, small, 15, "A9B8CC")
+            _m_text(s, 1.25, 4.95, 5.9, 0.6, small, 15, "A9B8CC")
         if logo:
             _fit_picture(s, logo, Inches(1.25), Inches(0.6), Inches(1.0), Inches(1.0))
     elif cover == "gradient":
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 4.3, MW, 3.2, tpl["bg"])
         _m_gradient(s, 0, 0, MW, 4.3, tpl["ink"], tpl["ink2"])
         _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 0.92, 1.05, 0.9, 0.09, tpl["accent"], back=False).adjustments[0] = 0.5
-        _m_text(s, 0.9, 1.25, 7.7, 2.75, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        _m_text(s, 0.9, 1.25, 6.6, 2.75, course, size, "FFFFFF", font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
         if subtitle:
-            _m_text(s, 0.9, 4.6, 7.7, 0.8, subtitle, 24, tpl["ink"])
+            _m_text(s, 0.9, 4.6, 6.6, 0.8, subtitle, 24, tpl["ink"])
         if small:
-            _m_text(s, 0.9, 5.4, 7.7, 0.6, small, 15, tpl["muted"])
+            _m_text(s, 0.9, 5.4, 6.6, 0.6, small, 15, tpl["muted"])
         if picture:
-            frame = _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 8.95, 2.55, 3.75, 3.75, "FFFFFF", back=False)
-            frame.adjustments[0] = 0.06
-            _fill_picture(s, picture, Inches(9.07), Inches(2.67), Inches(3.51), Inches(3.51))
+            frame = _m_shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 7.75, 1.0, 5.0, 5.5, "FFFFFF", back=False)
+            frame.adjustments[0] = 0.05
+            _fill_picture(s, picture, Inches(7.87), Inches(1.12), Inches(4.76), Inches(5.26))
         if logo:
             _fit_picture(s, logo, Inches(11.5), Inches(0.45), Inches(1.0), Inches(1.0))
     elif cover == "block":
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0.9, 2.15, 0.14, 2.75, tpl["accent"], back=False)
-        _m_text(s, 1.35, 1.55, 7.2, 2.6, course, size + 4, tpl["ink"], font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        _m_text(s, 1.35, 1.55, 6.1, 2.6, course, size + 4, tpl["ink"], font=MODERN_TITLE_FONT, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
         if subtitle:
-            _m_text(s, 1.35, 4.2, 7.2, 0.8, subtitle, 24, tpl["text"])
+            _m_text(s, 1.35, 4.2, 6.1, 0.8, subtitle, 24, tpl["text"])
         if small:
-            _m_text(s, 1.35, 4.95, 7.2, 0.6, small, 15, tpl["muted"])
+            _m_text(s, 1.35, 4.95, 6.1, 0.6, small, 15, tpl["muted"])
         if picture:
-            _fit_picture(s, picture, Inches(8.9), Inches(1.0), Inches(3.9), Inches(5.5))
+            _fill_picture(s, picture, Inches(7.75), Inches(0.7), Inches(5.1), Inches(6.1))
         else:
             _m_shape(s, MSO_SHAPE.OVAL, 9.6, 1.3, 3.2, 3.2, tpl["soft"], alpha=60000, back=False)
             _m_shape(s, MSO_SHAPE.OVAL, 10.9, 3.6, 2.0, 2.0, tpl["accent"], alpha=30000, back=False)
