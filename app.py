@@ -3387,8 +3387,10 @@ QUIZ_SYSTEM_PROMPT = (
     "omit this key entirely for short_answer\n"
     '  "correct_answer": for multiple_choice, the exact text of the correct option, copied '
     "verbatim from the options array; for short_answer, a concise model answer\n"
-    '  "explanation": one short sentence on why that answer is correct — this is for an '
-    "answer key a tutor reviews with a student, not for the student's copy of the quiz\n\n"
+    '  "explanation": written for the student who has just answered: one or two short sentences on '
+    "why the correct answer is right and, for multiple_choice, why the most tempting wrong option is "
+    "wrong — so a mistake becomes something learned\n"
+    '  "difficulty": "easy", "medium" or "hard" — how demanding this particular question is\n\n'
     "Write a mix of multiple_choice and short_answer unless told otherwise. Base every "
     "question strictly on the material provided — never introduce facts the material doesn't "
     "support or contradict it. If the material is too short or thin to support the requested "
@@ -3512,6 +3514,7 @@ def _parse_quiz_json(raw_text):
             "options": final_options,
             "correct_answer": correct_answer,
             "explanation": str(item.get("explanation") or "").strip(),
+            "difficulty": item.get("difficulty") if item.get("difficulty") in ("easy", "medium", "hard") else None,
         })
     if not questions:
         raise ConversionError("Couldn't generate a quiz from that material — please try again.")
@@ -3537,6 +3540,18 @@ def quiz_generate_endpoint():
         num_questions = 8
     num_questions = max(3, min(200, num_questions))
 
+    # How hard, and the lecturer's own requirements (topics, focus, format) — both optional.
+    difficulty = data.get("difficulty") if data.get("difficulty") in ("easy", "medium", "hard", "mixed") else "mixed"
+    level = {
+        "easy": "DIFFICULTY: make every question introductory \u2014 clear understanding of the key ideas, one simple step of reasoning. Mark each \"easy\".",
+        "medium": "DIFFICULTY: make every question course-level \u2014 understanding and applying ideas, one or two steps of reasoning. Mark each \"medium\".",
+        "hard": ("DIFFICULTY: make every question exam-level and challenging \u2014 applying ideas to new cases, analysing and comparing, "
+                 "multi-step reasoning. Mark each \"hard\"."),
+        "mixed": "DIFFICULTY: a genuine range from easy to hard across the set, each question marked with its own level.",
+    }[difficulty]
+    reqs = str(data.get("requirements") or "").strip()[:1200]
+    reqs_block = ("\n\nTHE LECTURER'S REQUIREMENTS \u2014 follow them exactly (topics to cover, question focus, examples, "
+                  "format), while keeping the JSON format above and basing every question on the material:\n<<<\n" + reqs + "\n>>>") if reqs else ""
     question_style = data.get("question_style") or "a mix of multiple_choice and short_answer"
     if question_style == "multiple_choice":
         question_style = "only multiple_choice"
@@ -3546,7 +3561,7 @@ def quiz_generate_endpoint():
         question_style = "a mix of multiple_choice and short_answer"
 
     user_message = (
-        f"Generate exactly {num_questions} questions ({question_style}) from this material:\n\n{text}"
+        f"Generate exactly {num_questions} questions ({question_style}) from this material.\n{level}\n\n{text}"
     )
 
     # Scales with num_questions rather than a flat value: confirmed
@@ -3561,16 +3576,16 @@ def quiz_generate_endpoint():
     # Capped at 64000 to stay within every current model's max-output
     # ceiling (verified as low as 64K tokens for some tiers) regardless
     # of which one handles this request.
-    max_tokens = min(64000, max(4000, num_questions * 300 + 500))
+    max_tokens = min(64000, max(4000, num_questions * 360 + 500))   # a little more room: explanations now teach
 
     try:
         result = call_claude(
-            system_prompt=QUIZ_SYSTEM_PROMPT,
+            system_prompt=QUIZ_SYSTEM_PROMPT + reqs_block,
             user_message=user_message,
             max_tokens=max_tokens,
         )
         questions = _parse_quiz_json(result)
-        return jsonify({"questions": questions, "title": title})
+        return jsonify({"questions": questions, "title": title, "difficulty": difficulty})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
