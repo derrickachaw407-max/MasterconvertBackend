@@ -24,6 +24,11 @@ from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
 from pptx.oxml.ns import qn as pptx_qn
 from docx.oxml import OxmlElement
+from docx.enum.style import WD_STYLE_TYPE
+import json as _json
+from openpyxl.comments import Comment as XlsxComment
+from openpyxl.styles import Alignment as XlsxAlignment
+from openpyxl.packaging.custom import StringProperty as XlsxStringProperty
 from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 from docx.text.run import Run as DocxRun
@@ -236,8 +241,8 @@ def _extract_pdf_font_size_headings(pdfplumber_pdf):
     level = 1
     prev_size = None
     for s in candidate_sizes:
-        if prev_size is not None and prev_size - s >= 2:
-            level += 1
+        if prev_size is not None and prev_size - s >= 1:
+            level += 1     # each distinct heading size is its own level (Word's Heading 1/2 can differ by a single point)
         size_to_level[s] = level
         prev_size = s
         if level > 3:
@@ -607,7 +612,7 @@ def apply_docx_style(doc, style_name):
         if is_heading:
             if style["uppercase_headings"]:
                 for run in para.runs:
-                    run.text = run.text.upper()
+                    run.font.all_caps = True   # shown in capitals; the words themselves stay as written
             for run in para.runs:
                 run.font.name = style["heading_font"]
                 run.font.color.rgb = style["heading_color"]
@@ -1242,10 +1247,17 @@ def _iter_all_runs(paragraph):
         # silently absorbed into the outer paragraph's text too, on top
         # of wherever it's separately extracted from (_iter_docx_shapes).
         results = []
-        for t in r_el.findall(tag):
-            if any(anc.tag in (f"{{{_WPS_NS}}}txbx", qn("w:txbxContent")) for anc in t.iterancestors()):
-                continue
-            results.append(t.text or "")
+        for t in r_el:
+            if t.tag == tag:
+                if any(anc.tag in (f"{{{_WPS_NS}}}txbx", qn("w:txbxContent")) for anc in t.iterancestors()):
+                    continue
+                results.append(t.text or "")
+            elif t.tag in (qn("w:br"), qn("w:cr")) and t.get(qn("w:type")) not in ("page", "column"):
+                # A line break (Shift+Enter) keeps the words apart — it used to
+                # be dropped, so "Nalerigu⏎Department" came out "NaleriguDepartment".
+                results.append("\n")
+            elif t.tag == qn("w:tab"):
+                results.append("\t")
         return "".join(results)
 
     def walk(container_el, deleted, link_address):
@@ -2293,6 +2305,25 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None,
     return out_path
 
 
+def _pptx_set_footer(slide, text):
+    """The slide's own footer (its layout's footer placeholder, filled in) —
+    where a Word document's page header and footer lines belong on slides."""
+    lp = next((p for p in slide.slide_layout.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.FOOTER), None)
+    if lp is None or not text:
+        return False
+    try:
+        slide.shapes.clone_placeholder(lp)
+    except Exception:
+        return False
+    ph = next((p for p in slide.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.FOOTER), None)
+    if ph is None:
+        return False
+    tf = ph.text_frame
+    tf.text = ""
+    _pptx_add_text(tf.paragraphs[0], text)
+    return True
+
+
 def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     """style selects one of this file's own built-in visual themes
     (minimal/academic/bold/classic) and is ignored when template_path is
@@ -2371,7 +2402,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         state["slide"], state["body_tf"], state["bullet_count"], state["lines_used"] = s, tf, 0, 0
         return s, tf
 
-    def add_bullet(para, level=0, numbered=False):
+    def add_bullet(para, level=0, numbered=False, plain=False):
         if state["slide"] is None:
             new_slide(_continuation_title())
 
@@ -2401,10 +2432,9 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         # boundaries. Numbered items are left whole since splitting one
         # would break the numbering's meaning (item "3" becoming two
         # separate bullets makes no sense as a numbered step).
-        if not numbered and len(full_text.split()) > _SENTENCE_SPLIT_WORD_THRESHOLD:
-            groups = _split_runs_at_sentence_boundaries(runs_data)
-        else:
-            groups = [runs_data] if runs_data else []
+        # A paragraph stays one paragraph — splitting it into sentence bullets
+        # meant converting back gave a different document.
+        groups = [runs_data] if runs_data else []
 
         pptx_align = _docx_align_to_pptx(_effective_paragraph_alignment(para))
         for group in groups:
@@ -2430,19 +2460,30 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             if numbered:
                 pPr = p._p.get_or_add_pPr()
                 pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
+            elif plain:
+                # An ordinary paragraph shows as an ordinary paragraph — no bullet added.
+                pPr = p._p.get_or_add_pPr()
+                pPr.set("marL", "0")
+                pPr.set("indent", "0")
+                pPr.append(pPr.makeelement(qn("a:buNone"), {}))
 
             captured = []  # (pptx_run, bold, italic, underline, is_link, hex_color, size_pt, is_deleted)
             for text, bold, italic, underline, is_link, address, hex_color, size_pt, is_deleted in group:
-                r = p.add_run()
-                r.text = text
-                if is_link and address:
-                    try:
-                        r.hyperlink.address = address
-                    except Exception:
-                        pass
-                if is_deleted:
-                    r._r.get_or_add_rPr().set("strike", "sngStrike")
-                captured.append((r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted))
+                for seg_i, seg in enumerate(text.split("\n")):
+                    if seg_i:
+                        p.add_line_break()       # a line break in the document stays a line break
+                    if not seg:
+                        continue
+                    r = p.add_run()
+                    r.text = seg
+                    if is_link and address:
+                        try:
+                            r.hyperlink.address = address
+                        except Exception:
+                            pass
+                    if is_deleted:
+                        r._r.get_or_add_rPr().set("strike", "sngStrike")
+                    captured.append((r, bold, italic, underline, is_link, hex_color, size_pt, is_deleted))
             _style_pptx_body_paragraph(p, template_style)
             # Re-apply emphasis after the shared style pass, since that pass
             # sets font attributes on every run and would otherwise stomp the
@@ -2466,7 +2507,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             state["bullet_count"] += 1
             state["lines_used"] += group_lines
 
-    def add_subheading(text):
+    def add_subheading(text, level=3):
         """Heading 2/3 in the source document reads as a subsection within
         the current topic, not a brand new topic — giving it a whole new
         slide (the old behavior for every heading level) fragmented what's
@@ -2488,12 +2529,11 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         else:
             p = body_tf.add_paragraph()
         p.level = 0
-        p.text = text
-        # A subheading is a section divider, not another item in the list
-        # — keeping its bullet marker made it look like just another
-        # bullet rather than something that visually "breaks up content"
-        # the way a real section header should.
+        _pptx_add_text(p, text)
+        _pptx_mark_runs(p.runs, f"h{level}")     # invisibly: this line was a Heading <level>
         pPr = p._p.get_or_add_pPr()
+        pPr.set("marL", "0")
+        pPr.set("indent", "0")
         pPr.append(pPr.makeelement(qn("a:buNone"), {}))
         if state["bullet_count"] > 0:
             p.space_before = Pt(18)
@@ -2791,6 +2831,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
     # the comment in add_table_slide for why that lookahead exists.
     blocks = list(_iter_block_items(doc))
     pending_table_title = None
+    pending_table_tag = ""
     skip_blocks = set()
 
     def _make_title_slide(text, block_idx):
@@ -2809,6 +2850,7 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         s = prs.slides.add_slide(layout)
         s.shapes.title.text = text
         _style_pptx_slide(s, template_style)
+        _slide_tag(s, "Title")
         sub_ph = next((p for p in s.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
         nxt = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
         used = False
@@ -2817,9 +2859,12 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             ntext = _full_paragraph_text(nxt).strip()
             if (ntext and not nstyle.startswith("heading") and nstyle != "title" and "list" not in nstyle
                     and len(ntext.split()) <= 25 and not any(True for _ in _iter_inline_images(nxt, doc))):
-                sub_ph.text_frame.text = ntext
+                sub_ph.text_frame.text = ""
+                sub_runs = _pptx_add_text(sub_ph.text_frame.paragraphs[0], ntext)
                 for p in sub_ph.text_frame.paragraphs:
                     _style_pptx_body_paragraph(p, template_style, size=Pt(24))
+                if (nxt.style.name or "") != "Subtitle":
+                    _pptx_mark_runs(sub_runs, "style=" + (nxt.style.name or "Normal"))
                 skip_blocks.add(block_idx + 1)
                 used = True
         if sub_ph is not None and not used:
@@ -2846,11 +2891,267 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
         return (_get_paragraph_direct_list_info(nxt, numbering_formats) is not None
                 or "list" in (nxt.style.name or "").lower())
 
-    for block_idx, block in enumerate(blocks):
+
+    # ---- A handout made by Slides → Handout: its hidden bookmarks mark where
+    # each slide began, so the same slides are rebuilt — one per mark, with
+    # their own titles, words, tables, pictures and speaker notes.
+    def _para_kind(para):
+        sname = (para.style.name or "").lower()
+        info = _get_paragraph_direct_list_info(para, numbering_formats)
+        if info is not None:
+            level, numbered = info
+            m = re.search(r"list (?:bullet|number|continue)\s*(\d+)", sname)
+            if m:
+                level = max(level, int(m.group(1)) - 1)   # "List Bullet 2" sits one level in
+            return ("number" if numbered else "bullet"), max(0, min(level, 4))
+        if "list" in sname:
+            m = re.search(r"(\d+)", sname)
+            return ("number" if "number" in sname else "bullet"), (max(0, min(int(m.group(1)) - 1, 4)) if m else 0)
+        return "plain", 0
+
+    def _write_runs(p, para, size=None, kind="plain", level=0):
+        runs_data = []
+        for src_run, text, is_link, address, is_deleted in _iter_all_runs(para):
+            if not text:
+                continue
+            b, i, u, color, sz = _effective_run_format(src_run)
+            runs_data.append((text, bool(b), bool(i), True if is_link else bool(u), is_link, address, (None if is_link else color), sz, is_deleted))
+        p.level = min(level, 4)
+        align = _docx_align_to_pptx(_effective_paragraph_alignment(para))
+        if align is not None:
+            p.alignment = align
+        pPr = p._p.get_or_add_pPr()
+        if kind == "number":
+            pPr.append(pPr.makeelement(qn("a:buAutoNum"), {"type": "arabicPeriod"}))
+        elif kind == "plain":
+            pPr.set("marL", "0")
+            pPr.set("indent", "0")
+            pPr.append(pPr.makeelement(qn("a:buNone"), {}))
+        captured = []
+        for text, bold, italic, underline, is_link, address, color, sz, is_deleted in runs_data:
+            for k, seg in enumerate(text.split("\n")):
+                if k:
+                    p.add_line_break()
+                if not seg:
+                    continue
+                r = p.add_run()
+                r.text = seg
+                if is_link and address:
+                    try:
+                        r.hyperlink.address = address
+                    except Exception:
+                        pass
+                if is_deleted:
+                    r._r.get_or_add_rPr().set("strike", "sngStrike")
+                captured.append((r, bold, italic, underline, is_link, color, sz))
+        _style_pptx_body_paragraph(p, template_style, size=size)
+        for r, bold, italic, underline, is_link, color, sz in captured:
+            r.font.bold, r.font.italic, r.font.underline = bold, italic, underline
+            if sz is not None and size is None:
+                r.font.size = Pt(sz)
+            if is_link:
+                r.font.color.rgb = PptxRGBColor(0x05, 0x63, 0xC1)
+            elif color:
+                try:
+                    r.font.color.rgb = PptxRGBColor.from_string(color)
+                except Exception:
+                    pass
+        return [c[0] for c in captured]
+
+    def _fill_table(s, table, left, top, width, height):
+        src_rows = [list(row.cells) for row in table.rows]
+        if not src_rows:
+            return
+        n_rows, n_cols = len(src_rows), max(len(r) for r in src_rows)
+        gtable = s.shapes.add_table(n_rows, n_cols, left, top, width, max(height, int(PptxInches(0.4) * n_rows))).table
+        merges = _find_docx_merges(src_rows, n_cols)
+        skip = {(r, c) for (a, b, c2, d) in merges for r in range(a, c2 + 1) for c in range(b, d + 1) if (r, c) != (a, b)}
+        cell_pt = Pt(18 if (n_rows <= 6 and n_cols <= 4) else 14 if (n_rows <= 10 and n_cols <= 6) else 12)
+        for r_idx, row in enumerate(src_rows):
+            for c_idx in range(n_cols):
+                if (r_idx, c_idx) in skip or c_idx >= len(row):
+                    continue
+                cell = gtable.cell(r_idx, c_idx)
+                tf = cell.text_frame
+                tf.text = ""
+                paras = [cp for cp in row[c_idx].paragraphs]
+                for k, cp in enumerate(paras):
+                    p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+                    for src_run, text, is_link, address, is_deleted in _iter_all_runs(cp):
+                        b, i, u, color, sz = _effective_run_format(src_run)
+                        for rr in _pptx_add_text(p, text):
+                            rr.font.size = cell_pt
+                            rr.font.bold, rr.font.italic = bool(b), bool(i)
+                            if template_style.get("body_font"):
+                                rr.font.name = template_style["body_font"]
+                shade = _get_docx_cell_shading(row[c_idx])
+                if shade:
+                    try:
+                        cell.fill.solid()
+                        cell.fill.fore_color.rgb = PptxRGBColor.from_string(shade)
+                    except Exception:
+                        pass
+        for a, b, c2, d in merges:
+            try:
+                gtable.cell(a, b).merge(gtable.cell(c2, d))
+            except Exception:
+                pass
+
+    def _marked_build():
+        groups, cur = [], None
+        for b in blocks:
+            mk = None if isinstance(b, DocxTable) else _docx_slide_mark(b)
+            if mk is not None or cur is None:
+                cur = {"cont": bool(mk and mk[1]), "items": []}
+                groups.append(cur)
+            cur["items"].append(b)
+        prev_title = ""
+        title_slide_layout = next((lo for lo in prs.slide_layouts
+                                   if PP_PLACEHOLDER.SUBTITLE in [p.placeholder_format.type for p in lo.placeholders]), title_layout)
+        # A layout with a title and two text columns side by side (PowerPoint's "Two Content").
+        two_layout = next((lo for lo in prs.slide_layouts
+                           if [p.placeholder_format.idx for p in lo.placeholders if p.placeholder_format.type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT)][:2] == [1, 2]
+                           and len([p for p in lo.placeholders if p.placeholder_format.type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT)]) == 2), None)
+        for g in groups:
+            title_par, kind, sub_pars, body, tables, images, notes = None, None, [], [], [], [], []
+            col2_at = None
+            for b in g["items"]:
+                if isinstance(b, DocxTable):
+                    tables.append(b)
+                    continue
+                if col2_at is None and any((bm.get(qn("w:name")) or "").startswith("_dct_col") for bm in b._p.iter(qn("w:bookmarkStart"))):
+                    col2_at = len(body)
+                images += list(_iter_inline_images(b, doc))
+                text = _full_paragraph_text(b)
+                if not text.strip():
+                    continue
+                sname = (b.style.name or "").lower()
+                if sname == "speaker notes":
+                    notes.append(text.strip())
+                    continue
+                hm = re.match(r"heading (\d+)", sname)
+                if title_par is None and not body and not sub_pars and (sname == "title" or hm):
+                    title_par, kind = b, ("Title" if sname == "title" else f"Heading {hm.group(1)}")
+                    continue
+                if kind == "Title" and not body and sname == "subtitle":
+                    sub_pars.append(b)
+                    continue
+                body.append(b)
+            title_text = _full_paragraph_text(title_par).strip() if title_par is not None else (prev_title if g["cont"] else "")
+            two_col = col2_at is not None and 0 < col2_at < len(body) and kind != "Title" and two_layout is not None
+            s = prs.slides.add_slide(title_slide_layout if kind == "Title" else (two_layout if two_col else title_layout))
+            if s.shapes.title is not None and title_text:
+                s.shapes.title.text_frame.text = ""
+                _pptx_add_text(s.shapes.title.text_frame.paragraphs[0], title_text)
+            _style_pptx_slide(s, template_style)
+            if s.shapes.title is not None and not title_text:
+                s.shapes.title._element.getparent().remove(s.shapes.title._element)   # an untitled slide stays untitled
+            _slide_tag(s, kind if (kind and not g["cont"]) else "")
+            if two_col:
+                cols = [body[:col2_at], body[col2_at:]]
+                # Both columns at one size: shrunk only if the fuller column wouldn't fit.
+                est = max(sum(max(1, -(-len(_full_paragraph_text(b)) // 34)) for b in col) for col in cols)
+                size = Pt(max(12, int(20 * MAX_LINES_PER_SLIDE / est))) if est > MAX_LINES_PER_SLIDE else None
+                for idx, col in zip((1, 2), cols):
+                    ph = next((p for p in s.placeholders if p.placeholder_format.idx == idx), None)
+                    if ph is None:
+                        continue
+                    tf = ph.text_frame
+                    tf.text = ""
+                    for k, b in enumerate(col):
+                        pk, lvl = _para_kind(b)
+                        _write_runs(tf.paragraphs[0] if k == 0 else tf.add_paragraph(), b, size=size, kind=pk, level=lvl)
+                body = []
+            if kind == "Title" and images:
+                # Pictures on a title slide sit beside the title, not over it.
+                sw, sh = prs.slide_width, prs.slide_height
+                for ph in s.placeholders:
+                    if ph.placeholder_format.type in (PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.SUBTITLE):
+                        top, height = ph.top, ph.height          # inherited from the layout — kept
+                        ph.left, ph.top, ph.width, ph.height = PptxInches(1.0), top, int(sw * 0.47), height
+                col_l, col_w = int(sw * 0.56), int(sw * 0.39)
+                each = int((sh - PptxInches(1.2)) / len(images))
+                for k, img in enumerate(images):
+                    px = _picture_size(img)
+                    if px:
+                        _add_scaled_picture(s, img, px, (col_l, PptxInches(0.6) + k * each, col_w, each))
+                images = []
+            if kind == "Title":
+                sub_ph = next((p for p in s.placeholders if p.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
+                lines = sub_pars + body
+                if sub_ph is not None:
+                    body = []
+                    if lines:
+                        tf = sub_ph.text_frame
+                        tf.text = ""
+                        for k, b in enumerate(lines):
+                            p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+                            runs = _write_runs(p, b, size=Pt(24 if len(lines) <= 2 else 16))
+                            if (b.style.name or "") != "Subtitle":
+                                _pptx_mark_runs(runs, "style=" + (b.style.name or "Normal"))
+                    else:
+                        sub_ph._element.getparent().remove(sub_ph._element)
+            body_ph = next((ph for ph in s.placeholders if ph.placeholder_format.idx == 1 and ph.placeholder_format.type != PP_PLACEHOLDER.SUBTITLE), None)
+            if body_ph is not None:
+                L, T, W, H = body_ph.left, body_ph.top, body_ph.width, body_ph.height
+            else:
+                L, T = PptxInches(0.6), PptxInches(1.7) if title_text else PptxInches(0.6)
+                W, H = prs.slide_width - PptxInches(1.2), prs.slide_height - T - PptxInches(0.6)
+            text_w = int(W * 0.58) if images and (body or tables) else W
+            text_h = 0
+            if body:
+                if body_ph is None:
+                    body_ph = s.shapes.add_textbox(L, T, text_w, H)
+                tf = body_ph.text_frame
+                tf.word_wrap = True
+                tf.text = ""
+                est = sum(_estimate_line_count(_full_paragraph_text(b)) for b in body) * (W / max(text_w, 1))
+                size = Pt(max(12, int(20 * MAX_LINES_PER_SLIDE / est))) if est > MAX_LINES_PER_SLIDE else None
+                for k, b in enumerate(body):
+                    p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+                    sname = (b.style.name or "").lower()
+                    hm = re.match(r"heading (\d+)", sname)
+                    if hm:
+                        runs = _write_runs(p, b, size=size)
+                        for r in runs:
+                            r.font.bold = True
+                        _pptx_mark_runs(runs, f"h{hm.group(1)}")
+                    else:
+                        pk, lvl = _para_kind(b)
+                        _write_runs(p, b, size=size, kind=pk, level=lvl)
+                text_h = H if not tables else min(int(H * 0.55), int(PptxInches(0.42) * est + PptxInches(0.3)))
+                body_ph.left, body_ph.top, body_ph.width, body_ph.height = L, T, text_w, text_h
+            elif body_ph is not None and not two_col:
+                body_ph._element.getparent().remove(body_ph._element)
+            if tables:
+                top = T + text_h
+                each = max(int((T + H - top) / len(tables)), int(PptxInches(0.8)))
+                for k, tb in enumerate(tables):
+                    _fill_table(s, tb, L, top + k * each, text_w, each)
+            if images:
+                gap = int(W * 0.04)
+                iL, iW = (L + text_w + gap, W - text_w - gap) if (body or tables) else (L, W)
+                each = int(H / len(images))
+                for k, img in enumerate(images):
+                    px = _picture_size(img)
+                    if px:
+                        _add_scaled_picture(s, img, px, (iL, T + k * each, iW, each))
+            if notes:
+                s.notes_slide.notes_text_frame.text = "\n".join(notes)
+            prev_title = title_text
+
+    marked = any(_docx_slide_mark(b) for b in blocks if not isinstance(b, DocxTable))
+    if marked:
+        _marked_build()
+
+    for block_idx, block in enumerate([] if marked else blocks):
         if block_idx in skip_blocks:
             continue
         if isinstance(block, DocxTable):
+            n_before = len(prs.slides)
             add_table_slide(block, carried_title=pending_table_title or state["section_title"])
+            if pending_table_title and len(prs.slides) > n_before:
+                _slide_tag(prs.slides[-1], pending_table_tag)
             pending_table_title = None
             continue
         pending_table_title = None
@@ -2889,7 +3190,9 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             if para_style_name == "title" and len(prs.slides) == 0 and _make_title_slide(text, block_idx):
                 continue
             next_block = blocks[block_idx + 1] if block_idx + 1 < len(blocks) else None
+            heading_tag = "Title" if para_style_name == "title" else f"Heading {heading_match.group(1)}"
             if isinstance(next_block, DocxTable):
+                pending_table_tag = heading_tag
                 # This heading has nothing else to show but a table right
                 # after it — deferring the slide entirely (rather than
                 # creating one now and a second, unlabeled one for the
@@ -2898,18 +3201,16 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
                 pending_table_title = text
             else:
                 new_slide(text)
+                _slide_tag(state["slide"], heading_tag)
         elif heading_match:
-            add_subheading(text)
+            add_subheading(text, int(heading_match.group(1)))
         else:
-            if state["slide"] is None and _is_lead_in(text) and _next_is_list_item(block_idx):
-                # A short lead-in ending in a colon, right before a list, with
-                # no slide open (just after a picture or table): it says what
-                # the list is about, so it becomes that slide's title.
-                new_slide(text.strip().rstrip(":").rstrip())
-                continue
             direct_list_info = _get_paragraph_direct_list_info(para, numbering_formats)
             if direct_list_info is not None:
                 level, numbered = direct_list_info
+                m_lvl = re.search(r"list (?:bullet|number|continue)\s*(\d+)", para_style_name)
+                if m_lvl:
+                    level = max(level, int(m_lvl.group(1)) - 1)   # "List Bullet 2" sits one level in
                 level = max(0, min(level, 4))
             else:
                 level = 0
@@ -2919,7 +3220,8 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
                     if m:
                         level = max(0, min(int(m.group(1)) - 1, 4))
                     numbered = "number" in para_style_name
-            add_bullet(para, level=level, numbered=numbered)
+            plain = direct_list_info is None and "list" not in para_style_name
+            add_bullet(para, level=level, numbered=numbered, plain=plain)
 
     # Only needed as a last-resort guarantee that the presentation has at
     # least one slide (e.g. a source document that was nothing but a
@@ -2952,25 +3254,14 @@ def docx_to_pptx(src_path, out_dir, style="minimal", template_path=None):
             _style_pptx_body_paragraph(p, template_style)
             state["bullet_count"] += 1
 
-    comments = _get_docx_comments(doc)
-    if comments:
-        new_slide("")   # the comments themselves, no added title
-        for author, comment_text in comments:
-            body_tf = state["body_tf"]
-            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
-            p.text = f"{author}: {comment_text}"
-            _style_pptx_body_paragraph(p, template_style)
-            state["bullet_count"] += 1
-
+    # Review comments are notes about the document, not part of it — they
+    # aren't put on a slide. The page header/footer lines become the slides'
+    # footer (where they belong on slides), not a slide of their own.
     header_footer = _get_docx_header_footer_text(doc)
     if header_footer:
-        new_slide("Header/Footer")
-        for line in header_footer:
-            body_tf = state["body_tf"]
-            p = body_tf.paragraphs[0] if state["bullet_count"] == 0 else body_tf.add_paragraph()
-            p.text = line
-            _style_pptx_body_paragraph(p, template_style)
-            state["bullet_count"] += 1
+        footer_text = "\n".join(header_footer)
+        for s in prs.slides:
+            _pptx_set_footer(s, footer_text)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.pptx")
@@ -3315,250 +3606,437 @@ def _handout_title(prs, slides):
     return (_sanitize_xml_text(core) if core else None), None, False
 
 
+# ---------------------------------------------------------------- invisible structure markers
+# Converting there and back must give back the original, so where a format
+# can't express something (where one slide ends inside a Word handout, which
+# heading level a slide title came from), it's noted invisibly — a hidden
+# bookmark, a slide's internal name, a run's link-target name — never as
+# words or labels anyone sees.
+_DCT_SLIDE_RE = re.compile(r"^_dct_s(\d+)(c?)$")
+
+
+def _docx_bookmark(paragraph, name, bid):
+    """A zero-length bookmark (Word hides names starting "_")."""
+    p = paragraph._p
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), str(bid))
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), str(bid))
+    pPr = p.find(qn("w:pPr"))
+    idx = list(p).index(pPr) + 1 if pPr is not None else 0
+    p.insert(idx, start)
+    p.insert(idx + 1, end)
+
+
+def _docx_slide_mark(paragraph):
+    """(slide number, continues the previous slide's title) where a handout
+    paragraph begins a slide's part of the document, else None."""
+    for bm in paragraph._p.iter(qn("w:bookmarkStart")):
+        m = _DCT_SLIDE_RE.match(bm.get(qn("w:name")) or "")
+        if m:
+            return int(m.group(1)), bool(m.group(2))
+    return None
+
+
+def _pptx_add_text(p, text):
+    """Text into a slide paragraph, each "\\n" a real line break."""
+    runs = []
+    for k, seg in enumerate(str(text).split("\n")):
+        if k:
+            p.add_line_break()
+        if seg:
+            r = p.add_run()
+            r.text = seg
+            runs.append(r)
+    return runs
+
+
+def _slide_tag(slide, tag):
+    """An invisible note on a slide (its internal name), e.g. "Heading 2"."""
+    if tag:
+        slide._element.cSld.set("name", tag)
+
+
+def _slide_tag_of(slide):
+    return slide._element.cSld.get("name") or ""
+
+
+def _pptx_mark_runs(runs, tag):
+    """An invisible note on a slide paragraph (its runs' link-target name)."""
+    for r in runs[:1]:
+        r._r.get_or_add_rPr().set("bmk", "dct:" + tag)
+
+
+def _pptx_para_mark(para):
+    for r in para._p.findall(qn("a:r")):
+        rPr = r.find(qn("a:rPr"))
+        if rPr is not None and (rPr.get("bmk") or "").startswith("dct:"):
+            return rPr.get("bmk")[4:]
+    return ""
+
+
+def _docx_table_caption(table):
+    """A Word table's title (its alt text) — where a spreadsheet tab's name rides along."""
+    tblPr = table._tbl.tblPr
+    cap = tblPr.find(qn("w:tblCaption")) if tblPr is not None else None
+    return (cap.get(qn("w:val")) or "").strip() if cap is not None else ""
+
+
+def _docx_set_table_caption(table, text):
+    tblPr = table._tbl.tblPr
+    for old in tblPr.findall(qn("w:tblCaption")):
+        tblPr.remove(old)
+    cap = OxmlElement("w:tblCaption")
+    cap.set(qn("w:val"), str(text)[:200])
+    tblPr.append(cap)
+
+
+def _notes_style(doc):
+    """The handout's style for speaker notes — so converting back puts them
+    back into the slide's notes instead of onto the slide."""
+    try:
+        return doc.styles["Speaker Notes"]
+    except KeyError:
+        st = doc.styles.add_style("Speaker Notes", WD_STYLE_TYPE.PARAGRAPH)
+        st.base_style = doc.styles["Normal"]
+        st.font.italic = True
+        st.font.size = DocxPt(10)
+        st.font.color.rgb = DocxRGBColor(0x59, 0x59, 0x59)
+        st.paragraph_format.left_indent = DocxInches(0.3)
+        st.paragraph_format.space_before = DocxPt(6)
+        return st
+
+
+def _pptx_inherited_bullet(shape, level):
+    """Whether a slide paragraph with no bullet setting of its own shows one:
+    looked up through its layout placeholder, the master placeholder and the
+    master's body text style."""
+    try:
+        if not shape.is_placeholder:
+            return False
+        ph_type = shape.placeholder_format.type
+        if ph_type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.SUBTITLE,
+                       PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE):
+            return False
+        lvl = f"a:lvl{min(level, 8) + 1}pPr"
+        chain = []
+        try:
+            lp = shape.part.slide_layout.placeholders.get(idx=shape.placeholder_format.idx)
+            if lp is not None:
+                chain.append(lp._element)
+        except Exception:
+            pass
+        master = shape.part.slide_layout.slide_master
+        for mp in master.placeholders:
+            if mp.placeholder_format.type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT):
+                chain.append(mp._element)
+                break
+        for el in chain:
+            for pPr in el.iter(qn(lvl)):
+                if pPr.find(qn("a:buNone")) is not None:
+                    return False
+                if pPr.find(qn("a:buChar")) is not None or pPr.find(qn("a:buAutoNum")) is not None or pPr.find(qn("a:buBlip")) is not None:
+                    return True
+        body_style = master._element.find(".//{http://schemas.openxmlformats.org/presentationml/2006/main}bodyStyle")
+        if body_style is not None:
+            pPr = body_style.find(qn(lvl))
+            if pPr is not None:
+                if pPr.find(qn("a:buNone")) is not None:
+                    return False
+                if pPr.find(qn("a:buChar")) is not None or pPr.find(qn("a:buAutoNum")) is not None:
+                    return True
+        return ph_type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT)
+    except Exception:
+        return False
+
+
+def _pptx_para_kind(shape, para):
+    """'number', 'bullet' or 'plain' — exactly how the paragraph shows on the slide."""
+    pPr = para._p.find(qn("a:pPr"))
+    if pPr is not None:
+        if pPr.find(qn("a:buAutoNum")) is not None:
+            return "number"
+        if pPr.find(qn("a:buNone")) is not None:
+            return "plain"
+        if pPr.find(qn("a:buChar")) is not None or pPr.find(qn("a:buBlip")) is not None:
+            return "bullet"
+    return "bullet" if _pptx_inherited_bullet(shape, para.level or 0) else "plain"
+
+
+def _docx_copy_pptx_runs(doc_p, para):
+    """A slide paragraph's words into a Word paragraph: its runs (emphasis,
+    colour, size, links), fields and line breaks, in order."""
+    from pptx.text.text import _Run as _PptxRun
+    for child in para._p:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "br":
+            doc_p.add_run().add_break()
+            continue
+        if tag not in ("r", "fld"):
+            continue
+        text = _sanitize_xml_text("".join(t.text or "" for t in child.iter(qn("a:t"))))
+        if not text:
+            continue
+        if tag == "fld":
+            doc_p.add_run(text)
+            continue
+        run = _PptxRun(child, para)
+        address = None
+        try:
+            address = run.hyperlink.address
+        except Exception:
+            pass
+        if address:
+            _add_docx_hyperlink(doc_p, address, text, bold=bool(run.font.bold), italic=bool(run.font.italic))
+            continue
+        r = doc_p.add_run(text)
+        if run.font.bold:
+            r.bold = True
+        if run.font.italic:
+            r.italic = True
+        if run.font.underline:
+            r.underline = True
+        hex_color = _safe_hex_color(run.font.color)
+        if hex_color:
+            try:
+                r.font.color.rgb = DocxRGBColor.from_string(hex_color)
+            except Exception:
+                pass
+        if run.font.size is not None:
+            r.font.size = DocxPt(run.font.size.pt)
+
+
+def _docx_text_of_pptx(text_frame):
+    """A text frame's words with its line breaks (python-pptx gives them as \\v)."""
+    return "\n".join(_sanitize_xml_text(p.text.replace("\x0b", "\n").replace("\v", "\n")).strip("\n") for p in text_frame.paragraphs).strip()
+
+
 def pptx_to_docx(src_path, out_dir, style="clean"):
+    """Slides → Handout. Everything on the slides, in reading order, and
+    nothing that isn't: titles become headings, bullets stay bullets and plain
+    text stays plain, line breaks and tables keep their shape, speaker notes
+    go in their own style, and a deck's footer goes in the page footer. Each
+    slide's start is marked with a hidden bookmark, so converting the handout
+    back gives the same slides again."""
     prs = _safe_load(Presentation, src_path)
     doc = Document()
-    # python-docx's own default template ships a <w:zoom val="bestFit"/>
-    # missing the "percent" attribute the OOXML schema actually requires
-    # on it — confirmed directly against the schema and present even in
-    # a completely unmodified new Document(), unrelated to anything in
-    # this function. Fixed here rather than left in, since it's a
-    # one-line, safe correction now that it's been found.
     zoom_el = doc.settings.element.find(qn("w:zoom"))
     if zoom_el is not None and zoom_el.get(qn("w:percent")) is None:
         zoom_el.set(qn("w:percent"), "100")
-    doc_title, doc_subtitle, skip_title_slide = _handout_title(prs, list(prs.slides))
-    if doc_title:
-        doc.add_heading(doc_title, 0)
-    if doc_subtitle:
-        doc.add_paragraph(doc_subtitle, style="Subtitle")
-    BULLET_STYLES = ["List Bullet", "List Bullet 2", "List Bullet 3"]
-    NUMBER_STYLES = ["List Number", "List Number 2", "List Number 3"]
+    deck_title = (prs.core_properties.title or "").strip()
+    if deck_title:
+        doc.core_properties.title = deck_title[:250]      # the file's own title property — never shown as text
+    notes_style = _notes_style(doc)
+    body = doc.element.body
+    BULLETS = ["List Bullet", "List Bullet 2", "List Bullet 3"]
+    NUMBERS = ["List Number", "List Number 2", "List Number 3"]
+    FURNITURE = (PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE)
 
-    # A quick pre-pass just for titles, to build a real, clickable table
-    # of contents up front before any slide content is added — skipped
-    # for a short deck, where flipping through a handful of headings is
-    # faster than reading a table of contents for them.
-    slide_titles = []
-    for i, slide in enumerate(prs.slides, 1):
+    def kids():
+        return [c for c in body if c.tag != qn("w:sectPr")]
+
+    def add_text_paragraph(shape, para):
+        if not (para.text or "").replace("\x0b", "").replace("\v", "").strip():
+            return
+        level = min(para.level or 0, 2)
+        kind = _pptx_para_kind(shape, para)
+        mark = _pptx_para_mark(para)
+        style_name = None
+        if mark.startswith("h") and mark[1:].isdigit():
+            style_name = f"Heading {min(int(mark[1:]), 9)}"
+        elif mark.startswith("style="):
+            style_name = mark[6:]
+        if style_name is None:
+            style_name = (NUMBERS if kind == "number" else BULLETS)[level] if kind != "plain" else "Normal"
+        try:
+            p = doc.add_paragraph(style=style_name)
+        except KeyError:
+            p = doc.add_paragraph()
+        if kind == "plain" and level and style_name == "Normal":
+            p.paragraph_format.left_indent = DocxInches(0.3 * level)
+        docx_align = _pptx_align_to_docx(para.alignment)
+        if docx_align is not None:
+            p.alignment = docx_align
+        _docx_copy_pptx_runs(p, para)
+
+    def add_table(shape):
+        src_rows = [list(row.cells) for row in shape.table.rows]
+        if not src_rows:
+            return
+        n_rows, n_cols = len(src_rows), max(len(r) for r in src_rows)
+        word_table = doc.add_table(rows=n_rows, cols=n_cols)
+        word_table.style = "Table Grid"
+        spans = []
+        for r_idx, row in enumerate(src_rows):
+            for c_idx in range(n_cols):
+                src_cell = row[c_idx] if c_idx < len(row) else None
+                if src_cell is None or (src_cell.is_spanned and not src_cell.is_merge_origin):
+                    continue
+                cell = word_table.cell(r_idx, c_idx)
+                first = True
+                for para in src_cell.text_frame.paragraphs:
+                    p = cell.paragraphs[0] if first else cell.add_paragraph()
+                    first = False
+                    _docx_copy_pptx_runs(p, para)
+                try:
+                    if src_cell.fill.type == MSO_FILL_TYPE.SOLID:
+                        hex_color = _safe_hex_color(src_cell.fill.fore_color)
+                        if hex_color:
+                            _set_docx_cell_shading(cell, hex_color)
+                except Exception:
+                    pass
+                if src_cell.is_merge_origin and (src_cell.span_height > 1 or src_cell.span_width > 1):
+                    spans.append((r_idx, c_idx, r_idx + src_cell.span_height - 1, c_idx + src_cell.span_width - 1))
+        for a, b, c, d in spans:
+            try:
+                word_table.cell(a, b).merge(word_table.cell(c, d))
+            except Exception:
+                pass
+
+    def add_chart(shape):
+        try:
+            chart = shape.chart
+            plot = chart.plots[0]
+            categories = [_sanitize_xml_text(str(cat)) for cat in plot.categories]
+            series_list = list(plot.series)
+        except Exception:
+            return
+        if not series_list:
+            return
+        try:
+            if chart.has_title:
+                t = _sanitize_xml_text(chart.chart_title.text_frame.text.strip())
+                if t:
+                    doc.add_paragraph(t)          # the chart's own title, as shown on the slide
+        except Exception:
+            pass
+        chart_table = doc.add_table(rows=len(categories) + 1, cols=len(series_list) + 1)
+        chart_table.style = "Table Grid"
+        for s_idx, series in enumerate(series_list, 1):
+            chart_table.cell(0, s_idx).text = _sanitize_xml_text(series.name or "")
+        for cat_idx, cat_name in enumerate(categories, 1):
+            chart_table.cell(cat_idx, 0).text = cat_name
+            for s_idx, series in enumerate(series_list, 1):
+                values = list(series.values)
+                val = values[cat_idx - 1] if cat_idx - 1 < len(values) else None
+                chart_table.cell(cat_idx, s_idx).text = _format_cell_value(val)
+
+    slides = list(prs.slides)
+    footers = []
+    prev_title = None
+    for n, slide in enumerate(slides, 1):
+        start = len(kids())
         title_shape = slide.shapes.title
-        if title_shape is not None and title_shape.has_text_frame and title_shape.text_frame.text.strip():
-            slide_titles.append(_sanitize_xml_text(title_shape.text_frame.text.strip()))
-        else:
-            slide_titles.append(None)
-    if skip_title_slide:
-        slide_titles[0] = None
-    real_titles = [t for t in slide_titles if t]
-    # A contents page only earns its space on a long deck — a 5-slide deck
-    # used to get a whole page listing its handful of headings.
-    # (No contents page: a handout mirrors the slides and adds nothing.)
+        title = _docx_text_of_pptx(title_shape.text_frame) if (title_shape is not None and title_shape.has_text_frame) else ""
+        kinds = {ph.placeholder_format.type for ph in slide.placeholders}
+        is_title_slide = PP_PLACEHOLDER.CENTER_TITLE in kinds or PP_PLACEHOLDER.SUBTITLE in kinds
+        tag = _slide_tag_of(slide)
+        cont = bool(title) and not is_title_slide and title == prev_title
+        subtitle_ph = next((ph for ph in slide.placeholders if ph.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE), None)
 
-    for i, slide in enumerate(prs.slides, 1):
-        if skip_title_slide and i == 1:
-            continue
-        title = None
-        text_shapes = []
-        table_shapes = []
-        chart_shapes = []
-        image_shapes = []
-        smartart_found = False
-        smartart_lines = []
-        for found, text in _iter_smartart_fallback_text(slide):
-            if found:
-                smartart_found = True
-            if text:
-                smartart_lines.append(text)
-        for shape in _iter_flat_shapes(slide.shapes):
-            if shape.has_table:
-                table_shapes.append(shape)
-                continue
-            if getattr(shape, "has_chart", False):
-                chart_shapes.append(shape)
-                continue
-            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                image_shapes.append(shape)
-                continue
-            if not shape.has_text_frame or not shape.text_frame.text.strip():
-                continue
-            if shape == slide.shapes.title:
-                title = _sanitize_xml_text(shape.text_frame.text.strip())
-            else:
-                text_shapes.append(shape)
-
-        # The slide's own title, or — for a slide without one — a thin
-        # divider line, never an invented "Slide N".
-        if title:
-            doc.add_heading(title, level=1)
-        else:
+        if title and is_title_slide:
+            p = doc.add_paragraph(style="Title")
+            _docx_copy_pptx_runs(p, title_shape.text_frame.paragraphs[0])
+            for para in title_shape.text_frame.paragraphs[1:]:
+                p.add_run().add_break()
+                _docx_copy_pptx_runs(p, para)
+        elif title and not cont:
+            m = re.match(r"Heading (\d)$", tag)
+            level = int(m.group(1)) if m else 1
+            p = doc.add_paragraph(style="Title" if tag == "Title" else f"Heading {level}")
+            for k, para in enumerate(title_shape.text_frame.paragraphs):
+                if k:
+                    p.add_run().add_break()
+                _docx_copy_pptx_runs(p, para)
+        elif not title and n > 1:
             _docx_divider(doc)
 
-        for shape in image_shapes:
+        shapes = []
+        for shape in _iter_flat_shapes(slide.shapes):
+            if title_shape is not None and shape._element is title_shape._element:
+                continue
+            if shape.is_placeholder and shape.placeholder_format.type in FURNITURE:
+                if shape.placeholder_format.type == PP_PLACEHOLDER.FOOTER and shape.has_text_frame and shape.text_frame.text.strip():
+                    footers.append(_docx_text_of_pptx(shape.text_frame))
+                continue
+            shapes.append(shape)
+        # Reading order: top to bottom, then left to right (rows within a quarter inch).
+        shapes.sort(key=lambda sh: (round((sh.top or 0) / 228600), sh.left or 0))
+        if subtitle_ph is not None:
+            shapes.sort(key=lambda sh: 0 if sh._element is subtitle_ph._element else 1)
+        pictures = []
+        body_columns = 0
+        for shape in shapes:
+            if (shape.is_placeholder and shape.has_text_frame and shape.text_frame.text.strip()
+                    and shape.placeholder_format.type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT)):
+                body_columns += 1
+                if body_columns == 2:
+                    # The slide's second column: noted, so converting back gives two columns again.
+                    col_start = len(kids())
+                    for para in shape.text_frame.paragraphs:
+                        add_text_paragraph(shape, para)
+                    new_col = kids()[col_start:]
+                    if new_col and new_col[0].tag == qn("w:p"):
+                        _docx_bookmark(DocxParagraph(new_col[0], doc._body), f"_dct_col{n}", 19000 + n)
+                    continue
+            if shape.has_table:
+                add_table(shape)
+            elif getattr(shape, "has_chart", False):
+                add_chart(shape)
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                pictures.append(shape)
+            elif shape.has_text_frame and shape.text_frame.text.strip():
+                if subtitle_ph is not None and shape._element is subtitle_ph._element and is_title_slide:
+                    for para in shape.text_frame.paragraphs:
+                        if para.text.strip():
+                            mark = _pptx_para_mark(para)
+                            st = mark[6:] if mark.startswith("style=") else "Subtitle"
+                            try:
+                                p = doc.add_paragraph(style=st)
+                            except KeyError:
+                                p = doc.add_paragraph(style="Subtitle")
+                            _docx_copy_pptx_runs(p, para)
+                    continue
+                for para in shape.text_frame.paragraphs:
+                    add_text_paragraph(shape, para)
+        for _found, text in _iter_smartart_fallback_text(slide):
+            if text:
+                doc.add_paragraph(_sanitize_xml_text(text), style="List Bullet")
+        # Pictures after the words, so converting back sets each beside its text.
+        for shape in pictures:
             try:
                 doc.add_picture(io.BytesIO(shape.image.blob), width=DocxInches(4))
             except Exception:
-                continue  # a malformed/unsupported embedded image shouldn't sink the whole conversion
-
-        for shape in text_shapes:
-            for para in shape.text_frame.paragraphs:
-                line = _sanitize_xml_text(para.text.strip())
-                if not line:
-                    continue
-                level = min(para.level or 0, 2)
-                pPr = para._p.find(qn("a:pPr"))
-                is_numbered = pPr is not None and pPr.find(qn("a:buAutoNum")) is not None
-                style_list = NUMBER_STYLES if is_numbered else BULLET_STYLES
-                try:
-                    p = doc.add_paragraph(style=style_list[level])
-                except KeyError:
-                    p = doc.add_paragraph(style="List Number" if is_numbered else "List Bullet")
-                    p.paragraph_format.left_indent = DocxInches(0.25 * (level + 1))
-                docx_align = _pptx_align_to_docx(para.alignment)
-                if docx_align is not None:
-                    p.alignment = docx_align
-                runs = [r for r in para.runs if r.text]
-                if not runs:
-                    p.add_run(line)
-                for run in runs:
-                    run_text = _sanitize_xml_text(run.text)
-                    address = None
-                    try:
-                        address = run.hyperlink.address
-                    except Exception:
-                        pass
-                    if address:
-                        _add_docx_hyperlink(
-                            p, address, run_text,
-                            bold=bool(run.font.bold), italic=bool(run.font.italic),
-                        )
-                    else:
-                        r = p.add_run(run_text)
-                        r.bold = bool(run.font.bold)
-                        r.italic = bool(run.font.italic)
-                        r.underline = bool(run.font.underline)
-                        hex_color = _safe_hex_color(run.font.color)
-                        if hex_color:
-                            try:
-                                r.font.color.rgb = DocxRGBColor.from_string(hex_color)
-                            except Exception:
-                                pass
-                        if run.font.size is not None:
-                            r.font.size = DocxPt(run.font.size.pt)
-
-        for shape in table_shapes:
-            src_rows = [list(row.cells) for row in shape.table.rows]
-            has_merges = any(cell.is_merge_origin for row in src_rows for cell in row)
-            rows = [[_sanitize_xml_text(cell.text.strip()) for cell in row] for row in src_rows]
-            if has_merges:
-                keep = list(range(len(rows)))
-            else:
-                keep = [i for i, r in enumerate(rows) if any(r)]
-            if not keep:
                 continue
-            rows = [rows[i] for i in keep]
-            src_rows = [src_rows[i] for i in keep]
-            n_rows, n_cols = len(rows), max(len(r) for r in rows)
-            word_table = doc.add_table(rows=n_rows, cols=n_cols)
-            word_table.style = "Light Grid Accent 1"
-            merge_spans = []
-            for r_idx, (doc_row, row) in enumerate(zip(word_table.rows, rows)):
-                doc_cells = doc_row.cells
-                for c_idx in range(n_cols):
-                    src_cell = src_rows[r_idx][c_idx] if c_idx < len(src_rows[r_idx]) else None
-                    if src_cell is not None and src_cell.is_spanned and not src_cell.is_merge_origin:
-                        continue  # covered by a merge origin elsewhere — filled in via the merge below
-                    cell = doc_cells[c_idx]
-                    cell.text = row[c_idx] if c_idx < len(row) else ""
-                    if r_idx == 0:
-                        for p in cell.paragraphs:
-                            for run in p.runs:
-                                run.bold = True
-                    if src_cell is not None:
-                        try:
-                            if src_cell.fill.type == MSO_FILL_TYPE.SOLID:
-                                hex_color = _safe_hex_color(src_cell.fill.fore_color)
-                                if hex_color:
-                                    _set_docx_cell_shading(cell, hex_color)
-                        except Exception:
-                            pass
-                        if src_cell.is_merge_origin and (src_cell.span_height > 1 or src_cell.span_width > 1):
-                            merge_spans.append((r_idx, c_idx, r_idx + src_cell.span_height - 1, c_idx + src_cell.span_width - 1))
-            for min_r, min_c, max_r, max_c in merge_spans:
-                try:
-                    word_table.cell(min_r, min_c).merge(word_table.cell(max_r, max_c))
-                except Exception:
-                    pass
-
-        for shape in chart_shapes:
-            try:
-                chart = shape.chart
-                plot = chart.plots[0]
-                categories = [_sanitize_xml_text(str(cat)) for cat in plot.categories]
-                series_list = list(plot.series)
-            except Exception:
-                continue
-            if not series_list:
-                continue
-            caption = doc.add_paragraph()
-            title_text = None
-            try:
-                if chart.has_title:
-                    title_text = _sanitize_xml_text(chart.chart_title.text_frame.text.strip())
-            except Exception:
-                pass
-            run = caption.add_run(f"Chart: {title_text}" if title_text else "Chart data")
-            run.italic = True
-            n_rows = len(categories) + 1
-            n_cols = len(series_list) + 1
-            chart_table = doc.add_table(rows=n_rows, cols=n_cols)
-            chart_table.style = "Light Grid Accent 1"
-            chart_table.cell(0, 0).text = ""
-            for s_idx, series in enumerate(series_list, 1):
-                chart_table.cell(0, s_idx).text = _sanitize_xml_text(series.name or f"Series {s_idx}")
-            for cat_idx, cat_name in enumerate(categories, 1):
-                chart_table.cell(cat_idx, 0).text = cat_name
-                for s_idx, series in enumerate(series_list, 1):
-                    values = list(series.values)
-                    val = values[cat_idx - 1] if cat_idx - 1 < len(values) else None
-                    chart_table.cell(cat_idx, s_idx).text = _format_cell_value(val)
-            for cell in chart_table.rows[0].cells:
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.bold = True
-
-        if smartart_lines:
-            label_p = doc.add_paragraph()
-            label_p.paragraph_format.space_before = DocxPt(8)
-            label_run = label_p.add_run("Diagram contents:")
-            label_run.italic = True
-            label_run.bold = True
-            for line in smartart_lines:
-                doc.add_paragraph(line, style="List Bullet")
-        elif smartart_found:
-            note_p = doc.add_paragraph()
-            note_p.paragraph_format.space_before = DocxPt(8)
-            run = note_p.add_run(
-                "[This slide contains a diagram (SmartArt) whose content could not be extracted.]"
-            )
-            run.italic = True
-            run.font.size = DocxPt(9)
-
         if slide.has_notes_slide:
-            notes_text = _sanitize_xml_text(slide.notes_slide.notes_text_frame.text.strip())
-            if notes_text:
-                # The notes, set apart by indent and italics rather than an
-                # added "Speaker Notes" label.
-                note_p = doc.add_paragraph()
-                note_p.paragraph_format.space_before = DocxPt(8)
-                note_p.paragraph_format.left_indent = DocxInches(0.3)
-                text_run = note_p.add_run(notes_text)
-                text_run.italic = True
-                text_run.font.size = DocxPt(10)
-                _add_docx_callout_style(note_p)
+            for para in slide.notes_slide.notes_text_frame.paragraphs:
+                if para.text.strip():
+                    p = doc.add_paragraph(style=notes_style)
+                    _docx_copy_pptx_runs(p, para)
+                    _add_docx_callout_style(p)
 
-        # No page break per slide: that made a 6-slide deck into 7 mostly
-        # blank pages — wasteful for students paying to print handouts.
-        # Each slide's heading starts its section in one continuous document.
+        # The hidden bookmark at this slide's first paragraph.
+        new = kids()[start:]
+        if not new or new[0].tag != qn("w:p"):
+            anchor = OxmlElement("w:p")
+            if new:
+                new[0].addprevious(anchor)
+            else:
+                body.insert(len(kids()), anchor)
+            first_p = DocxParagraph(anchor, doc._body)
+        else:
+            first_p = DocxParagraph(new[0], doc._body)
+        _docx_bookmark(first_p, f"_dct_s{n}{'c' if cont else ''}", 9000 + n)
+        prev_title = title if title else None
 
+    if footers:
+        common = Counter(footers).most_common(1)[0][0]
+        fp = doc.sections[0].footer.paragraphs[0]
+        for k, line in enumerate(common.split("\n")):
+            if k:
+                fp.add_run().add_break()
+            fp.add_run(line)
     apply_docx_style(doc, style)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.docx")
@@ -4529,19 +5007,76 @@ def _fmt_stat(v, whole):
     return f"{v:,.1f}" if abs(v) >= 1 else f"{v:,.2f}"
 
 
+# ---------------------------------------------------------------- Word ⇄ Excel helpers
+_XLSX_LAYOUT_PROP = "docente.layout"
+
+
+def _docx_comment_map(doc):
+    """{comment id: (author, text)} for a Word document's review comments."""
+    out = {}
+    try:
+        for part in doc.part.package.iter_parts():
+            if part.partname == "/word/comments.xml":
+                root = etree.fromstring(part.blob)
+                for c in root.findall(qn("w:comment")):
+                    text = _all_text_including_deletions(c).strip()
+                    if text:
+                        out[c.get(qn("w:id"))] = ((c.get(qn("w:author")) or "").strip(), text)
+    except Exception:
+        pass
+    return out
+
+
+def _docx_comment_ids(el):
+    ids = []
+    for tag in ("w:commentRangeStart", "w:commentReference"):
+        for c in el.iter(qn(tag)):
+            cid = c.get(qn("w:id"))
+            if cid not in ids:
+                ids.append(cid)
+    return ids
+
+
+def _docx_header_footer_lines(doc):
+    heads, foots = [], []
+    for section in doc.sections:
+        for container, bucket in ((section.header, heads), (section.footer, foots)):
+            try:
+                for p in container.paragraphs:
+                    t = _full_paragraph_text(p).strip()
+                    if t and t not in bucket:
+                        bucket.append(t)
+            except Exception:
+                pass
+    return heads, foots
+
+
+def _xlsx_layout(path):
+    """The original document's order, if this workbook was made by Word → Excel."""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=False)
+        for prop in wb.custom_doc_props.props:
+            if prop.name == _XLSX_LAYOUT_PROP:
+                data = _json.loads(prop.value)
+                return data if isinstance(data, dict) and data.get("v") == 1 else None
+    except Exception:
+        return None
+    return None
+
+
 def xlsx_to_docx(src_path, out_dir, style="clean"):
+    """Excel → Word, faithfully: each sheet's cells as a table, numbers shown
+    exactly as Excel shows them, and nothing invented — no summaries, labels
+    or titles. A sheet with a name of its own (not Excel's "Sheet1") keeps it
+    as a heading above its table; every table also carries its sheet's name
+    invisibly (its alt-text title), so converting back names the tabs the
+    same. A workbook made by Word → Excel goes back into the document's own
+    order, with the document's own styles."""
+    layout = _xlsx_layout(src_path)
     src_path = _xlsx_with_computed_values(src_path, out_dir)
     wb = _safe_load(openpyxl.load_workbook, src_path, data_only=True)
-    # A formula cell in a workbook that's never been opened in a real
-    # spreadsheet app (generated by a script, exported from a database) has
-    # no cached result — data_only=True silently returns None for it, which
-    # renders as a misleadingly blank cell with no sign a formula was ever
-    # there. Loading a second copy without data_only lets an uncalculated
-    # formula fall back to showing its actual formula text instead.
     wb_formulas = _safe_load(openpyxl.load_workbook, src_path, data_only=False)
-
-    sheet_rows = []
-    max_cols = 0
+    sheets, names, max_cols = {}, [], 0
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         ws_formulas = wb_formulas[sheet_name]
@@ -4556,119 +5091,130 @@ def xlsx_to_docx(src_path, out_dir, style="clean"):
                 if c_idx < len(formula_rows[row_idx]) and formula_rows[row_idx][c_idx].data_type == "f":
                     return True
             return False
-
         if not merged_ranges:
             keep = [i for i, r in enumerate(rows) if has_content(i, r)]
             rows = [rows[i] for i in keep]
             formula_rows = [formula_rows[i] for i in keep]
-        sheet_rows.append((sheet_name, rows, formula_rows, merged_ranges, ws))
+        # Columns that are empty all the way down (Excel's unused width) aren't part of the data.
+        if rows and not merged_ranges:
+            last = max((max((i for i, c in enumerate(r) if c.value is not None and str(c.value).strip() != ""), default=-1) for r in rows), default=-1)
+            rows = [r[:last + 1] for r in rows]
+            formula_rows = [r[:last + 1] for r in formula_rows]
+        sheets[sheet_name] = (rows, formula_rows, merged_ranges, ws)
+        names.append(sheet_name)
         if rows:
             max_cols = max(max_cols, max(len(r) for r in rows))
-
     doc = Document()
     if max_cols > 6:
-        # A wide sheet squeezed into a portrait page becomes unreadable —
-        # landscape gives every column real room.
         section = doc.sections[0]
         section.orientation = WD_ORIENT.LANDSCAPE
         section.page_width, section.page_height = section.page_height, section.page_width
-
-    # Titled after the spreadsheet itself — it used to read "Converted from
-    # Excel". Its own title property if it has one, else its sheet names.
-    names = [s[0] for s in sheet_rows]
-    wb_title = ""
     try:
         wb_title = (wb.properties.title or "").strip()
+        if wb_title:
+            doc.core_properties.title = wb_title[:250]   # the file's title property, not text on the page
     except Exception:
         pass
-    if wb_title:
-        doc_title = _sanitize_xml_text(wb_title)
-    elif len(names) == 1:
-        doc_title = names[0]
-    elif 1 < len(names) <= 3:
-        doc_title = ", ".join(names[:-1]) + " and " + names[-1]
-    elif names:
-        doc_title = f"{names[0]} and {len(names) - 1} other sheets"
-    else:
-        doc_title = "Spreadsheet report"
-    doc.add_heading(doc_title, 0)
-    for sheet_name, rows, formula_rows, merged_ranges, ws in sheet_rows:
-        if not (len(names) == 1 and doc_title == sheet_name):
-            doc.add_heading(sheet_name, level=1)
+
+    def add_table(sheet_name):
+        rows, formula_rows, merged_ranges, ws = sheets[sheet_name]
         if not rows:
-            doc.add_paragraph("(Empty sheet)")
-            continue
+            return None
         n_cols = max(len(r) for r in rows)
         table = doc.add_table(rows=len(rows), cols=n_cols)
-        table.style = "Light Grid Accent 1"
-        cell_comments = []
+        table.style = "Table Grid"
         for r_idx, (doc_row, row) in enumerate(zip(table.rows, rows)):
             doc_cells = doc_row.cells
             for c_idx in range(n_cols):
                 src_cell = row[c_idx] if c_idx < len(row) else None
                 val = src_cell.value if src_cell is not None else None
                 if val is None and c_idx < len(formula_rows[r_idx]) and formula_rows[r_idx][c_idx].data_type == "f":
-                    val = formula_rows[r_idx][c_idx].value  # uncalculated formula — show the formula itself, not blank
+                    val = formula_rows[r_idx][c_idx].value
                 cell = doc_cells[c_idx]
-                number_format = src_cell.number_format if src_cell is not None else None
-                cell.text = _format_cell_value(val, number_format)
-                if r_idx == 0:
-                    for p in cell.paragraphs:
-                        for run in p.runs:
-                            run.bold = True
-                if src_cell is not None:
-                    fill_hex = _xlsx_conditional_fill_hex(ws, src_cell) or _xlsx_cell_fill_hex(src_cell)
-                    if fill_hex:
-                        _set_docx_cell_shading(cell, fill_hex)
-                    if src_cell.comment is not None:
-                        note_text = (src_cell.comment.text or "").strip()
-                        if note_text:
-                            author = (src_cell.comment.author or "").strip() or "Comment"
-                            cell_comments.append((src_cell.coordinate, author, note_text))
+                cell.text = _format_cell_value(val, src_cell.number_format if src_cell is not None else None)
+                if src_cell is None:
+                    continue
+                try:
+                    if src_cell.font is not None and src_cell.font.b:
+                        for p in cell.paragraphs:
+                            for run in p.runs:
+                                run.bold = True
+                except Exception:
+                    pass
+                fill_hex = _xlsx_conditional_fill_hex(ws, src_cell) or _xlsx_cell_fill_hex(src_cell)
+                if fill_hex:
+                    _set_docx_cell_shading(cell, fill_hex)
+                if src_cell.comment is not None and (src_cell.comment.text or "").strip() and hasattr(doc, "add_comment"):
+                    runs = cell.paragraphs[0].runs or [cell.paragraphs[0].add_run("")]
+                    try:
+                        doc.add_comment(runs, text=src_cell.comment.text.strip(), author=(src_cell.comment.author or "").strip() or "Excel")
+                    except Exception:
+                        pass
         for mr in merged_ranges:
             try:
                 table.cell(mr.min_row - 1, mr.min_col - 1).merge(table.cell(mr.max_row - 1, mr.max_col - 1))
             except IndexError:
-                continue  # merge range falls outside the table we built — skip rather than crash
-        if cell_comments:
-            note_heading = doc.add_paragraph()
-            note_heading.paragraph_format.space_before = DocxPt(8)
-            note_run = note_heading.add_run("Cell comments:")
-            note_run.bold = True
-            note_run.italic = True
-            for coord, author, note_text in cell_comments:
-                doc.add_paragraph(f"{coord} ({author}): {note_text}", style="List Bullet")
+                continue
+        _docx_set_table_caption(table, sheet_name)
+        return table
 
-        # "At a glance": average, lowest and highest for each column of
-        # numbers — what turns a copied table into a report someone can read
-        # in ten seconds.
-        col_stats = _xlsx_numeric_column_stats(rows)
-        if col_stats:
-            doc.add_heading("At a glance", level=2)
-            doc.add_paragraph(f"{len(rows) - 1} rows of data.")
-            st = doc.add_table(rows=1 + len(col_stats), cols=4)
-            st.style = "Light Grid Accent 1"
-            for c_idx, head in enumerate(["Column", "Average", "Lowest", "Highest"]):
-                st.rows[0].cells[c_idx].text = head
-                for p in st.rows[0].cells[c_idx].paragraphs:
-                    for run in p.runs:
-                        run.bold = True
-            for r_idx, (h, avg, lo, hi, whole, fmt) in enumerate(col_stats, start=1):
-                if fmt and fmt != "General":   # money stays money (GH¢1,288.58), percentages stay %
-                    vals = [_sanitize_xml_text(h)] + [_format_cell_value(v, fmt) for v in (avg, lo, hi)]
-                else:
-                    vals = [_sanitize_xml_text(h), f"{avg:,.1f}", _fmt_stat(lo, whole), _fmt_stat(hi, whole)]
-                for c_idx, v in enumerate(vals):
-                    st.rows[r_idx].cells[c_idx].text = v
-        charts = getattr(ws, "_charts", None) or []
-        for chart in charts:
-            chart_title = _xlsx_chart_title(chart)
-            label = f'Chart: "{chart_title}"' if chart_title else "Chart (based on the data above)"
-            chart_p = doc.add_paragraph()
-            chart_p.paragraph_format.space_before = DocxPt(8)
-            chart_run = chart_p.add_run(label)
-            chart_run.italic = True
+    def add_text(text, style_name):
+        try:
+            p = doc.add_paragraph(style=style_name)
+        except KeyError:
+            p = doc.add_paragraph()
+        for k, seg in enumerate(str(text).split("\n")):
+            if k:
+                p.add_run().add_break()
+            if seg:
+                p.add_run(_sanitize_xml_text(seg))
+        return p
 
+    used = set()
+    if layout and layout.get("text") in sheets or (layout and not layout.get("text")):
+        text_rows = []
+        if layout.get("text"):
+            rows = sheets[layout["text"]][0]
+            text_rows = [str(r[0].value) for r in rows if r and r[0].value is not None and str(r[0].value).strip()]
+        n_p = sum(1 for e in layout.get("b", []) if e and e[0] == "p")
+        tables_ok = all(e[1] in sheets for e in layout.get("b", []) if e and e[0] in ("t", "c"))
+        if n_p == len(text_rows) and tables_ok:
+            k = 0
+            for e in layout["b"]:
+                if e[0] == "p":
+                    add_text(text_rows[k], e[1] if len(e) > 1 else "Normal")
+                    k += 1
+                elif e[0] in ("t", "c"):
+                    if len(e) >= 4 and e[3]:
+                        add_text(e[3], e[2])
+                    add_table(e[1])
+                    used.add(e[1])
+            if layout.get("text"):
+                used.add(layout["text"])
+        else:
+            layout = None
+    for name in names:
+        if name in used or not sheets[name][0]:
+            continue
+        if not re.fullmatch(r"(?i)sheet\s*\d*", name.strip()):
+            doc.add_heading(_sanitize_xml_text(name), level=1)   # the sheet's own name, as on its tab
+        add_table(name)
+
+    # Excel's own page header/footer → the document's page header/footer.
+    first_ws = wb[wb.sheetnames[0]] if wb.sheetnames else None
+    if first_ws is not None:
+        for hf, container in ((first_ws.oddHeader, doc.sections[0].header), (first_ws.oddFooter, doc.sections[0].footer)):
+            try:
+                parts = [x.text for x in (hf.left, hf.center, hf.right) if x is not None and x.text]
+            except Exception:
+                parts = []
+            lines = [ln for part in parts for ln in re.sub(r"&[A-Za-z]", "", part).split("\n") if ln.strip()]
+            if lines:
+                p = container.paragraphs[0]
+                for k, ln in enumerate(lines):
+                    if k:
+                        p.add_run().add_break()
+                    p.add_run(_sanitize_xml_text(ln))
     apply_docx_style(doc, style)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "converted.docx")
@@ -4760,60 +5306,92 @@ def docx_to_xlsx(src_path, out_dir):
         value = int(number) if not decimals and float(number).is_integer() else number
         return value, num_fmt
 
-    for i, table in enumerate(doc.tables, 1):
-        first_cell = next((c.text.strip() for row in table.rows for c in row.cells if c.text.strip()), "")
-        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, first_cell, f"Sheet{len(wb.worksheets) + 1}"))
-        src_rows = [list(row.cells) for row in table.rows]
-        n_cols = len(table.columns)
-        merges = _find_docx_merges(src_rows, n_cols)
-        skip_cells = {(r, c) for (min_r, min_c, max_r, max_c) in merges
-                      for r in range(min_r, max_r + 1) for c in range(min_c, max_c + 1)
-                      if (r, c) != (min_r, min_c)}
-        for r_idx, row in enumerate(table.rows, 1):
-            for c_idx, cell in enumerate(row.cells, 1):
-                if (r_idx - 1, c_idx - 1) in skip_cells:
-                    continue  # covered by a merge origin elsewhere — left blank, filled via the merge below
-                text = _full_cell_text(cell).strip()
-                value, num_fmt = (text, None) if r_idx == 1 else coerce_value(text)
-                xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
-                if num_fmt:
-                    xlsx_cell.number_format = num_fmt
-                shade = _get_docx_cell_shading(cell)
-                if shade:
-                    xlsx_cell.fill = XlsxPatternFill(start_color=shade, end_color=shade, fill_type="solid")
-        for min_r, min_c, max_r, max_c in merges:
-            try:
-                ws.merge_cells(start_row=min_r + 1, start_column=min_c + 1, end_row=max_r + 1, end_column=max_c + 1)
-            except Exception:
-                pass
-        for cell in ws[1]:
-            cell.font = XlsxFont(bold=True)
-        autosize_columns(ws, len(table.columns))
-
-    # Capture the document's own paragraph text too, in its own sheet —
-    # tables and surrounding prose commentary often coexist in a document,
-    # and the old behavior silently dropped all of it whenever any table
-    # was present.
-    text_rows = []
+    # The document in its own order: each table on a tab of its own, the
+    # paragraphs (in order) on one tab, and the order itself kept invisibly in
+    # the workbook's properties, so Excel → Word puts it all back. A heading
+    # straight above a table names that table's tab instead of being repeated.
+    blocks = list(_iter_block_items(doc))
+    comment_map = _docx_comment_map(doc)
+    layout = []
+    text_rows = []          # (text, comment ids)
     chart_data_list = []
-    for p in doc.paragraphs:
+    for bi, block in enumerate(blocks):
+        if isinstance(block, DocxTable):
+            table = block
+            heading = None
+            prev = blocks[bi - 1] if bi else None
+            if (prev is not None and not isinstance(prev, DocxTable) and layout and layout[-1][0] == "p" and text_rows
+                    and re.match(r"(heading \d+|title)$", (prev.style.name or "").lower())):
+                heading = (prev.style.name, text_rows.pop()[0])
+                layout.pop()
+            first_cell = next((c.text.strip() for row in table.rows for c in row.cells if c.text.strip()), "")
+            name_src = _docx_table_caption(table) or (heading[1] if heading else first_cell)
+            ws = wb.create_sheet(title=_xlsx_sheet_title(wb, name_src, f"Sheet{len(wb.worksheets) + 1}"))
+            src_rows = [list(row.cells) for row in table.rows]
+            n_cols = len(table.columns)
+            merges = _find_docx_merges(src_rows, n_cols)
+            skip_cells = {(r, c) for (min_r, min_c, max_r, max_c) in merges
+                          for r in range(min_r, max_r + 1) for c in range(min_c, max_c + 1)
+                          if (r, c) != (min_r, min_c)}
+            for r_idx, row in enumerate(table.rows, 1):
+                for c_idx, cell in enumerate(row.cells, 1):
+                    if (r_idx - 1, c_idx - 1) in skip_cells:
+                        continue  # covered by a merge origin elsewhere — left blank, filled via the merge below
+                    text = _full_cell_text(cell).strip()
+                    value, num_fmt = (text, None) if r_idx == 1 else coerce_value(text)
+                    xlsx_cell = ws.cell(row=r_idx, column=c_idx, value=value)
+                    if num_fmt:
+                        xlsx_cell.number_format = num_fmt
+                    for cid in _docx_comment_ids(cell._tc):
+                        if cid in comment_map:
+                            author, ctext = comment_map[cid]
+                            xlsx_cell.comment = XlsxComment(ctext, author or "Word")
+                    shade = _get_docx_cell_shading(cell)
+                    if shade:
+                        xlsx_cell.fill = XlsxPatternFill(start_color=shade, end_color=shade, fill_type="solid")
+            for min_r, min_c, max_r, max_c in merges:
+                try:
+                    ws.merge_cells(start_row=min_r + 1, start_column=min_c + 1, end_row=max_r + 1, end_column=max_c + 1)
+                except Exception:
+                    pass
+            for cell in ws[1]:
+                cell.font = XlsxFont(bold=True)
+            autosize_columns(ws, len(table.columns))
+            entry = ["t", ws.title]
+            if heading:
+                entry += [heading[0], heading[1]]
+            layout.append(entry)
+            continue
+        p = block
         full_text = _full_paragraph_text(p).strip()
         if full_text:
-            text_rows.append(full_text)
+            text_rows.append((full_text, _docx_comment_ids(p._p)))
+            layout.append(["p", p.style.name or "Normal"])
         for tb_para in _iter_textbox_paragraphs(p):
             tb_text = _full_paragraph_text(tb_para).strip()
             if tb_text:
-                text_rows.append(tb_text)
+                text_rows.append((tb_text, []))
+                layout.append(["p", "Normal"])
         for chart_title, chart_cats, chart_series, _chart_type in _iter_docx_charts(p, doc):
             chart_data_list.append((chart_title, chart_cats, chart_series))
+            layout.append(["c", len(chart_data_list) - 1])
+    text_sheet = None
     if text_rows:
-        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, text_rows[0], f"Sheet{len(wb.worksheets) + 1}"))
+        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, text_rows[0][0], f"Sheet{len(wb.worksheets) + 1}"))
         ws.column_dimensions["A"].width = 100
-        for r, line in enumerate(text_rows, 1):
-            ws.cell(row=r, column=1, value=line)
-
+        for r, (line, cids) in enumerate(text_rows, 1):
+            c = ws.cell(row=r, column=1, value=line)
+            if "\n" in line:
+                c.alignment = XlsxAlignment(wrap_text=True)
+            for cid in cids:
+                if cid in comment_map:
+                    author, ctext = comment_map[cid]
+                    c.comment = XlsxComment(ctext, author or "Word")
+        text_sheet = ws.title
+    chart_sheet_names = []
     for i, (chart_title, chart_cats, chart_series) in enumerate(chart_data_list, 1):
         ws = wb.create_sheet(title=_xlsx_sheet_title(wb, chart_title or (chart_cats[0] if chart_cats else ""), f"Sheet{len(wb.worksheets) + 1}"))
+        chart_sheet_names.append(ws.title)
         ws.cell(row=1, column=1, value="")
         for s_idx, (name, _values) in enumerate(chart_series, 2):
             ws.cell(row=1, column=s_idx, value=name).font = XlsxFont(bold=True)
@@ -4842,22 +5420,19 @@ def docx_to_xlsx(src_path, out_dir):
         for r, note in enumerate(endnotes, 1):
             ws.cell(row=r, column=1, value=f"{r}. {note}")
 
-    comments = _get_docx_comments(doc)
-    if comments:
-        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, comments[0][1], f"Sheet{len(wb.worksheets) + 1}"))
-        ws.column_dimensions["A"].width = 25
-        ws.column_dimensions["B"].width = 90
-        for r, (author, comment_text) in enumerate(comments, 1):   # no added header words
-            ws.cell(row=r, column=1, value=author)
-            ws.cell(row=r, column=2, value=comment_text)
-
-    header_footer = _get_docx_header_footer_text(doc)
-    if header_footer:
-        ws = wb.create_sheet(title=_xlsx_sheet_title(wb, header_footer[0], f"Sheet{len(wb.worksheets) + 1}"))
-        ws.column_dimensions["A"].width = 100
-        for r, line in enumerate(header_footer, 1):
-            ws.cell(row=r, column=1, value=line)
-
+    heads, foots = _docx_header_footer_lines(doc)
+    for ws in wb.worksheets:
+        if heads:
+            ws.oddHeader.center.text = "\n".join(heads)[:250]
+        if foots:
+            ws.oddFooter.center.text = "\n".join(foots)[:250]
+    for e in layout:
+        if e[0] == "c":
+            e[1] = chart_sheet_names[e[1]] if e[1] < len(chart_sheet_names) else ""
+    try:
+        wb.custom_doc_props.append(XlsxStringProperty(name=_XLSX_LAYOUT_PROP, value=_json.dumps({"v": 1, "text": text_sheet, "b": layout}, ensure_ascii=False)))
+    except Exception:
+        pass
     if not wb.sheetnames:
         wb.create_sheet(title="Sheet1")   # Excel's own default; nothing written into it
 
@@ -5074,6 +5649,44 @@ def summary_slides_to_pptx(slides, out_dir, style="visual", filename="Summary.pp
                     slide, chart["categories"], [(chart["series_name"], chart["values"])],
                     prs.slide_width, prs.slide_height,
                 )
+        elif slide_data.get("sections"):
+            # Heading (above) → each sub-heading → its points, indented beneath it —
+            # the way a lecturer's slide reads.
+            body_box = slide.shapes.add_textbox(margin_x, content_top, content_width, content_height)
+            body_tf = body_box.text_frame
+            body_tf.word_wrap = True
+            sub_color = PptxRGBColor(0x1F, 0x4E, 0x79) if style_conf["show_icon"] else HEADER_COLOR
+            first = True
+            n_points = sum(len(s.get("points") or []) for s in slide_data["sections"])
+            point_size = Pt(20 if n_points <= 5 else 18)
+            for sec in slide_data["sections"]:
+                if sec.get("subheading"):
+                    p = body_tf.paragraphs[0] if first else body_tf.add_paragraph()
+                    first = False
+                    p.space_before = Pt(0 if p is body_tf.paragraphs[0] else 14)
+                    p.space_after = Pt(6)
+                    _add_markdown_aware_pptx_text(p, sec["subheading"])
+                    for run in p.runs:
+                        run.font.size = Pt(24)
+                        run.font.color.rgb = sub_color
+                for pt_text in sec.get("points") or []:
+                    p = body_tf.paragraphs[0] if first else body_tf.add_paragraph()
+                    first = False
+                    p.space_after = Pt(6)
+                    pPr = p._p.get_or_add_pPr()
+                    pPr.set("marL", str(int(PptxInches(0.55))))
+                    pPr.set("indent", str(-int(PptxInches(0.28))))
+                    mark = p.add_run()
+                    mark.text = "\u2022\u2002"
+                    mark.font.size = point_size
+                    mark.font.color.rgb = sub_color
+                    _add_markdown_aware_pptx_text(p, pt_text)
+                    for run in p.runs:
+                        if run.font.size is None:
+                            run.font.size = point_size
+                        if run.font.color.type is None:
+                            run.font.color.rgb = BODY_COLOR
+            body_tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
         else:
             body_box = slide.shapes.add_textbox(margin_x, content_top, content_width, content_height)
             body_tf = body_box.text_frame
@@ -5628,10 +6241,24 @@ def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
         if not q_text:
             continue
 
+        case = str(q.get("case") or "").strip() if q.get("case_study") else ""
+        if case:
+            # A case study: its label, the scenario in plain text, then the question.
+            lab = doc.add_paragraph()
+            lab.paragraph_format.space_before = DocxPt(16)
+            lab.paragraph_format.space_after = DocxPt(3)
+            set_run(lab.add_run(f"{i}. Case study"), size=10.5, bold=True, color=DocxRGBColor(0x1F, 0x5F, 0x8B))
+            case_p = doc.add_paragraph()
+            case_p.paragraph_format.left_indent = DocxInches(0.3)
+            case_p.paragraph_format.space_after = DocxPt(6)
+            set_run(case_p.add_run(_sanitize_xml_text(case)), size=11)
         q_p = doc.add_paragraph()
-        q_p.paragraph_format.space_before = DocxPt(14)
+        q_p.paragraph_format.space_before = DocxPt(4 if case else 14)
         q_p.paragraph_format.space_after = DocxPt(4)
-        set_run(q_p.add_run(f"{i}. "), bold=True)
+        if case:
+            q_p.paragraph_format.left_indent = DocxInches(0.3)
+        else:
+            set_run(q_p.add_run(f"{i}. "), bold=True)
         set_run(q_p.add_run(_sanitize_xml_text(q_text)), bold=True)
 
         if q_type == "multiple_choice" and isinstance(q.get("options"), list) and q["options"]:

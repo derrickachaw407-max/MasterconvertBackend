@@ -2671,6 +2671,56 @@ def _notes(s, sd):
 
 
 
+# ------------------------------------------------ transitions, hidden slides, title notes
+# PowerPoint's own transitions (PresentationML), with the direction PowerPoint uses by default.
+TRANSITIONS = {
+    "fade": {},
+    "push": {"dir": "u"},
+    "wipe": {"dir": "r"},
+    "cover": {"dir": "l"},
+    "split": {"orient": "vert", "dir": "out"},
+    "zoom": {},
+}
+
+
+def _set_transition(slide, kind):
+    """<p:transition> sits after <p:clrMapOvr> (or <p:cSld>) and before <p:timing>."""
+    sld = slide._element
+    for old in sld.findall(qn("p:transition")):
+        sld.remove(old)
+    if kind not in TRANSITIONS:
+        return
+    tr = etree.Element(qn("p:transition"))
+    tr.set("spd", "med")
+    effect = etree.SubElement(tr, qn("p:" + kind))
+    for k, v in TRANSITIONS[kind].items():
+        effect.set(k, v)
+    anchor = sld.find(qn("p:clrMapOvr"))
+    if anchor is None:
+        anchor = sld.find(qn("p:cSld"))
+    anchor.addnext(tr)
+
+
+def _transition_of(slide):
+    tr = slide._element.find(qn("p:transition"))
+    if tr is None:
+        return None
+    for child in tr:
+        name = etree.QName(child).localname
+        if name in TRANSITIONS:
+            return name
+    return None
+
+
+def _finish_slides(slides, sd):
+    """Hidden and transition settings for every slide made from one deck slide."""
+    for s in slides:
+        if sd.get("hidden"):
+            s._element.set("show", "0")
+        if sd.get("transition"):
+            _set_transition(s, str(sd["transition"]))
+
+
 def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
     """deck: {
         template: one of TEMPLATES (or "student"/"tutor"),
@@ -2704,8 +2754,13 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
             _student_title_slide(prs, deck)
         else:
             _tutor_title_slide(prs, deck, tpl)
+        ts = deck.get("title_slide") if isinstance(deck.get("title_slide"), dict) else {}
+        if len(prs.slides):
+            _notes(prs.slides[0], ts)
+            _finish_slides([prs.slides[0]], {"transition": ts.get("transition")})
     for sd in slides:
         number = len(prs.slides) + 1
+        made_from = len(prs.slides)
         kind = sd.get("kind") or "content"
         if band:
             _modern_slide(prs, deck, sd, number, logo, tpl)
@@ -2719,6 +2774,7 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
             _picture_slide(prs, deck, sd, number, tpl)
         else:
             _content_slide(prs, deck, sd, number, logo, tpl)
+        _finish_slides(list(prs.slides)[made_from:], sd)
     if not len(prs.slides):
         raise StudioError("Add at least one slide first.")
     safe = re.sub(r"[^A-Za-z0-9 _.()-]+", "", filename).strip() or "Presentation.pptx"
@@ -3252,6 +3308,11 @@ def parse_pptx_to_deck(path, max_pictures=30):
         title_shape = s.shapes.title
         title = re.sub(r"\s+", " ", title_shape.text_frame.text.replace("\v", " ")).strip() if title_shape is not None and title_shape.has_text_frame else ""
         kinds = {ph.placeholder_format.type for ph in s.placeholders}
+        extras = {}
+        if s._element.get("show") == "0":
+            extras["hidden"] = True
+        if _transition_of(s):
+            extras["transition"] = _transition_of(s)
         is_title_slide = i == 0 and (PP_PLACEHOLDER.CENTER_TITLE in kinds or PP_PLACEHOLDER.SUBTITLE in kinds or "title slide" in (s.slide_layout.name or "").lower())
         # Slide numbers, dates and footers are the template's furniture, not
         # content — reading them made "3" an extra bullet on slide 3.
@@ -3271,12 +3332,17 @@ def parse_pptx_to_deck(path, max_pictures=30):
                 if i == 0 and not is_title_slide and len(texts) <= 3 and sum(len(sh.text_frame.text) for sh in texts) <= 300:
                     is_title_slide = True
         if is_title_slide:
+            title_notes = s.notes_slide.notes_text_frame.text.strip() if s.has_notes_slide else ""
             raw_lines = [l.strip() for l in cover_text.replace("\v", "\n").split("\n") if l.strip()]
             others = [re.sub(r"\s+", " ", sh.text_frame.text.replace("\v", " ")).strip() for sh in texts]
             code = next((m.group(1) for l in raw_lines for m in [re.match(r"^\((.+)\)$", l)] if m), "")
             course_lines = [l for l in raw_lines if not re.match(r"^\(.+\)$", l)]
             title_slide = {"lines": raw_lines[:4], "main": others[0][:200] if others else "", "sub": others[1][:200] if len(others) > 1 else "",
                            "course": " ".join(course_lines)[:80], "code": code[:30], "subtitle": others[0][:120] if others else ""}
+            if title_notes:
+                title_slide["notes"] = title_notes[:4000]
+            if _transition_of(s):
+                title_slide["transition"] = _transition_of(s)
             # The title slide's own pictures are the author's content: a small
             # square one is their logo, a large one the picture beside the
             # title. Mostly-transparent images are skipped — the lecture
@@ -3305,13 +3371,13 @@ def parse_pptx_to_deck(path, max_pictures=30):
         layout_name = (s.slide_layout.name or "").lower()
         if "section" in layout_name:
             others = [re.sub(r"\s+", " ", sh.text_frame.text).strip() for sh in texts]
-            slides.append({"kind": "section", "title": title[:120], "sub": (others[0] if others else "")[:200]})
+            slides.append(dict({"kind": "section", "title": title[:120], "sub": (others[0] if others else "")[:200]}, **extras))
             continue
         all_text = " ".join(re.sub(r"\s+", " ", sh.text_frame.text).strip() for sh in texts).strip()
         if not title and re.match(r'^["\u201c].{10,380}["\u201d]', all_text):
             m = re.match(r'^["\u201c](.+?)["\u201d]\s*(?:[-\u2013\u2014~]+\s*(.+))?$', all_text)
             if m:
-                slides.append({"kind": "quote", "quote": m.group(1).strip()[:400], "by": (m.group(2) or "").strip()[:120]})
+                slides.append(dict({"kind": "quote", "quote": m.group(1).strip()[:400], "by": (m.group(2) or "").strip()[:120]}, **extras))
                 continue
         if len(bodies) == 2:
             sd.update(kind="columns", left=_tidy_bullets(_paragraph_bullets(bodies[0].text_frame))[0],
@@ -3364,6 +3430,7 @@ def parse_pptx_to_deck(path, max_pictures=30):
             # "Thanks!", "Thank you for listening") — never rewritten.
             words_on_slide = [w for w in [title] + [b["text"] for b in sd.get("bullets", [])] if w]
             sd = {"kind": "end", "big": words_on_slide[0][:60], "title": " ".join(words_on_slide[1:])[:80]}
+        sd.update(extras)
         slides.append(sd)
     logo = title_slide.pop("logo", None)
     # Slide numbers only if the original had them — an import mirrors it.

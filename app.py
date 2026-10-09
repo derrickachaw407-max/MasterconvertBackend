@@ -17,6 +17,8 @@ import zipfile
 from collections import Counter
 from urllib.parse import urlparse
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -113,6 +115,8 @@ def _exempt_cors_preflight():
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docente")
+logger.warning("Email: %s", "set up — checking that it can sign in…" if (os.environ.get("EMAIL_ADDRESS") and (os.environ.get("EMAIL_APP_PASSWORD") or os.environ.get("BREVO_API_KEY")))
+               else "NOT set up — add EMAIL_ADDRESS and EMAIL_APP_PASSWORD on Render so new accounts can confirm their email")
 
 MIME_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -223,6 +227,22 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 # console.google.com -> Security -> 2-Step Verification -> App passwords.
 EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
+# Optional instead of Gmail's password: a Brevo API key (brevo.com, free tier),
+# which sends over HTTPS from the same EMAIL_ADDRESS once it's a verified sender.
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+
+# Email confirmation: every new account confirms its address with a 6-digit
+# code before using the app. Accounts made before this existed count as
+# confirmed. Only enforced once email sending is set up (above) — a code that
+# can't be sent can't be asked for.
+EMAIL_CODE_MINUTES = 15
+EMAIL_CODE_MAX_TRIES = 5
+EMAIL_RESEND_SECONDS = 45
+EMAIL_SENDS_PER_HOUR = 6
+
+# Free Pro for everyone until this moment (UTC = Ghana time). Set PROMO_PRO_UNTIL
+# to another ISO date to move it, or to "off" to end it early.
+PROMO_PRO_UNTIL = os.environ.get("PROMO_PRO_UNTIL", "2026-11-01T00:00:00+00:00")
 
 # ---------- App Store / Play Store purchase verification ----------
 # Neither store's client-side purchase flow can be built or tested from
@@ -356,6 +376,32 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_source TEXT")   # 'store', 'paystack' or 'bonus'
+            # Accounts that already exist count as confirmed (DEFAULT TRUE); new
+            # password sign-ups are created unconfirmed and confirm with a code.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT TRUE")
+            # A new address waiting for its code (the account keeps its current one until then).
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_email TEXT")
+            # Bumped to sign the account out everywhere (password reset, an address reclaimed by its owner).
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INTEGER NOT NULL DEFAULT 0")
+            # The address has really been shown to belong to the person: a code, Google, or a reset link.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_proven BOOLEAN NOT NULL DEFAULT FALSE")
+            # A friend's referral code given at sign-up (or at checkout), and whether
+            # its bonus months have been given — once per account.
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_code TEXT")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_rewarded BOOLEAN NOT NULL DEFAULT FALSE")
+            # Small server-wide switches both workers read (e.g. "email is paused until …").
+            cur.execute("CREATE TABLE IF NOT EXISTS app_flags (name TEXT PRIMARY KEY, until TIMESTAMPTZ)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS email_codes (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    code_hash TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    sends_hour INTEGER NOT NULL DEFAULT 1,
+                    hour_started TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS paystack_payments (
                     reference TEXT PRIMARY KEY,
@@ -369,6 +415,8 @@ def init_db():
                 )
                 """
             )
+            cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS referral_code TEXT")
+            cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS referral_applied BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS store_purchases (
@@ -499,6 +547,33 @@ def get_user_memory(user_id, limit=12):
 
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# New addresses (sign-up, profile, a corrected typo) must be ones mail can really reach.
+_NEW_EMAIL_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$")
+
+
+def _json_body():
+    d = request.get_json(silent=True)
+    return d if isinstance(d, dict) else {}
+
+
+def _text(v):
+    """A text field from a request, or "" when it's missing or not text."""
+    return v if isinstance(v, str) else ""
+
+
+def _release_unconfirmed(cur, email, keep_id):
+    """Someone has just proved this address is theirs: an unconfirmed account holding it lets it go
+    (and is signed out), so it can never block the real owner."""
+    cur.execute("UPDATE users SET email = 'released-' || id || '@invalid.invalid', pending_email = NULL, "
+                "token_version = token_version + 1 WHERE lower(email) = lower(%s) AND email_verified = FALSE AND id <> %s",
+                (email, keep_id))
+
+
+def _valid_new_email(email):
+    if len(email) > 254 or not _NEW_EMAIL_RE.match(email):
+        return False
+    local = email.split("@", 1)[0]
+    return not (local.startswith(".") or local.endswith(".") or ".." in local)
 
 
 def random_suffix(n=4):
@@ -515,8 +590,19 @@ def generate_promo_code():
     return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(10))
 
 
-def make_token(user_id):
-    return _serializer.dumps({"user_id": user_id})
+def make_token(user_id, version=0):
+    return _serializer.dumps({"user_id": user_id, "v": int(version or 0)})
+
+
+def _token_for(row):
+    return make_token(row["id"], row.get("token_version") if hasattr(row, "get") else 0)
+
+
+def _token_version(token):
+    try:
+        return int((_serializer.loads(token, max_age=TOKEN_MAX_AGE) or {}).get("v") or 0)
+    except Exception:
+        return 0
 
 
 def verify_token(token):
@@ -529,8 +615,8 @@ def verify_token(token):
         return None
 
 
-def make_reset_token(user_id):
-    return _serializer.dumps({"reset_user_id": user_id}, salt="password-reset")
+def make_reset_token(user_id, email=None):
+    return _serializer.dumps({"reset_user_id": user_id, "email": (email or "").lower()}, salt="password-reset")
 
 
 def verify_reset_token(token):
@@ -543,16 +629,349 @@ def verify_reset_token(token):
         return None
 
 
-def send_email(to_email, subject, body):
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+def _reset_token_email(token):
+    """The address a reset link was sent to (older links don't say)."""
+    try:
+        return (_serializer.loads(token, max_age=RESET_TOKEN_MAX_AGE, salt="password-reset") or {}).get("email") or None
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+# Whether email can be sent right now. A refused password, or mail that keeps
+# failing to get out, must never leave new people stuck behind a code that can't
+# arrive — so confirmation pauses (and the log says why). The pause is kept in the
+# database so both server workers agree; each reads it at most every 20 seconds.
+_PAUSE_CACHE = {"at": 0.0, "until": None}
+_EMAIL_FAILS = []          # (time, recipient) of recent failed sends in this worker
+_PAUSE_FOREVER_MINUTES = 60 * 24 * 365 * 50
+
+
+def _email_configured():
+    return bool(EMAIL_ADDRESS and (EMAIL_APP_PASSWORD or BREVO_API_KEY))
+
+
+def _email_paused():
+    now = time.time()
+    if now - _PAUSE_CACHE["at"] > 20 and DATABASE_URL:
+        try:
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT until FROM app_flags WHERE name = 'email_paused'")
+                    r = cur.fetchone()
+            finally:
+                conn.close()
+            _PAUSE_CACHE["until"] = r["until"].timestamp() if r and r["until"] else None
+            _PAUSE_CACHE["at"] = now
+        except Exception:
+            pass   # keep the last known answer
+    u = _PAUSE_CACHE["until"]
+    return u is not None and now < u
+
+
+def _email_ready():
+    """Email can be sent: Gmail (address + app password) or Brevo (address + API key), and it isn't paused."""
+    return _email_configured() and not _email_paused()
+
+
+def _set_email_pause(minutes):
+    """minutes > 0 pauses confirmation; 0 lifts the pause."""
+    until = time.time() + minutes * 60 if minutes else None
+    _PAUSE_CACHE.update(until=until, at=time.time())
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                if minutes:
+                    cur.execute("INSERT INTO app_flags (name, until) VALUES ('email_paused', now() + make_interval(mins => %s)) "
+                                "ON CONFLICT (name) DO UPDATE SET until = EXCLUDED.until", (int(minutes),))
+                else:
+                    cur.execute("DELETE FROM app_flags WHERE name = 'email_paused'")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Couldn't save the email pause: {e}")
+
+
+def _email_refused(why, retry_minutes=0):
+    """A refused password pauses confirmation for 30 minutes (then email is tried again);
+    mail that keeps failing pauses it for 15."""
+    _set_email_pause(retry_minutes or 30)
+    if retry_minutes:
+        logger.warning("Email: emails keep failing to send (%s). New accounts aren't asked for a code for the next %d minutes.", why, retry_minutes)
+    else:
+        logger.warning("Email: the email account REFUSED to sign in (%s). Check EMAIL_APP_PASSWORD (a Gmail App Password, "
+                       "not the normal password) or BREVO_API_KEY on Render. New accounts aren't asked for a code for the next 30 minutes.", why)
+
+
+def _send_failure_kind(err):
+    """'auth' (wrong password/key), 'address' (this address can never get mail) or 'general' (mail isn't getting out)."""
+    text = str(err)
+    if isinstance(err, smtplib.SMTPAuthenticationError) or "answered 401" in text or "answered 403" in text:
+        return "auth"
+    if isinstance(err, UnicodeError):
+        return "address"
+    if isinstance(err, smtplib.SMTPRecipientsRefused):
+        codes = [v[0] for v in (getattr(err, "recipients", None) or {}).values() if isinstance(v, tuple) and v]
+        return "address" if codes and all(500 <= int(c) < 600 for c in codes) else "general"
+    if "answered 400" in text and re.search(r"\bin to\b|\bto\[", text, re.I):
+        return "address"
+    return "general"
+
+
+def _email_send_result(ok, err=None, to=None):
+    """Three sends that fail for a general reason within 10 minutes pause confirmation for 15
+    minutes. An address that can never receive mail doesn't count."""
+    now = time.time()
+    if ok:
+        _EMAIL_FAILS.clear()
+        if _PAUSE_CACHE["until"]:
+            _set_email_pause(0)
+        return
+    kind = _send_failure_kind(err)
+    if kind == "auth":
+        return _email_refused(str(err)[:120])
+    if kind == "address":
+        return
+    _EMAIL_FAILS[:] = [f for f in _EMAIL_FAILS if now - f[0] < 600] + [(now, (to or "").lower())]
+    if len(_EMAIL_FAILS) >= 3:
+        _EMAIL_FAILS.clear()
+        _email_refused(f"{err.__class__.__name__}: {str(err)[:100]}", retry_minutes=15)
+
+
+def _check_email_login():
+    """Signs in once at start-up (sends nothing) so a wrong password shows up in the log straight away."""
+    if not _email_configured():
+        return
+    try:
+        if BREVO_API_KEY:
+            r = requests.get("https://api.brevo.com/v3/account", timeout=15,
+                             headers={"api-key": BREVO_API_KEY, "accept": "application/json"})
+            if r.status_code in (401, 403):
+                return _email_refused(f"Brevo answered {r.status_code}")
+            if r.status_code >= 300:
+                return
+        else:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        _set_email_pause(0)
+        logger.warning("Email: signed in OK — new accounts confirm their email with a code")
+    except smtplib.SMTPAuthenticationError as e:
+        _email_refused(f"Gmail said: {getattr(e, 'smtp_code', '')} wrong address or app password")
+    except Exception as e:
+        logger.warning(f"Email: couldn't check the email account just now ({e.__class__.__name__}) — it will be tried when needed")
+
+
+if os.environ.get("EMAIL_LOGIN_CHECK", "on") != "off":
+    import threading
+    threading.Thread(target=_check_email_login, daemon=True).start()
+
+
+def send_email(to_email, subject, body, html=None):
+    if not _email_ready():
         raise ConversionError("Email sending isn't configured on the server yet")
-    msg = MIMEText(body)
+    if BREVO_API_KEY:
+        payload = {"sender": {"name": "Docente", "email": EMAIL_ADDRESS}, "to": [{"email": to_email}],
+                   "subject": subject, "textContent": body}
+        if html:
+            payload["htmlContent"] = html
+        r = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, timeout=15,
+                          headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"})
+        if r.status_code >= 300:
+            raise ConversionError(f"The email service answered {r.status_code}: {r.text[:300]}")
+        return
+    if html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = EMAIL_ADDRESS
+    msg["From"] = formataddr(("Docente", EMAIL_ADDRESS))
     msg["To"] = to_email
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
         server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
         server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+
+
+# ---------- email confirmation codes ----------
+def _needs_verification(row):
+    """This account still has to confirm its email before using the app."""
+    return bool(row) and (row.get("email_verified") if hasattr(row, "get") else True) is False and _email_ready()
+
+
+def _code_hash(user_id, code, email):
+    """A code only confirms the address it was sent to."""
+    return hmac.new((SECRET_KEY or "docente").encode(), f"verify:{user_id}:{(email or '').strip().lower()}:{code}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _cancel_code(cur, user_id):
+    """The address changed: the waiting code stops working (the hourly count is kept)."""
+    cur.execute("UPDATE email_codes SET code_hash = '', expires_at = now() WHERE user_id = %s", (user_id,))
+
+
+def _code_email(name, code):
+    first = (str(name or "").strip().split() or ["there"])[0]
+    text = (f"Hi {first},\n\nYour Docente confirmation code is:\n\n    {code}\n\n"
+            f"It expires in {EMAIL_CODE_MINUTES} minutes. Enter it in the app to confirm this is your email address.\n\n"
+            "If you didn't create a Docente account, you can ignore this email.\n\n— Docente")
+    spaced = " ".join(code)
+    html = (
+        '<div style="background:#f2f3f7;padding:32px 12px;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#14161c">'
+        '<div style="max-width:440px;margin:0 auto;background:#ffffff;border-radius:18px;padding:30px 26px;border:1px solid #e3e5ec">'
+        '<div style="font-size:20px;font-weight:800;letter-spacing:-.01em">Docente</div>'
+        f'<p style="font-size:16px;line-height:1.5;margin:18px 0 6px">Hi {first},</p>'
+        '<p style="font-size:16px;line-height:1.5;margin:0 0 18px">Here is your confirmation code:</p>'
+        f'<div style="font-size:34px;font-weight:800;letter-spacing:.18em;text-align:center;background:#fff7e6;border:1px solid #f1d38a;'
+        f'border-radius:14px;padding:16px 8px;color:#14161c">{spaced}</div>'
+        f'<p style="font-size:14px;line-height:1.5;color:#4b5060;margin:18px 0 0">It expires in {EMAIL_CODE_MINUTES} minutes. '
+        "If you didn't create a Docente account, you can ignore this email.</p>"
+        '</div></div>')
+    return text, html
+
+
+def _send_verification_code(row, force=False, to=None):
+    """Makes a fresh 6-digit code (replacing any earlier one) and emails it.
+    Returns (sent, seconds_to_wait, error_message). force skips the short
+    resend wait (a corrected email address), never the hourly cap."""
+    if not _email_ready():
+        return False, 0, "Email isn't set up on the server yet."
+    now = datetime.now(timezone.utc)
+    uid = row["id"]
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT sent_at, sends_hour, hour_started FROM email_codes WHERE user_id = %s", (uid,))
+            prev = cur.fetchone()
+            sends, hour_started = 1, now
+            if prev:
+                since = (now - prev["sent_at"]).total_seconds()
+                if not force and since < EMAIL_RESEND_SECONDS:
+                    wait = int(EMAIL_RESEND_SECONDS - since) + 1
+                    return False, wait, f"A code is on its way — you can ask for another in {wait} seconds."
+                if now - prev["hour_started"] < timedelta(hours=1):
+                    sends, hour_started = prev["sends_hour"] + 1, prev["hour_started"]
+                    if sends > EMAIL_SENDS_PER_HOUR:
+                        wait = int((prev["hour_started"] + timedelta(hours=1) - now).total_seconds()) + 1
+                        return False, wait, "That's a lot of codes in an hour — please wait a little, then try again."
+            code = f"{secrets.randbelow(1000000):06d}"
+            cur.execute(
+                "INSERT INTO email_codes (user_id, code_hash, expires_at, attempts, sent_at, sends_hour, hour_started) "
+                "VALUES (%s, %s, %s, 0, %s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET code_hash = EXCLUDED.code_hash, "
+                "expires_at = EXCLUDED.expires_at, attempts = 0, sent_at = EXCLUDED.sent_at, sends_hour = EXCLUDED.sends_hour, "
+                "hour_started = EXCLUDED.hour_started",
+                (uid, _code_hash(uid, code, to or row["email"]), now + timedelta(minutes=EMAIL_CODE_MINUTES), now, sends, hour_started))
+    finally:
+        conn.close()
+    text, html = _code_email(row.get("name"), code)
+    try:
+        send_email(to or row["email"], f"{code} is your Docente code", text, html)
+    except Exception as e:
+        logger.warning(f"Couldn't send a confirmation code to user {uid}: {e}")
+        _email_send_result(False, e, to or row["email"])
+        # Let them try again straight away, and don't count the failed send against the hourly allowance.
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE email_codes SET sent_at = now() - make_interval(secs => %s), sends_hour = GREATEST(sends_hour - 1, 0) "
+                            "WHERE user_id = %s", (EMAIL_RESEND_SECONDS, uid))
+        finally:
+            conn.close()
+        if _send_failure_kind(e) == "address":
+            return False, 0, "That address can't receive our email — check it for typos (tap “Wrong email address?”)."
+        return False, 0, "We couldn't send the email just now — please try “Send a new code” in a moment."
+    _email_send_result(True)
+    return True, EMAIL_RESEND_SECONDS, None
+
+
+def _active_code(user_id):
+    """There's an unexpired, unused code waiting for this account."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM email_codes WHERE user_id = %s AND expires_at > now() AND attempts < %s", (user_id, EMAIL_CODE_MAX_TRIES))
+            return bool(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def _verify_info(row, sent=None):
+    """What the app needs to show the 'confirm your email' screen."""
+    need = _needs_verification(row)
+    info = {"required": need, "email": row["email"] if row else None}
+    if sent is not None:
+        info["sent"] = sent
+    return info
+
+
+# ---------- free Pro for everyone (October 2026) ----------
+def _promo_until():
+    if not PROMO_PRO_UNTIL or PROMO_PRO_UNTIL.strip().lower() in ("off", "no", "false", "0"):
+        return None
+    try:
+        d = datetime.fromisoformat(PROMO_PRO_UNTIL.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _promo_active():
+    until = _promo_until()
+    return bool(until and datetime.now(timezone.utc) < until)
+
+
+def _with_promo(row):
+    """During the promotion a Free account works as Pro (Monthly), until the
+    promotion ends — computed, never written, so nothing needs undoing after."""
+    if not row or not _promo_active() or effective_plan(row) != "free":
+        return row
+    r = dict(row)
+    r["plan"], r["plan_source"], r["plan_expires_at"] = "monthly", "promo", _promo_until()
+    return r
+
+
+# ---------- referral codes ----------
+def _clean_code(code):
+    return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())[:40]
+
+
+def _find_referrer(cur, code, user_id=None):
+    """The account a referral code belongs to: someone's personal code, or a
+    14-day code they made. Never the person's own code."""
+    code = _clean_code(code)
+    if not code:
+        return None
+    cur.execute("SELECT id, name FROM users WHERE referral_code = %s", (code,))
+    ref = cur.fetchone()
+    if not ref:
+        cur.execute("SELECT u.id, u.name FROM promo_codes p JOIN users u ON u.id = p.created_by "
+                    "WHERE p.code = %s AND p.expires_at > now()", (code,))
+        ref = cur.fetchone()
+    if ref and user_id and ref["id"] == user_id:
+        return None
+    return ref
+
+
+def _reward_referral(cur, user_id, code=None):
+    """A friend's code: both accounts get a bonus month, once per account — the
+    first time it buys Monthly or Yearly with a code (typed at checkout, or the
+    one saved at sign-up). Returns True when the bonus was given."""
+    cur.execute("SELECT id, referred_code, referral_rewarded FROM users WHERE id = %s FOR UPDATE", (user_id,))
+    me = cur.fetchone()
+    if not me or me["referral_rewarded"]:
+        return False
+    code = _clean_code(code) or _clean_code(me.get("referred_code"))
+    ref = _find_referrer(cur, code, user_id) if code else None
+    if not ref:
+        return False
+    cur.execute("UPDATE users SET bonus_credit_months = bonus_credit_months + 1 WHERE id = %s", (ref["id"],))
+    cur.execute("UPDATE users SET bonus_credit_months = bonus_credit_months + 1, referral_rewarded = TRUE, referred_code = %s WHERE id = %s",
+                (code, user_id))
+    logger.info(f"Referral bonus: user {user_id} with code from user {ref['id']}")
+    return True
 
 
 def _pass_expired(row):
@@ -567,6 +986,7 @@ def effective_plan(row):
 
 
 def user_row_to_dict(row):
+    row = _with_promo(row)
     exp = row.get("plan_expires_at") if hasattr(row, "get") else None
     msgs_used, msgs_limit, msgs_reset = _sage_status(row)
     return {
@@ -587,6 +1007,14 @@ def user_row_to_dict(row):
         "remy_messages_resets_at": (msgs_reset + timedelta(days=SAGE_WINDOW_DAYS)).isoformat() if msgs_reset else None,
         "referral_code": row["referral_code"],
         "bonus_credit_months": row.get("bonus_credit_months", 0) or 0,
+        # Email confirmation: the app shows the code screen while this is True.
+        "email_verified": bool(row.get("email_verified", True)) if hasattr(row, "get") else True,
+        "verify_email_required": _needs_verification(row),
+        # A new address waiting for its code (the account still uses "email" until then).
+        "pending_email": (row.get("pending_email") if hasattr(row, "get") else None) or None,
+        # A friend's referral code saved at sign-up, waiting for a first Pro purchase.
+        "referral_pending": bool(row.get("referred_code") and not row.get("referral_rewarded")) if hasattr(row, "get") else False,
+        "promo_until": _promo_until().isoformat() if _promo_active() else None,
         # File conversions are free and unlimited on every plan now — no
         # limit/remaining count to report for any plan, free included,
         # rather than the free tier's old fixed cap.
@@ -614,6 +1042,8 @@ def auth_required(fn):
             conn.close()
         if not row:
             return jsonify({"error": "Not authenticated"}), 401
+        if _token_version(token) != (row.get("token_version") or 0):
+            return jsonify({"error": "You were signed out — please log in again."}), 401
         if _pass_expired(row):
             # A Pay-per-Use pass has run out: back to Free, in the database
             # and for this request (allowances included).
@@ -643,7 +1073,10 @@ def auth_required(fn):
                 conn.close()
             row = dict(row)
             row["plan"], row["plan_expires_at"] = "free", None
-        if row.get("plan") == "free" and (row.get("bonus_credit_months") or 0) > 0:
+        if _needs_verification(row) and fn.__name__ not in _UNCONFIRMED_OK:
+            return jsonify({"error": f"Please confirm your email first — enter the 6-digit code we sent to {row['email']}.",
+                            "verify_email": True}), 403
+        if row.get("plan") == "free" and (row.get("bonus_credit_months") or 0) > 0 and not _promo_active():
             # A referral bonus month: kept in the bank while paid Pro runs (so
             # it never overlaps paid time) and started whenever the account is
             # on Free — straight away, or the moment paid time ends. The WHERE
@@ -662,10 +1095,15 @@ def auth_required(fn):
                 logger.warning(f"Couldn't start a bonus month for user {user_id}: {e}")
             finally:
                 conn.close()
-        request.current_user = row
+        # Free Pro during the promotion (bonus months stay banked until it ends).
+        request.current_user = _with_promo(row)
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+# What an account that hasn't confirmed its email yet may still do.
+_UNCONFIRMED_OK = {"me", "verify_email", "resend_code", "change_email", "delete_account_endpoint", "update_profile"}
 
 
 def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None):
@@ -708,8 +1146,41 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     data = resp.json()
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     if return_meta:
-        return {"text": text, "stop_reason": data.get("stop_reason")}
+        sources, queries = _search_trail(data.get("content") or [])
+        return {"text": text, "stop_reason": data.get("stop_reason"), "sources": sources, "queries": queries}
     return text
+
+
+def _search_trail(content):
+    """What a web-searching answer looked at: the searches it ran, and the pages —
+    the ones it actually cited first, then the others it found."""
+    found, order, queries = {}, [], []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        kind = b.get("type")
+        if kind == "server_tool_use" and b.get("name") == "web_search":
+            q = str((b.get("input") or {}).get("query") or "").strip()
+            if q and q not in queries:
+                queries.append(q[:200])
+        elif kind == "web_search_tool_result" and isinstance(b.get("content"), list):
+            for item in b["content"]:
+                if isinstance(item, dict) and item.get("type") == "web_search_result" and item.get("url"):
+                    url = str(item["url"])[:600]
+                    if url not in found:
+                        found[url] = {"title": str(item.get("title") or url).strip()[:200], "url": url, "cited": False}
+                        order.append(url)
+        elif kind == "text":
+            for c in b.get("citations") or []:
+                url = str((c or {}).get("url") or "")[:600]
+                if not url.startswith("http"):
+                    continue
+                if url not in found:
+                    found[url] = {"title": str(c.get("title") or url).strip()[:200], "url": url, "cited": True}
+                    order.append(url)
+                found[url]["cited"] = True
+    ranked = [found[u] for u in order if found[u]["cited"]] + [found[u] for u in order if not found[u]["cited"]]
+    return ranked, queries
 
 
 OUTLINE_LINE_RE = re.compile(r'^\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$')
@@ -1191,7 +1662,14 @@ def handle_server_error(e):
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "email": _email_ready(),
+                    "promo_until": _promo_until().isoformat() if _promo_active() else None})
+
+
+@app.route("/api/promo", methods=["GET"])
+def promo_status():
+    """For the app's banner — no account needed."""
+    return jsonify({"active": _promo_active(), "until": _promo_until().isoformat() if _promo_active() else None})
 
 
 # ---------- auth ----------
@@ -1205,10 +1683,10 @@ def signup():
     if not DATABASE_URL or not SECRET_KEY:
         return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
 
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
+    data = _json_body()
+    name = _text(data.get("name")).strip()
+    email = _text(data.get("email")).strip().lower()
+    password = _text(data.get("password"))
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are all required"}), 400
@@ -1216,27 +1694,33 @@ def signup():
         return jsonify({"error": "That name is too long (200 characters max)"}), 400
     if len(email) > 254:  # RFC 5321's own limit on a valid email address
         return jsonify({"error": "That email is too long"}), 400
-    if not EMAIL_RE.match(email):
+    if not _valid_new_email(email):
         return jsonify({"error": "That doesn't look like a valid email"}), 400
     if len(password) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if len(password) > 200:
+        return jsonify({"error": "That password is too long (200 characters max)"}), 400
+    friend_code = _clean_code(data.get("referral_code"))
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM users WHERE email = %s", (email,))
             if cur.fetchone():
-                return jsonify({"error": "An account with that email already exists"}), 409
+                return jsonify({"error": "An account with that email already exists — log in instead, or reset your password."}), 409
+            if friend_code and not _find_referrer(cur, friend_code):
+                return jsonify({"error": "That referral code wasn't found — check it, or leave the box empty.", "field": "referral"}), 400
 
             referral_code = generate_referral_code(name)
             try:
                 cur.execute(
                     """
-                    INSERT INTO users (name, email, password_hash, referral_code)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO users (name, email, password_hash, referral_code, email_verified, referred_code)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING *
                     """,
-                    (name, email, generate_password_hash(password), referral_code),
+                    # Accounts made while email isn't set up count as confirmed, like the older ones.
+                    (name, email, generate_password_hash(password), referral_code, not _email_configured(), friend_code or None),
                 )
                 row = cur.fetchone()
             except psycopg2.errors.UniqueViolation:
@@ -1248,11 +1732,14 @@ def signup():
                 # message the explicit check gives, rather than falling
                 # through to a generic 500.
                 conn.rollback()
-                return jsonify({"error": "An account with that email already exists"}), 409
+                return jsonify({"error": "An account with that email already exists — log in instead, or reset your password."}), 409
     finally:
         conn.close()
 
-    return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
+    sent = None
+    if _needs_verification(row):
+        sent, _, _ = _send_verification_code(row)
+    return jsonify({"token": _token_for(row), "user": user_row_to_dict(row), "verify": _verify_info(row, sent)})
 
 
 @app.route("/api/auth/login", methods=["POST", "OPTIONS"])
@@ -1263,9 +1750,9 @@ def login():
     if not DATABASE_URL or not SECRET_KEY:
         return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
 
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
+    data = _json_body()
+    email = _text(data.get("email")).strip().lower()
+    password = _text(data.get("password"))
 
     if not email or not password:
         return jsonify({"error": "Email and password are both required"}), 400
@@ -1292,7 +1779,10 @@ def login():
     if not row or not row["password_hash"] or not password_ok:
         return jsonify({"error": "Incorrect email or password"}), 401
 
-    return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
+    sent = None
+    if _needs_verification(row) and not _active_code(row["id"]):
+        sent, _, _ = _send_verification_code(row)
+    return jsonify({"token": _token_for(row), "user": user_row_to_dict(row), "verify": _verify_info(row, sent)})
 
 
 @app.route("/api/auth/forgot-password", methods=["POST", "OPTIONS"])
@@ -1302,11 +1792,11 @@ def forgot_password():
         return "", 204
     if not DATABASE_URL or not SECRET_KEY:
         return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        return jsonify({"error": "Password reset emails aren't configured on the server yet"}), 500
+    if not _email_ready():
+        return jsonify({"error": "We can't send password-reset emails right now — please try again later, or write to support.docente@gmail.com."}), 503
 
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    data = _json_body()
+    email = _text(data.get("email")).strip().lower()
     if not email:
         return jsonify({"error": "Email required"}), 400
 
@@ -1321,7 +1811,7 @@ def forgot_password():
     # Always the same response whether or not the email has an account —
     # never confirm or deny that in the response itself.
     if row:
-        token = make_reset_token(row["id"])
+        token = make_reset_token(row["id"], email)
         reset_link = f"{FRONTEND_URL}/?reset_token={token}"
         try:
             send_email(
@@ -1334,8 +1824,10 @@ def forgot_password():
                 "If you didn't request this, you can safely ignore this email — "
                 "your password won't change unless you click the link above.",
             )
-        except ConversionError:
-            pass  # already validated config above; a transient send failure shouldn't leak state
+        except Exception as e:
+            # Never a 500, and never a hint about whether the address has an account.
+            logger.warning(f"Couldn't send a password reset email: {e}")
+            _email_send_result(False, e, email)
 
     return jsonify({"message": "If that email has an account, a reset link has been sent."})
 
@@ -1348,9 +1840,9 @@ def reset_password():
     if not DATABASE_URL or not SECRET_KEY:
         return jsonify({"error": "Accounts aren't configured on the server yet"}), 500
 
-    data = request.get_json(silent=True) or {}
-    token = data.get("token") or ""
-    new_password = data.get("password") or ""
+    data = _json_body()
+    token = _text(data.get("token"))
+    new_password = _text(data.get("password"))
 
     if len(new_password) < 8:
         return jsonify({"error": "Password must be at least 8 characters"}), 400
@@ -1358,13 +1850,21 @@ def reset_password():
     user_id = verify_reset_token(token)
     if not user_id:
         return jsonify({"error": "This reset link is invalid or has expired — request a new one"}), 400
+    link_email = _reset_token_email(token)
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            # Receiving the link proves the address it was sent to: if that's still the account's
+            # address, it counts as confirmed (and a Google link made before it was confirmed is
+            # dropped). Every other signed-in device is signed out.
             cur.execute(
-                "UPDATE users SET password_hash = %s WHERE id = %s",
-                (generate_password_hash(new_password), user_id),
+                """UPDATE users SET password_hash = %s, token_version = token_version + 1,
+                       google_sub = CASE WHEN email_verified OR lower(email) <> %s THEN google_sub ELSE NULL END,
+                       email_verified = email_verified OR lower(email) = %s,
+                       email_proven = email_proven OR lower(email) = %s
+                   WHERE id = %s""",
+                (generate_password_hash(new_password), link_email or "", link_email or "", link_email or "", user_id),
             )
             if cur.rowcount == 0:
                 # The token's signature was valid, but the account it
@@ -1380,6 +1880,7 @@ def reset_password():
 
 
 @app.route("/api/auth/google", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per minute; 60 per hour")
 def google_signin():
     if request.method == "OPTIONS":
         return "", 204
@@ -1391,8 +1892,8 @@ def google_signin():
     from google.oauth2 import id_token as google_id_token
     from google.auth.transport import requests as google_requests
 
-    data = request.get_json(silent=True) or {}
-    credential = data.get("credential") or ""
+    data = _json_body()
+    credential = _text(data.get("credential"))
     if not credential:
         return jsonify({"error": "No Google credential was provided"}), 400
     try:
@@ -1412,95 +1913,310 @@ def google_signin():
 
     google_sub = payload["sub"]
     email = (payload.get("email") or "").strip().lower()
+    google_checked = payload.get("email_verified") is True or str(payload.get("email_verified")).lower() == "true"
     name = payload.get("name") or email.split("@")[0]
+    if not email:
+        return jsonify({"error": "Google didn't share an email address for this account."}), 400
 
+    notice = None
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE google_sub = %s OR email = %s", (google_sub, email))
+            # The Google account itself first; the email address only if this Google account is new here.
+            cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
             row = cur.fetchone()
             if row:
-                if not row["google_sub"]:
-                    cur.execute("UPDATE users SET google_sub = %s WHERE id = %s RETURNING *", (google_sub, row["id"]))
+                if google_checked and (row["email"] or "").lower() == email and not (row.get("email_verified") and row.get("email_proven")):
+                    # Google has confirmed this very address.
+                    cur.execute("UPDATE users SET email_verified = TRUE, email_proven = TRUE WHERE id = %s RETURNING *", (row["id"],))
                     row = cur.fetchone()
             else:
-                referral_code = generate_referral_code(name)
-                try:
-                    cur.execute(
-                        """
-                        INSERT INTO users (name, email, google_sub, referral_code)
-                        VALUES (%s, %s, %s, %s)
-                        RETURNING *
-                        """,
-                        (name, email, google_sub, referral_code),
-                    )
-                    row = cur.fetchone()
-                except psycopg2.errors.UniqueViolation:
-                    # The same narrow race as signup's — two sign-in
-                    # attempts for the same brand-new Google account
-                    # landing at nearly the same moment. Unlike signup,
-                    # this isn't really the user's fault and isn't a
-                    # "duplicate account" in the same sense — the other
-                    # concurrent request already created the account by
-                    # now, so re-querying and continuing normally
-                    # fulfills the same "sign in with Google" intent
-                    # instead of surfacing an error for it.
-                    conn.rollback()
-                    cur.execute("SELECT * FROM users WHERE google_sub = %s OR email = %s", (google_sub, email))
-                    row = cur.fetchone()
-                    if not row:
-                        return jsonify({"error": "Google sign-in failed. Please try again."}), 500
+                cur.execute("SELECT * FROM users WHERE email = %s", (email,))
+                row = cur.fetchone()
+                if row and not google_checked:
+                    return jsonify({"error": "This email already has a Docente account — log in with your password."}), 409
+                keep_ref = None
+                if row and not row.get("email_proven"):
+                    # An account holding this address that never proved it was theirs — made with a
+                    # password, or by another Google account that switched its address to this one.
+                    # Google has now proved the address belongs to this person: the account becomes
+                    # theirs and confirmed, any other Google account and the unproven password are
+                    # unlinked, and every other sign-in it handed out ends. Nothing is deleted.
+                    notice = "password_off" if row.get("password_hash") else None
+                    try:
+                        cur.execute("UPDATE users SET google_sub = %s, email_verified = TRUE, email_proven = TRUE, password_hash = NULL, "
+                                    "token_version = token_version + 1 WHERE id = %s RETURNING *", (google_sub, row["id"]))
+                        row = cur.fetchone()
+                        logger.warning(f"Account {row['id']} reclaimed on Google sign-in by the address's owner (old password and links switched off)")
+                    except psycopg2.errors.UniqueViolation:
+                        conn.rollback()
+                        cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+                        row = cur.fetchone()
+                        if not row:
+                            return jsonify({"error": "Google sign-in failed. Please try again."}), 500
+                elif row and not row.get("google_sub"):
+                    try:
+                        cur.execute("UPDATE users SET google_sub = %s WHERE id = %s RETURNING *", (google_sub, row["id"]))
+                        row = cur.fetchone()
+                    except psycopg2.errors.UniqueViolation:
+                        conn.rollback()
+                        cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+                        row = cur.fetchone()
+                        if not row:
+                            return jsonify({"error": "Google sign-in failed. Please try again."}), 500
+                elif not row:
+                    referral_code = generate_referral_code(name)
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO users (name, email, google_sub, referral_code, email_verified, email_proven, referred_code)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            RETURNING *
+                            """,
+                            (name, email, google_sub, referral_code, bool(google_checked), bool(google_checked), keep_ref),
+                        )
+                        row = cur.fetchone()
+                    except psycopg2.errors.UniqueViolation:
+                        # The same narrow race as signup's — two sign-in attempts for the same
+                        # brand-new Google account at nearly the same moment: the other request
+                        # already created it, so carry on with that one.
+                        conn.rollback()
+                        cur.execute("SELECT * FROM users WHERE google_sub = %s", (google_sub,))
+                        row = cur.fetchone()
+                        if not row:
+                            return jsonify({"error": "Google sign-in failed. Please try again."}), 500
     finally:
         conn.close()
 
-    return jsonify({"token": make_token(row["id"]), "user": user_row_to_dict(row)})
+    sent = None
+    if _needs_verification(row) and not _active_code(row["id"]):
+        sent, _, _ = _send_verification_code(row)
+    out = {"token": _token_for(row), "user": user_row_to_dict(row), "verify": _verify_info(row, sent)}
+    if notice:
+        out["notice"] = notice
+    return jsonify(out)
+
+
+@app.route("/api/auth/verify-email", methods=["POST", "OPTIONS"])
+@limiter.limit("30 per hour", key_func=_account_or_ip_key)
+@auth_required
+def verify_email():
+    """Confirms the sign-up address, or (for a confirmed account) a new address waiting in pending_email."""
+    row = request.current_user
+    if row.get("email_verified", True) is not False and not row.get("pending_email"):
+        return jsonify({"verified": True, "user": user_row_to_dict(row)})
+    raw_code = _json_body().get("code")
+    code = re.sub(r"\D", "", raw_code if isinstance(raw_code, str) else (str(raw_code) if isinstance(raw_code, int) else ""))[:6]
+    if len(code) != 6:
+        return jsonify({"error": "Enter the 6-digit code from the email."}), 400
+    conn = get_db()
+    conn.autocommit = False
+    changed = False
+    try:
+        with conn.cursor() as cur:
+            # The address is read and locked here, so a change made at the same moment can't slip through.
+            cur.execute("SELECT email, email_verified, pending_email FROM users WHERE id = %s FOR UPDATE", (row["id"],))
+            now_row = cur.fetchone()
+            if not now_row:
+                conn.rollback()
+                return jsonify({"error": "This account no longer exists."}), 404
+            signup = now_row["email_verified"] is False
+            target = now_row["email"] if signup else now_row["pending_email"]
+            if not target:
+                conn.rollback()
+                return jsonify({"verified": True, "user": user_row_to_dict(row)})
+            cur.execute("SELECT * FROM email_codes WHERE user_id = %s FOR UPDATE", (row["id"],))
+            ec = cur.fetchone()
+            if not ec or ec["expires_at"] <= datetime.now(timezone.utc):
+                conn.rollback()
+                return jsonify({"error": "That code has expired — tap “Send a new code”.", "expired": True}), 400
+            if ec["attempts"] >= EMAIL_CODE_MAX_TRIES:
+                conn.rollback()
+                return jsonify({"error": "Too many tries with that code — tap “Send a new code”.", "expired": True}), 429
+            if not ec["code_hash"] or not hmac.compare_digest(ec["code_hash"], _code_hash(row["id"], code, target)):
+                cur.execute("UPDATE email_codes SET attempts = attempts + 1 WHERE user_id = %s RETURNING attempts", (row["id"],))
+                left = max(0, EMAIL_CODE_MAX_TRIES - cur.fetchone()["attempts"])
+                conn.commit()
+                more = f" {left} {'try' if left == 1 else 'tries'} left." if left else " Tap “Send a new code”."
+                return jsonify({"error": "That code isn't right — check the email and try again." + more, "tries_left": left}), 400
+            if signup:
+                cur.execute("UPDATE users SET email_verified = TRUE, email_proven = TRUE WHERE id = %s RETURNING *", (row["id"],))
+            else:
+                try:
+                    cur.execute("SAVEPOINT move_email")
+                    _release_unconfirmed(cur, target, row["id"])
+                    cur.execute("UPDATE users SET email = pending_email, pending_email = NULL, email_verified = TRUE, email_proven = TRUE "
+                                "WHERE id = %s RETURNING *", (row["id"],))
+                    changed = True
+                except psycopg2.errors.UniqueViolation:
+                    cur.execute("ROLLBACK TO SAVEPOINT move_email")
+                    cur.execute("UPDATE users SET pending_email = NULL WHERE id = %s", (row["id"],))
+                    cur.execute("DELETE FROM email_codes WHERE user_id = %s", (row["id"],))
+                    conn.commit()
+                    return jsonify({"error": "That address now belongs to another Docente account, so your email wasn't changed.",
+                                    "taken": True}), 409
+            user = cur.fetchone()
+            cur.execute("DELETE FROM email_codes WHERE user_id = %s", (row["id"],))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return jsonify({"verified": True, "changed": changed, "user": user_row_to_dict(user)})
+
+
+@app.route("/api/auth/resend-code", methods=["POST", "OPTIONS"])
+@limiter.limit("12 per hour", key_func=_account_or_ip_key)
+@auth_required
+def resend_code():
+    row = request.current_user
+    if row.get("email_verified", True) is not False:
+        pending = row.get("pending_email")
+        if not pending:
+            return jsonify({"verified": True, "sent": False})
+        if not _email_ready():
+            return jsonify({"error": "We can't send emails right now — please try again in a little while."}), 503
+        sent, wait, err = _send_verification_code(row, to=pending)
+        if not sent:
+            return jsonify({"error": err, "retry_after": wait}), (429 if wait else 503)
+        return jsonify({"sent": True, "retry_after": wait, "email": pending, "pending": True})
+    if not _email_ready():
+        # Email stopped working on the server: don't keep anyone waiting for a code.
+        return jsonify({"verified": True, "sent": False, "user": user_row_to_dict(row)})
+    sent, wait, err = _send_verification_code(row)
+    if not sent:
+        return jsonify({"error": err, "retry_after": wait}), (429 if wait else 503)
+    return jsonify({"sent": True, "retry_after": wait, "email": row["email"]})
+
+
+@app.route("/api/auth/cancel-email-change", methods=["POST", "OPTIONS"])
+@auth_required
+def cancel_email_change():
+    """Keep the current address: the waiting new one and its code are dropped."""
+    row = request.current_user
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET pending_email = NULL WHERE id = %s RETURNING *", (row["id"],))
+            new_row = cur.fetchone()
+            if row.get("email_verified", True) is not False:
+                _cancel_code(cur, row["id"])
+    finally:
+        conn.close()
+    return jsonify({"user": user_row_to_dict(new_row)})
+
+
+@app.route("/api/auth/change-email", methods=["POST", "OPTIONS"])
+@limiter.limit("6 per hour", key_func=_account_or_ip_key)
+@auth_required
+def change_email():
+    """A typo in the sign-up address: fix it before confirming, and get a code there."""
+    row = request.current_user
+    if row.get("email_verified", True) is not False:
+        return jsonify({"error": "Your email is already confirmed — change it from your profile."}), 400
+    email = _text(_json_body().get("email")).strip().lower()
+    if not _valid_new_email(email):
+        return jsonify({"error": "That doesn't look like a valid email"}), 400
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            try:
+                # Only while the account is still unconfirmed — decided by the database at this moment.
+                cur.execute("UPDATE users SET email = %s, pending_email = NULL WHERE id = %s AND email_verified = FALSE RETURNING *",
+                            (email, row["id"]))
+                new_row = cur.fetchone()
+                if not new_row:
+                    return jsonify({"error": "Your email is already confirmed — change it from your profile."}), 400
+                _cancel_code(cur, row["id"])
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return jsonify({"error": "An account with that email already exists."}), 409
+    finally:
+        conn.close()
+    if not _email_ready():
+        return jsonify({"user": user_row_to_dict(new_row), "sent": False, "verified": not _needs_verification(new_row)})
+    sent, wait, err = _send_verification_code(new_row, force=True)
+    return jsonify({"user": user_row_to_dict(new_row), "sent": sent, "error": err, "retry_after": wait})
 
 
 @app.route("/api/auth/me", methods=["GET", "OPTIONS"])
 @auth_required
 def me():
-    return jsonify({"user": user_row_to_dict(request.current_user)})
+    row = request.current_user
+    if _needs_verification(row) and not _active_code(row["id"]):
+        sent, _, _ = _send_verification_code(row)
+        return jsonify({"user": user_row_to_dict(row), "verify": _verify_info(row, sent)})
+    return jsonify({"user": user_row_to_dict(row)})
 
 
 @app.route("/api/auth/update-profile", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per hour", key_func=_account_or_ip_key)
 @auth_required
 def update_profile():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
+    data = _json_body()
+    name = _text(data.get("name")).strip()
+    email = _text(data.get("email")).strip().lower()
+    me_row = request.current_user
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
     if len(name) > 200:
         return jsonify({"error": "That name is too long (200 characters max)"}), 400
     if len(email) > 254:
         return jsonify({"error": "That email is too long"}), 400
-    if not EMAIL_RE.match(email):
+    current = (me_row.get("email") or "").strip().lower()
+    changed = email != current
+    if not EMAIL_RE.match(email) or (changed and not _valid_new_email(email)):
         return jsonify({"error": "That doesn't look like a valid email"}), 400
 
+    unconfirmed = me_row.get("email_verified", True) is False
+    # A confirmed account's new address waits in pending_email until its code is entered —
+    # the current address keeps working meanwhile, and nobody else's address can be held.
+    pending = changed and not unconfirmed and _email_configured()
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM users WHERE email = %s AND id != %s",
-                (email, request.current_user["id"]),
-            )
-            if cur.fetchone():
-                return jsonify({"error": "That email is already in use"}), 409
+            if changed:
+                cur.execute("SELECT id FROM users WHERE email = %s AND id != %s AND email_verified IS NOT FALSE", (email, me_row["id"]))
+                if cur.fetchone():
+                    return jsonify({"error": "That email is already in use"}), 409
             try:
-                cur.execute(
-                    "UPDATE users SET name = %s, email = %s WHERE id = %s RETURNING *",
-                    (name, email, request.current_user["id"]),
-                )
-                row = cur.fetchone()
+                if pending:
+                    cur.execute("UPDATE users SET name = %s, pending_email = %s WHERE id = %s RETURNING *", (name, email, me_row["id"]))
+                    row = cur.fetchone()
+                    _cancel_code(cur, me_row["id"])
+                elif changed and unconfirmed:
+                    # Still confirming the sign-up address: the same as fixing a typo on the code screen.
+                    cur.execute("UPDATE users SET name = %s, email = %s, pending_email = NULL WHERE id = %s AND email_verified = FALSE RETURNING *",
+                                (name, email, me_row["id"]))
+                    row = cur.fetchone()
+                    if not row:
+                        return jsonify({"error": "Please try again."}), 409
+                    _cancel_code(cur, me_row["id"])
+                elif changed:
+                    # Email isn't set up on the server, so there's no way to confirm: change it straight away.
+                    cur.execute("UPDATE users SET name = %s, email = %s, pending_email = NULL, email_proven = FALSE WHERE id = %s RETURNING *",
+                                (name, email, me_row["id"]))
+                    row = cur.fetchone()
+                else:
+                    cur.execute("UPDATE users SET name = %s WHERE id = %s RETURNING *", (name, me_row["id"]))
+                    row = cur.fetchone()
             except psycopg2.errors.UniqueViolation:
-                # Same narrow race as signup/google sign-in: another
-                # account could claim this exact email between the
-                # check above and this update.
+                # Another account claimed this exact email between the check above and this update.
                 conn.rollback()
                 return jsonify({"error": "That email is already in use"}), 409
     finally:
         conn.close()
 
+    if pending:
+        if not _email_ready():
+            return jsonify({"user": user_row_to_dict(row), "verify": {"email": email, "pending": True, "sent": False,
+                            "error": "We can't send emails right now — try “Send a new code” in a little while."}})
+        sent, wait, err = _send_verification_code(row, force=True, to=email)
+        return jsonify({"user": user_row_to_dict(row), "verify": {"email": email, "pending": True, "sent": sent, "error": err, "retry_after": wait}})
+    if changed and unconfirmed and _email_ready():
+        sent, wait, err = _send_verification_code(row, force=True)
+        return jsonify({"user": user_row_to_dict(row), "verify": {"email": row["email"], "sent": sent, "error": err, "retry_after": wait}})
     return jsonify({"user": user_row_to_dict(row)})
 
 
@@ -1795,31 +2511,10 @@ def plan_upgrade():
                     (transaction_key, request.current_user["id"], plan),
                 )
 
-            if referral_code and plan in ("monthly", "yearly"):
-                cur.execute(
-                    "SELECT * FROM users WHERE referral_code = %s AND id != %s",
-                    (referral_code, row["id"]),
-                )
-                referrer = cur.fetchone()
-                if not referrer:
-                    # A referral code someone generated (valid for 14 days).
-                    cur.execute(
-                        "SELECT u.* FROM promo_codes p JOIN users u ON u.id = p.created_by "
-                        "WHERE p.code = %s AND p.expires_at > now() AND u.id != %s",
-                        (referral_code, row["id"]),
-                    )
-                    referrer = cur.fetchone()
-                if referrer:
-                    cur.execute(
-                        "UPDATE users SET bonus_credit_months = bonus_credit_months + 1 WHERE id = %s",
-                        (referrer["id"],),
-                    )
-                    cur.execute(
-                        "UPDATE users SET bonus_credit_months = bonus_credit_months + 1 WHERE id = %s RETURNING *",
-                        (row["id"],),
-                    )
-                    row = cur.fetchone()
-                    bonus_applied = True
+            if plan in ("monthly", "yearly") and _reward_referral(cur, row["id"], referral_code):
+                cur.execute("SELECT * FROM users WHERE id = %s", (row["id"],))
+                row = cur.fetchone()
+                bonus_applied = True
     finally:
         conn.close()
 
@@ -1887,9 +2582,13 @@ def _paystack_apply(reference, paid_amount, currency):
                 return pay["user_id"], "mismatch"
             _, days, credits = PAYSTACK_PLANS[pay["plan"]]
             if days:
+                # Bought during the free-Pro promotion: the paid days start when it ends.
+                start = _promo_until() if _promo_active() else datetime.now(timezone.utc)
                 cur.execute(
-                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now()) + make_interval(days => %s), plan_source = 'paystack' WHERE id = %s",
-                    (pay["plan"], days, pay["user_id"]))
+                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), plan_source = 'paystack' WHERE id = %s",
+                    (pay["plan"], start, days, pay["user_id"]))
+                if pay["plan"] in ("monthly", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
+                    cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
             if credits:
                 cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
             cur.execute("UPDATE paystack_payments SET status = 'success', applied_at = now() WHERE reference = %s", (reference,))
@@ -1926,13 +2625,17 @@ def paystack_initialize():
     user = request.current_user
     if plan in ("monthly", "yearly") and user.get("plan") in ("monthly", "yearly") and _owns_store_plan(user["id"]):
         return jsonify({"error": "You already have Pro through the App Store or Google Play — manage it there."}), 409
+    friend_code = _clean_code((request.get_json(silent=True) or {}).get("referral_code"))
     amount = PAYSTACK_PLANS[plan][0]
     reference = f"dct_{user['id']}_{secrets.token_hex(6)}"
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount) VALUES (%s, %s, %s, %s)",
-                        (reference, user["id"], plan, amount))
+            if friend_code and plan in ("monthly", "yearly"):
+                if not _find_referrer(cur, friend_code, user["id"]):
+                    return jsonify({"error": "That referral code wasn't found (or it's your own) — check it, or leave it empty.", "field": "referral"}), 400
+            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code) VALUES (%s, %s, %s, %s, %s)",
+                        (reference, user["id"], plan, amount, friend_code or None))
     finally:
         conn.close()
     try:
@@ -1987,9 +2690,11 @@ def paystack_verify():
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s", (user["id"],))
             row = cur.fetchone()
+            cur.execute("SELECT referral_applied FROM paystack_payments WHERE reference = %s", (reference,))
+            bonus = bool((cur.fetchone() or {}).get("referral_applied"))
     finally:
         conn.close()
-    return jsonify({"status": "success", "user": user_row_to_dict(row)})
+    return jsonify({"status": "success", "user": user_row_to_dict(row), "referral_bonus_applied": bonus})
 
 
 @app.route("/api/paystack/webhook", methods=["POST"])
@@ -2275,6 +2980,36 @@ def referral_current():
         conn.close()
 
 
+@app.route("/api/referral/check", methods=["POST", "OPTIONS"])
+@limiter.limit("40 per hour")
+def referral_check():
+    """Is this a real referral code? Used as it's typed (sign-up and checkout)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    code = _clean_code((request.get_json(silent=True) or {}).get("code"))
+    if len(code) < 4:
+        return jsonify({"valid": False, "error": "Enter the whole code."})
+    header = request.headers.get("Authorization", "")
+    uid = verify_token(header.split(" ", 1)[1]) if header.startswith("Bearer ") else None
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            ref = _find_referrer(cur, code)
+            if not ref:
+                return jsonify({"valid": False, "error": "That code wasn't found — check the spelling, or ask for a fresh code."})
+            if uid and ref["id"] == uid:
+                return jsonify({"valid": False, "error": "That's your own code — share it with friends instead."})
+            if uid:
+                cur.execute("SELECT referral_rewarded FROM users WHERE id = %s", (uid,))
+                me = cur.fetchone()
+                if me and me["referral_rewarded"]:
+                    return jsonify({"valid": False, "error": "You've already had a referral bonus — it's once per account."})
+    finally:
+        conn.close()
+    first = (str(ref.get("name") or "").strip().split() or ["a friend"])[0][:30]
+    return jsonify({"valid": True, "from": first})
+
+
 @app.route("/api/referral/generate", methods=["POST", "OPTIONS"])
 @app.route("/api/promo/generate", methods=["POST", "OPTIONS"], endpoint="promo_generate_legacy")
 @limiter.limit("10 per hour", key_func=_account_or_ip_key)
@@ -2458,7 +3193,7 @@ def _log_sage_message_and_consume(user_row):
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
-            row = cur.fetchone()
+            row = _with_promo(cur.fetchone())
             used, limit, reset_at = _sage_status(row)
             source = "allowance"
             if used >= limit:
@@ -2984,10 +3719,14 @@ SUMMARIZE_SYSTEM_PROMPT = (
     "job. Return ONLY a JSON array — no markdown code fences, no preamble, no commentary "
     "before or after it, nothing but the array itself, starting with [ and ending with ].\n\n"
     "Each element is one slide, an object with exactly these keys:\n"
-    '  "header": an action-oriented or descriptive headline for this one slide (e.g. '
-    '"Revenue Grew 15% in Q3", not a generic label like "Financials")\n'
-    '  "bullets": an array of short strings for this slide — omit or leave empty when '
-    'this slide instead uses "chart" below\n'
+    '  "header": the HEADING of this slide — the topic it is about, as a lecturer would title it '
+    '(e.g. "Areas of Biomechanics", "Causes of Academic Stress"). Consecutive slides on the same '
+    'topic may share a heading.\n'
+    '  "sections": the body of this slide, in the lecture pattern — an array of 1 to 3 objects, each '
+    '{"subheading": a SUB-HEADING naming the specific aspect discussed (at most 7 words, e.g. '
+    '"Developmental biomechanics"), "points": an array of 1 to 4 short points about it (each at '
+    'most 16 words)} — empty when this slide instead uses "chart" below\n'
+    '  "bullets": leave this an empty array — "sections" replaces it\n'
     '  "icon": one single emoji that visually represents this slide\'s content (e.g. '
     '\U0001F4C8 for growth, \U0001F4A1 for an idea, \u2705 for a takeaway/action) — pick '
     "one that actually fits the specific content, not the same one repeatedly\n"
@@ -2997,12 +3736,11 @@ SUMMARIZE_SYSTEM_PROMPT = (
     '  "is_cta": true only on the final slide, false everywhere else\n\n'
     "Follow every one of these — each is a specific, checkable property, not a vague style "
     "goal:\n\n"
-    "1. RADICAL CONTENT CONDENSATION. The 6x6 rule: at most 6 bullets per slide, at most 6 "
-    "words per bullet. One idea per slide — isolate a single core message per slide rather "
-    "than crowding several concepts onto one; this means splitting the material across "
-    "multiple slides is expected and correct, not a fallback. Every header is an "
-    "action-oriented or descriptive headline stating the actual takeaway, never a generic "
-    "category label.\n"
+    "1. HEADING, SUB-HEADING, THEN THE POINTS. Every content slide reads like a well-made "
+    "lecture slide: the heading says the topic we are on, each sub-heading says what we are "
+    "about to talk about, and its points say it. At most 3 sub-headings and 8 points on a "
+    "slide — split a big topic across several slides that share the heading rather than "
+    "crowding one. Points are short and specific, never full paragraphs.\n"
     "2. VISUAL HIERARCHY THROUGH BOLDING. Wrap key metrics, dates, names, and other "
     "load-bearing terms in **double asterisks** so a reader can scan the slide in under "
     "three seconds and immediately see what matters — but don't bold everything; bolding "
@@ -3073,7 +3811,7 @@ def _structure_summary(audience, obj, slides, presenters):
         s["is_cta"] = False
     plain = lambda header, items, icon: [{"header": header, "bullets": items[i:i + 6], "icon": icon, "chart": None, "is_cta": False}
                                          for i in range(0, len(items), 6)]
-    outline = [re.sub(r"\*\*", "", s["header"]) for s in slides]
+    outline = list(dict.fromkeys(re.sub(r"\*\*", "", s["header"]).strip() for s in slides))
     out = [{"kind": "cover", "header": title, "bullets": [], "icon": "", "chart": None, "is_cta": False}]
     if audience == "student":
         out += plain("Presented by", presenters or ["Name \u2014 Index number"], "\U0001F465")
@@ -3117,6 +3855,17 @@ def _parse_summary_json(raw_text):
         if not header:
             continue
         bullets = [str(b).strip() for b in (item.get("bullets") or []) if str(b).strip()][:6]
+        sections = []
+        for sec in (item.get("sections") or [])[:3]:
+            if not isinstance(sec, dict):
+                continue
+            sh = str(sec.get("subheading") or "").strip()[:120]
+            pts = [str(p).strip()[:240] for p in (sec.get("points") or []) if str(p).strip()][:4]
+            if sh or pts:
+                sections.append({"subheading": sh, "points": pts})
+        if sections and not bullets:
+            # Older readers of a slide (and the outline) still see sensible bullets.
+            bullets = [x for sec in sections for x in ([sec["subheading"]] if sec["subheading"] else []) + sec["points"]][:10]
         icon = str(item.get("icon") or "").strip()
         chart = item.get("chart")
         if isinstance(chart, dict):
@@ -3146,6 +3895,7 @@ def _parse_summary_json(raw_text):
         slides.append({
             "header": header,
             "bullets": bullets,
+            "sections": sections or None,
             "icon": icon,
             "chart": chart,
             "is_cta": bool(item.get("is_cta")),
@@ -3239,14 +3989,17 @@ def sage_endpoint():
                 "\n\nWhat you remember about this student from earlier — use it naturally where it "
                 "genuinely helps; don't recite it back: " + "; ".join(notes))
         system_prompt += "\n\n" + MEMORY_INSTRUCTION
+    system_prompt += "\n\n" + THINKING_INSTRUCTION
     try:
-        result = call_claude(
+        meta = call_claude(
             system_prompt=system_prompt,
             messages=turns,
             max_tokens=4000,
             use_search=True,
             model=ANTHROPIC_MODEL_STRONG,
+            return_meta=True,
         )
+        result = meta["text"]
     except Exception as e:
         # The message was counted above, before the AI call — but no reply
         # arrived, so give it back. Otherwise a timeout or AI outage quietly
@@ -3256,10 +4009,12 @@ def sage_endpoint():
         if isinstance(e, ConversionError):
             return jsonify({"error": str(e)}), 502
         raise
+    thinking, result = split_thinking_anywhere(result or "")
     note, reply = split_memory_note(result or "")
     if note and memory_on:
         add_user_memory(request.current_user["id"], note)
-    return jsonify({"reply": (reply or "").strip() or result})
+    return jsonify({"reply": (reply or "").strip() or result, "thinking": thinking,
+                    "sources": (meta.get("sources") or [])[:8], "searched": (meta.get("queries") or [])[:5]})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
@@ -3447,6 +4202,60 @@ QUIZ_SYSTEM_PROMPT = (
 )
 
 
+QUIZ_STANDALONE_RULES = (
+    "\n\nSTAND-ALONE QUESTIONS — the most important rule. The quiz is downloaded, printed and "
+    "used on its own by people who never see the source text, so no question, option, answer or "
+    "explanation may refer to the source: never \"the material\", \"the document\", \"the text\", "
+    "\"the passage\", \"the notes\", \"the lecture\", \"the reading\", \"the article\", \"the author\", "
+    "\"the source\" or \"the information given\", and never \"according to\" any of those. Name the "
+    "subject itself instead (\"In biomechanics, …\", \"Under the WHO guidelines, …\"). Every question "
+    "must make complete sense to someone holding only the printed quiz.\n\n"
+    "RETURN ONE JSON OBJECT (not a bare array): {\"title\": a short, specific title naming the subject "
+    "(at most 9 words, e.g. \"Introduction to Biomechanics\"), \"questions\": [the question objects]}."
+)
+
+
+def _quiz_case_rules(n_case, total, tutor=True):
+    share = (f"Exactly {n_case} of the {total} questions must be CASE STUDIES, spread through the quiz. " if n_case < total
+             else f"EVERY one of the {total} questions must be a CASE STUDY, each with its own scenario. ")
+    return (
+        "\n\nCASE STUDIES — " + ("this quiz is for a tutor to set. " if tutor else "") + share +
+        "A case study has \"case_study\": true and a "
+        "\"case\" field: a realistic scenario of 4 to 7 sentences with concrete details (a named person, "
+        "age, setting, measurements or figures — whatever suits the subject; Ghanaian names and settings "
+        "are welcome). Its \"question\" must only be answerable by applying the subject's ideas to that "
+        "scenario — assess, decide, calculate, explain or predict — never by recalling a definition. "
+        "Case studies may be multiple_choice or short_answer; their explanations refer to the case's "
+        "details." + (" Every other question has \"case_study\": false and no \"case\"." if n_case < total else "")
+    )
+
+
+# Leftover references to the source, cleaned out of anything the AI still words that way.
+_SRC_WORDS = (r"(?:study\s+)?(?:material|materials|document|documents|text|passage|notes|note|lecture(?:\s+notes)?|reading|"
+              r"article|source(?:\s+text)?|content|information\s+(?:given|provided)|(?:given|provided)\s+(?:text|material|notes|information))")
+_SRC_LEAD = re.compile(r"^\s*(?:according\s+to|based\s+on|as\s+(?:stated|described|mentioned|explained|discussed|noted|shown|outlined|defined)\s+in|"
+                       r"as\s+per|from|in|per|using)\s+(?:the|this|these|your)\s+" + _SRC_WORDS + r"\s*,\s*", re.I)
+_SRC_MID = re.compile(r",?\s+(?:according\s+to|as\s+(?:stated|described|mentioned|explained|discussed|noted|outlined|defined)\s+in|as\s+per|based\s+on)\s+"
+                      r"(?:the|this|these|your)\s+" + _SRC_WORDS + r"(?=[\s,.?!;:)]|$)", re.I)
+_SRC_PAIR = re.compile(r",\s+(?:according\s+to|as\s+(?:stated|described|mentioned|explained|discussed|noted|outlined|defined)\s+in|as\s+per|based\s+on)\s+"
+                       r"(?:the|this|these|your)\s+" + _SRC_WORDS + r"\s*,\s*", re.I)
+_SRC_TAIL = re.compile(r"\s+(?:in|from|within|by)\s+(?:the|this|these|your)\s+" + _SRC_WORDS + r"(?=\s*[?.!,;:)]|\s*$)", re.I)
+
+
+def _standalone(text):
+    t = str(text or "").strip()
+    if not t:
+        return t
+    t2 = _SRC_LEAD.sub("", t)
+    t2 = _SRC_PAIR.sub(" ", t2)       # "Which term, as described in the notes, refers…" → "Which term refers…"
+    t2 = _SRC_MID.sub("", t2)
+    t2 = _SRC_TAIL.sub("", t2)
+    t2 = re.sub(r"\s{2,}", " ", t2).strip()
+    if t2 != t and t2:
+        t2 = t2[0].upper() + t2[1:]
+    return t2 or t
+
+
 def _parse_quiz_json(raw_text):
     """Claude is instructed to return a bare JSON array, but models
     sometimes wrap it in a markdown code fence despite that instruction
@@ -3459,10 +4268,15 @@ def _parse_quiz_json(raw_text):
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
         text = text.strip()
+    if not text.startswith(("[", "{")):
+        a = min([i for i in (text.find("{"), text.find("[")) if i >= 0] or [0])
+        text = text[a:]
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         raise ConversionError("Couldn't generate a quiz from that material — please try again.")
+    if isinstance(data, dict):        # {"title": …, "questions": […]}
+        data = data.get("questions")
     if not isinstance(data, list) or not data:
         raise ConversionError("Couldn't generate a quiz from that material — please try again.")
 
@@ -3471,14 +4285,16 @@ def _parse_quiz_json(raw_text):
         if not isinstance(item, dict):
             continue
         q_type = item.get("type") if item.get("type") in ("multiple_choice", "short_answer") else "short_answer"
-        q_text = str(item.get("question") or "").strip()
+        q_text = _standalone(item.get("question"))
         if not q_text:
             continue
         options = item.get("options") if isinstance(item.get("options"), list) else None
         if q_type == "multiple_choice" and (not options or len(options) < 2):
             q_type = "short_answer"  # a malformed MC question still becomes a usable question, not a dropped one
             options = None
-        correct_answer = str(item.get("correct_answer") or "").strip()
+        if options:
+            options = [_standalone(o) for o in options]
+        correct_answer = _standalone(item.get("correct_answer"))
         if q_type == "multiple_choice" and options and correct_answer:
             # Confirmed directly this is a real failure mode, not a
             # theoretical one: a model can name a correct_answer that
@@ -3495,7 +4311,10 @@ def _parse_quiz_json(raw_text):
                 q_type = "short_answer"
                 options = None
         final_options = [str(o) for o in options][:8] if options else None
-        if final_options:
+        if final_options and sorted(o.strip().lower() for o in final_options) == ["false", "true"]:
+            final_options = ["True", "False"]
+            correct_answer = "True" if correct_answer.strip().lower() == "true" else "False"
+        elif final_options:
             # A model's own habits about *where* it places the correct
             # option (first, or last, after the distractors) would
             # otherwise carry straight through to the printed quiz —
@@ -3513,9 +4332,12 @@ def _parse_quiz_json(raw_text):
             "question": q_text,
             "options": final_options,
             "correct_answer": correct_answer,
-            "explanation": str(item.get("explanation") or "").strip(),
+            "explanation": _standalone(item.get("explanation")),
             "difficulty": item.get("difficulty") if item.get("difficulty") in ("easy", "medium", "hard") else None,
         })
+        case = _standalone(item.get("case")) if item.get("case_study") else ""
+        questions[-1]["case_study"] = bool(case)
+        questions[-1]["case"] = case[:2400] if case else None
     if not questions:
         raise ConversionError("Couldn't generate a quiz from that material — please try again.")
     return questions
@@ -3549,19 +4371,25 @@ def quiz_generate_endpoint():
                  "multi-step reasoning. Mark each \"hard\"."),
         "mixed": "DIFFICULTY: a genuine range from easy to hard across the set, each question marked with its own level.",
     }[difficulty]
+    audience = "tutor" if data.get("audience") == "tutor" else "student"
     reqs = str(data.get("requirements") or "").strip()[:1200]
     reqs_block = ("\n\nTHE LECTURER'S REQUIREMENTS \u2014 follow them exactly (topics to cover, question focus, examples, "
                   "format), while keeping the JSON format above and basing every question on the material:\n<<<\n" + reqs + "\n>>>") if reqs else ""
-    question_style = data.get("question_style") or "a mix of multiple_choice and short_answer"
-    if question_style == "multiple_choice":
+    style = str(data.get("question_style") or "mixed")
+    if style == "multiple_choice":
         question_style = "only multiple_choice"
-    elif question_style == "short_answer":
+    elif style == "short_answer":
         question_style = "only short_answer"
+    elif style == "true_false":
+        question_style = ("only TRUE/FALSE questions: each is \"type\": \"multiple_choice\" with \"options\" exactly "
+                          "[\"True\", \"False\"] and a clear statement as its \"question\"; roughly half true and half false, "
+                          "and a false statement must be wrong in one specific, checkable way")
     else:
         question_style = "a mix of multiple_choice and short_answer"
 
     user_message = (
-        f"Generate exactly {num_questions} questions ({question_style}) from this material.\n{level}\n\n{text}"
+        f"Generate exactly {num_questions} questions ({question_style}) on the subject below — remember: "
+        f"no question may mention the source.\n{level}\n\nSOURCE TEXT (for you only — the quiz-taker never sees it):\n\n{text}"
     )
 
     # Scales with num_questions rather than a flat value: confirmed
@@ -3576,16 +4404,27 @@ def quiz_generate_endpoint():
     # Capped at 64000 to stay within every current model's max-output
     # ceiling (verified as low as 64K tokens for some tiers) regardless
     # of which one handles this request.
-    max_tokens = min(64000, max(4000, num_questions * 360 + 500))   # a little more room: explanations now teach
+    n_case = num_questions if style == "case_study" else (max(1, round(num_questions / 3)) if audience == "tutor" else 0)
+    # A little more room: explanations now teach, and a case study's scenario runs long.
+    max_tokens = min(64000, max(4000, num_questions * 360 + n_case * 260 + 600))
 
     try:
         result = call_claude(
-            system_prompt=QUIZ_SYSTEM_PROMPT + reqs_block,
+            system_prompt=QUIZ_SYSTEM_PROMPT + QUIZ_STANDALONE_RULES + (_quiz_case_rules(n_case, num_questions, audience == "tutor") if n_case else "") + reqs_block,
             user_message=user_message,
             max_tokens=max_tokens,
         )
         questions = _parse_quiz_json(result)
-        return jsonify({"questions": questions, "title": title, "difficulty": difficulty})
+        if title in ("", "Practice Quiz"):
+            try:
+                made = json.loads(result[result.find("{"):result.rfind("}") + 1]) if "{" in result else {}
+                named = str(made.get("title") or "").strip() if isinstance(made, dict) else ""
+            except ValueError:
+                named = ""
+            named = _standalone(re.sub(r"\s+", " ", named))[:90]
+            if named:
+                title = named if "quiz" in named.lower() else f"{named} — Practice Quiz"
+        return jsonify({"questions": questions, "title": title, "difficulty": difficulty, "audience": audience, "question_style": style})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
 
@@ -3669,11 +4508,27 @@ THINK_END = "[/THINKING]"
 THINKING_INSTRUCTION = (
     "Before your main reply, briefly think out loud about how you're approaching this "
     "request — your read on what's being asked, which sources or angle you're leaning on, "
-    "and why. Keep it a few sentences, in your own natural voice. Wrap it in the exact "
+    "and why — as 2 to 4 short steps, one per line, each a single sentence in your own "
+    "natural voice (the app shows them one at a time). Wrap it in the exact "
     f"markers {THINK_START} and {THINK_END} with nothing else on those lines, then "
     "immediately after the closing marker write your actual answer in full — the thinking "
     "is shown to the student separately and is never a substitute for the complete answer."
 )
+
+
+def split_thinking_anywhere(text):
+    """Like split_thinking, but the block may come after a few words (a web-searching
+    answer sometimes says something before it thinks)."""
+    t = text or ""
+    a = t.find(THINK_START)
+    if a == -1:
+        return None, t
+    b = t.find(THINK_END, a)
+    if b == -1:
+        return None, t
+    thinking = t[a + len(THINK_START):b].strip()
+    rest = (t[:a] + t[b + len(THINK_END):]).strip()
+    return (thinking or None), rest
 
 
 def split_thinking(text):
