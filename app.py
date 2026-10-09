@@ -741,6 +741,19 @@ def _email_send_result(ok, err=None, to=None):
         _email_refused(f"{err.__class__.__name__}: {str(err)[:100]}", retry_minutes=15)
 
 
+def _email_unreachable(err):
+    """The email server can't be reached at all: rather than leave new students waiting for a code
+    that can't arrive, confirmation pauses for 15 minutes and the check runs again then."""
+    import threading
+    _set_email_pause(15)
+    logger.warning("Email: can't reach the email server (%s). New accounts aren't asked for a code for the next 15 minutes "
+                   "(they confirm later); checking again then. If this keeps happening with Gmail, add BREVO_API_KEY on Render "
+                   "— Brevo sends over the web instead.", err.__class__.__name__)
+    t = threading.Timer(15 * 60, _check_email_login)
+    t.daemon = True
+    t.start()
+
+
 def _claim_email_check():
     """Only one server worker signs in at start-up — two at the same moment made Gmail hang up on both."""
     if not DATABASE_URL:
@@ -757,6 +770,52 @@ def _claim_email_check():
             conn.close()
     except Exception:
         return True
+
+
+_GMAIL_PORT = {"port": 465}   # the Gmail door that last worked from this server
+
+
+class _GmailSession:
+    """A signed-in connection to Gmail: port 465 (SSL) or, if that door hangs up, port 587 (STARTTLS)."""
+    def __enter__(self):
+        first = _GMAIL_PORT["port"]
+        last = None
+        self.s = None
+        for port in [first] + [p for p in (465, 587) if p != first]:
+            try:
+                if port == 465:
+                    s = smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15)
+                else:
+                    s = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+                    s.starttls()
+                self.s = s
+                if port != first:
+                    logger.warning(f"Email: Gmail answered on port {port} (port {first} hung up) — using {port} from now on")
+                _GMAIL_PORT["port"] = port
+                break
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionError, TimeoutError) as e:
+                last = e
+        if self.s is None:
+            raise last
+        try:
+            self.s.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        except Exception:
+            self._close()
+            raise
+        return self.s
+
+    def _close(self):
+        try:
+            self.s.quit()
+        except Exception:
+            try:
+                self.s.close()
+            except Exception:
+                pass
+
+    def __exit__(self, *a):
+        self._close()
+        return False
 
 
 def _check_email_login(attempt=1):
@@ -777,8 +836,8 @@ def _check_email_login(attempt=1):
             if r.status_code >= 300:
                 return
         else:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-                server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            with _GmailSession():
+                pass
         _set_email_pause(0)
         logger.warning("Email: signed in OK — new accounts confirm their email with a code")
     except smtplib.SMTPAuthenticationError as e:
@@ -787,7 +846,7 @@ def _check_email_login(attempt=1):
         if attempt == 1:
             time.sleep(20)
             return _check_email_login(attempt=2)
-        logger.warning(f"Email: couldn't check the email account just now ({e.__class__.__name__}) — it will be tried when needed")
+        _email_unreachable(e)
 
 
 if os.environ.get("EMAIL_LOGIN_CHECK", "on") != "off":
@@ -827,8 +886,7 @@ def send_email(to_email, subject, body, html=None):
     msg["To"] = to_email
     for attempt in (1, 2):
         try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-                server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            with _GmailSession() as server:
                 server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
             return
         except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionError, TimeoutError) as e:
