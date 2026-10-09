@@ -115,8 +115,8 @@ def _exempt_cors_preflight():
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("docente")
-logger.warning("Email: %s", "set up — checking that it can sign in…" if (os.environ.get("EMAIL_ADDRESS") and (os.environ.get("EMAIL_APP_PASSWORD") or os.environ.get("BREVO_API_KEY")))
-               else "NOT set up — add EMAIL_ADDRESS and EMAIL_APP_PASSWORD on Render so new accounts can confirm their email")
+if not (os.environ.get("EMAIL_ADDRESS") and (os.environ.get("EMAIL_APP_PASSWORD") or os.environ.get("BREVO_API_KEY"))):
+    logger.warning("Email: NOT set up — add EMAIL_ADDRESS and EMAIL_APP_PASSWORD on Render so new accounts can confirm their email")
 
 MIME_TYPES = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -741,10 +741,33 @@ def _email_send_result(ok, err=None, to=None):
         _email_refused(f"{err.__class__.__name__}: {str(err)[:100]}", retry_minutes=15)
 
 
-def _check_email_login():
+def _claim_email_check():
+    """Only one server worker signs in at start-up — two at the same moment made Gmail hang up on both."""
+    if not DATABASE_URL:
+        return True
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO app_flags (name, until) VALUES ('email_checked', now()) "
+                            "ON CONFLICT (name) DO UPDATE SET until = now() WHERE app_flags.until IS NULL OR app_flags.until < now() - interval '2 minutes' "
+                            "RETURNING name")
+                return cur.fetchone() is not None
+        finally:
+            conn.close()
+    except Exception:
+        return True
+
+
+def _check_email_login(attempt=1):
     """Signs in once at start-up (sends nothing) so a wrong password shows up in the log straight away."""
     if not _email_configured():
         return
+    if attempt == 1:
+        time.sleep(random.uniform(0.5, 3.0))
+        if not _claim_email_check():
+            return
+        logger.warning("Email: set up — checking that it can sign in…")
     try:
         if BREVO_API_KEY:
             r = requests.get("https://api.brevo.com/v3/account", timeout=15,
@@ -761,6 +784,9 @@ def _check_email_login():
     except smtplib.SMTPAuthenticationError as e:
         _email_refused(f"Gmail said: {getattr(e, 'smtp_code', '')} wrong address or app password")
     except Exception as e:
+        if attempt == 1:
+            time.sleep(20)
+            return _check_email_login(attempt=2)
         logger.warning(f"Email: couldn't check the email account just now ({e.__class__.__name__}) — it will be tried when needed")
 
 
@@ -777,8 +803,16 @@ def send_email(to_email, subject, body, html=None):
                    "subject": subject, "textContent": body}
         if html:
             payload["htmlContent"] = html
-        r = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, timeout=15,
-                          headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"})
+        for attempt in (1, 2):
+            try:
+                r = requests.post("https://api.brevo.com/v3/smtp/email", json=payload, timeout=15,
+                                  headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"})
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == 2:
+                    raise
+                logger.warning(f"Email: the connection dropped ({e.__class__.__name__}) — trying once more")
+                time.sleep(1.5)
         if r.status_code >= 300:
             raise ConversionError(f"The email service answered {r.status_code}: {r.text[:300]}")
         return
@@ -791,9 +825,17 @@ def send_email(to_email, subject, body, html=None):
     msg["Subject"] = subject
     msg["From"] = formataddr(("Docente", EMAIL_ADDRESS))
     msg["To"] = to_email
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-        server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+    for attempt in (1, 2):
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+                server.sendmail(EMAIL_ADDRESS, to_email, msg.as_string())
+            return
+        except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, ConnectionError, TimeoutError) as e:
+            if attempt == 2:
+                raise
+            logger.warning(f"Email: the connection dropped ({e.__class__.__name__}) — trying once more")
+            time.sleep(1.5)
 
 
 # ---------- email confirmation codes ----------
