@@ -2030,6 +2030,17 @@ def _number_paragraph(paragraph):
         ppr.append(auto)
 
 
+# b bold, i italic, u underline, s strikethrough, p superscript, d subscript (p and d never together)
+FMT_FLAGS = "biuspd"
+
+
+def _fmt_merge(a, f):
+    out = "".join(c for c in FMT_FLAGS if c in a or c in f)
+    if "p" in out and "d" in out:            # raised and lowered at once: the newer one wins
+        out = out.replace("d" if "p" in f else "p", "")
+    return out
+
+
 def _fmt_chars(fmt, length):
     """One formatting string per character ("", "b", "bi", …) from a point's ranges."""
     chars = [""] * length
@@ -2039,7 +2050,7 @@ def _fmt_chars(fmt, length):
         except (TypeError, ValueError, IndexError):
             continue
         for k in range(max(0, s), min(length, e)):
-            chars[k] = "".join(c for c in "biu" if c in chars[k] or c in f)
+            chars[k] = _fmt_merge(chars[k], f)
     return chars
 
 
@@ -2064,7 +2075,7 @@ def _clean_fmt(fmt, delta, length):
     out = []
     for r in fmt[:80]:
         try:
-            s, e, f = int(r[0]) + delta, int(r[1]) + delta, "".join(c for c in "biu" if c in str(r[2]))
+            s, e, f = int(r[0]) + delta, int(r[1]) + delta, _fmt_merge("", str(r[2]))
         except (TypeError, ValueError, IndexError):
             continue
         s, e = max(0, s), min(length, e)
@@ -2074,7 +2085,7 @@ def _clean_fmt(fmt, delta, length):
 
 
 def _fmt_segments(text, fmt):
-    """(words, "biu"-flags) pieces of a point, in order."""
+    """(words, flags) pieces of a point, in order."""
     if not fmt:
         return [(text, "")]
     chars = _fmt_chars(fmt, len(text))
@@ -2156,6 +2167,14 @@ def _write_bullets(placeholder, bullets, box_in, numbered):
                 r.font.italic = True
             if "u" in flags:
                 r.font.underline = True
+            if "s" in flags or "p" in flags or "d" in flags:
+                rpr = r._r.get_or_add_rPr()
+                if "s" in flags:
+                    rpr.set("strike", "sngStrike")
+                if "p" in flags:
+                    rpr.set("baseline", "30000")      # PowerPoint's own superscript
+                elif "d" in flags:
+                    rpr.set("baseline", "-25000")     # and subscript
 
 
 def _add_table(slide, spec, left, top, width, height):
@@ -3414,13 +3433,23 @@ def _run_flags(rpr):
         flags += "i"
     if rpr.get("u") not in (None, "none"):
         flags += "u"
+    if rpr.get("strike") in ("sngStrike", "dblStrike"):
+        flags += "s"
+    try:
+        base = int(rpr.get("baseline") or 0)
+    except ValueError:
+        base = 0
+    if base > 0:
+        flags += "p"
+    elif base < 0:
+        flags += "d"
     return flags
 
 
 def _paragraph_bullets(text_frame):
     """Each paragraph's words with tidy spaces, its level, and — when only some of its words are
-    bold, italic or underlined — that formatting (a whole paragraph in bold is the deck's own
-    style, not emphasis)."""
+    bold, italic, underlined, struck through, raised or lowered — that formatting (a whole
+    paragraph in bold is the deck's own style, not emphasis)."""
     out = []
     for p in text_frame.paragraphs:
         chars, flags = [], []
@@ -3451,7 +3480,12 @@ def _paragraph_bullets(text_frame):
             continue
         b = {"text": s, "level": max(0, min(int(p.level or 0), 3))}
         kept = kept[:len(s)]
-        if len({f for ch, f in zip(s, kept) if ch != " "}) > 1:
+        # a style every word shares is the deck's own (a whole line in bold); one only some words have is emphasis
+        shown = [f for ch, f in zip(s, kept) if ch != " "]
+        common = "".join(c for c in FMT_FLAGS if shown and all(c in f for f in shown))
+        if common:
+            kept = ["".join(c for c in f if c not in common) for f in kept]
+        if any(kept):
             fmt = _fmt_from_chars(kept)
             if fmt:
                 b["fmt"] = fmt
@@ -3601,6 +3635,8 @@ def parse_pptx_to_deck(path, max_pictures=30):
                 # An unmarked first slide with only a few short texts is the cover.
                 if i == 0 and not is_title_slide and len(texts) <= 3 and sum(len(sh.text_frame.text) for sh in texts) <= 300:
                     is_title_slide = True
+        if i == 0 and not is_title_slide and not title and not texts and len(all_slides) > 1:
+            is_title_slide = True          # a first slide with no words at all: the cover, not yet filled in
         if is_title_slide:
             title_notes = s.notes_slide.notes_text_frame.text.strip() if s.has_notes_slide else ""
             raw_lines = [l.strip() for l in cover_text.replace("\v", "\n").split("\n") if l.strip()]
