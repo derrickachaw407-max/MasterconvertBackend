@@ -2030,6 +2030,73 @@ def _number_paragraph(paragraph):
         ppr.append(auto)
 
 
+def _fmt_chars(fmt, length):
+    """One formatting string per character ("", "b", "bi", …) from a point's ranges."""
+    chars = [""] * length
+    for r in fmt or []:
+        try:
+            s, e, f = int(r[0]), int(r[1]), str(r[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        for k in range(max(0, s), min(length, e)):
+            chars[k] = "".join(c for c in "biu" if c in chars[k] or c in f)
+    return chars
+
+
+def _fmt_from_chars(chars):
+    out, k = [], 0
+    while k < len(chars):
+        if not chars[k]:
+            k += 1
+            continue
+        j = k
+        while j < len(chars) and chars[j] == chars[k]:
+            j += 1
+        out.append([k, j, chars[k]])
+        k = j
+    return out
+
+
+def _clean_fmt(fmt, delta, length):
+    """A point's formatting, checked, moved by `delta` characters and kept inside its words."""
+    if not isinstance(fmt, list):
+        return []
+    out = []
+    for r in fmt[:80]:
+        try:
+            s, e, f = int(r[0]) + delta, int(r[1]) + delta, "".join(c for c in "biu" if c in str(r[2]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        s, e = max(0, s), min(length, e)
+        if f and e > s:
+            out.append([s, e, f])
+    return out
+
+
+def _fmt_segments(text, fmt):
+    """(words, "biu"-flags) pieces of a point, in order."""
+    if not fmt:
+        return [(text, "")]
+    chars = _fmt_chars(fmt, len(text))
+    out, k = [], 0
+    while k < len(text):
+        j = k
+        while j < len(text) and chars[j] == chars[k]:
+            j += 1
+        out.append((text[k:j], chars[k]))
+        k = j
+    return out or [(text, "")]
+
+
+def _eff_len(b):
+    """Characters a point takes up: bold words are a little wider (the editor counts the same)."""
+    text = b["text"]
+    if not b.get("fmt"):
+        return len(text)
+    bold = sum(1 for f in _fmt_chars(b["fmt"], len(text)) if "b" in f)
+    return len(text) + int(bold * 0.08 + 0.5)
+
+
 def _body_size(bullets, width_in, height_in, top=30):
     """The largest size (top pt down to 16pt) at which every bullet, wrapped,
     fits its box. Preview engines shrink text unpredictably, so the size is
@@ -2040,7 +2107,7 @@ def _body_size(bullets, width_in, height_in, top=30):
         per_line = max(8, int((width_in - 0.3) * 72 / (size * 0.58)))
         lines = 0
         for b in bullets:
-            lines += max(1, math.ceil(len(b["text"]) / max(8, per_line - 3 - 3 * b["level"])))
+            lines += max(1, math.ceil(_eff_len(b) / max(8, per_line - 3 - 3 * b["level"])))
         if lines * size * 1.2 + len(bullets) * size * 0.45 <= height_in * 72:
             return size
     return 16
@@ -2053,9 +2120,14 @@ def _clean_bullets(raw):
             b = {"text": b, "level": 0}
         if not isinstance(b, dict):
             continue
-        text = str(b.get("text", "")).strip()
+        raw = str(b.get("text", ""))
+        text = raw.strip()
         if text:
-            out.append({"text": text[:600], "level": max(0, min(int(b.get("level", 0) or 0), 3))})
+            item = {"text": text[:600], "level": max(0, min(int(b.get("level", 0) or 0), 3))}
+            fmt = _clean_fmt(b.get("fmt"), -(len(raw) - len(raw.lstrip())), len(item["text"]))
+            if fmt:
+                item["fmt"] = fmt
+            out.append(item)
     return out[:40]
 
 
@@ -2074,9 +2146,16 @@ def _write_bullets(placeholder, bullets, box_in, numbered):
         p.level = b["level"]
         if numbered and b["level"] == 0:
             _number_paragraph(p)
-        r = p.add_run()
-        r.text = b["text"]
-        r.font.size = Pt(size if b["level"] == 0 else max(size - 4, 14))
+        for words, flags in _fmt_segments(b["text"], b.get("fmt")):
+            r = p.add_run()
+            r.text = words
+            r.font.size = Pt(size if b["level"] == 0 else max(size - 4, 14))
+            if "b" in flags:
+                r.font.bold = True
+            if "i" in flags:
+                r.font.italic = True
+            if "u" in flags:
+                r.font.underline = True
 
 
 def _add_table(slide, spec, left, top, width, height):
@@ -2414,6 +2493,8 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
                     run._r.getparent().remove(run._r)
                 hpara.runs[0].text = heading
                 hpara.runs[0].font.bold = False   # no bold in slides: the heading's colour sets it apart
+                hpara.runs[0].font.italic = None
+                hpara.runs[0].font.underline = None
                 hpara.runs[0].font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
                 hppr = hp.get_or_add_pPr()
                 etree.SubElement(hppr, qn("a:buNone"))
@@ -2712,13 +2793,114 @@ def _transition_of(slide):
     return None
 
 
+# Points that appear one click at a time: PowerPoint's own entrance effects, by paragraph.
+ANIMATIONS = {"appear": (1, 0), "fade": (10, 0), "wipe": (22, 8)}
+
+
+def _point_clicks(slide, sd):
+    """[(shape id, paragraph), …] per click: each main point with its sub-points. Column headings
+    and empty paragraphs stay in view from the start."""
+    columns = (sd.get("kind") or "content") == "columns"
+    bodies = sorted((ph for ph in slide.placeholders if ph.placeholder_format.idx in (1, 2) and ph.has_text_frame),
+                    key=lambda ph: ph.placeholder_format.idx)
+    clicks = []
+    for ph in bodies:
+        side = "left" if ph.placeholder_format.idx == 1 else "right"
+        heading = columns and str(sd.get(side + "_heading") or "").strip()
+        first_in_shape = True
+        for k, p in enumerate(ph.text_frame.paragraphs):
+            if (heading and k == 0) or not "".join(r.text for r in p.runs).strip():
+                continue
+            if first_in_shape or (p.level or 0) == 0:
+                clicks.append([])
+            clicks[-1].append((ph.shape_id, k))
+            first_in_shape = False
+    return clicks
+
+
+def _set_timing(slide, kind, clicks):
+    """<p:timing> (after <p:transition>): one click per entry of `clicks`, its first paragraph
+    on the click and the rest with it."""
+    sld = slide._element
+    for old in sld.findall(qn("p:timing")):
+        sld.remove(old)
+    if kind not in ANIMATIONS or not clicks:
+        return
+    preset, subtype = ANIMATIONS[kind]
+    counter = [2]
+
+    def nid():
+        counter[0] += 1
+        return str(counter[0])
+
+    def el(parent, tag, **attrs):
+        return etree.SubElement(parent, qn("p:" + tag), **{k: str(v) for k, v in attrs.items()})
+
+    def target(parent, spid, para):
+        t = el(el(el(parent, "tgtEl"), "spTgt", spid=spid), "txEl")
+        el(t, "pRg", st=para, end=para)
+
+    timing = etree.Element(qn("p:timing"))
+    root = el(el(el(timing, "tnLst"), "par"), "cTn", id=1, dur="indefinite", restart="never", nodeType="tmRoot")
+    seq = el(el(root, "childTnLst"), "seq", concurrent=1, nextAc="seek")
+    steps = el(el(seq, "cTn", id=2, dur="indefinite", nodeType="mainSeq"), "childTnLst")
+    for click in clicks:
+        outer = el(el(steps, "par"), "cTn", id=nid(), fill="hold")
+        el(el(outer, "stCondLst"), "cond", delay="indefinite")
+        inner = el(el(el(outer, "childTnLst"), "par"), "cTn", id=nid(), fill="hold")
+        el(el(inner, "stCondLst"), "cond", delay=0)
+        effects = el(inner, "childTnLst")
+        for n, (spid, para) in enumerate(click):
+            eff = el(el(effects, "par"), "cTn", id=nid(), presetID=preset, presetClass="entr", presetSubtype=subtype,
+                     fill="hold", grpId=0, nodeType="clickEffect" if n == 0 else "withEffect")
+            el(el(eff, "stCondLst"), "cond", delay=0)
+            parts = el(eff, "childTnLst")
+            show = el(parts, "set")
+            behaviour = el(show, "cBhvr")
+            dot = el(behaviour, "cTn", id=nid(), dur=1, fill="hold")
+            el(el(dot, "stCondLst"), "cond", delay=0)
+            target(behaviour, spid, para)
+            el(el(behaviour, "attrNameLst"), "attrName").text = "style.visibility"
+            el(el(show, "to"), "strVal", val="visible")
+            if kind in ("fade", "wipe"):
+                fx = el(parts, "animEffect", transition="in", filter="fade" if kind == "fade" else "wipe(left)")
+                b2 = el(fx, "cBhvr")
+                el(b2, "cTn", id=nid(), dur=500)
+                target(b2, spid, para)
+    for evt, tag in (("onPrev", "prevCondLst"), ("onNext", "nextCondLst")):
+        el(el(el(seq, tag), "cond", evt=evt, delay=0), "tgtEl").append(etree.Element(qn("p:sldTgt")))
+    builds = el(timing, "bldLst")
+    for spid in dict.fromkeys(spid for click in clicks for spid, _ in click):
+        el(builds, "bldP", spid=spid, grpId=0, build="p")
+    anchor = sld.find(qn("p:transition"))
+    if anchor is None:
+        anchor = sld.find(qn("p:clrMapOvr"))
+    if anchor is None:
+        anchor = sld.find(qn("p:cSld"))
+    anchor.addnext(timing)
+
+
+def _animation_of(slide):
+    """How a slide's points appear ("appear", "fade", "wipe"), or None: any entrance effect on
+    the paragraphs of a text box counts (other effects come in as Fade)."""
+    timing = slide._element.find(qn("p:timing"))
+    if timing is None:
+        return None
+    for ctn in timing.iter(qn("p:cTn")):
+        if ctn.get("presetClass") == "entr" and ctn.find(".//" + qn("p:txEl")) is not None:
+            return {"1": "appear", "10": "fade", "22": "wipe"}.get(ctn.get("presetID"), "fade")
+    return None
+
+
 def _finish_slides(slides, sd):
-    """Hidden and transition settings for every slide made from one deck slide."""
+    """Hidden, transition and point-by-point settings for every slide made from one deck slide."""
     for s in slides:
         if sd.get("hidden"):
             s._element.set("show", "0")
         if sd.get("transition"):
             _set_transition(s, str(sd["transition"]))
+        if sd.get("animate") in ANIMATIONS and (sd.get("kind") or "content") in ("content", "columns"):
+            _set_timing(s, sd["animate"], _point_clicks(s, sd))
 
 
 def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
@@ -2862,6 +3044,7 @@ def _m_number(slide, number, tpl, on_colour=False):
     fill = "FFFFFF" if on_colour else tpl["ink"]
     text_hex = tpl["ink"] if on_colour else "FFFFFF"
     badge = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 12.15, 6.88, 0.62, 0.38, fill, back=False)
+    badge.name = "Docente slide number"
     badge.adjustments[0] = 0.5
     tf = badge.text_frame
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
@@ -2883,7 +3066,7 @@ def _m_number(slide, number, tpl, on_colour=False):
 def _m_footer(slide, tpl, deck, number, on_colour=False):
     foot = _tutor_footer(deck)
     if foot and not on_colour:
-        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"])
+        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"]).name = "Docente footer"
     if deck.get("slide_numbers", True):
         _m_number(slide, number, tpl, on_colour)
 
@@ -3120,6 +3303,8 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
                     run._r.getparent().remove(run._r)
                 hpara.runs[0].text = heading
                 hpara.runs[0].font.bold = False
+                hpara.runs[0].font.italic = None
+                hpara.runs[0].font.underline = None
                 hpara.runs[0].font.name = MODERN_TITLE_FONT
                 hpara.runs[0].font.color.rgb = RGBColor.from_string(tpl["emph"])
                 etree.SubElement(hp.get_or_add_pPr(), qn("a:buNone"))
@@ -3199,13 +3384,78 @@ def _picture_data_url(image_blob):
     return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def _furniture_box(sh, slide_h):
+    # A footer or slide number drawn as an ordinary text box: one this builder named, or a lone
+    # number along the very bottom of the slide.
+    if (sh.name or "").startswith("Docente "):
+        return True
+    text = sh.text_frame.text.strip()
+    return bool(re.fullmatch(r"\d{1,3}", text)) and sh.top is not None and bool(slide_h) and sh.top >= slide_h * 0.88
+
+
+def _column_heading(text_frame):
+    """A column's heading: an unbulleted first line with points under it."""
+    paras = [p for p in text_frame.paragraphs if "".join(r.text for r in p.runs).strip()]
+    if len(paras) < 2 or (paras[0].level or 0) != 0:
+        return ""
+    ppr = paras[0]._p.find(qn("a:pPr"))
+    if ppr is None or ppr.find(qn("a:buNone")) is None:
+        return ""
+    return re.sub(r"\s+", " ", "".join(r.text for r in paras[0].runs)).strip()[:80]
+
+
+def _run_flags(rpr):
+    if rpr is None:
+        return ""
+    flags = ""
+    if rpr.get("b") in ("1", "true"):
+        flags += "b"
+    if rpr.get("i") in ("1", "true"):
+        flags += "i"
+    if rpr.get("u") not in (None, "none"):
+        flags += "u"
+    return flags
+
+
 def _paragraph_bullets(text_frame):
+    """Each paragraph's words with tidy spaces, its level, and — when only some of its words are
+    bold, italic or underlined — that formatting (a whole paragraph in bold is the deck's own
+    style, not emphasis)."""
     out = []
     for p in text_frame.paragraphs:
-        text = "".join(r.text for r in p.runs).strip() or p.text.strip() if hasattr(p, "text") else ""
-        text = re.sub(r"\s+", " ", text.replace("\v", " ")).strip()
-        if text:
-            out.append({"text": text[:600], "level": max(0, min(int(p.level or 0), 3))})
+        chars, flags = [], []
+        for child in p._p.iterchildren():
+            tag = etree.QName(child).localname
+            if tag in ("r", "fld"):
+                t = child.find(qn("a:t"))
+                f = _run_flags(child.find(qn("a:rPr")))
+                for ch in (t.text or "") if t is not None else "":
+                    chars.append(ch)
+                    flags.append(f)
+            elif tag == "br":
+                chars.append(" ")
+                flags.append("")
+        text, kept = [], []
+        for ch, f in zip(chars, flags):
+            if ch.isspace():
+                if not text or text[-1] == " ":
+                    continue
+                ch = " "
+            text.append(ch)
+            kept.append(f)
+        while text and text[-1] == " ":
+            text.pop()
+            kept.pop()
+        s = "".join(text)[:600]
+        if not s:
+            continue
+        b = {"text": s, "level": max(0, min(int(p.level or 0), 3))}
+        kept = kept[:len(s)]
+        if len({f for ch, f in zip(s, kept) if ch != " "}) > 1:
+            fmt = _fmt_from_chars(kept)
+            if fmt:
+                b["fmt"] = fmt
+        out.append(b)
     return out
 
 
@@ -3223,15 +3473,26 @@ def _tidy_bullets(bullets):
     numbered)."""
     out = []
     for b in bullets:
-        text = _TYPED_BULLET.sub("", b["text"]).strip()
+        m = _TYPED_BULLET.match(b["text"])
+        rest = b["text"][m.end():] if m else b["text"]
+        text = rest.strip()
         if text:
-            out.append(dict(b, text=text))
+            item = dict(b, text=text)
+            if b.get("fmt"):
+                cut = len(b["text"]) - len(rest) + (len(rest) - len(rest.lstrip()))
+                item["fmt"] = _clean_fmt(b["fmt"], -cut, len(text))
+                if not item["fmt"]:
+                    del item["fmt"]
+            out.append(item)
     merged, i = [], 0
     while i < len(out):
         b = out[i]
         nxt = out[i + 1] if i + 1 < len(out) else None
         if len(b["text"]) == 1 and b["text"].isalnum() and nxt and len(nxt["text"]) <= 40 and nxt["level"] == b["level"]:
-            merged.append(dict(nxt, text=b["text"] + ": " + nxt["text"]))
+            joined = dict(nxt, text=b["text"] + ": " + nxt["text"])
+            if nxt.get("fmt"):
+                joined["fmt"] = _clean_fmt(nxt["fmt"], 3, len(joined["text"]))
+            merged.append(joined)
             i += 2
             continue
         merged.append(b)
@@ -3243,7 +3504,15 @@ def _tidy_bullets(bullets):
         seq = [int(m.group(1)) for m in nums]
         if seq == list(range(seq[0], seq[0] + len(seq))) and seq[0] in (0, 1):
             numbered = True
-            merged = [dict(b, text=_TYPED_NUMBER.sub("", b["text"])) if b["level"] == 0 else b for b in merged]
+            def _unnumber(b):
+                m = _TYPED_NUMBER.match(b["text"])
+                item = dict(b, text=b["text"][m.end():] if m else b["text"])
+                if b.get("fmt") and m:
+                    item["fmt"] = _clean_fmt(b["fmt"], -m.end(), len(item["text"]))
+                    if not item["fmt"]:
+                        del item["fmt"]
+                return item
+            merged = [_unnumber(b) if b["level"] == 0 else b for b in merged]
     return merged, numbered
 
 
@@ -3319,7 +3588,8 @@ def parse_pptx_to_deck(path, max_pictures=30):
         furniture = (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER)
         texts = [sh for sh in shapes if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip()
                  and (title_shape is None or sh.shape_id != title_shape.shape_id)
-                 and not (sh.is_placeholder and sh.placeholder_format.type in furniture)]
+                 and not (sh.is_placeholder and sh.placeholder_format.type in furniture)
+                 and not _furniture_box(sh, prs.slide_height)]
         # No title placeholder text: find the text box acting as the title.
         cover_text = title_shape.text_frame.text if (title_shape is not None and title_shape.has_text_frame) else ""
         if not title:
@@ -3380,8 +3650,14 @@ def parse_pptx_to_deck(path, max_pictures=30):
                 slides.append(dict({"kind": "quote", "quote": m.group(1).strip()[:400], "by": (m.group(2) or "").strip()[:120]}, **extras))
                 continue
         if len(bodies) == 2:
-            sd.update(kind="columns", left=_tidy_bullets(_paragraph_bullets(bodies[0].text_frame))[0],
-                      right=_tidy_bullets(_paragraph_bullets(bodies[1].text_frame))[0])
+            cols = {"kind": "columns"}
+            for side, body in (("left", bodies[0]), ("right", bodies[1])):
+                head, pts = _column_heading(body.text_frame), _paragraph_bullets(body.text_frame)
+                if head and pts:
+                    pts = pts[1:]
+                    cols[side + "_heading"] = head
+                cols[side] = _tidy_bullets(pts)[0]
+            sd.update(cols)
         else:
             bullets = []
             for sh in texts:
@@ -3411,6 +3687,8 @@ def parse_pptx_to_deck(path, max_pictures=30):
                     media = {"type": "image", "data": url}
                     pictures += 1
                     break
+        if (sd.get("bullets") or sd.get("left") or sd.get("right")) and _animation_of(s):
+            sd["animate"] = _animation_of(s)
         if media:
             sd["media"] = media
             sd["media_position"] = "right" if (sd.get("bullets") or sd.get("left")) else "full"
