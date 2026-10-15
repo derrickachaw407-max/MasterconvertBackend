@@ -3484,6 +3484,44 @@ def preview_file_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _pptx_fix_form(form):
+    """Fix slides' choices, read and checked once for one file or a batch:
+    Keep my design (sizes, fonts, colours, heading alignment) or a Docente
+    template. Returns (pptx_options, studio_template, error)."""
+    pptx_options = {}
+    for size_field in ("title_size", "body_size"):
+        raw = form.get(size_field)
+        if raw:
+            try:
+                size_val = float(raw)
+            except ValueError:
+                return None, None, f"'{size_field}' must be a number"
+            if not (6 <= size_val <= 200):
+                return None, None, f"'{size_field}' must be between 6 and 200 points"
+            pptx_options[size_field] = size_val
+    for font_field in ("title_font", "body_font"):
+        raw = (form.get(font_field) or "").strip()
+        if raw:
+            if len(raw) > 100:
+                return None, None, f"'{font_field}' is too long"
+            pptx_options[font_field] = raw
+    for color_field in ("title_color", "body_color"):
+        raw = (form.get(color_field) or "").strip().lstrip("#")
+        if raw:
+            if not re.fullmatch(r"[0-9A-Fa-f]{6}", raw):
+                return None, None, f"'{color_field}' must be a 6-digit hex color"
+            pptx_options[color_field] = raw
+    title_align = (form.get("title_align") or "").strip().lower()
+    if title_align:
+        if title_align not in ("left", "center", "right"):
+            return None, None, "'title_align' must be left, center, or right"
+        pptx_options["title_align"] = title_align
+    studio_template = (form.get("studio_template") or "").strip() or None
+    if studio_template and studio_template not in {t["id"] for t in template_catalog()}:
+        return None, None, "Unknown template — please choose one from the list."
+    return pptx_options, studio_template, None
+
+
 @app.route("/api/convert-batch", methods=["POST", "OPTIONS"])
 @limiter.limit(BATCH_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -3499,6 +3537,11 @@ def convert_batch_endpoint():
     style = (request.form.get("style") or "").lower().strip() or None
     if not from_fmt or not to_fmt:
         return jsonify({"error": "Missing 'from' or 'to' format"}), 400
+    pptx_options, studio_template = None, None
+    if from_fmt == "pptx" and to_fmt == "pptx":
+        pptx_options, studio_template, err = _pptx_fix_form(request.form)
+        if err:
+            return jsonify({"error": err}), 400
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_batch_{uuid.uuid4().hex[:8]}_")
     details = []
@@ -3517,14 +3560,26 @@ def convert_batch_endpoint():
                 details.append({"filename": filename, "success": False, "error": str(e)})
                 continue
 
-            src_path = os.path.join(work_dir, safe_upload_filename(filename)[0])
+            # each file in its own folder: results with the same name never overwrite each other
+            file_dir = tempfile.mkdtemp(dir=work_dir)
+            src_path = os.path.join(file_dir, safe_upload_filename(filename)[0])
             file.save(src_path)
             try:
-                result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style)
+                if studio_template:
+                    deck = parse_pptx_to_deck(src_path)
+                    deck["template"] = studio_template
+                    result_path = build_template_deck(deck, file_dir, "fixed.pptx")
+                else:
+                    result_path = convert(src_path, from_fmt, to_fmt, file_dir, style=style, pptx_options=pptx_options)
+                if to_fmt == "pptx":
+                    try:
+                        _colour_not_bold(result_path)
+                    except Exception as e:   # a finished deck is never lost to this tidy-up
+                        logger.warning(f"Colour-not-bold pass skipped: {e}")
                 base_name = safe_download_name(filename).rsplit(".", 1)[0]
                 converted.append((result_path, f"{base_name}.{to_fmt}"))
                 details.append({"filename": filename, "success": True})
-            except ConversionError as e:
+            except (ConversionError, StudioError) as e:
                 details.append({"filename": filename, "success": False, "error": str(e)})
             except Exception:
                 details.append({"filename": filename, "success": False, "error": "Conversion failed"})

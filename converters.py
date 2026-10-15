@@ -740,6 +740,16 @@ def docx_to_pdf(src_path, out_dir, style=None):
     return _soffice_convert(src_path, "pdf", out_dir)
 
 
+def pptx_to_pdf(src_path, out_dir, style=None):
+    """Slides as a PDF: one page per slide, as LibreOffice draws them."""
+    return _soffice_convert(src_path, "pdf", out_dir)
+
+
+def xlsx_to_pdf(src_path, out_dir, style=None):
+    """A spreadsheet as a PDF, page by page as it would print."""
+    return _soffice_convert(src_path, "pdf", out_dir)
+
+
 def preview_file(src_path, out_dir, ext):
     """Produces a PDF the frontend can embed directly for a genuine,
     real preview of whatever was just generated — not a mocked-up
@@ -2140,8 +2150,10 @@ def pptx_to_pptx(src_path, out_dir, style=None, template_path=None,
         for level, runs, numbered in bullets:
             expanded.extend(_pptx_fix_split_bullet_if_long(level, runs, numbered))
 
-        chars_per_line = _pptx_fix_chars_per_line(body_shape.width, _PPTX_FIX_CAL_SIZE_PT)
-        max_lines = _pptx_fix_max_effective_lines(body_shape.height, _PPTX_FIX_CAL_SIZE_PT)
+        # Budget at the size the text will really be (the chosen size, or
+        # the 26 pt default) — not always at 26 pt.
+        chars_per_line = _pptx_fix_chars_per_line(body_shape.width, body_size or _PPTX_FIX_CAL_SIZE_PT)
+        max_lines = _pptx_fix_max_effective_lines(body_shape.height, body_size or _PPTX_FIX_CAL_SIZE_PT)
 
         def is_section_header(gi):
             """A level-0, fully-bold bullet immediately followed by at
@@ -5451,6 +5463,8 @@ CONVERTERS = {
     ("xlsx", "docx"): xlsx_to_docx,
     ("docx", "xlsx"): docx_to_xlsx,
     ("pptx", "pptx"): pptx_to_pptx,
+    ("pptx", "pdf"): pptx_to_pdf,
+    ("xlsx", "pdf"): xlsx_to_pdf,
 }
 
 
