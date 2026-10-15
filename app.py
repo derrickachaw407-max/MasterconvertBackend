@@ -38,7 +38,8 @@ from converters import (
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
     warm_up_libreoffice,
 )
-from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError
+from converters import _soffice_convert   # the server's own LibreOffice runner
+from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -1513,6 +1514,279 @@ def _topic_search(text, max_results=8):
     return search_for_sources(query, max_results=max_results)
 
 
+# ------------------------------------------------ real papers anyone can download (3.0)
+# Evidence comes from real papers with a free PDF: open-access works from OpenAlex, Semantic
+# Scholar and Europe PMC, searched together. Nothing without a PDF link is kept; DOIs and
+# abstracts come along so each citation can be traced to the paper. Any index that fails is
+# skipped — the others still answer.
+import concurrent.futures as _futures
+import math as _math
+
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
+_PAPER_TIMEOUT = 9
+_PAPER_UA = {"User-Agent": "Docente/3.0 (study app; https://getdocente.vercel.app)"}
+_PAPER_STOP = set((
+    "a an and are as at be been being but by can could do does for from had has have how i if in into is it its "
+    "me my of on or our so than that the their them then there these they this those to was we were what when "
+    "where which while who whom why will with would you your about explain describe discuss define write essay "
+    "paragraph review literature please give tell make short brief detailed note notes some any more most role "
+    "effect effects use using used between among").split())
+
+
+def _paper_terms(q):
+    """The words that carry a query's meaning (no small words, plural -s dropped)."""
+    out = []
+    for w in re.findall(r"[a-z][a-z\-]{2,}", str(q or "").lower()):
+        if w in _PAPER_STOP:
+            continue
+        w = w[:-1] if len(w) > 4 and w.endswith("s") and not w.endswith("ss") else w
+        if w not in out:
+            out.append(w)
+    return out[:14]
+
+
+def _oa_abstract(inv):
+    """OpenAlex keeps an abstract as {word: [positions]}: put the words back in order."""
+    if not isinstance(inv, dict) or not inv:
+        return None
+    pos = []
+    for word, places in inv.items():
+        for p in places or []:
+            if isinstance(p, int):
+                pos.append((p, str(word)))
+    if not pos:
+        return None
+    pos.sort()
+    text = " ".join(w for _, w in pos[:700]).strip()
+    return text or None
+
+
+def _norm_doi(d):
+    d = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", str(d or "").strip(), flags=re.I).strip()
+    return d.lower() if d.startswith("10.") else None
+
+
+def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, cites=0, biblio=None):
+    title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(title or ""))).strip().rstrip(".")
+    if not title or not pdf or not str(pdf).startswith("http"):
+        return None
+    try:
+        year = int(year) if year else None
+    except (TypeError, ValueError):
+        year = None
+    authors = [re.sub(r"\s+", " ", str(a)).strip() for a in (authors or []) if str(a or "").strip()][:20]
+    abstract = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(abstract or ""))).strip() or None
+    doi = _norm_doi(doi)
+    return {"title": title[:400], "authors": authors or None, "year": year, "venue": (str(venue).strip()[:200] or None) if venue else None,
+            "doi": doi, "pdf": str(pdf)[:600], "landing": (str(landing)[:600] if landing else None),
+            "url": f"https://doi.org/{doi}" if doi else str(pdf)[:600],
+            "abstract": abstract[:2000] if abstract else None, "found_in": found_in, "cites": int(cites or 0), "biblio": biblio or {}}
+
+
+def _openalex_papers(query, n, since=None):
+    flt = "is_oa:true" + (f",publication_year:>{since - 1}" if since else "")
+    params = {"search": query[:300], "filter": flt, "per-page": max(n * 3, 15),
+              "select": "id,doi,display_name,publication_year,authorships,primary_location,best_oa_location,locations,"
+                        "abstract_inverted_index,biblio,cited_by_count,type"}
+    if OPENALEX_API_KEY:
+        params["api_key"] = OPENALEX_API_KEY
+    resp = requests.get("https://api.openalex.org/works", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
+    if resp.status_code == 400:      # a field name the index no longer knows: ask without choosing fields
+        params.pop("select", None)
+        resp = requests.get("https://api.openalex.org/works", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
+    if resp.status_code != 200:
+        return [], f"OpenAlex HTTP {resp.status_code}"
+    out = []
+    for w in (resp.json() or {}).get("results") or []:
+        if not isinstance(w, dict):
+            continue
+        best = w.get("best_oa_location") or {}
+        locs = [l for l in (w.get("locations") or []) if isinstance(l, dict)]
+        pdf = best.get("pdf_url") or next((l.get("pdf_url") for l in locs if l.get("pdf_url")), None)
+        prim = w.get("primary_location") or {}
+        venue = ((prim.get("source") or {}).get("display_name")) or ((best.get("source") or {}).get("display_name"))
+        authors = [((a or {}).get("author") or {}).get("display_name") for a in (w.get("authorships") or [])]
+        b = w.get("biblio") or {}
+        p = _paper(w.get("display_name") or w.get("title"), authors, w.get("publication_year"), venue, w.get("doi"), pdf,
+                   best.get("landing_page_url") or prim.get("landing_page_url"), _oa_abstract(w.get("abstract_inverted_index")),
+                   "OpenAlex", w.get("cited_by_count"),
+                   {k: b.get(k) for k in ("volume", "issue", "first_page", "last_page") if b.get(k)})
+        if p:
+            out.append(p)
+    return out, None if out else "OpenAlex found no open papers with a PDF"
+
+
+def _s2_papers(query, n, since=None):
+    headers = dict(_PAPER_UA)
+    if SEMANTIC_SCHOLAR_API_KEY:
+        headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+    params = {"query": query[:300], "limit": max(n * 3, 15), "openAccessPdf": "",
+              "fields": "title,url,year,authors,abstract,venue,openAccessPdf,externalIds,citationCount,journal"}
+    if since:
+        params["year"] = f"{since}-"
+    resp = requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params=params, headers=headers, timeout=_PAPER_TIMEOUT)
+    if resp.status_code == 400:      # the "has a PDF" filter refused: ask without it (each paper is still checked below)
+        params.pop("openAccessPdf", None)
+        resp = requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params=params, headers=headers, timeout=_PAPER_TIMEOUT)
+    if resp.status_code != 200:
+        return [], f"Semantic Scholar HTTP {resp.status_code}"
+    out = []
+    for x in (resp.json() or {}).get("data") or []:
+        if not isinstance(x, dict):
+            continue
+        pdf = ((x.get("openAccessPdf") or {}).get("url") or "").strip()
+        j = x.get("journal") or {}
+        pages = str(j.get("pages") or "").strip()
+        first, _, last = pages.partition("-")
+        biblio = {k: v for k, v in (("volume", str(j.get("volume") or "").strip()), ("first_page", first.strip()), ("last_page", last.strip())) if v}
+        p = _paper(x.get("title"), [(a or {}).get("name") for a in (x.get("authors") or [])], x.get("year"),
+                   x.get("venue") or j.get("name"), (x.get("externalIds") or {}).get("DOI"), pdf, x.get("url"), x.get("abstract"),
+                   "Semantic Scholar", x.get("citationCount"), biblio)
+        if p:
+            out.append(p)
+    return out, None if out else "Semantic Scholar found no open papers with a PDF"
+
+
+def _epmc_papers(query, n, since=None):
+    q = f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y" + (f" AND PUB_YEAR:[{since} TO 3000]" if since else "")
+    params = {"query": q, "format": "json", "resultType": "core", "pageSize": max(n * 2, 12)}
+    resp = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
+    if resp.status_code != 200:
+        return [], f"Europe PMC HTTP {resp.status_code}"
+    out = []
+    for x in ((resp.json() or {}).get("resultList") or {}).get("result") or []:
+        if not isinstance(x, dict):
+            continue
+        urls = ((x.get("fullTextUrlList") or {}).get("fullTextUrl")) or []
+        pdf = next((u.get("url") for u in urls if isinstance(u, dict) and str(u.get("documentStyle")).lower() == "pdf"
+                    and str(u.get("availability", "")).lower() in ("open access", "free") and u.get("url")), None)
+        if not pdf and x.get("pmcid"):
+            pdf = f"https://europepmc.org/articles/{x['pmcid']}?pdf=render"
+        names = []
+        for a in ((x.get("authorList") or {}).get("author")) or []:
+            if isinstance(a, dict):
+                full = " ".join(v for v in (a.get("firstName"), a.get("lastName")) if v) or a.get("fullName")
+                names.append(full)
+        journal = (((x.get("journalInfo") or {}).get("journal")) or {}).get("title")
+        pages = str(x.get("pageInfo") or "")
+        first, _, last = pages.partition("-")
+        biblio = {k: v for k, v in (("volume", str((x.get("journalInfo") or {}).get("volume") or "")), ("issue", str((x.get("journalInfo") or {}).get("issue") or "")),
+                                     ("first_page", first.strip()), ("last_page", last.strip())) if v}
+        landing = f"https://europepmc.org/article/{x.get('source', 'MED')}/{x.get('id')}" if x.get("id") else None
+        p = _paper(x.get("title"), names, x.get("pubYear"), journal, x.get("doi"), pdf, landing, x.get("abstractText"),
+                   "Europe PMC", x.get("citedByCount"), biblio)
+        if p:
+            out.append(p)
+    return out, None if out else "Europe PMC found no open papers with a PDF"
+
+
+def _title_key(t):
+    return re.sub(r"[^a-z0-9]+", "", str(t or "").lower())[:120]
+
+
+def _rank_papers(papers, query):
+    """Most relevant first: how many of the query's words the title and abstract share, then
+    having an abstract (something to ground a sentence in), then being recent and well cited."""
+    terms = _paper_terms(query)
+    year_now = datetime.now(timezone.utc).year
+
+    def score(p):
+        rank = p.get("_rank", 0)
+        title = (p["title"] or "").lower()
+        abstract = (p.get("abstract") or "").lower()
+        hit_t = sum(1 for t in terms if t in title)
+        hit_a = sum(1 for t in terms if t in abstract)
+        cover = (hit_t + 0.5 * hit_a) / max(1, len(terms))
+        recent = 1.0 if (p.get("year") or 0) >= year_now - 5 else 0.5 if (p.get("year") or 0) >= year_now - 10 else 0
+        return cover * 6 + (1.2 if p.get("abstract") else 0) + recent + min(_math.log10((p.get("cites") or 0) + 1), 3) * 0.3 - rank * 0.04
+
+    return sorted(papers, key=score, reverse=True)
+
+
+def _pdf_alive(url):
+    """False only for a link that is plainly dead: 404/410, or no such site."""
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=4, headers=_PAPER_UA)
+        return r.status_code not in (404, 410)
+    except requests.exceptions.SSLError:
+        return True
+    except requests.exceptions.Timeout:
+        return True
+    except requests.exceptions.RequestException:
+        return False
+    except Exception:
+        return True
+
+
+def search_papers(query, max_results=8, since=None, check_links=True):
+    """Real, downloadable papers for a topic: [{title, authors, year, venue, doi, pdf, url,
+    abstract, ...}] most relevant first, and a reason when there are none."""
+    query = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not query:
+        return [], "no topic"
+    order = (("OpenAlex", _openalex_papers), ("Semantic Scholar", _s2_papers), ("Europe PMC", _epmc_papers))
+    got, why = {}, []
+    with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+        jobs = {name: pool.submit(fn, query, max_results, since) for name, fn in order}
+        for name, _ in order:
+            try:
+                papers, diag = jobs[name].result(timeout=_PAPER_TIMEOUT * 2 + 3)
+            except Exception as e:
+                papers, diag = [], f"{name} failed: {e}"
+            for i, p in enumerate(papers):
+                p["_rank"] = i          # its place in that index's own relevance order
+            got[name] = papers
+            if diag:
+                why.append(diag)
+    found = [p for name, _ in order for p in got.get(name, [])]
+    seen_doi, seen_title, merged = set(), set(), []
+    for p in found:
+        tk = _title_key(p["title"])
+        if (p["doi"] and p["doi"] in seen_doi) or tk in seen_title:
+            # the same paper from another index: keep whatever this copy adds
+            twin = next((m for m in merged if (p["doi"] and m["doi"] == p["doi"]) or _title_key(m["title"]) == tk), None)
+            if twin is not None:
+                for k in ("abstract", "venue", "doi", "authors", "year"):
+                    if not twin.get(k) and p.get(k):
+                        twin[k] = p[k]
+                if not twin.get("biblio") and p.get("biblio"):
+                    twin["biblio"] = p["biblio"]
+                if twin["doi"]:
+                    twin["url"] = f"https://doi.org/{twin['doi']}"
+            continue
+        if p["doi"]:
+            seen_doi.add(p["doi"])
+        seen_title.add(tk)
+        merged.append(p)
+    ranked = _rank_papers(merged, query)[: max_results * 2]
+    if check_links and ranked:
+        alive = {}
+        with _futures.ThreadPoolExecutor(max_workers=8) as pool:
+            jobs = {pool.submit(_pdf_alive, p["pdf"]): i for i, p in enumerate(ranked)}
+            try:
+                for job in _futures.as_completed(jobs, timeout=6):
+                    try:
+                        alive[jobs[job]] = job.result()
+                    except Exception:
+                        alive[jobs[job]] = True
+            except _futures.TimeoutError:
+                pass
+        ranked = [p for i, p in enumerate(ranked) if alive.get(i, True)]
+    papers = ranked[:max_results]
+    for p in papers:
+        p.pop("_rank", None)
+    logger.info("search_papers: %r -> %d paper(s) (%s)", query[:80], len(papers), "; ".join(why) or "ok")
+    return papers, (None if papers else ("; ".join(why) or "no open papers with a PDF were found"))
+
+
+def paper_topic_search(text, max_results=8, since=None):
+    """search_papers for what a person wrote: by its topic, and not at all for small talk."""
+    query = _search_topic(text)
+    if not _worth_searching(query):
+        return [], "not a topic"
+    return search_papers(query, max_results=max_results, since=since)
+
+
 def _no_sources_note(diag, subject):
     """What the writing model is told when no sources are available — in plain
     words, never the technical diagnostic (which named HTTP codes, service
@@ -1606,14 +1880,23 @@ def enrich_sources_for_apa(sources):
         e["citation_key"] = f"({e['author_intext']}, {e['year_display']})"
 
     for e in enriched:
-        pieces = [f"{e['author_refs']} ({e['year_display']})."]
         title = e["title"].rstrip(".")
-        pieces.append(f"{title}.")
-        if e.get("venue"):
-            pieces.append(f"{e['venue']}.")
-        e["ref_text"] = " ".join(pieces)
+        vol, iss, pages = _biblio_parts(e)
+        tail = ""
+        if e.get("venue"):      # APA 7: *Journal*, *volume*(issue), pages.
+            tail = f" *{e['venue']}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "") + (f", {pages}" if pages else "") + "."
+        e["ref_text"] = f"{e['author_refs']} ({e['year_display']}). {title}." + tail
 
     return enriched
+
+
+def _biblio_parts(e):
+    """(volume, issue, pages) as the index gave them; pages as "100\u2013110"."""
+    b = e.get("biblio") or {}
+    vol, iss = str(b.get("volume") or "").strip(), str(b.get("issue") or "").strip()
+    first, last = str(b.get("first_page") or "").strip(), str(b.get("last_page") or "").strip()
+    pages = f"{first}\u2013{last}" if first and last and first != last else first
+    return vol[:20], iss[:20], pages[:30]
 
 
 # Citation styles for Evidence-Based Writing. Every style is built from the
@@ -1659,7 +1942,9 @@ def enrich_sources(sources, style="apa"):
                 auth = parts[0] + " et al." if len(parts) > 3 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
             else:
                 auth = org
-            e["ref_text"] = f"{auth} ({yd}) " + (f"\u2018{title}\u2019, {venue}." if venue else f"{title}.")
+            vol, iss, pages = _biblio_parts(e)
+            e["ref_text"] = f"{auth} ({yd}) " + (f"\u2018{title}\u2019, *{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "")
+                                                  + (f", pp. {pages}" if pages else "") + "." if venue else f"*{title}*.")
         elif style == "chicago":
             full = [" ".join(n) for n in names]
             if not names:
@@ -1672,14 +1957,18 @@ def enrich_sources(sources, style="apa"):
                 auth = f"{inverted}, and {full[1]}"
             else:
                 auth = inverted + ", " + ", ".join(full[1:-1]) + ", and " + full[-1]
-            e["ref_text"] = f"{auth}. {yd}. \u201c{title}.\u201d" + (f" {venue}." if venue else "")
+            vol, iss, pages = _biblio_parts(e)
+            e["ref_text"] = f"{auth}. {yd}. \u201c{title}.\u201d" + (f" *{venue}*" + (f" {vol}" if vol else "") + (f" ({iss})" if vol and iss else "")
+                                                                  + (f": {pages}" if pages else "") + "." if venue else "")
         else:   # MLA 9
             year = str(e.get("year") or "n.d.")
             if names:
                 auth = inverted if len(names) == 1 else f"{inverted}, and {' '.join(names[1])}" if len(names) == 2 else f"{inverted}, et al"
-                e["ref_text"] = f"{auth}. \u201c{title}.\u201d " + (f"{venue}, " if venue else "") + f"{year}."
+                vol, iss, pages = _biblio_parts(e)
+                e["ref_text"] = (f"{auth}. \u201c{title}.\u201d " + (f"*{venue}*, " if venue else "") + (f"vol. {vol}, " if vol else "")
+                                 + (f"no. {iss}, " if iss else "") + f"{year}" + (f", pp. {pages}" if pages else "") + ".")
             else:
-                e["ref_text"] = f"\u201c{title}.\u201d {venue or org}, {year}."
+                e["ref_text"] = f"\u201c{title}.\u201d *{venue or org}*, {year}."
     if style == "mla":     # two works by one author: MLA tells them apart by a short title
         counts = Counter(e["citation_key"] for e in enriched)
         for e in enriched:
@@ -1697,18 +1986,85 @@ def build_sources_block(sources):
     lines = []
     for s in sources:
         line = f"{s['citation_key']} {s['title']}"
+        if s.get("venue") or s.get("year"):
+            line += f" \u2014 {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
         if s.get("abstract"):
-            line += f"\n    Abstract: {s['abstract'][:400]}"
+            line += f"\n    Abstract: {s['abstract'][:700]}"
         lines.append(line)
     return "\n".join(lines)
 
 
-def build_references_list(sources):
-    """The client-facing References section: plain reference text plus its
-    URL as a separate field (so the frontend can render the URL as a live
-    link), alphabetized by author/organization the way APA requires."""
-    ordered = sorted(sources, key=lambda s: s["author_intext"].lower())
-    return [{"text": s["ref_text"], "url": s["url"]} for s in ordered]
+def build_references_list(sources, cited=None):
+    """The reference list: only the sources the text cites (all of them when cited is None),
+    alphabetical as APA requires. Each entry: its text, its link (DOI, or the PDF), the PDF
+    itself, the DOI, and its in-text key — so a download can link every citation to it."""
+    picked = [s for i, s in enumerate(sources) if cited is None or i in cited]
+    ordered = sorted(picked, key=lambda s: (s["author_intext"].lower(), s.get("year_display") or ""))
+    return [{"text": s["ref_text"], "url": s["url"], "pdf": s.get("pdf") or None, "doi": s.get("doi") or None,
+             "key": s.get("citation_key") or ""} for s in ordered]
+
+
+# An in-text citation's shape: a capitalised name, then the year (or n.d.), maybe a page.
+_CITE_SHAPE = re.compile(r"^[A-Z\u00C0-\u024F][^;()]{0,120}?,?\s+(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.)"
+                         r"(?:\s*,\s*(?:p|pp|para|chap|ch)\.?\s*[\w\u2013\-]+)?$")
+
+
+def _cite_norm(s):
+    s = str(s or "").replace("&", " and ").replace("\u2019", "'").replace("\u2018", "'").lower()
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" ,.;")
+
+
+def keep_known_citations(text, sources, style="apa"):
+    """Keeps the in-text citations that match a real source and takes out any other, so every
+    citation left in the text leads to a real paper. Returns (text, cited): the indices of the
+    sources the text cites (in parentheses, or as "Mensah and Boateng (2022)")."""
+    if not text:
+        return text, set()
+    inners = {}
+    for i, s in enumerate(sources or []):
+        key = str(s.get("citation_key") or "")
+        if key.startswith("(") and key.endswith(")"):
+            inners[_cite_norm(key[1:-1])] = i
+    cited = set()
+
+    def known(part):
+        n = _cite_norm(part)
+        if n in inners:
+            return inners[n]
+        for k, i in inners.items():
+            if n.startswith(k + ",") or n.startswith(k + " p") or re.search(r"(?:^|\W)" + re.escape(k) + r"(?:$|[\s,])", n):
+                return i
+        return None
+
+    def fix(m):
+        parts = [p.strip() for p in m.group(1).split(";")]
+        kept, dropped = [], False
+        for p in parts:
+            i = known(p)
+            if i is not None:
+                cited.add(i)
+                kept.append(p)
+            elif style != "mla" and _CITE_SHAPE.match(p):
+                dropped = True          # looks like a citation, but no such source: out
+            else:
+                kept.append(p)
+        if not dropped:
+            return m.group(0)
+        return "(" + "; ".join(kept) + ")" if kept else ""
+
+    out = re.sub(r"\(([^()]{2,400})\)", fix, text)
+    out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"[ \t]+(?=\n|$)", "", out)
+    # narrative citations: "Mensah and Boateng (2022)", "Asante et al. (2019)"
+    low = _cite_norm(out)
+    for k, i in inners.items():
+        name, _, year = k.rpartition(",") if "," in k else k.rpartition(" ")
+        name, year = name.strip(), year.strip()
+        if name and year and re.search(re.escape(name) + r"\s*\(" + re.escape(year) + r"\)", low):
+            cited.add(i)
+    return out, cited
 
 
 @app.after_request
@@ -3941,8 +4297,11 @@ def _summary_structure_prompt(audience):
             'of the topic (its header begins "Introduction" or "Overview"), then the content in the order the material '
             'presents it. Do NOT include a cover, outline, references, objectives, discussion or thank-you slide — those '
             'are added separately — and no slide has is_cta true.\n'
-            '  "references": every reference or citation that appears in the material, copied exactly as written there. '
-            "Never invent, complete or add a reference; if the material cites nothing, return [].\n"
+            '  "references": every reference or citation that appears in the material, copied exactly as written there '
+            "(with its web address \u2014 DOI or link \u2014 when the material gives one). Never invent, complete or add a reference; "
+            "if the material cites nothing, return [].\n"
+            "When the material uses in-text citations such as (Mensah & Boateng, 2023), keep them at the end of the points "
+            "that use them, copied exactly.\n"
             + SUMMARY_STRUCTURE[audience])
 
 
@@ -4095,6 +4454,114 @@ SAGE_SYSTEM_PROMPT = (
 )
 
 
+# ------------------------------------------------ Remy: evidence first (3.0)
+_REMY_NO_PAPERS = re.compile(
+    r"\b(?:e-?mails?|letters?|cover letter|cv|resume|grammar|spelling|proofread|rewrite|rephrase|paraphrase|translat\w*|"
+    r"timetable|schedule|plan my|my (?:week|day|weekend)|to-?do|brainstorm|ideas? for|names? for|poem|story|joke|song|lyrics|"
+    r"caption|tweet|post for|code|program(?:me)? in|python|javascript|html|css|sql|excel formula|recipe|cook|weather|news|today|"
+    r"tonight|tomorrow|latest|right now|this (?:week|month|year)|score|who won|exchange rate|price of)\b", re.I)
+
+
+def _remy_wants_papers(message):
+    """A question about a topic, where real papers are the right evidence."""
+    m = str(message or "")
+    if len(m) > 2000 or _REMY_NO_PAPERS.search(m):
+        return False
+    q = _search_topic(m)
+    return _worth_searching(q) and len(_paper_terms(q)) >= 1
+
+
+def _paper_reference(p):
+    """One paper as an APA reference line."""
+    try:
+        return enrich_sources([dict(p)], "apa")[0]["ref_text"]
+    except Exception:
+        return f"{p.get('title', '')}."
+
+
+def _remy_papers_block(papers):
+    lines = []
+    for i, p in enumerate(papers, 1):
+        au = p.get("authors") or []
+        if au:
+            sur = [a.split()[-1] for a in au if a.split()]
+            who = sur[0] + (" et al." if len(sur) > 2 else (" & " + sur[1] if len(sur) == 2 else ""))
+        else:
+            who = p.get("venue") or "Unknown authors"
+        lines.append(f"[{i}] {who} ({p.get('year') or 'n.d.'}). {p['title']}." + (f" {p['venue']}." if p.get("venue") else ""))
+        if p.get("abstract"):
+            lines.append(f"    Abstract: {p['abstract'][:700]}")
+    return ("EVIDENCE FIRST: below are real, open-access research papers found for this question (each one can be downloaded "
+            "free), numbered. Ground your answer in them first — explain in your own words, never copy — and cite them "
+            "inline as [1], [2] right after the sentences they support, using only these numbers. Cite a paper only for what its "
+            "title or abstract actually supports. For anything they don't cover, use your own knowledge (or web search for current "
+            "facts) without a number. Never invent a paper, an author, a statistic or a quotation. Don't list the papers at the end "
+            "— the app shows them under your answer.\n\nPAPERS:\n" + "\n".join(lines))
+
+
+_REMY_CITE = re.compile(r"(?<![\w\]\[])\[(\d{1,2}(?:\s*[,–\-]\s*\d{1,2})*)\]")
+
+
+def _number_cited_papers(text, papers):
+    """Remy's [n] citations renumbered 1, 2, 3… in the order they first appear; a number that
+    matches no paper is taken out. Returns (text, the cited papers in that order)."""
+    if not papers or not text:
+        return text, []
+
+    def nums_of(group):
+        out = []
+        for part in re.split(r"\s*,\s*", group):
+            r = re.match(r"^(\d+)\s*[–\-]\s*(\d+)$", part)
+            if r:
+                a, b = int(r.group(1)), int(r.group(2))
+                out += list(range(a, b + 1)) if a <= b and b - a < 10 else [a, b]
+            elif part.strip().isdigit():
+                out.append(int(part))
+        return out
+
+    order = []
+    for m in _REMY_CITE.finditer(text):
+        for k in nums_of(m.group(1)):
+            if 1 <= k <= len(papers) and k not in order:
+                order.append(k)
+    new_no = {k: i + 1 for i, k in enumerate(order)}
+
+    def rewrite(m):
+        nums = sorted({new_no[k] for k in nums_of(m.group(1)) if k in new_no})
+        return "[" + ", ".join(str(n) for n in nums) + "]" if nums else ""
+
+    out = _REMY_CITE.sub(rewrite, text)
+    out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    used = []
+    for k in order:
+        p = papers[k - 1]
+        used.append({"n": new_no[k], "title": p["title"], "authors": (p.get("authors") or [])[:6], "year": p.get("year"),
+                     "venue": p.get("venue"), "url": p["url"], "pdf": p.get("pdf"), "doi": p.get("doi"), "text": _paper_reference(p)})
+    return out, used
+
+
+_SMALL_WORDS = {"a", "an", "and", "as", "at", "but", "by", "for", "in", "of", "on", "or", "the", "to", "vs", "via", "with", "from", "into"}
+
+
+def _topic_title(message):
+    """A document title from what the question is about ("hand hygiene in hospitals" ->
+    "Hand Hygiene in Hospitals") — never the question itself; None when there's no clear topic."""
+    t = re.sub(r"[?!.]+$", "", _search_topic(message)).strip()
+    words = t.split()
+    if not (1 <= len(words) <= 12) or len(t) > 90:
+        return None
+    out = []
+    for i, w in enumerate(words):
+        if w.isupper() and len(w) > 1:
+            out.append(w)
+        elif i and w.lower() in _SMALL_WORDS:
+            out.append(w.lower())
+        else:
+            out.append(w[:1].upper() + w[1:])
+    return " ".join(out)
+
+
 @app.route("/api/sage", methods=["POST", "OPTIONS"])
 @auth_required
 def sage_endpoint():
@@ -4150,6 +4617,16 @@ def sage_endpoint():
                 "genuinely helps; don't recite it back: " + "; ".join(notes))
         system_prompt += "\n\n" + MEMORY_INSTRUCTION
     system_prompt += "\n\n" + THINKING_INSTRUCTION
+    # Evidence first (3.0): a question about a topic gets real open papers to ground the answer.
+    papers = []
+    if not attachment and _remy_wants_papers(message):
+        try:
+            papers, _ = paper_topic_search(message, max_results=6)
+        except Exception as e:
+            logger.warning(f"Remy's paper search failed: {e}")
+            papers = []
+    if papers:
+        system_prompt += "\n\n" + _remy_papers_block(papers)
     try:
         meta = call_claude(
             system_prompt=system_prompt,
@@ -4173,7 +4650,8 @@ def sage_endpoint():
     note, reply = split_memory_note(result or "")
     if note and memory_on:
         add_user_memory(request.current_user["id"], note)
-    return jsonify({"reply": (reply or "").strip() or result, "thinking": thinking,
+    reply, used = _number_cited_papers((reply or "").strip() or result, papers)
+    return jsonify({"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
                     "sources": (meta.get("sources") or [])[:8], "searched": (meta.get("queries") or [])[:5]})
 
 
@@ -4265,7 +4743,7 @@ def summary_to_pptx_endpoint():
     slides = data.get("slides")
     if not isinstance(slides, list) or not slides:
         return jsonify({"error": "No slide plan provided."}), 400
-    style = data.get("style") if data.get("style") in ("visual", "plain") else "visual"
+    style = data.get("style") if data.get("style") in ("visual", "plain") else "plain"   # 3.0: Plain White
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_sum_{uuid.uuid4().hex[:8]}_")
     try:
@@ -4779,6 +5257,25 @@ def write_endpoint():
     recent_years = recent_years if recent_years in (5, 10) else 0
     note = {"text": ""}
 
+    since = (datetime.now(timezone.utc).year - recent_years + 1) if recent_years else None
+
+    def _find(text, n=8, topic=True):
+        """Real, downloadable papers for this request, cited in the chosen style — recent ones
+        when the student asked for them, older ones added (with a note) when too few came up."""
+        look = paper_topic_search if topic else search_papers
+        papers, diag = look(text, max_results=n, since=since)
+        if since and len(papers) < 3 and diag != "not a topic":
+            older, _ = look(text, max_results=n)
+            have = {p["url"] for p in papers}
+            fresh = len(papers)
+            papers = papers + [p for p in older if p["url"] not in have][: n - len(papers)]
+            if len(papers) > fresh:
+                note["text"] = (f"Only {fresh} paper{'' if fresh == 1 else 's'} from the last {recent_years} years came up, "
+                                "so older ones were added to support the writing properly.")
+            if papers:
+                diag = None
+        return enrich_sources(papers, style), diag
+
     def _prep(srcs):
         if recent_years and srcs:
             cutoff = datetime.now(timezone.utc).year - recent_years
@@ -4826,8 +5323,7 @@ def write_endpoint():
         if not previous_text:
             return jsonify({"error": "Nothing to continue"}), 400
         try:
-            cont_sources, cont_diag = search_for_sources(topic)
-            cont_sources = _prep(cont_sources)
+            cont_sources, cont_diag = _find(topic)
             if cont_sources:
                 cont_sources_block = build_sources_block(cont_sources)
                 cont_system_prompt = (
@@ -4864,10 +5360,11 @@ def write_endpoint():
             cont_text = cont_result["text"].strip()
             if not cont_text:
                 raise ConversionError("Couldn't continue — try again")
+            cont_text, cont_cited = keep_known_citations(cont_text, cont_sources, style)
             return jsonify({
                 "type": "result",
                 "text": cont_text,
-                "references": build_references_list(cont_sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "references": build_references_list(cont_sources, cont_cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
                 "truncated": cont_result["stop_reason"] == "max_tokens",
             })
         except ConversionError as e:
@@ -4883,8 +5380,7 @@ def write_endpoint():
             # One shared search across the whole outline — a bigger, single pool
             # of real sources every section draws from, instead of one search per
             # section (slower and more likely to fragment/duplicate sources).
-            sources, sources_diag = search_for_sources(combined_headings, max_results=8)
-            sources = _prep(sources)
+            sources, sources_diag = _find(combined_headings, topic=False)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -4925,6 +5421,10 @@ def write_endpoint():
                     use_search=False,
                 ).strip()
                 sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
+            cited_all = set()
+            for sec in outline:
+                sec["text"], c = keep_known_citations(sec["text"], sources, style)
+                cited_all |= c
 
             return jsonify({
                 "type": "result",
@@ -4932,7 +5432,8 @@ def write_endpoint():
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
                     for s in outline
                 ],
-                "references": build_references_list(sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "references": build_references_list(sources, cited_all), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "title": next((s["heading"] for s in outline if s.get("level", 1) <= 1 and s.get("heading")), None),
             })
 
         # Chat mode (history present) and simple mode (first message, no history
@@ -4958,8 +5459,7 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-            raw_sources, search_diag = _topic_search(search_query)
-            sources = _prep(raw_sources)
+            sources, search_diag = _find(search_query)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -4998,8 +5498,7 @@ def write_endpoint():
 
                 )
         else:
-            raw_sources2, search_diag2 = _topic_search(topic)
-            sources = _prep(raw_sources2)
+            sources, search_diag2 = _find(topic)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -5061,11 +5560,13 @@ def write_endpoint():
         if is_clarify:
             return jsonify({"type": "clarify", "text": text, "thinking": thinking})
 
+        text, cited = keep_known_citations(text, sources, style)
         return jsonify({
             "type": "result",
             "text": text,
             "thinking": thinking,
-            "references": build_references_list(sources), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+            "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+            "title": _topic_title(topic) if not attachment else None,
             "truncated": truncated,
         })
     except ConversionError as e:
@@ -5129,7 +5630,14 @@ def slides_import_endpoint():
         f.save(path)
         deck = parse_pptx_to_deck(path)
         deck["filename"] = safe_download_name(f.filename)
-        return jsonify({"deck": deck})
+        # The file's own design, kept (2.9). Rendering can fail on an unusual file: then it
+        # opens in one of our designs, as before.
+        original = None
+        try:
+            original = parse_pptx_original(path, work_dir, to_pdf=lambda src_path, out: _soffice_convert(src_path, "pdf", out))
+        except Exception as e:
+            logger.warning(f"Keeping the deck's own design failed: {e}")
+        return jsonify({"deck": deck, "original": original})
     except StudioError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
@@ -5143,12 +5651,26 @@ def slides_import_endpoint():
 @limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def slides_build_endpoint():
-    deck = request.get_json(silent=True)
+    original = request.files.get("original")
+    if original is not None:          # a deck that keeps its own design: changes go into the original file
+        try:
+            deck = json.loads(request.form.get("deck") or "")
+        except Exception:
+            deck = None
+    else:
+        deck = request.get_json(silent=True)
     if not isinstance(deck, dict):
         return jsonify({"error": "The slides couldn't be read — please try again."}), 400
     work_dir = tempfile.mkdtemp(prefix=f"mc_build_{uuid.uuid4().hex[:8]}_")
     try:
-        path = build_template_deck(deck, work_dir, str(deck.get("filename") or "Presentation.pptx"))
+        if original is not None:
+            orig_path = os.path.join(work_dir, "original.pptx")
+            original.save(orig_path)
+            out_dir = os.path.join(work_dir, "out")
+            os.makedirs(out_dir, exist_ok=True)
+            path = build_original_deck(deck, orig_path, out_dir, str(deck.get("filename") or "Presentation.pptx"))
+        else:
+            path = build_template_deck(deck, work_dir, str(deck.get("filename") or "Presentation.pptx"))
         return send_file(path, mimetype=MIME_TYPES["pptx"], as_attachment=True,
                          download_name=os.path.basename(path))
     except StudioError as e:
@@ -5368,6 +5890,326 @@ def _parse_draft_deck_json(raw, group):
     }
 
 
+# ------------------------------------------------ 3.0: drawings for slides
+# A drawing arrives as a short list of shapes on a 1000 x 600 canvas (stick figures, lines,
+# arrows, boxes, circles, labels) and is drawn here as a clear black-on-white picture.
+_DRAW_W, _DRAW_H, _DRAW_SCALE = 1000, 600, 3
+_DRAW_COLOURS = {"black": (17, 17, 17), "grey": (105, 105, 105), "gray": (105, 105, 105), "red": (196, 30, 30),
+                 "blue": (25, 85, 200), "green": (20, 132, 60), "orange": (214, 110, 0)}
+# a stick figure's joints in each pose, as (forward, up) in heights, feet at (0, 0)
+_POSES = {
+    "stand": {"head": (0, .91), "neck": (0, .80), "hip": (0, .45), "el1": (-.10, .62), "ha1": (-.13, .46), "el2": (.10, .62), "ha2": (.13, .46),
+              "kn1": (-.05, .22), "ft1": (-.08, 0), "kn2": (.05, .22), "ft2": (.08, 0)},
+    "walk": {"head": (.02, .91), "neck": (.02, .80), "hip": (0, .45), "el1": (-.10, .63), "ha1": (-.16, .50), "el2": (.12, .63), "ha2": (.18, .52),
+             "kn1": (-.08, .23), "ft1": (-.16, 0), "kn2": (.10, .24), "ft2": (.14, 0)},
+    "run": {"head": (.10, .88), "neck": (.08, .77), "hip": (0, .45), "el1": (-.10, .66), "ha1": (-.04, .56), "el2": (.18, .68), "ha2": (.26, .74),
+            "kn1": (-.16, .30), "ft1": (-.26, .14), "kn2": (.18, .30), "ft2": (.16, .02)},
+    "sit": {"head": (-.02, .68), "neck": (-.02, .57), "hip": (-.04, .25), "el1": (.06, .42), "ha1": (.16, .36), "el2": (.04, .44), "ha2": (.14, .38),
+            "kn1": (.22, .27), "ft1": (.22, 0), "kn2": (.20, .27), "ft2": (.24, 0)},
+    "squat": {"head": (.06, .66), "neck": (.05, .55), "hip": (-.08, .28), "el1": (.16, .50), "ha1": (.30, .52), "el2": (.14, .48), "ha2": (.28, .50),
+              "kn1": (.14, .24), "ft1": (.02, 0), "kn2": (.12, .22), "ft2": (.06, 0)},
+    "lift": {"head": (0, .91), "neck": (0, .80), "hip": (0, .45), "el1": (-.10, .90), "ha1": (-.08, 1.02), "el2": (.10, .90), "ha2": (.08, 1.02),
+             "kn1": (-.06, .22), "ft1": (-.10, 0), "kn2": (.06, .22), "ft2": (.10, 0)},
+    "push": {"head": (.12, .86), "neck": (.10, .75), "hip": (-.02, .44), "el1": (.24, .70), "ha1": (.38, .70), "el2": (.22, .66), "ha2": (.36, .66),
+             "kn1": (-.02, .22), "ft1": (-.16, 0), "kn2": (.08, .22), "ft2": (.06, 0)},
+    "pull": {"head": (-.10, .86), "neck": (-.08, .75), "hip": (.02, .44), "el1": (.10, .68), "ha1": (.26, .68), "el2": (.10, .64), "ha2": (.26, .64),
+             "kn1": (.08, .22), "ft1": (.16, 0), "kn2": (-.02, .22), "ft2": (-.04, 0)},
+    "reach": {"head": (.02, .91), "neck": (.02, .80), "hip": (0, .45), "el1": (-.10, .62), "ha1": (-.13, .46), "el2": (.16, .88), "ha2": (.30, .98),
+              "kn1": (-.05, .22), "ft1": (-.08, 0), "kn2": (.05, .22), "ft2": (.08, 0)},
+    "point": {"head": (0, .91), "neck": (0, .80), "hip": (0, .45), "el1": (-.10, .62), "ha1": (-.13, .46), "el2": (.17, .76), "ha2": (.34, .76),
+              "kn1": (-.05, .22), "ft1": (-.08, 0), "kn2": (.05, .22), "ft2": (.08, 0)},
+    "wave": {"head": (0, .91), "neck": (0, .80), "hip": (0, .45), "el1": (-.10, .62), "ha1": (-.13, .46), "el2": (.16, .80), "ha2": (.18, .98),
+             "kn1": (-.05, .22), "ft1": (-.08, 0), "kn2": (.05, .22), "ft2": (.08, 0)},
+    "jump": {"head": (0, 1.01), "neck": (0, .90), "hip": (0, .55), "el1": (-.12, 1.0), "ha1": (-.18, 1.12), "el2": (.12, 1.0), "ha2": (.18, 1.12),
+             "kn1": (-.10, .34), "ft1": (-.06, .14), "kn2": (.10, .34), "ft2": (.06, .14)},
+    "lie": {"head": (-.86, .07), "neck": (-.75, .05), "hip": (-.38, .05), "el1": (-.60, .02), "ha1": (-.46, .02), "el2": (-.62, .10), "ha2": (-.48, .12),
+            "kn1": (-.18, .05), "ft1": (0, .03), "kn2": (-.18, .10), "ft2": (0, .08)},
+}
+
+
+def _draw_font(size):
+    from PIL import ImageFont
+    for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+              "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"):
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _num(v, lo=-200, hi=1200, default=0.0):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v)) if v == v else default
+
+
+def render_drawing(spec):
+    """A drawing spec ({"items": [...]}) as a PNG data URL; None when there is nothing to draw."""
+    from PIL import Image, ImageDraw
+    items = spec.get("items") if isinstance(spec, dict) else spec
+    if not isinstance(items, list):
+        return None
+    S = _DRAW_SCALE
+    img = Image.new("RGB", (_DRAW_W * S, _DRAW_H * S), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    drawn = 0
+    for it in items[:60]:
+        if not isinstance(it, dict):
+            continue
+        t = str(it.get("t") or it.get("type") or "").lower()
+        col = _DRAW_COLOURS.get(str(it.get("color") or "black").lower(), _DRAW_COLOURS["black"])
+        w = int(max(1, min(12, _num(it.get("w"), 1, 12, 4))) * S)
+        fill = col if it.get("fill") else None
+        try:
+            if t == "person":
+                x, y, h = _num(it.get("x"), default=500), _num(it.get("y"), default=560), _num(it.get("h"), 40, 600, 300)
+                pose = _POSES.get(str(it.get("pose") or "stand").lower(), _POSES["stand"])
+                s = -1 if str(it.get("face") or "right").lower() == "left" else 1
+                P = lambda k: ((x + s * pose[k][0] * h) * S, (y - pose[k][1] * h) * S)
+                r = h * 0.085 * S
+                hx, hy = P("head")
+                d.ellipse((hx - r, hy - r, hx + r, hy + r), outline=col, width=w)
+                for a, b in (("neck", "hip"), ("neck", "el1"), ("el1", "ha1"), ("neck", "el2"), ("el2", "ha2"),
+                             ("hip", "kn1"), ("kn1", "ft1"), ("hip", "kn2"), ("kn2", "ft2")):
+                    d.line((P(a), P(b)), fill=col, width=w, joint="curve")
+                for k in ("ha1", "ha2", "ft1", "ft2", "el1", "el2", "kn1", "kn2", "hip", "neck"):
+                    cx, cy = P(k)
+                    d.ellipse((cx - w / 2, cy - w / 2, cx + w / 2, cy + w / 2), fill=col)
+                if it.get("label"):
+                    f = _draw_font(int(22 * S))
+                    d.text((x * S, (y + 30) * S), str(it["label"])[:40], fill=col, font=f, anchor="mm")
+            elif t in ("line", "arrow"):
+                p = [_num(v) * S for v in (it.get("p") or [])[:4]]
+                if len(p) < 4:
+                    continue
+                d.line(p, fill=col, width=w)
+                if t == "arrow" or it.get("head"):
+                    import math
+                    ang = math.atan2(p[3] - p[1], p[2] - p[0])
+                    L = (16 + w / S * 2) * S
+                    a1 = (p[2] - L * math.cos(ang - 0.45), p[3] - L * math.sin(ang - 0.45))
+                    a2 = (p[2] - L * math.cos(ang + 0.45), p[3] - L * math.sin(ang + 0.45))
+                    d.polygon([(p[2], p[3]), a1, a2], fill=col)
+            elif t == "rect":
+                x, y, rw, rh = [_num(v) for v in ((it.get("p") or [0, 0, 0, 0]) + [0, 0, 0, 0])[:4]]
+                if rw <= 0 or rh <= 0:
+                    continue
+                d.rectangle((x * S, y * S, (x + rw) * S, (y + rh) * S), outline=col, width=w, fill=fill)
+            elif t in ("circle", "ellipse"):
+                c = it.get("c") or [500, 300]
+                cx, cy = _num(c[0] if len(c) > 0 else 500), _num(c[1] if len(c) > 1 else 300)
+                rx = _num(it.get("r") if t == "circle" else it.get("rx"), 1, 600, 30)
+                ry = _num(it.get("r") if t == "circle" else it.get("ry"), 1, 600, 30)
+                d.ellipse(((cx - rx) * S, (cy - ry) * S, (cx + rx) * S, (cy + ry) * S), outline=col, width=w, fill=fill)
+            elif t in ("poly", "polygon", "polyline"):
+                pts = [(_num(q[0]) * S, _num(q[1]) * S) for q in (it.get("pts") or [])[:40] if isinstance(q, (list, tuple)) and len(q) >= 2]
+                if len(pts) < 2:
+                    continue
+                if it.get("closed", t != "polyline") and len(pts) >= 3:
+                    d.polygon(pts, outline=col, fill=fill, width=w)
+                else:
+                    d.line(pts, fill=col, width=w, joint="curve")
+            elif t == "text":
+                p = it.get("p") or [500, 300]
+                s_ = str(it.get("s") or it.get("text") or "")[:60]
+                if not s_:
+                    continue
+                f = _draw_font(int(_num(it.get("size"), 12, 60, 26) * S))
+                anchor = {"start": "lm", "left": "lm", "end": "rm", "right": "rm"}.get(str(it.get("align") or "").lower(), "mm")
+                d.text((_num(p[0]) * S, _num(p[1] if len(p) > 1 else 300) * S), s_, fill=col, font=f, anchor=anchor)
+            else:
+                continue
+            drawn += 1
+        except Exception:
+            continue
+    if not drawn:
+        return None
+    img = img.resize((1500, 900), Image.LANCZOS)
+    import io as _io
+    buf = _io.BytesIO()
+    img.save(buf, "PNG", optimize=True)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# ------------------------------------------------ 3.0: a complete deck from a few words
+_DECK_MAX = 16
+_DRAW_WORDS = re.compile(r"\b(draw\w*|diagram\w*|illustrat\w*|stick ?(?:man|men|figures?)|sketch\w*|picture\w*|visual\w*|figure\w*|image\w*)\b", re.I)
+_CHART_WORDS = re.compile(r"\b(chart\w*|graph\w*|data|statistic\w*|figures?|numbers?)\b", re.I)
+_DECK_SYSTEM = (
+    "You are Remy, the assistant in Docente, writing a COMPLETE slide deck from a short request, for a {group} to present. "
+    "Reply with ONE JSON object only — no preamble, no code fences: {{\"title_slide\": {{...}}, \"slides\": [...]}}.\n"
+    "{title_fields}"
+    "slides: {min_slides} to {max_slides} items in teaching order: an introduction or overview first, then the content, then key "
+    "takeaways or a summary. Each item is one of:\n"
+    '  {{"kind": "content", "title": "...", "bullets": [{{"text": "...", "level": 0}}], "notes": "..."}} — 3 to 5 points, each at most '
+    "16 words (level 1 for a sub-point, at most 2 on a slide);\n"
+    '  {{"kind": "columns", "title": "...", "left_heading": "...", "left": [...], "right_heading": "...", "right": [...], "notes": "..."}} '
+    "— for a comparison, 2 to 4 points a side;\n"
+    '  {{"kind": "section", "title": "...", "sub": "..."}} — a divider between big parts, only in decks of 10 or more slides.\n'
+    "Every title names its slide's real topic (never \"Slide 3\", \"Continued\" or \"Overview\" twice). \"notes\": 2 or 3 sentences "
+    "of what to say on that slide. Don't add a cover, a references slide or a thank-you slide — they are added for you.\n"
+    "Rules: never invent statistics, dates, named studies or quotations; write in the request's own language; leave a "
+    "title-slide field blank rather than inventing a course, code, lecturer or institution the request didn't mention."
+)
+_DECK_EVIDENCE = (
+    "\n\nEVIDENCE: base the content on these real, open-access papers first. When a point uses a paper, end that point with "
+    "the paper's exact citation key, e.g. \"Short naps improve recall {example}\". Use only these keys, copied exactly; points "
+    "from general knowledge carry no citation.\nPAPERS:\n{papers}"
+)
+_DECK_DRAWINGS = (
+    "\n\nDRAWINGS: the request asks for drawings or visuals, so give the slides that need one (an experiment with stick "
+    "figures, a labelled diagram, a simple process) a \"drawing\": {\"items\": [...]} on a 1000 x 600 canvas (x to the right, y "
+    "down), black lines on white, at most 40 items:\n"
+    '  {"t": "person", "x": 300, "y": 540, "h": 300, "pose": "stand"|"walk"|"run"|"sit"|"squat"|"lift"|"push"|"pull"|"reach"|"point"|"wave"|"jump"|"lie", '
+    '"face": "left"|"right", "label": "optional"} — a stick figure, (x, y) where its feet touch the ground;\n'
+    '  {"t": "line", "p": [x1, y1, x2, y2]}, {"t": "arrow", "p": [x1, y1, x2, y2]}, {"t": "rect", "p": [x, y, w, h]}, '
+    '{"t": "circle", "c": [x, y], "r": 30}, {"t": "ellipse", "c": [x, y], "rx": 60, "ry": 30}, '
+    '{"t": "poly", "pts": [[x, y], ...], "closed": true}, {"t": "text", "p": [x, y], "s": "a short label", "size": 26}.\n'
+    'Any item may add "w" (line width 2-10), "fill": true, or "color": "red"|"blue"|"green"|"orange"|"grey" to pick something '
+    "out. Draw the ground as a line under people and objects; keep labels short, beside what they name and clear of the lines. "
+    "A slide with a drawing has at most 3 points."
+)
+_DECK_CHARTS = (
+    "\n\nCHARTS: when a paper's abstract above states real numbers worth comparing, a slide may add \"chart\": {\"chart_type\": "
+    "\"column\"|\"bar\"|\"line\"|\"pie\", \"title\": \"...\", \"categories\": [...], \"series\": [{\"name\": \"...\", \"values\": [numbers]}], "
+    "\"from\": \"the citation key of that paper\"} — every number exactly as that abstract states it, never estimated."
+)
+
+
+def _deck_points(raw, limit=8):
+    out = []
+    for b in (raw or [])[:limit]:
+        if isinstance(b, str):
+            b = {"text": b, "level": 0}
+        if not isinstance(b, dict):
+            continue
+        text = re.sub(r"\s+", " ", str(b.get("text") or "")).strip()
+        if not text:
+            continue
+        try:
+            level = max(0, min(int(b.get("level") or 0), 1))
+        except (TypeError, ValueError):
+            level = 0
+        out.append({"text": text[:260], "level": level})
+    return out
+
+
+def _chart_from_paper(spec, sources):
+    """A chart only when every number in it is stated in the abstract of the paper it cites."""
+    if not isinstance(spec, dict):
+        return None
+    key = str(spec.get("from") or "").strip()
+    paper = next((s for s in sources if s.get("citation_key") == key), None)
+    abstract = (paper or {}).get("abstract") or ""
+    cats = [str(c)[:40] for c in (spec.get("categories") or [])][:12]
+    series = []
+    for s in (spec.get("series") or [])[:4]:
+        if not isinstance(s, dict):
+            continue
+        vals = []
+        for v in (s.get("values") or [])[:len(cats)]:
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                return None
+        series.append({"name": str(s.get("name") or "Value")[:40], "values": vals})
+    if not paper or not cats or not series or any(len(s["values"]) != len(cats) for s in series):
+        return None
+    shown = set(re.findall(r"\d+(?:\.\d+)?", abstract.replace(",", "")))
+    for s in series:
+        for v in s["values"]:
+            forms = {f"{v:g}"} | ({str(int(v))} if v == int(v) else set())
+            if not forms & shown:          # a number the paper doesn't state: no chart
+                return None
+    kind = spec.get("chart_type") if spec.get("chart_type") in ("column", "bar", "line", "pie") else "column"
+    return {"type": "chart", "chart_type": kind, "categories": cats, "series": series, "title": str(spec.get("title") or "")[:80]}
+
+
+def _parse_full_deck(raw, group, sources, style="apa"):
+    """The AI's deck as Slide Studio's deck: points checked against the papers, more than 5 points
+    split onto a second slide, drawings drawn, charts kept only with real numbers, a References
+    slide for the papers cited, and the closing slide."""
+    data = None
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw or "").strip())
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        a, b = cleaned.find("{"), cleaned.rfind("}")
+        if a >= 0 and b > a:
+            try:
+                data = json.loads(cleaned[a:b + 1])
+            except json.JSONDecodeError:
+                data = None
+    if not isinstance(data, dict):
+        raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
+    ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
+    clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+    if group == "tutor":
+        title_slide = {"course": clip(ts_raw.get("course"), 80), "code": clip(ts_raw.get("code"), 30), "subtitle": clip(ts_raw.get("subtitle"), 120),
+                       "lecturer": clip(ts_raw.get("lecturer"), 80), "date": clip(ts_raw.get("date"), 40)}
+    else:
+        lines = [clip(l, 120) for l in (ts_raw.get("lines") or []) if clip(l, 120)][:3]
+        title_slide = {"lines": lines, "main": clip(ts_raw.get("main"), 200), "sub": clip(ts_raw.get("sub"), 200)}
+    cited = set()
+
+    def check(points):
+        for b in points:
+            b["text"], c = keep_known_citations(b["text"], sources, style)
+            cited.update(c)
+        return [b for b in points if b["text"].strip()]
+
+    slides = []
+    for sd in (data.get("slides") or [])[:_DECK_MAX + 4]:
+        if not isinstance(sd, dict):
+            continue
+        kind = sd.get("kind") if sd.get("kind") in ("content", "columns", "section") else "content"
+        title = clip(sd.get("title"), 140)
+        notes = clip(sd.get("notes"), 900)
+        if kind == "section":
+            slides.append({"kind": "section", "title": title, "sub": clip(sd.get("sub"), 200)})
+            continue
+        if kind == "columns":
+            slides.append({"kind": "columns", "title": title, "list_style": "bullets", "notes": notes,
+                           "left_heading": clip(sd.get("left_heading"), 60), "left": check(_deck_points(sd.get("left"), 5)),
+                           "right_heading": clip(sd.get("right_heading"), 60), "right": check(_deck_points(sd.get("right"), 5))})
+            continue
+        points = check(_deck_points(sd.get("bullets")))
+        media = None
+        if sd.get("drawing"):
+            url = render_drawing(sd.get("drawing"))
+            if url:
+                media = {"type": "image", "data": url, "fit": "whole"}
+        if media is None and sd.get("chart"):
+            media = _chart_from_paper(sd.get("chart"), sources)
+        if not title and not points and not media:
+            continue
+        per = 3 if media else 5           # big text: split rather than shrink
+        chunks = [points[i:i + per] for i in range(0, len(points), per)] or [[]]
+        for k, chunk in enumerate(chunks):
+            s = {"kind": "content", "title": title, "list_style": "bullets", "bullets": chunk, "notes": notes if k == 0 else ""}
+            if media and k == 0:
+                s["media"] = media
+                s["media_position"] = "right" if chunk else "full"
+            slides.append(s)
+    body = slides[:_DECK_MAX]
+    if not any(s["kind"] != "section" for s in body):
+        raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
+    refs = build_references_list(sources, cited) if sources else []
+    for i in range(0, len(refs), 4):
+        body.append({"kind": "content", "title": "References", "list_style": "bullets", "bullets": [
+            {"text": re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else ""), "level": 0} for r in refs[i:i + 4]]})
+    body.append({"kind": "end", "title": "Any questions" if group == "tutor" else "Thank you for listening", "big": "Thank you"})
+    return {"template": ("tutor" if group == "tutor" else "student") + "-plain", "title_slide": title_slide, "slide_numbers": True,
+            "slides": body}, refs
+
+
 @app.route("/api/slides/draft", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -5377,10 +6219,25 @@ def slides_draft_endpoint():
     topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
     if not topic:
         return jsonify({"error": "Tell Remy what the deck is about first."}), 400
-    system = _DRAFT_SYSTEM.format(
+    # Evidence first: real papers for the topic, and the request's own wishes (drawings, charts).
+    try:
+        papers, _ = paper_topic_search(topic, max_results=6)
+    except Exception as e:
+        logger.warning(f"Deck paper search failed: {e}")
+        papers = []
+    sources = enrich_sources(papers, "apa") if papers else []
+    system = _DECK_SYSTEM.format(
         group="tutor preparing a lecture" if group == "tutor" else "student preparing a presentation or report",
-        title_fields=_DRAFT_TITLE_FIELDS[group], min_slides=4,
+        title_fields=_DRAFT_TITLE_FIELDS[group], min_slides=8, max_slides=_DECK_MAX - 2,
     )
+    if sources:
+        system += _DECK_EVIDENCE.format(example=sources[0]["citation_key"], papers="\n".join(
+            f"{s['citation_key']} {s['title']} \u2014 {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
+            + (f"\n    Abstract: {s['abstract'][:600]}" if s.get("abstract") else "") for s in sources))
+    if _DRAW_WORDS.search(topic):
+        system += _DECK_DRAWINGS
+    if sources and _CHART_WORDS.search(topic):
+        system += _DECK_CHARTS
     # A whole drafted deck is real AI work, so it draws on the same Remy
     # messages as chatting with Remy: the month's allowance first, then any
     # Pay-per-Use messages. Checked before the AI call (never spend on a
@@ -5391,10 +6248,13 @@ def slides_draft_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 429
     try:
-        raw = call_claude(system, f"Topic: {topic}", max_tokens=3000)
-        deck = _parse_draft_deck_json(raw, group)
-        deck["filename"] = (re.sub(r"[^\w \-]+", "", topic).strip()[:60] or ("Lecture" if group == "tutor" else "Presentation"))
-        return jsonify({"deck": deck})
+        raw = call_claude(system, f"Request: {topic}", max_tokens=9000)
+        deck, refs = _parse_full_deck(raw, group, sources)
+        # named after the deck's own title — never the request
+        ts = deck["title_slide"]
+        name = (ts.get("main") or ts.get("subtitle") or ts.get("course") or _topic_title(topic) or "").strip()
+        deck["filename"] = (re.sub(r"[^\w \-]+", "", name).strip()[:60] or ("Lecture" if group == "tutor" else "Presentation"))
+        return jsonify({"deck": deck, "references": refs})
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from)
         return jsonify({"error": str(e)}), 502

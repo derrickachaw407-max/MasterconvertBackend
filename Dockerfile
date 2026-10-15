@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
+# The fonts are metric twins of Calibri, Cambria, Arial, Times New Roman and Courier New:
+# without them LibreOffice draws those (the fonts of most Word and PowerPoint files) with a wider
+# stand-in, so a PDF made here broke its lines and pages differently from the original.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     poppler-utils \
     tesseract-ocr \
+    fonts-crosextra-carlito \
+    fonts-crosextra-caladea \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

@@ -1811,6 +1811,58 @@ TEMPLATES = {
 }
 ALIASES = {"student": "student-classic", "tutor": "tutor-classic"}
 
+
+# ---- Projection-safe colours (2.9) ----
+# Text on a projected slide loses contrast (a lit room, a grey projector, people far
+# away). Colours that carry words are deepened — the same hue, mixed toward black on a
+# light background (toward white on a dark one) — until they stand clear of their
+# background: body text 12:1, titles, highlighted words, captions and footers 7:1.
+# The app's preview computes the very same values.
+def _lum(h):
+    out = []
+    for i in (0, 2, 4):
+        v = int(h[i:i + 2], 16) / 255.0
+        out.append(v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2]
+
+
+def _contrast(a, b):
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _deepen(h, bg, ratio):
+    h, bg = h.lstrip("#").upper(), bg.lstrip("#").upper()
+    if _contrast(h, bg) >= ratio:
+        return h
+    target = "000000" if _lum(bg) > 0.18 else "FFFFFF"
+    for k in range(1, 51):
+        t = k * 0.02
+        c = "".join("%02X" % int(round(int(h[i:i + 2], 16) + (int(target[i:i + 2], 16) - int(h[i:i + 2], 16)) * t)) for i in (0, 2, 4))
+        if _contrast(c, bg) >= ratio:
+            return c
+    return target
+
+
+def _readable_templates():
+    for tpl in TEMPLATES.values():
+        if tpl.get("style") == "modern":
+            bg = tpl["bg"]
+            tpl["ink"] = _deepen(tpl["ink"], bg, 7.0)                  # titles
+            if tpl.get("ink2"):
+                tpl["ink2"] = _deepen(tpl["ink2"], "FFFFFF", 4.5)       # white cover titles over the gradient's far end
+            tpl["text"] = _deepen(tpl["text"], bg, 12.0)               # points
+            tpl["muted"] = _deepen(tpl["muted"], bg, 7.0)              # captions, footers, small cover lines
+            tpl["emph"] = _deepen(tpl["emph"], bg, 7.0)                # highlighted words, column headings
+            tpl["soft"] = _deepen(tpl["soft"], tpl["ink"], 7.0)        # subtitles on the dark cover and section slides
+        elif tpl["group"] == "student":
+            tpl["title_hex"] = _deepen((tpl.get("theme") or {}).get("accent1") or "4E67C8", "FFFFFF", 7.0)
+
+
+_readable_templates()
+TUTOR_TEXT = "1A1A1A"      # classic lecture templates: points (the theme's own grey was 404040)
+TUTOR_TITLE = "262626"     # and titles
+
 # Where things go on a content slide, per family (inches: left, top, width, height)
 GEOMETRY = {
     "student": {"body": (0.89, 1.9, 11.89, 4.8), "right_text_w": 6.2, "right_media": (7.35, 2.0, 5.4, 4.6),
@@ -2108,18 +2160,23 @@ def _eff_len(b):
     return len(text) + int(bold * 0.08 + 0.5)
 
 
-def _body_size(bullets, width_in, height_in, top=30):
+LINE_SPACING = 1.1      # within a point (PowerPoint's "Multiple 1.1"); the preview's line height is 1.3
+LINE_H = 1.3            # height of a line, in font sizes, for fitting
+POINT_GAP = 0.5         # space between points, in font sizes
+
+
+def _body_size(bullets, width_in, height_in, top=32):
     """The largest size (top pt down to 16pt) at which every bullet, wrapped,
     fits its box. Preview engines shrink text unpredictably, so the size is
     chosen here, measured against the wider substitute font a computer
     without the template's font falls back to — so nothing spills out
     anywhere the deck is opened."""
-    for size in [s for s in (30, 28, 26, 24, 22, 20, 18, 16) if s <= top]:
+    for size in [s for s in (32, 30, 28, 26, 24, 22, 20, 18, 16) if s <= top]:
         per_line = max(8, int((width_in - 0.3) * 72 / (size * 0.58)))
         lines = 0
         for b in bullets:
             lines += max(1, math.ceil(_eff_len(b) / max(8, per_line - 3 - 3 * b["level"])))
-        if lines * size * 1.2 + len(bullets) * size * 0.45 <= height_in * 72:
+        if lines * size * LINE_H + len(bullets) * size * POINT_GAP <= height_in * 72:
             return size
     return 16
 
@@ -2142,6 +2199,22 @@ def _clean_bullets(raw):
     return out[:40]
 
 
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>\"]+[^\s<>\".,;:)\]]")
+
+
+def _url_pieces(text):
+    """(words, url-or-None) pieces of a run of text: web addresses on their own, to be links."""
+    out, pos = [], 0
+    for m in _URL_IN_TEXT.finditer(text or ""):
+        if m.start() > pos:
+            out.append((text[pos:m.start()], None))
+        out.append((m.group(0), m.group(0)))
+        pos = m.end()
+    if pos < len(text or ""):
+        out.append((text[pos:], None))
+    return out or [(text, None)]
+
+
 def _write_bullets(placeholder, bullets, box_in, numbered):
     """Fills a body placeholder with bullets sized to fit the box."""
     tf = placeholder.text_frame
@@ -2157,10 +2230,17 @@ def _write_bullets(placeholder, bullets, box_in, numbered):
         p.level = b["level"]
         if numbered and b["level"] == 0:
             _number_paragraph(p)
+        s = size if b["level"] == 0 else max(size - 4, 16)
+        p.line_spacing = LINE_SPACING
+        p.space_before = Pt(0) if i == 0 else Pt(round(s * POINT_GAP))
+        p.space_after = Pt(0)
         for words, flags in _fmt_segments(b["text"], b.get("fmt")):
+          for words, url in _url_pieces(words):
             r = p.add_run()
             r.text = words
-            r.font.size = Pt(size if b["level"] == 0 else max(size - 4, 14))
+            if url:
+                r.hyperlink.address = url        # a web address on a slide: a live link
+            r.font.size = Pt(s)
             if "b" in flags:
                 r.font.bold = True
             if "i" in flags:
@@ -2184,9 +2264,29 @@ def _add_table(slide, spec, left, top, width, height):
         return
     n_cols = min(max(len(r) for r in rows), 10)
     rows = [(r + [""] * n_cols)[:n_cols] for r in rows]
-    h = min(height, Inches(0.46) * len(rows))
+    pt = 20 if len(rows) <= 6 and n_cols <= 4 else 16 if len(rows) <= 10 else 14
+    h = min(height, Inches(0.5 if pt == 20 else 0.42 if pt == 16 else 0.36) * len(rows))
     table = slide.shapes.add_table(len(rows), n_cols, left, top, width, h).table
-    size = Pt(16 if len(rows) <= 6 and n_cols <= 4 else 13 if len(rows) <= 10 else 11)
+    size = Pt(pt)
+    if spec.get("plain"):       # Plain White: white cells, thin black lines, the header row in bold
+        table.horz_banding = False
+        for r_i, row in enumerate(rows):
+            for c_i in range(n_cols):
+                cell = table.cell(r_i, c_i)
+                cell.text = row[c_i]
+                cell.fill.background()
+                tcpr = cell._tc.get_or_add_tcPr()
+                for side in ("a:lnB", "a:lnT", "a:lnR", "a:lnL"):
+                    ln = etree.Element(qn(side), w="12700")
+                    fill = etree.SubElement(ln, qn("a:solidFill"))
+                    etree.SubElement(fill, qn("a:srgbClr")).set("val", "000000")
+                    tcpr.insert(0, ln)
+                for p in cell.text_frame.paragraphs:
+                    for run in p.runs:
+                        run.font.size = size
+                        run.font.bold = r_i == 0
+                        run.font.color.rgb = RGBColor(0, 0, 0)
+        return
     for r_i, row in enumerate(rows):
         for c_i in range(n_cols):
             cell = table.cell(r_i, c_i)
@@ -2250,12 +2350,34 @@ def _add_chart(slide, spec, left, top, width, height):
         plot.data_labels.show_value = False
 
 
+def _picture_area(tpl):
+    """The space under a slide's title and above its footer, and the left margin the
+    points keep (inches). Same numbers as the app's preview."""
+    if tpl.get("style") == "modern":
+        if tpl.get("chrome") == "card":
+            return (0.6, 1.62, 12.13, 5.08), 0.35
+        return (0.0, 1.6, 13.333, 5.2), (1.2 if tpl.get("chrome") == "block" else 0.9)
+    if tpl.get("group") == "student":
+        return (0.0, 1.71, 13.333, 5.79), 0.89
+    return (0.0, 2.2, 13.333, 4.8), 1.2
+
+
+def _picture_boxes(tpl, pos):
+    """(points box or None, picture box) for a picture placed right / below / full."""
+    (x, y, w, h), margin = _picture_area(tpl)
+    if pos == "right":
+        return (x + margin, y + 0.15, w / 3 - margin - 0.2, h - 0.3), (x + w / 3, y, w * 2 / 3, h)
+    if pos == "below":
+        return (x + margin, y + 0.1, w - 2 * margin, h / 3 - 0.15), (x, y + h / 3, w, h * 2 / 3)
+    return None, (x, y, w, h)
+
+
 def _add_media(slide, media, box):
     mtype = media.get("type")
     if mtype == "image":
         data = _image_bytes(media.get("data"))
         if data:
-            _fit_picture(slide, data, *box)
+            (_fit_picture if media.get("fit") == "whole" else _fill_picture)(slide, data, *box)
     elif mtype == "table":
         _add_table(slide, media, *box)
     elif mtype == "chart":
@@ -2447,7 +2569,7 @@ def _tutor_title_slide(prs, deck, tpl):
             r.font.color.brightness = 0.25
 
 
-def _set_title(slide, text, group):
+def _set_title(slide, text, group, tpl=None):
     t = slide.shapes.title
     tf = t.text_frame
     tf.text = ""
@@ -2459,10 +2581,12 @@ def _set_title(slide, text, group):
         p.alignment = PP_ALIGN.CENTER
         r.font.name = "Arial Black"
         r.font.bold = False
-        r.font.size = Pt(36 if n <= 28 else 32 if n <= 40 else 28 if n <= 56 else 24)
+        # A long title keeps a readable size and takes a second line (the box holds two).
+        r.font.size = Pt(36 if n <= 28 else 32 if n <= 40 else 28 if n <= 90 else 24)
+        r.font.color.rgb = RGBColor.from_string((tpl or {}).get("title_hex") or "3E52A0")
     else:
         r.font.size = Pt(44 if n <= 24 else 38 if n <= 34 else 32 if n <= 48 else 28)
-    # No colour here: titles inherit each template's own title style.
+        r.font.color.rgb = RGBColor.from_string(TUTOR_TITLE)
 
 
 def _look_accent(slide, tpl):
@@ -2486,7 +2610,7 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
     s = prs.slides.add_slide(lay)
     _look_accent(s, tpl)
     title = str(sd.get("title") or "").strip()[:140]
-    _set_title(s, title, group)
+    _set_title(s, title, group, tpl)
     if logo and deck.get("logo_on_all_slides"):
         s.shapes.title.width = s.shapes.title.width - Inches(1.0)
         _fit_picture(s, logo, Inches(12.2), Inches(0.3), Inches(0.9), Inches(0.9))
@@ -2533,6 +2657,8 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
             body_box, media_box = None, geo["full_media"]
         else:
             body_box, media_box = (L, T, W, H), None
+        if media and media.get("type") == "image":
+            body_box, media_box = _picture_boxes(tpl, pos)
         if body is not None:
             if bullets and body_box:
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
@@ -2541,6 +2667,8 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
                 _remove(body)
         if media and media_box:
             _add_media(s, media, tuple(Inches(v) for v in media_box))
+    if group == "tutor":
+        _ink_points(s, TUTOR_TEXT)
 
     if deck.get("slide_numbers", True):
         _add_slide_number(s, lay, number, group)
@@ -2550,6 +2678,37 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
     if notes:
         s.notes_slide.notes_text_frame.text = notes[:4000]
     return s
+
+
+def _ink_points(slide, hex_):
+    """Points on a classic lecture slide in near-black (column headings keep their colour),
+    each first-level point led by a ► in the template's accent — the template's own marker
+    was a blank, so points ran together on a projector."""
+    for ph in slide.placeholders:
+        if ph.placeholder_format.idx not in (1, 2):
+            continue
+        for p in ph.text_frame.paragraphs:
+            for r in p.runs:
+                if r.font.color is None or r.font.color.type is None:
+                    r.font.color.rgb = RGBColor.from_string(hex_)
+            pPr = p._p.get_or_add_pPr()
+            if p.level == 0 and p.runs and pPr.find(qn("a:buNone")) is None and pPr.find(qn("a:buAutoNum")) is None:
+                for tag in ("a:buSzPct", "a:buFont", "a:buChar"):
+                    for old in pPr.findall(qn(tag)):
+                        pPr.remove(old)
+                at = 0
+                for i, child in enumerate(pPr):
+                    if child.tag in (qn("a:lnSpc"), qn("a:spcBef"), qn("a:spcAft"), qn("a:buClrTx"), qn("a:buClr")):
+                        at = i + 1
+                size = etree.Element(qn("a:buSzPct")); size.set("val", "70000")
+                font = etree.Element(qn("a:buFont")); font.set("typeface", "Arial")
+                char = etree.Element(qn("a:buChar")); char.set("char", "►")
+                for k, el in enumerate((size, font, char)):
+                    pPr.insert(at + k, el)
+                pt = next((r.font.size.pt for r in p.runs if r.font.size), 24)
+                hang = str(int(round(pt * 1.05 * 12700)))      # the marker, then the words a marker's width along (as in the preview)
+                pPr.set("marL", hang)
+                pPr.set("indent", "-" + hang)
 
 
 def _tutor_footer(deck):
@@ -2566,7 +2725,7 @@ def _closing_slide(prs, deck, sd, number, tpl):
     if group == "student":
         lay = _layout(prs, "Title and Content")
         s = prs.slides.add_slide(lay)
-        _set_title(s, str(sd.get("title") or "").strip()[:140], group)
+        _set_title(s, str(sd.get("title") or "").strip()[:140], group, tpl)
         for ph in list(s.placeholders):
             if ph.placeholder_format.idx == 1:
                 _remove(ph)
@@ -2580,8 +2739,7 @@ def _closing_slide(prs, deck, sd, number, tpl):
         r.font.name = "Arial Black"
         r.font.bold = False
         r.font.size = Pt(72 if len(big) <= 14 else 54)
-        r.font.color.theme_color = MSO_THEME_COLOR.ACCENT_1
-        r.font.color.brightness = -0.25
+        r.font.color.rgb = RGBColor.from_string(tpl.get("title_hex") or "3E52A0")
         if deck.get("slide_numbers", True):
             _add_slide_number(s, lay, number, group)
         return s
@@ -3058,8 +3216,27 @@ def _m_text(slide, x, y, w, h, text, size, hex_, font=None, italic=False, align=
 
 
 def _m_number(slide, number, tpl, on_colour=False):
-    """A real slide-number field inside a small rounded badge."""
+    """A real slide-number field inside a small rounded badge (Plain White: just the number)."""
     import uuid
+    if tpl.get("plain"):
+        box = slide.shapes.add_textbox(Inches(11.9), Inches(6.88), Inches(0.87), Inches(0.38))
+        box.name = "Docente slide number"
+        tf = box.text_frame
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.RIGHT
+        fld = etree.SubElement(p._p, qn("a:fld"))
+        fld.set("id", "{%s}" % str(uuid.uuid4()).upper())
+        fld.set("type", "slidenum")
+        rpr = etree.SubElement(fld, qn("a:rPr"))
+        rpr.set("lang", "en-US")
+        rpr.set("sz", "1400")
+        sf = etree.SubElement(rpr, qn("a:solidFill"))
+        etree.SubElement(sf, qn("a:srgbClr")).set("val", "000000")
+        etree.SubElement(rpr, qn("a:latin")).set("typeface", MODERN_BODY_FONT)
+        etree.SubElement(fld, qn("a:t")).text = str(number)
+        return
     fill = "FFFFFF" if on_colour else tpl["ink"]
     text_hex = tpl["ink"] if on_colour else "FFFFFF"
     badge = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 12.15, 6.88, 0.62, 0.38, fill, back=False)
@@ -3149,7 +3326,7 @@ def _m_title(slide, tpl, title, box, room_for_logo=False):
     p.alignment = PP_ALIGN.LEFT
     r = p.add_run()
     r.text = title
-    r.font.size = Pt(36 if len(title) <= 40 else 30 if len(title) <= 64 else 24)
+    r.font.size = Pt(36 if len(title) <= 40 else 30 if len(title) <= 64 else 26)
     r.font.bold, r.font.name = False, MODERN_TITLE_FONT
     r.font.color.rgb = RGBColor.from_string(tpl["ink"])
 
@@ -3212,6 +3389,15 @@ def _modern_title_slide(prs, deck, tpl):
             _m_shape(s, MSO_SHAPE.OVAL, 10.9, 3.6, 2.0, 2.0, tpl["accent"], alpha=30000, back=False)
         if logo:
             _fit_picture(s, logo, Inches(1.35), Inches(0.6), Inches(1.0), Inches(1.0))
+    elif cover == "plain":      # the title in black on white, centred (beside the picture, if any)
+        if picture:
+            _fit_picture(s, picture, Inches(7.35), Inches(1.0), Inches(5.3), Inches(5.5))
+        tx, tw, al = (0.9, 6.1, "left") if picture else (0.9, 11.53, "center")
+        _m_text(s, tx, 1.5, tw, 2.6, course, size, "000000", font=MODERN_TITLE_FONT, align=al, anchor=MSO_ANCHOR.BOTTOM, spacing=0.9)
+        if subtitle:
+            _m_text(s, tx, 4.25, tw, 0.8, subtitle, 24, "262626", align=al)
+        if small:
+            _m_text(s, tx, 5.0, tw, 0.6, small, 16, "404040", align=al)
     else:   # photo
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["bg"])
         if picture:
@@ -3234,6 +3420,21 @@ def _modern_title_slide(prs, deck, tpl):
 def _modern_slide(prs, deck, sd, number, logo, tpl):
     kind = sd.get("kind") or "content"
     title = str(sd.get("title") or "").strip()[:140]
+    if kind in ("section", "end") and tpl.get("plain"):      # black words on white, nothing else
+        s = prs.slides.add_slide(_layout(prs, "Blank"))
+        if kind == "section":
+            _m_text(s, 0.9, 2.2, 11.53, 2.0, title or " ", 44 if len(title) <= 36 else 34, "000000", font=MODERN_TITLE_FONT, align="center", anchor=MSO_ANCHOR.BOTTOM)
+            sub = str(sd.get("sub") or "").strip()[:200]
+            if sub:
+                _m_text(s, 0.9, 4.35, 11.53, 0.9, sub, 24, "404040", align="center", anchor=MSO_ANCHOR.TOP)
+        else:
+            big = str(sd.get("big") or "Thank you").strip()[:60]
+            _m_text(s, 0.9, 2.0, 11.53, 2.3, big, 64 if len(big) <= 14 else 46, "000000", font=MODERN_TITLE_FONT, align="center", anchor=MSO_ANCHOR.BOTTOM)
+            if title:
+                _m_text(s, 0.9, 4.4, 11.53, 0.9, title, 26, "404040", align="center", anchor=MSO_ANCHOR.TOP)
+        _m_footer(s, tpl, deck, number)
+        _notes(s, sd)
+        return s
     if kind in ("section", "end"):
         s = prs.slides.add_slide(_layout(prs, "Blank"))
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
@@ -3257,7 +3458,8 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         _m_chrome(s, tpl)
         quote = str(sd.get("quote") or "").strip().strip('"\u201c\u201d')[:400] or " "
         by = str(sd.get("by") or "").strip()[:120]
-        _m_text(s, 1.1, 0.7, 1.8, 1.8, "\u201c", 140, tpl["accent"], font="Georgia", anchor=MSO_ANCHOR.TOP)
+        if not tpl.get("plain"):
+            _m_text(s, 1.1, 0.7, 1.8, 1.8, "\u201c", 140, tpl["accent"], font="Georgia", anchor=MSO_ANCHOR.TOP)
         n = len(quote)
         box = _m_text(s, 1.6, 1.4, 10.1, 4.3, quote, 38 if n <= 70 else 30 if n <= 140 else 24 if n <= 240 else 20,
                       tpl["ink"], font=MODERN_TITLE_FONT, italic=True, align="center")
@@ -3342,6 +3544,8 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
             body_box, media_box = None, geo["full_media"]
         else:
             body_box, media_box = (L, T, W, H), None
+        if media and media.get("type") == "image":
+            body_box, media_box = _picture_boxes(tpl, pos)
         if body is not None:
             if bullets and body_box:
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
@@ -3350,6 +3554,8 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
             else:
                 _remove(body)
         if media and media_box:
+            if tpl.get("plain") and media.get("type") == "table":
+                media = dict(media, plain=True)
             _add_media(s, media, tuple(Inches(v) for v in media_box))
     _m_footer(s, tpl, deck, number)
     _notes(s, sd)
@@ -3802,3 +4008,785 @@ def _mostly_transparent(blob):
             return sum(1 for a in alpha.getdata() if a < 40) > 0.5 * 64 * 64
     except Exception:
         return False
+
+
+# ======================================================================== the file's own design (2.9)
+import colorsys as _colorsys
+import glob as _glob
+import shutil as _shutil
+import subprocess as _subprocess
+
+_RNS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+ORIG_MAX_SLIDES = 60
+
+
+def _o_theme(prs):
+    """Theme colours and fonts, and the master's colour map."""
+    master = prs.slide_masters[0]
+    th = {"cols": {}, "major": "Calibri", "minor": "Calibri", "map": {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}}
+    try:
+        theme = etree.fromstring(master.part.part_related_by(RT.THEME).blob)
+        scheme = theme.find(".//" + qn("a:clrScheme"))
+        for el in (scheme if scheme is not None else []):
+            name = etree.QName(el).localname
+            if len(el):
+                c = el[0]
+                v = c.get("val") if etree.QName(c).localname == "srgbClr" else c.get("lastClr")
+                if v:
+                    th["cols"][name] = v.upper()
+        for key, tag in (("major", "a:majorFont"), ("minor", "a:minorFont")):
+            lat = theme.find(".//" + qn(tag) + "/" + qn("a:latin"))
+            if lat is not None and lat.get("typeface"):
+                th[key] = lat.get("typeface")
+    except Exception:
+        pass
+    cmap = master._element.find(qn("p:clrMap"))
+    if cmap is not None:
+        th["map"].update(dict(cmap.attrib))
+    return th
+
+
+def _o_mods(hex_, el):
+    """lumMod / lumOff / shade / tint on a colour (as PowerPoint applies them)."""
+    try:
+        r, g, b = (int(hex_[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    except Exception:
+        return None
+    for m in el:
+        tag, v = etree.QName(m).localname, m.get("val")
+        if v is None:
+            continue
+        v = int(v) / 100000.0
+        if tag in ("lumMod", "lumOff"):
+            h, l, s = _colorsys.rgb_to_hls(r, g, b)
+            l = l * v if tag == "lumMod" else l + v
+            r, g, b = _colorsys.hls_to_rgb(h, max(0.0, min(1.0, l)), s)
+        elif tag == "shade":
+            r, g, b = r * v, g * v, b * v
+        elif tag == "tint":
+            r, g, b = r + (1 - r) * (1 - v), g + (1 - g) * (1 - v), b + (1 - b) * (1 - v)
+    return "".join("%02X" % int(round(max(0.0, min(1.0, x)) * 255)) for x in (r, g, b))
+
+
+def _o_colour(fill, th):
+    """A solidFill (or any element holding a colour) -> 'RRGGBB' or None."""
+    if fill is None:
+        return None
+    for c in fill:
+        tag = etree.QName(c).localname
+        base = None
+        if tag == "srgbClr":
+            base = c.get("val")
+        elif tag == "schemeClr":
+            v = c.get("val")
+            base = th["cols"].get(th["map"].get(v, v)) or th["cols"].get(v)
+        elif tag == "sysClr":
+            base = c.get("lastClr")
+        elif tag == "prstClr":
+            base = {"black": "000000", "white": "FFFFFF"}.get(c.get("val"))
+        else:
+            continue
+        return _o_mods(base.upper(), c) if base else None
+    return None
+
+
+def _o_bases(shape):
+    """The placeholders this one inherits from: its layout's, then the master's."""
+    out, cur = [], shape
+    for _ in range(2):
+        nxt = None
+        try:
+            nxt = cur._base_placeholder if getattr(cur, "is_placeholder", False) else None
+        except Exception:
+            nxt = None
+        if nxt is None:
+            break
+        out.append(nxt)
+        cur = nxt
+    return out
+
+
+def _o_chain(shape, prs, L, kind):
+    """Where a paragraph at level L gets its look, nearest first: the shape's own list style,
+    its layout's and master's placeholders, then the master's text styles."""
+    tag = qn("a:lvl%dpPr" % (L + 1))
+    chain = []
+    for sh in [shape] + _o_bases(shape):
+        tb = sh._element.find(".//" + qn("p:txBody"))
+        ls = tb.find(qn("a:lstStyle")) if tb is not None else None
+        if ls is not None and ls.find(tag) is not None:
+            chain.append(ls.find(tag))
+    styles = prs.slide_masters[0]._element.find(qn("p:txStyles"))
+    if styles is not None:
+        name = {"title": "p:titleStyle", "body": "p:bodyStyle"}.get(kind, "p:otherStyle")
+        st = styles.find(qn(name))
+        if st is not None and st.find(tag) is not None:
+            chain.append(st.find(tag))
+    return chain
+
+
+def _o_bodypr(shape):
+    out = {}
+    for sh in [shape] + _o_bases(shape):
+        bp = sh._element.find(".//" + qn("a:bodyPr"))
+        if bp is None:
+            continue
+        for k in ("anchor", "lIns", "tIns", "rIns", "bIns"):
+            if k not in out and bp.get(k) is not None:
+                out[k] = bp.get(k)
+        na = bp.find(qn("a:normAutofit"))
+        if "scale" not in out and na is not None:
+            out["scale"] = int(na.get("fontScale", "100000")) / 100000.0
+            out["autofit"] = True
+    return out
+
+
+def _o_font(face, th):
+    if not face:
+        return None
+    return th["major"] if face.startswith("+mj") else th["minor"] if face.startswith("+mn") else face
+
+
+# Bullet characters drawn from symbol fonts, as the characters they show.
+_O_WINGDINGS = {"l": "\u25CF", "n": "\u25A0", "q": "\u2751", "v": "\u2756", "\u00a7": "\u25AA", "\u00d8": "\u27A2", "\u00fc": "\u2713",
+                "o": "\u25A1", "\u00a8": "\u25FB", "\u00e0": "\u2192", "\u00e8": "\u2794", "w": "\u2B25", "u": "\u2B25", "\u00f0": "\u21E8",
+                "\u00d7": "\u2794", "\u00de": "\u27A4"}
+
+
+def _o_bullet_char(ch, face):
+    face = (face or "").lower()
+    if ch and len(ch) == 1 and 0xF000 <= ord(ch) <= 0xF0FF:
+        ch = chr(ord(ch) - 0xF000)
+    if "wingdings" in face or "webdings" in face:
+        return _O_WINGDINGS.get(ch, "\u2022")
+    if face == "symbol":
+        return "\u2022"
+    return ch or "\u2022"
+
+
+def _o_para_style(shape, prs, th, kind, L, para=None):
+    """Size (pt), font, colour, bold, alignment, bullet, line spacing and space before for
+    paragraphs at level L of this shape."""
+    out = {"sz": None, "font": None, "color": None, "b": False, "algn": None, "bu": None, "lnSpc": None, "spcBef": None}
+    rprs, pprs = [], []
+    if para is not None:
+        r = para.find(qn("a:r"))
+        if r is not None and r.find(qn("a:rPr")) is not None:
+            rprs.append(r.find(qn("a:rPr")))
+        ppr = para.find(qn("a:pPr"))
+        if ppr is not None:
+            pprs.append(ppr)
+            if ppr.find(qn("a:defRPr")) is not None:
+                rprs.append(ppr.find(qn("a:defRPr")))
+        epr = para.find(qn("a:endParaRPr"))
+        if epr is not None and r is None:
+            rprs.append(epr)
+    for lv in _o_chain(shape, prs, L, kind):
+        pprs.append(lv)
+        if lv.find(qn("a:defRPr")) is not None:
+            rprs.append(lv.find(qn("a:defRPr")))
+    for rp in rprs:
+        if out["sz"] is None and rp.get("sz"):
+            out["sz"] = int(rp.get("sz")) / 100.0
+        if out["font"] is None:
+            lat = rp.find(qn("a:latin"))
+            if lat is not None and lat.get("typeface"):
+                out["font"] = _o_font(lat.get("typeface"), th)
+        if out["color"] is None:
+            out["color"] = _o_colour(rp.find(qn("a:solidFill")), th)
+        if rp.get("b") is not None and out.get("_b") is None:
+            out["_b"] = rp.get("b") in ("1", "true")
+        if rp.get("i") is not None and out.get("_i") is None:
+            out["_i"] = rp.get("i") in ("1", "true")
+        if rp.get("cap") is not None and out.get("_cap") is None:
+            out["_cap"] = rp.get("cap")
+        if rp.get("spc") is not None and out.get("_spc") is None:
+            try:
+                out["_spc"] = int(rp.get("spc")) / 100.0      # letter spacing, in points
+            except ValueError:
+                out["_spc"] = 0
+    out["b"] = bool(out.pop("_b", False))
+    # italic, capitals and letter spacing: only when the deck uses them
+    if out.pop("_i", False):
+        out["i"] = True
+    cap = out.pop("_cap", None)
+    if cap in ("all", "small"):
+        out["cap"] = cap
+    spc = out.pop("_spc", 0)
+    if spc:
+        out["spc"] = spc
+    for pp in pprs:
+        if out["algn"] is None and pp.get("algn"):
+            out["algn"] = pp.get("algn")
+        if out["bu"] is None:
+            if pp.find(qn("a:buNone")) is not None:
+                out["bu"] = ""
+            elif pp.find(qn("a:buAutoNum")) is not None:
+                out["bu"] = "#"
+            elif pp.find(qn("a:buChar")) is not None:
+                bf = next((x.find(qn("a:buFont")) for x in pprs if x.find(qn("a:buFont")) is not None), None)
+                out["bu"] = _o_bullet_char(pp.find(qn("a:buChar")).get("char"), bf.get("typeface") if bf is not None else "")
+                bc = _o_colour(pp.find(qn("a:buClr")), th)
+                if bc:
+                    out["buColor"] = bc
+        if out["lnSpc"] is None:
+            ls = pp.find(qn("a:lnSpc"))
+            if ls is not None and ls.find(qn("a:spcPct")) is not None:
+                out["lnSpc"] = int(ls.find(qn("a:spcPct")).get("val", "100000")) / 100000.0
+        if out["spcBef"] is None:
+            sb = pp.find(qn("a:spcBef"))
+            if sb is not None and sb.find(qn("a:spcPts")) is not None:
+                out["spcBef"] = int(sb.find(qn("a:spcPts")).get("val", "0")) / 100.0
+    if out["sz"] is None:
+        out["sz"] = 44.0 if kind == "title" else 18.0 if kind == "other" else 28.0 - 4 * L
+    if out["font"] is None:
+        out["font"] = th["major"] if kind == "title" else th["minor"]
+    if out["color"] is None:
+        out["color"] = th["cols"].get(th["map"].get("tx1", "dk1")) or "000000"
+    if out["bu"] is None:
+        out["bu"] = "" if kind in ("title", "other") else "•"
+    return out
+
+
+def _o_box(shape, prs, th, kind):
+    """Where a shape's words sit (inches) and how they look, level by level."""
+    emu = 914400.0
+    bp = _o_bodypr(shape)
+    ins = [int(bp.get("lIns", 91440)) / emu, int(bp.get("tIns", 45720)) / emu, int(bp.get("rIns", 91440)) / emu, int(bp.get("bIns", 45720)) / emu]
+    paras = shape._element.findall(".//" + qn("a:p")) if shape is not None else []
+    first_at = {}
+    for p in paras:
+        ppr = p.find(qn("a:pPr"))
+        lv = int(ppr.get("lvl", "0")) if ppr is not None else 0
+        if lv not in first_at and (p.find(qn("a:r")) is not None or p.find(qn("a:fld")) is not None):
+            first_at[lv] = p
+    levels = [_o_para_style(shape, prs, th, kind, L, first_at.get(L)) for L in range(3)]
+    return {"id": shape.shape_id, "x": round((shape.left or 0) / emu, 3), "y": round((shape.top or 0) / emu, 3),
+            "w": round((shape.width or 0) / emu, 3), "h": round((shape.height or 0) / emu, 3),
+            "ins": [round(v, 3) for v in ins], "anchor": bp.get("anchor") or ("ctr" if kind == "title" else "t"),
+            "fit": bool(bp.get("autofit")), "scale": round(bp.get("scale", 1.0), 3), "lv": levels}
+
+
+def _o_fit_scale(points, box):
+    """How much a shrink-to-fit box shrinks its words (the editor's own estimate, the same rule)."""
+    if not box or not box.get("fit") or not points:
+        return 1.0
+    W = box["w"] - box["ins"][0] - box["ins"][2]
+    H = box["h"] - box["ins"][1] - box["ins"][3]
+    lv = box.get("lv") or [{"sz": 18}]
+    f = 1.0
+    while f >= 0.5:
+        used = 0.0
+        for k, b in enumerate(points):
+            level = max(0, min(int(b.get("level", 0) or 0), len(lv) - 1))
+            st = lv[level]
+            sz = (st.get("sz") or 18) * f
+            ind = level * 0.4 + (sz / 72 * 1.1 if st.get("bu") else 0)
+            per = max(6, int((W - ind) * 72 / (sz * 0.52)))
+            lines = max(1, math.ceil(_eff_len({"text": b.get("text") or "", "fmt": b.get("fmt")}) / per))
+            used += lines * sz * 1.2 * (st.get("lnSpc") or 1) + ((st.get("spcBef") or 0) * f if k else 0)
+        if used <= H * 72:
+            return round(f, 2)
+        f -= 0.05
+    return 0.5
+
+
+def _o_set_fontscale(sh, f):
+    bp = sh._element.find(".//" + qn("a:bodyPr"))
+    if bp is None:
+        return
+    na = bp.find(qn("a:normAutofit"))
+    if na is None:
+        return
+    if f >= 0.999:
+        for k in ("fontScale", "lnSpcReduction"):
+            if k in na.attrib:
+                del na.attrib[k]
+    else:
+        na.set("fontScale", str(int(round(f * 100)) * 1000))
+        if "lnSpcReduction" in na.attrib:
+            del na.attrib["lnSpcReduction"]
+
+
+def _o_furniture(sh):
+    return getattr(sh, "is_placeholder", False) and sh.placeholder_format.type in (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER)
+
+
+def _o_covered(slide, sh):
+    """Words hidden under a picture (or chart, table, group) placed over them: they stay part
+    of the slide's picture rather than becoming words drawn on top of everything."""
+    shapes = list(slide.shapes)
+    ids = [x.shape_id for x in shapes]
+    if sh.shape_id not in ids:
+        return False
+    ax, ay, aw, ah = sh.left or 0, sh.top or 0, sh.width or 0, sh.height or 0
+    if aw <= 0 or ah <= 0:
+        return False
+    for other in shapes[ids.index(sh.shape_id) + 1:]:
+        try:
+            st = int(other.shape_type) if other.shape_type is not None else -1
+        except Exception:
+            st = -1
+        is_pic_ph = st == 14 and getattr(other, "is_placeholder", False) and other.placeholder_format.type == PP_PLACEHOLDER.PICTURE
+        if st not in (3, 6, 13, 19) and not is_pic_ph:
+            continue
+        bx, by, bw, bh = other.left or 0, other.top or 0, other.width or 0, other.height or 0
+        iw = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+        ih = max(0, min(ay + ah, by + bh) - max(ay, by))
+        if iw * ih >= 0.6 * aw * ah:
+            return True
+    return False
+
+
+def _o_pick(slide, prs, first):
+    """The slide's title shape and its main text shape (either may be None)."""
+    title = slide.shapes.title
+    if title is not None and not title.has_text_frame:
+        title = None
+    # top-level shapes only: a shape inside a group measures from the group, not the slide
+    texts = [sh for sh in slide.shapes if getattr(sh, "has_text_frame", False) and not _o_furniture(sh)
+             and not _furniture_box(sh, prs.slide_height) and (title is None or sh.shape_id != title.shape_id)]
+    if title is None or not title.text_frame.text.strip():
+        found = _prominent_title_shape([sh for sh in texts if sh.text_frame.text.strip()], prs.slide_height, max_top=0.75 if first else 0.28)
+        if found is not None and (title is None or not title.text_frame.text.strip()):
+            if title is None:
+                title = found
+                texts = [sh for sh in texts if sh.shape_id != found.shape_id]
+    body = None
+    for sh in texts:     # the content / subtitle placeholder, filled or not
+        if getattr(sh, "is_placeholder", False) and sh.placeholder_format.type in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT, PP_PLACEHOLDER.SUBTITLE) \
+                and sh.placeholder_format.idx in (1, 2, 13):
+            if body is None or sh.placeholder_format.idx < body.placeholder_format.idx:
+                body = sh
+    if body is None:     # otherwise the largest box of words
+        filled = [sh for sh in texts if sh.text_frame.text.strip() and (sh.width or 0) * (sh.height or 0) > 0]
+        if filled:
+            body = max(filled, key=lambda sh: (sh.width or 0) * (sh.height or 0))
+    if title is not None and _o_covered(slide, title):
+        title = None
+    if body is not None and _o_covered(slide, body):
+        body = None
+    return title, body
+
+
+def _o_number(slide, prs, th):
+    """A slide-number field's box (so the editor can draw the right number after a reorder)."""
+    for sh in slide.shapes:
+        if getattr(sh, "has_text_frame", False) and sh._element.find(".//" + qn("a:fld")) is not None:
+            if any(f.get("type") == "slidenum" for f in sh._element.iter(qn("a:fld"))):
+                return _o_box(sh, prs, th, "other")
+    return None
+
+
+def _o_clear(sh, keep_numbers=False):
+    """Takes the words out of a shape, keeping its paragraphs' look (for the background picture)."""
+    tb = sh._element.find(".//" + qn("p:txBody"))
+    if tb is None:
+        return
+    ps = tb.findall(qn("a:p"))
+    for k, p in enumerate(ps):
+        if k:
+            tb.remove(p)
+            continue
+        for child in list(p):
+            if etree.QName(child).localname in ("r", "fld", "br"):
+                p.remove(child)
+
+
+def _o_render(path, work_dir, clear, blank_name, to_pdf=None):
+    """Pictures of the slides (JPEG data URLs), the editable words taken out; the last is a
+    new slide on the deck's content layout. None if LibreOffice can't render it."""
+    d = os.path.join(work_dir, "bg")
+    os.makedirs(d, exist_ok=True)
+    prs = Presentation(path)
+    slides = list(prs.slides)[:ORIG_MAX_SLIDES]
+    for i, s in enumerate(slides):
+        ids = clear.get(i, set())
+        for sh in _flat_shapes(s.shapes):
+            if sh.shape_id in ids and getattr(sh, "has_text_frame", False):
+                _o_clear(sh)
+    # drop slides past the limit, then add the blank one
+    lst = prs.slides._sldIdLst
+    for sid in list(lst)[ORIG_MAX_SLIDES:]:
+        lst.remove(sid)
+    # this copy's own layout (a layout from another opened copy would bring a second set of parts)
+    blank_layout = next((lay for lay in prs.slide_layouts if lay.name == blank_name), None) if blank_name else None
+    if blank_layout is not None:
+        b = prs.slides.add_slide(blank_layout)
+        for ph in list(b.placeholders):
+            if ph.placeholder_format.type in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT, PP_PLACEHOLDER.SUBTITLE):
+                _remove(ph)
+    src = os.path.join(d, "bg.pptx")
+    prs.save(src)
+    try:
+        if to_pdf is not None:
+            to_pdf(src, d)          # the server's own LibreOffice runner (its profile, its time limit)
+        else:
+            _subprocess.run(["soffice", "--headless", "--norestore", "--convert-to", "pdf", "--outdir", d, src],
+                            capture_output=True, timeout=170, env=dict(os.environ, HOME=d))
+        pdf = os.path.join(d, "bg.pdf")
+        if not os.path.exists(pdf):
+            return None
+        _subprocess.run(["pdftoppm", "-r", "96", "-jpeg", "-jpegopt", "quality=74", pdf, os.path.join(d, "p")], capture_output=True, timeout=120)
+    except Exception:
+        return None
+    pages = sorted(_glob.glob(os.path.join(d, "p-*.jpg")), key=lambda p: int(re.findall(r"(\d+)\.jpg$", p)[0]))
+    out = []
+    for p in pages:
+        with open(p, "rb") as fh:
+            out.append("data:image/jpeg;base64," + base64.b64encode(fh.read()).decode("ascii"))
+    return out
+
+
+def _o_content_layout(prs):
+    """The deck's own layout for a new slide: the one most of its slides with a title and text use."""
+    counts = {}
+    for s in prs.slides:
+        lay = s.slide_layout
+        kinds = {ph.placeholder_format.type for ph in lay.placeholders}
+        if (PP_PLACEHOLDER.TITLE in kinds) and (PP_PLACEHOLDER.BODY in kinds or PP_PLACEHOLDER.OBJECT in kinds):
+            counts[id(lay)] = (counts.get(id(lay), (0, lay))[0] + 1, lay)
+    if counts:
+        return max(counts.values(), key=lambda v: v[0])[1]
+    for lay in prs.slide_layouts:
+        kinds = {ph.placeholder_format.type for ph in lay.placeholders}
+        if PP_PLACEHOLDER.TITLE in kinds and (PP_PLACEHOLDER.BODY in kinds or PP_PLACEHOLDER.OBJECT in kinds):
+            return lay
+    return prs.slide_layouts[0] if len(prs.slide_layouts) else None
+
+
+def _o_layout_boxes(layout, prs, th):
+    t = b = None
+    for ph in layout.placeholders:
+        k = ph.placeholder_format.type
+        if k in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE) and t is None:
+            t = _o_box(ph, prs, th, "title")
+        elif k in (PP_PLACEHOLDER.BODY, PP_PLACEHOLDER.OBJECT) and ph.placeholder_format.idx == 1 and b is None:
+            b = _o_box(ph, prs, th, "body")
+    return t, b
+
+
+def parse_pptx_original(path, work_dir, to_pdf=None):
+    try:
+        prs = Presentation(path)
+    except Exception:
+        raise StudioError("That PowerPoint file couldn't be opened — it may be damaged or password-protected.")
+    th = _o_theme(prs)
+    emu = 914400.0
+    out = {"w": round(prs.slide_width / emu, 3), "h": round(prs.slide_height / emu, 3), "slides": []}
+    clear = {}
+    for i, s in enumerate(list(prs.slides)[:ORIG_MAX_SLIDES]):
+        title, body = _o_pick(s, prs, i == 0)
+        info = {"i": i}
+        ids = set()
+        if title is not None:
+            info["t"] = _o_box(title, prs, th, "title")
+            info["t0"] = re.sub(r"\s+", " ", title.text_frame.text.replace("\v", " ")).strip()[:200]
+            ids.add(title.shape_id)
+        if body is not None:
+            kind = "body" if getattr(body, "is_placeholder", False) else "other"
+            info["b"] = _o_box(body, prs, th, kind)
+            info["b0"] = _paragraph_bullets(body.text_frame)[:40]
+            ids.add(body.shape_id)
+        num = _o_number(s, prs, th)
+        if num:
+            info["n"] = num
+            ids.add(num["id"])
+        if s.has_notes_slide:
+            info["notes0"] = s.notes_slide.notes_text_frame.text.strip()[:4000]
+        info["hidden0"] = s._element.get("show") == "0"
+        info["tr0"] = _transition_of(s) or ""
+        clear[i] = ids
+        out["slides"].append(info)
+    lay = _o_content_layout(prs)
+    if lay is not None:
+        t, b = _o_layout_boxes(lay, prs, th)
+        out["blank"] = {"t": t, "b": b, "layout": lay.name}
+    pics = _o_render(path, work_dir, clear, lay.name if lay is not None else None, to_pdf)
+    if not pics or len(pics) < len(out["slides"]):
+        return None
+    for k, info in enumerate(out["slides"]):
+        info["bg"] = pics[k]
+    if "blank" in out and len(pics) > len(out["slides"]):
+        out["blank"]["bg"] = pics[len(out["slides"])]
+    return out
+
+
+# ---------------------------------------------------------------- writing the changes back
+def _o_find(slide, sid):
+    for sh in _flat_shapes(slide.shapes):
+        if sh.shape_id == sid:
+            return sh
+    return None
+
+
+def _o_dup(prs, src):
+    """A real copy of a slide: its shapes, pictures, background, transition and animations."""
+    new = prs.slides.add_slide(src.slide_layout)
+    for sh in list(new.shapes):
+        _remove(sh)
+    rid = {}
+    for k, rel in list(src.part.rels.items()):
+        if rel.reltype in (RT.SLIDE_LAYOUT, RT.NOTES_SLIDE):
+            continue
+        try:
+            rid[k] = new.part.relate_to(rel.target_ref if rel.is_external else rel.target_part, rel.reltype, is_external=rel.is_external)
+        except Exception:
+            continue
+    tree = new.shapes._spTree
+    for el in src.shapes._spTree.iterchildren():
+        if el.tag in (qn("p:nvGrpSpPr"), qn("p:grpSpPr")):
+            continue
+        cp = copy.deepcopy(el)
+        for node in cp.iter():
+            for attr in list(node.attrib):
+                if attr.startswith(_RNS) and node.get(attr) in rid:
+                    node.set(attr, rid[node.get(attr)])
+        tree.append(cp)
+    csld_src, csld_new = src._element.find(qn("p:cSld")), new._element.find(qn("p:cSld"))
+    bg = csld_src.find(qn("p:bg"))
+    if bg is not None:
+        old = csld_new.find(qn("p:bg"))
+        if old is not None:
+            csld_new.remove(old)
+        csld_new.insert(0, copy.deepcopy(bg))
+    for tag in ("p:transition", "p:timing"):
+        el = src._element.find(qn(tag))
+        if el is not None:
+            new._element.append(copy.deepcopy(el))
+    return new
+
+
+def _o_set_title(sh, text):
+    """New words in a title, in the title's own paragraph and run style."""
+    tb = sh._element.find(".//" + qn("p:txBody"))
+    ps = tb.findall(qn("a:p"))
+    ppr = rpr = None
+    if ps:
+        ppr = ps[0].find(qn("a:pPr"))
+        r = ps[0].find(qn("a:r"))
+        rpr = r.find(qn("a:rPr")) if r is not None else ps[0].find(qn("a:endParaRPr"))
+    for p in ps:
+        tb.remove(p)
+    p = etree.SubElement(tb, qn("a:p"))
+    if ppr is not None:
+        p.append(copy.deepcopy(ppr))
+    if text:
+        r = etree.SubElement(p, qn("a:r"))
+        if rpr is not None:
+            rr = copy.deepcopy(rpr)
+            rr.tag = qn("a:rPr")
+            r.append(rr)
+        etree.SubElement(r, qn("a:t")).text = text
+
+
+def _o_level_styles(sh):
+    """Each level's first paragraph style and run style in a text shape: {level: (pPr, rPr)}."""
+    tpl = {}
+    tb = sh._element.find(".//" + qn("p:txBody")) if sh is not None else None
+    for p in (tb.findall(qn("a:p")) if tb is not None else []):
+        ppr = p.find(qn("a:pPr"))
+        lv = int(ppr.get("lvl", "0")) if ppr is not None else 0
+        r = p.find(qn("a:r"))
+        if lv not in tpl and r is not None:
+            tpl[lv] = (ppr, r.find(qn("a:rPr")))
+    return tpl
+
+
+def _o_set_points(sh, bullets, fallback=None):
+    """New points in a text shape, each level in that level's own paragraph and run style
+    (a new slide borrows them from the deck's own slides)."""
+    tb = sh._element.find(".//" + qn("p:txBody"))
+    ps = tb.findall(qn("a:p"))
+    tpl = _o_level_styles(sh) or dict(fallback or {})
+    if not tpl and ps:
+        ppr = ps[0].find(qn("a:pPr"))
+        tpl[0] = (ppr, ps[0].find(qn("a:endParaRPr")))
+    for p in ps:
+        tb.remove(p)
+    for b in bullets or [{"text": "", "level": 0}]:
+        lv = max(0, min(int(b.get("level", 0) or 0), 4))
+        base = tpl.get(lv) or tpl.get(min(tpl, key=lambda k: abs(k - lv))) if tpl else (None, None)
+        ppr, rpr = base if base else (None, None)
+        p = etree.SubElement(tb, qn("a:p"))
+        pp = copy.deepcopy(ppr) if ppr is not None else etree.Element(qn("a:pPr"))
+        if lv:
+            pp.set("lvl", str(lv))
+        elif "lvl" in pp.attrib:
+            del pp.attrib["lvl"]
+        p.append(pp)
+        for words, flags in _fmt_segments(str(b.get("text") or ""), b.get("fmt")):
+            r = etree.SubElement(p, qn("a:r"))
+            rr = copy.deepcopy(rpr) if rpr is not None else etree.Element(qn("a:rPr"))
+            rr.tag = qn("a:rPr")
+            if "b" in flags:
+                rr.set("b", "1")
+            if "i" in flags:
+                rr.set("i", "1")
+            if "u" in flags:
+                rr.set("u", "sng")
+            if "s" in flags:
+                rr.set("strike", "sngStrike")
+            if "p" in flags:
+                rr.set("baseline", "30000")
+            elif "d" in flags:
+                rr.set("baseline", "-25000")
+            r.append(rr)
+            etree.SubElement(r, qn("a:t")).text = words
+
+
+def _o_textbox(slide, box, text_or_points, title):
+    """Words where the original slide had none: a text box where the deck's layout puts them."""
+    if not box:
+        return
+    tb = slide.shapes.add_textbox(Inches(box["x"]), Inches(box["y"]), Inches(box["w"]), Inches(box["h"]))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    lv0 = (box.get("lv") or [{}])[0]
+    items = [{"text": text_or_points, "level": 0}] if title else text_or_points
+    for k, b in enumerate(items):
+        p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
+        p.level = max(0, min(int(b.get("level", 0) or 0), 4))
+        st = (box.get("lv") or [{}])[min(p.level, len(box.get("lv") or [{}]) - 1)] or lv0
+        r = p.add_run()
+        r.text = str(b.get("text") or "")
+        if st.get("sz"):
+            r.font.size = Pt(st["sz"])
+        if st.get("font"):
+            r.font.name = st["font"]
+        if st.get("color"):
+            r.font.color.rgb = RGBColor.from_string(st["color"])
+
+
+def _o_norm(points):
+    return [(str(b.get("text") or "").strip(), int(b.get("level", 0) or 0), json_dumps_sorted(b.get("fmt") or [])) for b in points or [] if str(b.get("text") or "").strip()]
+
+
+def json_dumps_sorted(v):
+    import json as _json
+    return _json.dumps(v, sort_keys=True)
+
+
+def build_original_deck(deck, original_path, out_dir, filename="Presentation.pptx"):
+    try:
+        prs = Presentation(original_path)
+    except Exception:
+        raise StudioError("The original PowerPoint couldn't be opened again — choose a design under Design and export.")
+    originals = list(prs.slides)
+    lst = prs.slides._sldIdLst
+    first_ids = list(lst)
+    layout = _o_content_layout(prs)
+    # a new slide's points look like the deck's own: borrowed from its first slide on that layout
+    borrowed = {}
+    for s0 in originals:
+        if layout is not None and s0.slide_layout.name == layout.name:
+            ph = next((p for p in s0.placeholders if p.placeholder_format.idx == 1 and p.has_text_frame and p.text_frame.text.strip()), None)
+            if ph is not None:
+                borrowed = _o_level_styles(ph)
+                break
+    entries = [(True, deck.get("title_slide") or {})] + [(False, sd) for sd in (deck.get("slides") or [])[:MAX_SLIDES] if isinstance(sd, dict)]
+    used, order = set(), []
+    for cover, sd in entries:
+        o = sd.get("orig") if isinstance(sd.get("orig"), dict) else {}
+        i = o.get("i")
+        fresh = False
+        if isinstance(i, int) and 0 <= i < len(originals):
+            if i in used:
+                slide, fresh = _o_dup(prs, originals[i]), True
+            else:
+                slide = originals[i]
+                used.add(i)
+        else:
+            if layout is None:
+                continue
+            slide, fresh = prs.slides.add_slide(layout), True
+            o = {}
+        title = str((sd.get("main") if cover else sd.get("title")) or "").strip()[:200]
+        if cover:
+            points = [{"text": l.strip(), "level": 0} for l in str(sd.get("sub") or "").split("\n") if l.strip()]
+        else:
+            points = _clean_bullets(sd.get("bullets"))
+        # title
+        if o.get("t"):
+            if title != (o.get("t0") or "") or fresh:
+                sh = _o_find(slide, o["t"]["id"])
+                if sh is not None and getattr(sh, "has_text_frame", False):
+                    if title != (o.get("t0") or ""):
+                        _o_set_title(sh, title)
+        elif title:
+            if fresh and not o:
+                ph = slide.shapes.title
+                if ph is not None:
+                    ph.text_frame.text = title
+            else:
+                _o_textbox(slide, ((deck.get("original") or {}).get("blank") or {}).get("t"), title, True)
+        # main text
+        if o.get("b"):
+            if _o_norm(points) != _o_norm(o.get("b0")):
+                sh = _o_find(slide, o["b"]["id"])
+                if sh is not None and getattr(sh, "has_text_frame", False):
+                    _o_set_points(sh, points)
+                    if o["b"].get("fit"):
+                        _o_set_fontscale(sh, _o_fit_scale(points, o["b"]))
+        elif points:
+            if fresh and not o:
+                ph = next((p for p in slide.placeholders if p.placeholder_format.idx == 1 and p.has_text_frame), None)
+                if ph is not None:
+                    _o_set_points(ph, points, borrowed)
+                else:
+                    _o_textbox(slide, ((deck.get("original") or {}).get("blank") or {}).get("b"), points, False)
+            else:
+                _o_textbox(slide, ((deck.get("original") or {}).get("blank") or {}).get("b"), points, False)
+        # a picture added in the editor: the right two-thirds of the text area
+        media = sd.get("media") if isinstance(sd.get("media"), dict) else None
+        if not cover and media and media.get("type") == "image":
+            box = (o.get("b") or ((deck.get("original") or {}).get("blank") or {}).get("b"))
+            if box:
+                x, y, w, h = box["x"], box["y"], box["w"], box["h"]
+                _add_media(slide, media, (Inches(x + w / 3), Inches(y), Inches(w * 2 / 3), Inches(h)))
+                sh = _o_find(slide, box["id"]) if o.get("b") else None
+                if sh is not None:
+                    sh.width = Inches(max(1.0, w / 3 - 0.15))
+        # notes, hidden, transition
+        notes = str(sd.get("notes") or "").strip()
+        if notes != (o.get("notes0") or "") and (notes or slide.has_notes_slide):
+            slide.notes_slide.notes_text_frame.text = notes[:4000]
+        if bool(sd.get("hidden")) != bool(o.get("hidden0")):
+            if sd.get("hidden"):
+                slide._element.set("show", "0")
+            elif "show" in slide._element.attrib:
+                del slide._element.attrib["show"]
+        tr = sd.get("transition") or ""
+        if tr != (o.get("tr0") or "") and (tr in TRANSITIONS or tr in ("", "none")):
+            _set_transition(slide, tr or "none")
+        order.append(slide)
+    # the deck's order; slides it doesn't use are dropped
+    by_id = {sid.get("id"): sid for sid in lst}
+    wanted = [by_id.get(str(s.slide_id)) for s in order]
+    keep = set(id(e) for e in wanted if e is not None)
+    for sid in list(lst):
+        lst.remove(sid)
+        if id(sid) not in keep:
+            try:
+                prs.part.drop_rel(sid.get(qn("r:id")))
+            except Exception:
+                pass
+    for e in wanted:
+        if e is not None:
+            lst.append(e)
+    if not len(lst):
+        raise StudioError("There are no slides to export.")
+    name = re.sub(r'[\\/:*?"<>|]+', "", str(filename or "Presentation.pptx")).strip() or "Presentation.pptx"
+    if not name.lower().endswith(".pptx"):
+        name += ".pptx"
+    out = os.path.join(out_dir, name)
+    prs.save(out)
+    return out
+
+
+# ------------------------------------------------ 3.0: Plain White (Remy's decks)
+_PLAIN = {"style": "modern", "name": "Plain White", "cover": "plain", "chrome": "plain", "media": "large", "plain": True,
+          "ink": "000000", "ink2": "000000", "accent": "000000", "emph": "000000", "soft": "404040",
+          "bg": "FFFFFF", "text": "000000", "muted": "404040"}
+TEMPLATES["student-plain"] = dict(_PLAIN, group="student")
+TEMPLATES["tutor-plain"] = dict(_PLAIN, group="tutor")
