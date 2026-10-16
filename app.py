@@ -286,6 +286,7 @@ STORE_PRODUCT_TO_PLAN = {
     "com.docente.app.payperuse": "payperuse",
     "com.docente.app.pass30": "payperuse",
     "com.docente.app.pro.monthly": "monthly",
+    "com.docente.app.pro.halfyear": "halfyear",   # 3.2: 6 months (both stores offer a 6-month period)
     "com.docente.app.pro.yearly": "yearly",
     # Earlier placeholder ids, still accepted.
     "com.docently.app.payperuse": "payperuse",
@@ -293,6 +294,13 @@ STORE_PRODUCT_TO_PLAN = {
     "com.docently.app.yearly": "yearly",
 }
 PASS_DAYS = 30   # kept for any account on the earlier 30-day pass
+# 3.2: Pro is 1 month or 6 months ('halfyear'). 'yearly' is no longer sold, but one bought earlier still counts.
+PRO_PLANS = ("monthly", "halfyear", "yearly")
+_PRO_SQL = "('monthly', 'halfyear', 'yearly')"
+# What Pro adds beyond Free (none of Free's own allowances change).
+REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Remy reads (~8 / ~25 pages)
+REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
+DECK_CONTENT_FREE, DECK_CONTENT_PRO = 14, 22         # content slides in a deck Remy drafts
 PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: Remy messages that never expire
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
@@ -506,12 +514,12 @@ def _memory_on(user_row):
 
 def _owns_store_plan(user_id):
     """Whether this account holds a verified App Store / Google Play
-    subscription (Monthly or Yearly)."""
+    subscription (any length of Pro)."""
     try:
         conn = get_db()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT 1 AS ok FROM store_purchases WHERE user_id = %s AND product IN ('monthly', 'yearly') LIMIT 1", (user_id,))
+                cur.execute("SELECT 1 AS ok FROM store_purchases WHERE user_id = %s AND product IN " + _PRO_SQL + " LIMIT 1", (user_id,))
                 return cur.fetchone() is not None
         finally:
             conn.close()
@@ -523,7 +531,7 @@ def _unpaid_plan(row):
     """True for a Monthly or Yearly plan that has no end date (so it isn't a
     Paystack pass or a dated store plan) and no verified store purchase on
     record — Pro that was never paid for."""
-    if row.get("plan") not in ("monthly", "yearly") or row.get("plan_expires_at"):
+    if row.get("plan") not in PRO_PLANS or row.get("plan_expires_at"):
         return False
     return not _owns_store_plan(row["id"])
 
@@ -1167,7 +1175,7 @@ def auth_required(fn):
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan IN ('monthly', 'yearly') AND plan_expires_at IS NULL", (user_id,))
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan IN " + _PRO_SQL + " AND plan_expires_at IS NULL", (user_id,))
                 conn.commit()
                 logger.warning(f"Removed a Monthly/Yearly plan with no payment behind it from user {user_id}")
             except Exception as e:
@@ -1209,7 +1217,27 @@ def auth_required(fn):
 _UNCONFIRMED_OK = {"me", "verify_email", "resend_code", "change_email", "delete_account_endpoint", "update_profile"}
 
 
-def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None):
+# 3.2: what each AI call used, logged as counts with an estimated cost (USD per million tokens; web search per
+# search) so the real cost of a Remy answer can be checked — never anyone's words or account.
+_AI_RATES = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (2.0, 10.0)}
+_AI_SEARCH_COST = 0.01
+
+
+def _log_ai_use(model, usage, feature):
+    try:
+        u = usage or {}
+        cin, cout = _AI_RATES.get(model, (5.0, 25.0))
+        tin, tout = int(u.get("input_tokens") or 0), int(u.get("output_tokens") or 0)
+        cw, cr = int(u.get("cache_creation_input_tokens") or 0), int(u.get("cache_read_input_tokens") or 0)
+        searches = int((u.get("server_tool_use") or {}).get("web_search_requests") or 0)
+        cost = (tin * cin + cw * cin * 1.25 + cr * cin * 0.1 + tout * cout) / 1e6 + searches * _AI_SEARCH_COST
+        logger.info(f"AI use: {feature or '-'} {model} in={tin} cache_w={cw} cache_r={cr} out={tout} searches={searches} cost~${cost:.4f}")
+    except Exception:
+        pass
+
+
+def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None,
+                timeout=None, feature=None):
     """messages, when given, is sent to the API exactly as the native
     multi-turn conversation it already is (alternating user/assistant
     turns) — the correct way to give Claude real conversational
@@ -1238,7 +1266,7 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
                 "content-type": "application/json",
             },
             json=payload,
-            timeout=140 if use_search else 110,
+            timeout=timeout or (140 if use_search else 110),
         )
     except requests.exceptions.Timeout:
         raise ConversionError("AI request timed out — try again, or try a narrower topic")
@@ -1247,6 +1275,7 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     if resp.status_code != 200:
         raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
     data = resp.json()
+    _log_ai_use(payload["model"], data.get("usage"), feature)
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     if return_meta:
         sources, queries = _search_trail(data.get("content") or [])
@@ -2979,7 +3008,7 @@ def plan_upgrade():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            if transaction_key and plan in ("monthly", "yearly"):
+            if transaction_key and plan in PRO_PLANS:
                 # One purchase, one account: if another account held this
                 # subscription, it moves here and leaves that account.
                 cur.execute("SELECT user_id, product FROM store_purchases WHERE transaction_key = %s", (transaction_key,))
@@ -3007,7 +3036,7 @@ def plan_upgrade():
                 cur.execute("UPDATE users SET plan = %s, plan_expires_at = %s, plan_source = 'store' WHERE id = %s RETURNING *",
                             (plan, plan_until, request.current_user["id"]))
             row = cur.fetchone()
-            if transaction_key and plan in ("monthly", "yearly"):
+            if transaction_key and plan in PRO_PLANS:
                 # Which account owns this subscription: the stores' renewal,
                 # cancellation and refund notices find the account by it.
                 cur.execute(
@@ -3016,7 +3045,7 @@ def plan_upgrade():
                     (transaction_key, request.current_user["id"], plan),
                 )
 
-            if plan in ("monthly", "yearly") and _reward_referral(cur, row["id"], referral_code):
+            if plan in PRO_PLANS and _reward_referral(cur, row["id"], referral_code):
                 cur.execute("SELECT * FROM users WHERE id = %s", (row["id"],))
                 row = cur.fetchone()
                 bonus_applied = True
@@ -3039,9 +3068,11 @@ PAYSTACK_API = "https://api.paystack.co"
 PAYSTACK_PLANS = {
     # plan: (price in pesewas, days of Pro, Remy messages added)
     "monthly": (10000, 30, 0),
-    "yearly": (30000, 365, 0),
-    "payperuse": (3000, 0, 30),
+    "halfyear": (40000, 182, 0),   # 3.2: 6 months — a whole semester, for about the price of 4 months
+    "payperuse": (3000, 0, 30),    # the Remy Pack
+    "yearly": (30000, 365, 0),     # no longer sold (see PAYSTACK_ON_SALE); kept so an older payment still applies
 }
+PAYSTACK_ON_SALE = ("halfyear", "monthly", "payperuse")
 
 
 def _paystack_on():
@@ -3092,7 +3123,7 @@ def _paystack_apply(reference, paid_amount, currency):
                 cur.execute(
                     "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), plan_source = 'paystack' WHERE id = %s",
                     (pay["plan"], start, days, pay["user_id"]))
-                if pay["plan"] in ("monthly", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
+                if pay["plan"] in PRO_PLANS and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
                     cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
             if credits:
                 cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
@@ -3112,7 +3143,7 @@ def paystack_config():
         "enabled": _paystack_on(), "public_key": PAYSTACK_PUBLIC_KEY if _paystack_on() else None, "currency": "GHS",
         # live or test keys — never the key itself — so the setup can be checked at a glance
         "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test") if _paystack_on() else None,
-        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2]} for k, v in PAYSTACK_PLANS.items()},
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2]} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
     })
 
 
@@ -3125,10 +3156,10 @@ def paystack_initialize():
     if _from_store_app():
         return jsonify({"error": "In the Docente app, Pro is bought through the App Store or Google Play."}), 403
     plan = str((request.get_json(silent=True) or {}).get("plan") or "")
-    if plan not in PAYSTACK_PLANS:
-        return jsonify({"error": "Choose Monthly, Yearly or Pay-per-Use."}), 400
+    if plan not in PAYSTACK_ON_SALE:
+        return jsonify({"error": "Choose 6 months or 1 month of Pro, or a Remy Pack."}), 400
     user = request.current_user
-    if plan in ("monthly", "yearly") and user.get("plan") in ("monthly", "yearly") and _owns_store_plan(user["id"]):
+    if plan in PRO_PLANS and user.get("plan") in PRO_PLANS and _owns_store_plan(user["id"]):
         return jsonify({"error": "You already have Pro through the App Store or Google Play — manage it there."}), 409
     friend_code = _clean_code((request.get_json(silent=True) or {}).get("referral_code"))
     amount = PAYSTACK_PLANS[plan][0]
@@ -3136,7 +3167,7 @@ def paystack_initialize():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            if friend_code and plan in ("monthly", "yearly"):
+            if friend_code and plan in PRO_PLANS:
                 if not _find_referrer(cur, friend_code, user["id"]):
                     return jsonify({"error": "That referral code wasn't found (or it's your own) — check it, or leave it empty.", "field": "referral"}), 400
             cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code) VALUES (%s, %s, %s, %s, %s)",
@@ -3711,11 +3742,11 @@ def _log_sage_message_and_consume(user_row):
                     if row["plan"] == "free":
                         raise ConversionError(
                             f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
-                            f"Get Pro for {SAGE_PAID_MESSAGES_LIMIT} a month, or Pay-per-Use for {PAYPERUSE_MESSAGES} more."
+                            f"Get Pro for {SAGE_PAID_MESSAGES_LIMIT} a month, or a Remy Pack for {PAYPERUSE_MESSAGES} more."
                         )
                     raise ConversionError(
                         f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
-                        f"account. It resets next month — or Pay-per-Use adds {PAYPERUSE_MESSAGES} more now."
+                        f"account. It resets next month — or a Remy Pack adds {PAYPERUSE_MESSAGES} more now."
                     )
             if source == "allowance":
                 cur.execute(
@@ -4218,7 +4249,7 @@ def images_to_pdf_endpoint():
 
 
 def _is_pro(user):
-    return (user or {}).get("plan") in ("monthly", "yearly")
+    return (user or {}).get("plan") in PRO_PLANS
 
 
 @app.route("/api/pdf/apply", methods=["POST", "OPTIONS"])
@@ -4449,9 +4480,11 @@ def extract_text_endpoint():
         src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
         file.save(src_path)
         text = extract_text(src_path, ext)
-        if len(text) > 20000:
-            text = text[:20000]
-        return jsonify({"text": text, "filename": safe_download_name(file.filename)})
+        cap = REMY_ATTACH_PRO if (request.form.get("limit") == str(REMY_ATTACH_PRO) and _is_pro(request.current_user)) else REMY_ATTACH_FREE
+        cut = len(text) > cap
+        if cut:
+            text = text[:cap]
+        return jsonify({"text": text, "filename": safe_download_name(file.filename), "cut": cut, "limit": cap})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
@@ -4810,8 +4843,9 @@ def sage_endpoint():
         return jsonify({"error": "That's too long for one message (20,000 character limit)"}), 400
 
     attachment = (data.get("attachment") or "").strip()
-    if len(attachment) > 20000:
-        return jsonify({"error": "That attached document is too long (20,000 character limit)"}), 400
+    att_max = REMY_ATTACH_PRO if _is_pro(request.current_user) else REMY_ATTACH_FREE
+    if len(attachment) > att_max:
+        return jsonify({"error": f"That attached document is too long ({att_max:,} character limit)"}), 400
 
     # Real multi-turn history, capped the same way /api/write already
     # caps its own — bounded so a very long-running conversation can't
@@ -4858,7 +4892,7 @@ def sage_endpoint():
     papers = []
     if not attachment and _remy_wants_papers(message):
         try:
-            papers, _ = paper_topic_search(message, max_results=6)
+            papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
         except Exception as e:
             logger.warning(f"Remy's paper search failed: {e}")
             papers = []
@@ -4872,6 +4906,7 @@ def sage_endpoint():
             use_search=True,
             model=ANTHROPIC_MODEL_STRONG,
             return_meta=True,
+            feature="remy",
         )
         result = meta["text"]
     except Exception as e:
@@ -6376,7 +6411,7 @@ def _chart_from_paper(spec, sources):
     return {"type": "chart", "chart_type": kind, "categories": cats, "series": series, "title": str(spec.get("title") or "")[:80]}
 
 
-def _parse_full_deck(raw, group, sources, style="apa"):
+def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
     """The AI's deck as Slide Studio's deck: points checked against the papers, more than 5 points
     split onto a second slide, drawings drawn, charts kept only with real numbers, a References
     slide for the papers cited, and the closing slide."""
@@ -6410,7 +6445,8 @@ def _parse_full_deck(raw, group, sources, style="apa"):
         return [b for b in points if b["text"].strip()]
 
     slides = []
-    for sd in (data.get("slides") or [])[:_DECK_MAX + 4]:
+    deck_max = deck_max or _DECK_MAX
+    for sd in (data.get("slides") or [])[:deck_max + 4]:
         if not isinstance(sd, dict):
             continue
         kind = sd.get("kind") if sd.get("kind") in ("content", "columns", "section") else "content"
@@ -6442,7 +6478,7 @@ def _parse_full_deck(raw, group, sources, style="apa"):
                 s["media"] = media
                 s["media_position"] = "right" if chunk else "full"
             slides.append(s)
-    body = slides[:_DECK_MAX]
+    body = slides[:deck_max]
     if not any(s["kind"] != "section" for s in body):
         raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
     refs = build_references_list(sources, cited) if sources else []
@@ -6477,6 +6513,8 @@ def slides_draft_endpoint():
     topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
     if not topic:
         return jsonify({"error": "Tell Remy what the deck is about first."}), 400
+    pro = _is_pro(request.current_user)
+    content_max = DECK_CONTENT_PRO if pro else DECK_CONTENT_FREE   # room for 2 section dividers on top
     # Evidence first: real papers for the topic, and the request's own wishes (drawings, charts).
     try:
         papers, _ = paper_topic_search(topic, max_results=6)
@@ -6486,7 +6524,7 @@ def slides_draft_endpoint():
     sources = enrich_sources(papers, "apa") if papers else []
     system = _DECK_SYSTEM.format(
         group="tutor preparing a lecture" if group == "tutor" else "student preparing a presentation or report",
-        title_fields=_DRAFT_TITLE_FIELDS[group] + _DECK_ORDER_FIELDS[group], min_slides=8, max_slides=_DECK_MAX - 2,
+        title_fields=_DRAFT_TITLE_FIELDS[group] + _DECK_ORDER_FIELDS[group], min_slides=8, max_slides=content_max,
     )
     if sources:
         system += _DECK_EVIDENCE.format(example=sources[0]["citation_key"], papers="\n".join(
@@ -6506,8 +6544,8 @@ def slides_draft_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 429
     try:
-        raw = call_claude(system, f"Request: {topic}", max_tokens=9000)
-        deck, refs = _parse_full_deck(raw, group, sources)
+        raw = call_claude(system, f"Request: {topic}", max_tokens=12000 if pro else 9000, timeout=150 if pro else None, feature="deck")
+        deck, refs = _parse_full_deck(raw, group, sources, deck_max=content_max + 2)
         # named after the deck's own title — never the request
         ts = deck["title_slide"]
         name = (ts.get("main") or ts.get("subtitle") or ts.get("course") or _topic_title(topic) or "").strip()
