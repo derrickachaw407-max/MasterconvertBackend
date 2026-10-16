@@ -6250,6 +6250,2095 @@ def docx_to_xlsx(src_path, out_dir):
     return out_path
 
 
+
+# ======================================================================== 3.1: the PDF editor
+import logging
+_PDFED_MAX_PAGES = 500
+_PDFED_MAX_ITEMS = 4000
+_PDFED_OCR_PAGES = 12
+_PDFED_RASTER_PAGES = 40
+_PDFED_FONT_FILES = {
+    # regular, bold, italic, bold italic — metric twins of the fonts most documents use
+    "calibri": ("Carlito-Regular.ttf", "Carlito-Bold.ttf", "Carlito-Italic.ttf", "Carlito-BoldItalic.ttf"),
+    "cambria": ("Caladea-Regular.ttf", "Caladea-Bold.ttf", "Caladea-Italic.ttf", "Caladea-BoldItalic.ttf"),
+    "sans": ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf", "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"),
+    "serif": ("LiberationSerif-Regular.ttf", "LiberationSerif-Bold.ttf", "LiberationSerif-Italic.ttf", "LiberationSerif-BoldItalic.ttf"),
+    "mono": ("LiberationMono-Regular.ttf", "LiberationMono-Bold.ttf", "LiberationMono-Italic.ttf", "LiberationMono-BoldItalic.ttf"),
+    "dejavu": ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+}
+_PDFED_FONT_DIRS = ("/usr/share/fonts/truetype/crosextra", "/usr/share/fonts/truetype/liberation",
+                    "/usr/share/fonts/truetype/liberation2", "/usr/share/fonts/truetype/dejavu")
+_PDFED_BUILTIN = {"sans": ("Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique"),
+                  "serif": ("Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic"),
+                  "mono": ("Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique")}
+_pdfed_fonts = {}
+_pdfed_font_paths = {}
+
+
+def _pdfed_num(v, lo=-1e6, hi=1e6, default=0.0):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if f != f or f in (float("inf"), float("-inf")):
+        return default
+    return max(lo, min(hi, f))
+
+
+def _pdfed_rect(r):
+    """[x0, y0, x1, y1] in page points, in order; None unless four numbers."""
+    if not isinstance(r, (list, tuple)) or len(r) != 4:
+        return None
+    a = [_pdfed_num(v) for v in r]
+    x0, x1 = sorted((a[0], a[2]))
+    y0, y1 = sorted((a[1], a[3]))
+    return [x0, y0, x1, y1]
+
+
+def _pdfed_rgb(h, default=(0, 0, 0)):
+    h = str(h or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+        return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return default
+
+
+def _pdfed_family(name):
+    """The kind of font a PDF font name is (or a hint the editor sends): calibri, cambria, serif, mono, sans."""
+    n = str(name or "").lower().split("+", 1)[-1]
+    if "calibri" in n or "carlito" in n:
+        return "calibri"
+    if "cambria" in n or "caladea" in n:
+        return "cambria"
+    if any(k in n for k in ("courier", "mono", "consol", "menlo", "code")):
+        return "mono"
+    if "sans" not in n and any(k in n for k in ("serif", "times", "roman", "georgia", "garamond", "antiqua", "palatino", "minion", "book")):
+        return "serif"
+    return "sans"
+
+
+def _pdfed_font_file(name):
+    if name in _pdfed_font_paths:
+        return _pdfed_font_paths[name]
+    found = None
+    for d in _PDFED_FONT_DIRS:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            found = p
+            break
+    if found is None:
+        for root in ("/usr/share/fonts", "/usr/local/share/fonts"):
+            for dirpath, _dirs, files in os.walk(root):
+                if name in files:
+                    found = os.path.join(dirpath, name)
+                    break
+            if found:
+                break
+    _pdfed_font_paths[name] = found
+    return found
+
+
+def _pdfed_ttf(family, style):
+    """(reportlab font name, TTFont) for a family and style (0 regular, 1 bold, 2 italic, 3 both); None if missing."""
+    key = (family, style)
+    if key in _pdfed_fonts:
+        return _pdfed_fonts[key]
+    result = None
+    files = _PDFED_FONT_FILES.get(family)
+    if files:
+        path = _pdfed_font_file(files[style]) or _pdfed_font_file(files[0])
+        if path:
+            try:
+                from reportlab.pdfbase import pdfmetrics
+                from reportlab.pdfbase.ttfonts import TTFont
+                name = "Ded-%s-%d" % (family, style)
+                font = TTFont(name, path)
+                pdfmetrics.registerFont(font)
+                result = (name, font)
+            except Exception:
+                result = None
+    _pdfed_fonts[key] = result
+    return result
+
+
+def _pdfed_font(family, text, bold=False, italic=False):
+    """The font to write `text` in: the family asked for when it has every character, else Liberation
+    Sans, else DejaVu (which has almost every alphabet), else the PDF built-ins."""
+    style = (1 if bold else 0) + (2 if italic else 0)
+    chars = {ord(ch) for ch in str(text) if ch not in " \t\r\n"}
+    for fam in dict.fromkeys((family, "sans" if family in ("calibri",) else family, "dejavu")):
+        f = _pdfed_ttf(fam, style)
+        if f and chars <= set(f[1].face.charToGlyph):
+            return f[0]
+    base = {"cambria": "serif", "serif": "serif", "mono": "mono"}.get(family, "sans")
+    return _PDFED_BUILTIN[base][style]
+
+
+def _pdfed_wrap(text, fontname, size, width):
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    out = []
+    for para in str(text).replace("\r\n", "\n").split("\n"):
+        line = ""
+        for word in para.split(" "):
+            trial = (line + " " + word) if line else word
+            if line and stringWidth(trial, fontname, size) > width:
+                out.append(line)
+                line = word
+            else:
+                line = trial
+        out.append(line)
+    return out
+
+
+def _pdfed_draw(c, it, assets, cover_rects):
+    """Draws one item onto the page's overlay canvas."""
+    from reportlab.lib.utils import ImageReader
+    t = it.get("type")
+    r = _pdfed_rect(it.get("rect"))
+    color = _pdfed_rgb(it.get("color"), (0, 0, 0))
+    if t in ("whiteout", "edit") and r:
+        c.saveState()
+        c.setFillColorRGB(*_pdfed_rgb(it.get("bg"), (1, 1, 1)))
+        pad = _pdfed_num(it.get("pad"), 0, 6, 0.8)
+        c.rect(r[0] - pad, r[1] - pad, (r[2] - r[0]) + 2 * pad, (r[3] - r[1]) + 2 * pad, stroke=0, fill=1)
+        c.restoreState()
+    if t == "edit" and r:
+        text = str(it.get("text") or "")[:4000]
+        if text.strip():
+            size = _pdfed_num(it.get("size"), 2, 300, 11)
+            fam = _pdfed_family(it.get("font"))
+            fname = _pdfed_font(fam, text, it.get("bold"), it.get("italic"))
+            x = _pdfed_num(it.get("x"), -1e5, 1e5, r[0])
+            base = _pdfed_num(it.get("baseline"), -1e5, 1e5, r[1] + (r[3] - r[1]) * 0.22)
+            c.setFont(fname, size)
+            c.setFillColorRGB(*color)
+            c.drawString(x, base, text)
+    elif t == "text" and r:
+        text = str(it.get("text") or "")[:8000]
+        if text.strip():
+            size = _pdfed_num(it.get("size"), 2, 300, 14)
+            fam = _pdfed_family(it.get("font") or "sans")
+            fname = _pdfed_font(fam, text, it.get("bold"), it.get("italic"))
+            width = max(r[2] - r[0], size)
+            lines = _pdfed_wrap(text, fname, size, width)
+            leading = size * 1.2
+            y = r[3] - size * 0.95
+            align = it.get("align") or "left"
+            c.setFont(fname, size)
+            c.setFillColorRGB(*color)
+            for line in lines:
+                if align == "center":
+                    c.drawCentredString(r[0] + width / 2, y, line)
+                elif align == "right":
+                    c.drawRightString(r[0] + width, y, line)
+                else:
+                    c.drawString(r[0], y, line)
+                y -= leading
+    elif t in ("image", "replace_image") and r:
+        path = assets.get(str(it.get("file") or ""))
+        if path and os.path.exists(path):
+            try:
+                c.drawImage(ImageReader(path), r[0], r[1], r[2] - r[0], r[3] - r[1], mask="auto")
+            except Exception:
+                pass
+    elif t == "highlight":
+        c.saveState()
+        try:
+            c.setBlendMode("Multiply")
+        except Exception:
+            c.setFillAlpha(0.4)
+        c.setFillColorRGB(*_pdfed_rgb(it.get("color"), (1.0, 0.89, 0.30)))
+        for q in (it.get("rects") or ([r] if r else []))[:500]:
+            q = _pdfed_rect(q)
+            if q:
+                c.rect(q[0], q[1], q[2] - q[0], q[3] - q[1], stroke=0, fill=1)
+        c.restoreState()
+    elif t in ("underline", "strike"):
+        c.saveState()
+        c.setStrokeColorRGB(*color)
+        for q in (it.get("rects") or ([r] if r else []))[:500]:
+            q = _pdfed_rect(q)
+            if not q:
+                continue
+            h = q[3] - q[1]
+            c.setLineWidth(max(0.6, h * 0.07))
+            y = q[1] + h * (0.12 if t == "underline" else 0.42)
+            c.line(q[0], y, q[2], y)
+        c.restoreState()
+    elif t == "ink":
+        c.saveState()
+        c.setStrokeColorRGB(*color)
+        c.setLineWidth(_pdfed_num(it.get("width"), 0.3, 40, 2))
+        c.setLineCap(1)
+        c.setLineJoin(1)
+        for path in (it.get("paths") or [])[:300]:
+            pts = [(_pdfed_num(p[0]), _pdfed_num(p[1])) for p in (path or [])[:4000] if isinstance(p, (list, tuple)) and len(p) == 2]
+            if len(pts) == 1:
+                pts.append((pts[0][0] + 0.01, pts[0][1]))
+            if len(pts) < 2:
+                continue
+            p = c.beginPath()
+            p.moveTo(*pts[0])
+            for q in pts[1:]:
+                p.lineTo(*q)
+            c.drawPath(p, stroke=1, fill=0)
+        c.restoreState()
+    elif t in ("check", "cross", "dot") and r:
+        w, h = r[2] - r[0], r[3] - r[1]
+        c.saveState()
+        c.setStrokeColorRGB(*color)
+        c.setFillColorRGB(*color)
+        c.setLineWidth(max(1.0, min(w, h) * 0.12))
+        c.setLineCap(1)
+        c.setLineJoin(1)
+        if t == "check":
+            p = c.beginPath()
+            p.moveTo(r[0] + w * 0.12, r[1] + h * 0.52)
+            p.lineTo(r[0] + w * 0.40, r[1] + h * 0.20)
+            p.lineTo(r[0] + w * 0.88, r[1] + h * 0.84)
+            c.drawPath(p, stroke=1, fill=0)
+        elif t == "cross":
+            c.line(r[0] + w * 0.18, r[1] + h * 0.18, r[2] - w * 0.18, r[3] - h * 0.18)
+            c.line(r[0] + w * 0.18, r[3] - h * 0.18, r[2] - w * 0.18, r[1] + h * 0.18)
+        else:
+            c.circle(r[0] + w / 2, r[1] + h / 2, min(w, h) * 0.22, stroke=0, fill=1)
+        c.restoreState()
+    elif t == "redact" and r:
+        c.saveState()
+        c.setFillColorRGB(0, 0, 0)
+        c.rect(r[0], r[1], r[2] - r[0], r[3] - r[1], stroke=0, fill=1)
+        c.restoreState()
+    for q in cover_rects:          # pictures that couldn't be taken out: painted over
+        c.saveState()
+        c.setFillColorRGB(1, 1, 1)
+        c.rect(q[0], q[1], q[2] - q[0], q[3] - q[1], stroke=0, fill=1)
+        c.restoreState()
+
+
+_PDFED_TURNABLE = ("text", "image", "replace_image", "check", "cross", "dot")
+
+
+def _pdfed_frame(c, rect, rot):
+    """Turns the canvas so that (0, 0)–(w, h) is `rect` as it's seen on a page turned by `rot`
+    (0, 90, 180 or 270, clockwise, as /Rotate turns it); returns (w, h)."""
+    x0, y0, x1, y1 = rect
+    c.translate(*{0: (x0, y0), 90: (x1, y0), 180: (x1, y1), 270: (x0, y1)}[rot])
+    if rot:
+        c.rotate(rot)
+    return (x1 - x0, y1 - y0) if rot in (0, 180) else (y1 - y0, x1 - x0)
+
+
+def _pdfed_overlay(wpage, items, cover, assets, k, total, numbers, watermark, view_rot=0, box=None):
+    """One page's drawing, as a one-page PDF to lay over it; None when there's nothing to draw.
+    Items added while the page was seen turned carry that turn ("rot") and are drawn upright as seen;
+    page numbers and the watermark go where they're seen on the page as it will be shown (view_rot,
+    and `box`: the page's new crop, if it has one)."""
+    drawn = [it for it in items if it.get("type") not in ("note", "remove_image")]
+    if not drawn and not cover and not numbers and not watermark:
+        return None
+    from reportlab.pdfgen import canvas as rl_canvas
+    mb = wpage.mediabox
+    cb = wpage.cropbox
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(max(float(mb.right), 1.0), max(float(mb.top), 1.0)))
+    if cover:          # pictures that couldn't be taken out are painted over first, under anything new
+        _pdfed_draw(c, {"type": "none"}, assets, cover)
+    for it in drawn:
+        rot = int(_pdfed_num(it.get("rot"), 0, 359, 0)) // 90 * 90
+        r = _pdfed_rect(it.get("rect"))
+        if rot and r and it.get("type") in _PDFED_TURNABLE:
+            c.saveState()
+            w, h = _pdfed_frame(c, r, rot)
+            _pdfed_draw(c, dict(it, rect=[0, 0, w, h]), assets, [])
+            c.restoreState()
+        else:
+            _pdfed_draw(c, it, assets, [])
+    frame = box or [float(cb.left), float(cb.bottom), float(cb.right), float(cb.top)]
+    vr = int(view_rot or 0) // 90 * 90 % 360
+    if watermark:
+        text = str(watermark.get("text") or "")[:120]
+        if text.strip():
+            size = _pdfed_num(watermark.get("size"), 8, 200, 60)
+            fname = _pdfed_font("sans", text, True, False)
+            c.saveState()
+            W, H = _pdfed_frame(c, frame, vr)
+            c.setFillColorRGB(*_pdfed_rgb(watermark.get("color"), (0.5, 0.5, 0.5)))
+            c.setFillAlpha(_pdfed_num(watermark.get("opacity"), 0.05, 1, 0.18))
+            c.translate(W / 2, H / 2)
+            c.rotate(_pdfed_num(watermark.get("angle"), -180, 180, 45))
+            from reportlab.pdfbase.pdfmetrics import stringWidth
+            long_side = 0.8 * (W * W + H * H) ** 0.5          # a long watermark is made to fit across the page
+            wide = stringWidth(text, fname, size)
+            if wide > long_side:
+                size = max(8, size * long_side / wide)
+            c.setFont(fname, size)
+            c.drawCentredString(0, -size / 3, text)
+            c.restoreState()
+    if numbers:
+        n = k + int(_pdfed_num(numbers.get("start"), -9999, 99999, 1))
+        fmt = str(numbers.get("format") or "{n}")[:60]
+        label = fmt.replace("{n}", str(n)).replace("{total}", str(total + int(_pdfed_num(numbers.get("start"), -9999, 99999, 1)) - 1))
+        size = _pdfed_num(numbers.get("size"), 6, 40, 11)
+        pos = str(numbers.get("position") or "bottom-center")
+        fname = _pdfed_font("sans", label)
+        c.saveState()
+        W, H = _pdfed_frame(c, frame, vr)
+        y = 24 if pos.startswith("bottom") else (H - 24 - size * 0.7)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont(fname, size)
+        if pos.endswith("left"):
+            c.drawString(36, y, label)
+        elif pos.endswith("right"):
+            c.drawRightString(W - 36, y, label)
+        else:
+            c.drawCentredString(W / 2, y, label)
+        c.restoreState()
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return pypdf.PdfReader(buf).pages[0]
+
+
+def _pdfed_mult(m, n):
+    a, b, c_, d, e, f = m
+    a2, b2, c2, d2, e2, f2 = n
+    return [a * a2 + b * c2, a * b2 + b * d2, c_ * a2 + d * c2, c_ * b2 + d * d2, e * a2 + f * c2 + e2, e * b2 + f * d2 + f2]
+
+
+def _pdfed_box_of(ctm):
+    pts = [(0, 0), (1, 0), (0, 1), (1, 1)]
+    xs = [ctm[0] * x + ctm[2] * y + ctm[4] for x, y in pts]
+    ys = [ctm[1] * x + ctm[3] * y + ctm[5] for x, y in pts]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _pdfed_overlap(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _pdfed_clean(wpage, image_rects, text_rects, writer):
+    """Takes things out of the page's own content, so they're really gone (not just covered):
+      * pictures: the drawing of each picture found in one of image_rects;
+      * words: every piece of text that starts inside one of text_rects (the lines that were edited
+        — their old words would otherwise still be found by search and copy).
+    Text is followed through the page's text positioning (Tm, Td, TD, T*, TL, ' and "), which is all a
+    start point needs. Returns the image boxes where no picture was found (to be painted over)."""
+    image_rects = [r for r in image_rects if r]
+    text_rects = [[r[0] - 1.5, r[1] - 2.0, r[2] + 1.5, r[3] + 2.0] for r in text_rects if r]
+    if not image_rects and not text_rects:
+        return []
+    try:
+        from pypdf.generic import ContentStream
+        contents = wpage.get_contents()
+        if contents is None:
+            return image_rects
+        cs = ContentStream(contents, writer)
+        res = wpage.get("/Resources")
+        res = res.get_object() if res is not None else {}
+        xobjs = res.get("/XObject") if hasattr(res, "get") else None
+        xobjs = xobjs.get_object() if xobjs is not None else {}
+        ident = [1, 0, 0, 1, 0, 0]
+        ctm, stack, found, keep, changed, dropped = ident[:], [], set(), [], False, set()
+        tm, tlm, leading, rise = ident[:], ident[:], 0.0, 0.0
+
+        def text_start():
+            m = _pdfed_mult(tm, ctm)
+            return m[2] * rise + m[4], m[3] * rise + m[5]
+
+        def in_text_rects(pt):
+            return any(r[0] <= pt[0] <= r[2] and r[1] <= pt[1] <= r[3] for r in text_rects)
+        for operands, op in cs.operations:
+            if op == b"q":
+                stack.append(ctm[:])
+            elif op == b"Q":
+                ctm = stack.pop() if stack else ident[:]
+            elif op == b"cm" and len(operands) == 6:
+                ctm = _pdfed_mult([float(v) for v in operands], ctm)
+            elif op == b"BT":
+                tm, tlm = ident[:], ident[:]
+            elif op == b"Tm" and len(operands) == 6:
+                tm = [float(v) for v in operands]
+                tlm = tm[:]
+            elif op in (b"Td", b"TD") and len(operands) == 2:
+                tx, ty = float(operands[0]), float(operands[1])
+                if op == b"TD":
+                    leading = -ty
+                tlm = _pdfed_mult([1, 0, 0, 1, tx, ty], tlm)
+                tm = tlm[:]
+            elif op == b"TL" and operands:
+                leading = float(operands[0])
+            elif op == b"Ts" and operands:
+                rise = float(operands[0])
+            elif op in (b"T*", b"'", b'"'):
+                tlm = _pdfed_mult([1, 0, 0, 1, 0, -leading], tlm)
+                tm = tlm[:]
+            if text_rects and op in (b"Tj", b"TJ", b"'", b'"') and in_text_rects(text_start()):
+                changed = True
+                if op in (b"'", b'"'):
+                    keep.append(([], b"T*"))      # the move to the next line stays; only the words go
+                continue
+            if image_rects and op in (b"Do", b"INLINE IMAGE"):
+                is_image = op == b"INLINE IMAGE"
+                if op == b"Do" and operands:
+                    xo = xobjs.get(operands[0]) if hasattr(xobjs, "get") else None
+                    xo = xo.get_object() if xo is not None else None
+                    is_image = bool(xo is not None and xo.get("/Subtype") == "/Image")
+                if is_image:
+                    box = _pdfed_box_of(ctm)
+                    hit = next((i for i, r in enumerate(image_rects) if i not in found and _pdfed_overlap(box, r) > 0.6), None)
+                    if hit is not None:
+                        found.add(hit)
+                        changed = True
+                        if op == b"Do":
+                            dropped.add(operands[0])
+                        continue
+            keep.append((operands, op))
+        if changed:
+            cs.operations = keep
+            wpage.replace_contents(cs)
+        # a picture taken out leaves the file too (not only the page's drawing): it's dropped from this
+        # page's own copy of its resources — other pages sharing them keep theirs — and, no longer used
+        # anywhere, it isn't written (see pdf_apply_plan)
+        unused = dropped - {ops[0] for ops, o in keep if o == b"Do" and ops}
+        if unused:
+            from pypdf.generic import DictionaryObject, NameObject
+            new_res = DictionaryObject(dict(res.items()))
+            new_res[NameObject("/XObject")] = DictionaryObject({k: v for k, v in xobjs.items() if k not in unused})
+            wpage[NameObject("/Resources")] = new_res
+            writer._pdfed_dropped = True
+        return [r for i, r in enumerate(image_rects) if i not in found]
+    except Exception:
+        logging.getLogger(__name__).warning("PDF editor: couldn't take something out of a page; painting over it", exc_info=True)
+        return image_rects
+
+
+def _pdfed_note(writer, k, it):
+    from pypdf.annotations import Text
+    from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject, FloatObject, NameObject,
+                               NumberObject, TextStringObject)
+    r = _pdfed_rect(it.get("rect"))
+    if not r:
+        return
+    x, top = r[0], r[3]
+    rgb = _pdfed_rgb(it.get("color"), (1.0, 0.84, 0.25))
+    annot = Text(rect=(x, top - 22, x + 22, top), text=str(it.get("text") or "")[:8000], open=False)
+    annot[NameObject("/C")] = ArrayObject([FloatObject(v) for v in rgb])
+    annot[NameObject("/T")] = TextStringObject(str(it.get("author") or "Note")[:80])
+    annot[NameObject("/Name")] = NameObject("/Comment")
+    annot[NameObject("/F")] = NumberObject(4)
+    ap = DecodedStreamObject()
+    ap.set_data(("q %.3f %.3f %.3f rg 0.15 0.15 0.15 RG 1 w 1 1 20 20 re B "
+                 "0.15 0.15 0.15 RG 1.2 w 5 15 m 17 15 l S 5 11 m 17 11 l S 5 7 m 13 7 l S Q" % rgb).encode("ascii"))
+    ap.update({NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Form"),
+               NameObject("/BBox"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(22), FloatObject(22)])})
+    annot[NameObject("/AP")] = DictionaryObject({NameObject("/N"): writer._add_object(ap)})
+    writer.add_annotation(k, annot)
+
+
+def _pdfed_field_name(annot):
+    parts, node, guard = [], annot, 0
+    while node is not None and guard < 20:
+        t = node.get("/T")
+        if t is not None:
+            parts.append(str(t))
+        parent = node.get("/Parent")
+        node = parent.get_object() if parent is not None else None
+        guard += 1
+    return ".".join(reversed(parts))
+
+
+def _pdfed_field_attr(annot, key):
+    node, guard = annot, 0
+    while node is not None and guard < 20:
+        if key in node:
+            return node[key]
+        parent = node.get("/Parent")
+        node = parent.get_object() if parent is not None else None
+        guard += 1
+    return None
+
+
+def _pdfed_fill_form(writer, answers, flatten=False):
+    """Writes the answers into the PDF's own form fields (matched by full name or short name): text,
+    ticks (their own "on" state) and choices."""
+    if not answers:
+        return
+    for page in writer.pages:
+        annots = page.get("/Annots")
+        annots = annots.get_object() if annots is not None else []
+        values = {}
+        for ref in annots or []:
+            a = ref.get_object()
+            if a.get("/Subtype") != "/Widget":
+                continue
+            full = _pdfed_field_name(a)
+            short = full.rsplit(".", 1)[-1]
+            key = full if full in answers else (short if short in answers else None)
+            if key is None:
+                continue
+            v = answers[key]
+            ft = _pdfed_field_attr(a, "/FT")
+            if ft == "/Btn":
+                ap = a.get("/AP")
+                ap = ap.get_object() if ap is not None else {}
+                states = [str(s) for s in ((ap.get("/N").get_object().keys()) if ap.get("/N") is not None else []) if str(s) != "/Off"]
+                if isinstance(v, bool) or v in ("true", "false", "on", "off", "", None):
+                    on = v in (True, "true", "on")
+                    val = (states[0] if states else "/Yes") if on else "/Off"
+                else:
+                    want = "/" + str(v).lstrip("/")
+                    val = want if want in states else "/Off"
+                if val == "/Off" and values.get(short, "/Off") != "/Off":
+                    continue        # a group of choices: the chosen button's state wins over the others' "off"
+                values[short] = val
+            else:
+                values[short] = str(v)[:2000]
+        if values:
+            try:
+                writer.update_page_form_field_values(page, values, auto_regenerate=False, flatten=flatten)
+            except Exception:
+                logging.getLogger(__name__).warning("PDF editor: a form answer couldn't be written", exc_info=True)
+    try:
+        writer.set_need_appearances_writer(True)
+    except Exception:
+        pass
+
+
+def _pdfed_render(pdf_path, k, dpi, unrotated=True):
+    """Page k as a PIL picture (RGB) of its visible area; with unrotated=True as stored, not as turned."""
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        page = doc[k]
+        rot = page.get_rotation()
+        if unrotated and rot:
+            page.set_rotation(0)
+        img = page.render(scale=dpi / 72.0, may_draw_forms=True).to_pil().convert("RGB")
+        return img, rot
+    finally:
+        doc.close()
+
+
+def _pdfed_ocr_layer(img, dpi, work_dir, tag):
+    """An invisible, searchable text layer for a page picture (Tesseract); None when it can't be made."""
+    png = os.path.join(work_dir, "ocr_%s.png" % tag)
+    img.save(png, dpi=(dpi, dpi))
+    base = os.path.join(work_dir, "ocr_%s" % tag)
+    try:
+        subprocess.run(["tesseract", png, base, "-l", "eng", "--dpi", str(dpi), "-c", "textonly_pdf=1", "pdf"],
+                       capture_output=True, timeout=90, check=True)
+        return pypdf.PdfReader(base + ".pdf").pages[0]
+    except Exception:
+        return None
+
+
+def _pdfed_lay_text(page, layer, box):
+    """Lays a text layer (made from a picture of the box) over the page, stretched to the box."""
+    from pypdf import Transformation
+    lw, lh = float(layer.mediabox.width), float(layer.mediabox.height)
+    if lw <= 0 or lh <= 0:
+        return
+    t = Transformation().scale(box[2] / lw, box[3] / lh).translate(box[0], box[1])
+    page.merge_transformed_page(layer, t)
+
+
+def _pdfed_rasterize(path, pages, work_dir, dpi=200, ocr=True):
+    """Turns these pages into pictures of themselves (redaction: nothing under a black box survives),
+    with their visible words made searchable again. Returns the new file's path."""
+    from reportlab.pdfgen import canvas as rl_canvas
+    reader = pypdf.PdfReader(path)
+    writer = pypdf.PdfWriter(clone_from=reader)
+    for n, k in enumerate(sorted(set(pages))[:_PDFED_RASTER_PAGES]):
+        src = writer.pages[k]
+        cb = src.cropbox
+        x0, y0, w, h = float(cb.left), float(cb.bottom), float(cb.width), float(cb.height)
+        img, rot = _pdfed_render(path, k, dpi)
+        jpg = os.path.join(work_dir, "raster_%d.jpg" % k)
+        img.save(jpg, "JPEG", quality=90)
+        buf = io.BytesIO()
+        c = rl_canvas.Canvas(buf, pagesize=(w, h))
+        c.drawImage(jpg, 0, 0, w, h)
+        c.showPage()
+        c.save()
+        buf.seek(0)
+        newp = pypdf.PdfReader(buf).pages[0]
+        if ocr and n < _PDFED_OCR_PAGES:
+            layer = _pdfed_ocr_layer(img, dpi, work_dir, "r%d" % k)
+            if layer is not None:
+                _pdfed_lay_text(newp, layer, (0, 0, w, h))
+        added = writer.insert_page(newp, k)
+        if rot:
+            added.rotate(rot)
+        writer.remove_page(k + 1)
+    out = os.path.join(work_dir, "rasterized.pdf")
+    with open(out, "wb") as f:
+        writer.write(f)
+    return out
+
+
+def pdf_has_text(path, k):
+    try:
+        with pdfplumber.open(path) as pdf:
+            return len((pdf.pages[k].extract_text() or "").strip()) >= 12
+    except Exception:
+        return True
+
+
+def _pdfed_ocr(writer, path, work_dir, dpi=200):
+    """Makes scanned pages searchable: pages with no words of their own get Tesseract's invisible
+    text layer over them (the page itself isn't changed). Returns how many pages were done."""
+    done = 0
+    for k, page in enumerate(writer.pages):
+        if done >= _PDFED_OCR_PAGES:
+            break
+        if pdf_has_text(path, k):
+            continue
+        img, _rot = _pdfed_render(path, k, dpi)
+        layer = _pdfed_ocr_layer(img, dpi, work_dir, "o%d" % k)
+        if layer is None:
+            continue
+        cb = page.cropbox
+        _pdfed_lay_text(page, layer, (float(cb.left), float(cb.bottom), float(cb.width), float(cb.height)))
+        done += 1
+    return done
+
+
+def pdf_plan_needs_pro(plan):
+    """Whether this plan uses a Pro tool: redaction, or a password / limits on what readers may do."""
+    if not isinstance(plan, dict):
+        return False
+    if any(isinstance(it, dict) and it.get("type") == "redact" for it in (plan.get("items") or [])):
+        return True
+    out = plan.get("output") or {}
+    perms = out.get("permissions") or {}
+    return bool(out.get("password")) or any(v is False for v in perms.values()) if isinstance(perms, dict) else bool(out.get("password"))
+
+
+def pdf_apply_plan(src_path, plan, out_dir, assets=None, password=None):
+    """The PDF editor's Save: the original PDF plus the editor's plan → the edited PDF.
+    Returns (path, notes) — notes says what couldn't be done in full (e.g. OCR page limit)."""
+    from pypdf.constants import UserAccessPermissions as UAP
+    assets = assets or {}
+    notes = []
+    if not isinstance(plan, dict):
+        raise PdfEditError("The changes couldn't be read — please try again.")
+    os.makedirs(out_dir, exist_ok=True)
+
+    sources = [src_path] + [assets.get(str(n)) for n in (plan.get("sources") or [])[:20]]
+    readers, src_encrypted = [], False
+    for k, p in enumerate(sources):
+        if not p or not os.path.exists(p):
+            raise PdfEditError("A PDF you added is missing — please add it again.")
+        r = _safe_load(pypdf.PdfReader, p)
+        if r.is_encrypted:
+            ok = False
+            for pw in ([password] if (k == 0 and password) else []) + [""]:
+                try:
+                    if r.decrypt(pw):
+                        ok = True
+                        break
+                except Exception:
+                    pass
+            if not ok:
+                raise PdfEditError("This PDF has a password — type it to open the file." if k == 0
+                                   else "A PDF you added has a password — open it on its own and save it first.")
+            if k == 0:
+                src_encrypted = True
+        readers.append(r)
+
+    pages = plan.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise PdfEditError("There are no pages left to save.")
+    if len(pages) > _PDFED_MAX_PAGES:
+        raise PdfEditError(f"That's more than {_PDFED_MAX_PAGES} pages — please split the PDF first.")
+
+    # ---- the pages, in their new order (runs from one file go in together: links and forms keep working)
+    plain_order = all(isinstance(p, dict) and not p.get("blank") and int(_pdfed_num(p.get("src"), 0, 99, 0)) == 0
+                      and int(_pdfed_num(p.get("i"), 0, 1e6, -1)) == n for n, p in enumerate(pages)) \
+        and len(pages) == len(readers[0].pages)
+    if plain_order:
+        writer = pypdf.PdfWriter(clone_from=readers[0])
+    else:
+        writer = pypdf.PdfWriter()
+        seg = {"src": None, "pages": []}
+
+        def flush():
+            if seg["pages"]:
+                writer.append(readers[seg["src"]], pages=list(seg["pages"]), import_outline=False)
+            seg["src"], seg["pages"] = None, []
+        for p in pages:
+            if not isinstance(p, dict):
+                raise PdfEditError("The changes couldn't be read — please try again.")
+            if p.get("blank"):
+                flush()
+                writer.add_blank_page(_pdfed_num(p.get("w"), 72, 14400, 595.3), _pdfed_num(p.get("h"), 72, 14400, 841.9))
+                continue
+            s = int(_pdfed_num(p.get("src"), 0, len(readers) - 1, 0))
+            i = int(_pdfed_num(p.get("i"), 0, 1e6, 0))
+            if i >= len(readers[s].pages):
+                raise PdfEditError("The changes refer to a page that isn't in the file.")
+            if seg["src"] != s:
+                flush()
+                seg["src"] = s
+            seg["pages"].append(i)
+        flush()
+    if len(writer.pages) != len(pages):
+        raise PdfEditError("The pages couldn't be put together — please try again.")
+
+    # ---- what's drawn on each page
+    items = [it for it in (plan.get("items") or []) if isinstance(it, dict)]
+    if len(items) > _PDFED_MAX_ITEMS:
+        raise PdfEditError("That's a lot of changes for one save — please save part of them first.")
+    by_page = {}
+    for it in items:
+        by_page.setdefault(int(_pdfed_num(it.get("page"), -1, 1e6, -1)), []).append(it)
+    out_opts = plan.get("output") if isinstance(plan.get("output"), dict) else {}
+    numbers = out_opts.get("page_numbers") if isinstance(out_opts.get("page_numbers"), dict) else None
+    watermark = out_opts.get("watermark") if isinstance(out_opts.get("watermark"), dict) else None
+    redact_pages, note_items = [], []
+    total = len(writer.pages)
+    for k in range(total):
+        wpage = writer.pages[k]
+        its = by_page.get(k, [])
+        drops = [_pdfed_rect(it.get("rect")) for it in its if it.get("type") in ("remove_image", "replace_image")]
+        edited = [_pdfed_rect(it.get("rect")) for it in its if it.get("type") == "edit"]
+        cover = _pdfed_clean(wpage, drops, edited, writer) if (drops or edited) else []
+        p = pages[k]
+        rot = (int(_pdfed_num(p.get("rotate"), -3600, 3600, 0)) // 90 * 90) % 360
+        crop = _pdfed_rect(p.get("crop"))
+        if not (crop and crop[2] - crop[0] >= 18 and crop[3] - crop[1] >= 18):
+            crop = None
+        try:
+            seen = (int(wpage.rotation or 0) + rot) % 360
+        except Exception:
+            seen = rot
+        overlay = _pdfed_overlay(wpage, its, cover, assets, k, total, numbers, watermark, view_rot=seen, box=crop)
+        if overlay is not None:
+            wpage.merge_page(overlay)
+        for it in its:
+            if it.get("type") == "note":
+                note_items.append((k, it))
+            elif it.get("type") == "redact":
+                redact_pages.append(k)
+        if rot:
+            wpage.rotate(rot)
+        if crop:
+            from pypdf.generic import RectangleObject
+            wpage.cropbox = RectangleObject(crop)
+    if getattr(writer, "_pdfed_dropped", False):
+        try:
+            writer.compress_identical_objects(remove_identicals=False, remove_orphans=True)
+        except Exception:
+            logging.getLogger(__name__).warning("PDF editor: unused pictures couldn't be left out of the file", exc_info=True)
+    for k, it in note_items[:500]:
+        try:
+            _pdfed_note(writer, k, it)
+        except Exception:
+            logging.getLogger(__name__).warning("PDF editor: a note couldn't be added", exc_info=True)
+    form = plan.get("form")
+    if isinstance(form, dict) and form:
+        _pdfed_fill_form(writer, dict(list(form.items())[:1000]), flatten=bool(plan.get("flatten_form")))
+
+    stage = os.path.join(out_dir, "stage_a.pdf")
+    with open(stage, "wb") as f:
+        writer.write(f)
+
+    # ---- redaction: those pages become pictures of themselves (their words searchable again)
+    if redact_pages:
+        if len(set(redact_pages)) > _PDFED_RASTER_PAGES:
+            raise PdfEditError(f"Redaction works on up to {_PDFED_RASTER_PAGES} pages at a time — please save in parts.")
+        stage = _pdfed_rasterize(stage, redact_pages, out_dir)
+
+    ocr = bool(out_opts.get("ocr"))
+    compress = bool(out_opts.get("compress"))
+    pw = out_opts.get("password")
+    perms = out_opts.get("permissions") if isinstance(out_opts.get("permissions"), dict) else {}
+    keep_old_pw = src_encrypted and "password" not in out_opts and password
+    protect = None
+    if pw or keep_old_pw or any(v is False for v in perms.values()):
+        flags = UAP(0xFFFFFFFC)          # everything allowed (the reserved bits set, as the PDF rules ask)
+        if perms.get("print") is False:
+            flags &= ~(UAP.PRINT | UAP.PRINT_TO_REPRESENTATION)
+        if perms.get("copy") is False:
+            flags &= ~(UAP.EXTRACT | UAP.EXTRACT_TEXT_AND_GRAPHICS)
+        if perms.get("edit") is False:
+            flags &= ~(UAP.MODIFY | UAP.ADD_OR_MODIFY | UAP.ASSEMBLE_DOC | UAP.FILL_FORM_FIELDS)
+        protect = (str(pw if pw else (password if keep_old_pw else ""))[:128], flags)
+    groups = _pdfed_groups(out_opts.get("split"), total)
+
+    final = os.path.join(out_dir, "edited.pdf")
+    if not (ocr or compress or protect):
+        os.replace(stage, final)
+    else:
+        writer = pypdf.PdfWriter(clone_from=pypdf.PdfReader(stage))
+        if ocr:
+            done = _pdfed_ocr(writer, stage, out_dir)
+            if done >= _PDFED_OCR_PAGES:
+                notes.append(f"The first {_PDFED_OCR_PAGES} scanned pages were made searchable — save again to do more.")
+        if compress:
+            for page in writer.pages:
+                for img in page.images:
+                    try:
+                        img.replace(img.image, quality=int(_pdfed_num(out_opts.get("quality"), 20, 95, 65)))
+                    except Exception:
+                        continue
+                try:
+                    page.compress_content_streams()
+                except Exception:
+                    pass
+            try:
+                writer.compress_identical_objects()
+            except Exception:
+                pass
+        if protect and not groups:
+            writer.encrypt(user_password=protect[0], owner_password=os.urandom(16).hex(), permissions_flag=protect[1], algorithm="AES-256")
+        with open(final, "wb") as f:
+            writer.write(f)
+        if compress and os.path.getsize(final) > os.path.getsize(stage) and not ((protect and not groups) or ocr):
+            os.replace(stage, final)        # compressing didn't make it smaller: the uncompressed one is kept
+    if groups:
+        return _pdfed_split(final, groups, out_dir, protect), notes
+    return final, notes
+
+
+def _pdfed_groups(raw, total):
+    """The editor's 'split': lists of page numbers (from 0, in the saved order), one list per file."""
+    if raw is None or raw == []:
+        return None
+    if not isinstance(raw, list):
+        raise PdfEditError("The split couldn't be read — please try again.")
+    groups = []
+    for g in raw[:500]:
+        if not isinstance(g, list):
+            raise PdfEditError("The split couldn't be read — please try again.")
+        idx = []
+        for v in g[:_PDFED_MAX_PAGES]:
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                raise PdfEditError("The split couldn't be read — please try again.")
+            if not 0 <= n < total:
+                raise PdfEditError("The split refers to a page that isn't in the file.")
+            idx.append(n)
+        if idx:
+            groups.append(idx)
+    if len(groups) < 2:
+        raise PdfEditError("Splitting needs at least two parts.")
+    return groups
+
+
+def _pdfed_split(path, groups, out_dir, protect=None):
+    """The edited PDF as several files — one per group of pages, each protected like the whole would be.
+    Files are named 'page N.pdf' when every part is a single page, otherwise 'part N.pdf'."""
+    reader = pypdf.PdfReader(path)
+    singles = all(len(g) == 1 for g in groups)
+    used, out = set(), []
+    for n, g in enumerate(groups, 1):
+        w = pypdf.PdfWriter()
+        w.append(reader, pages=list(g), import_outline=False)
+        if protect:
+            w.encrypt(user_password=protect[0], owner_password=os.urandom(16).hex(), permissions_flag=protect[1], algorithm="AES-256")
+        name = ("page %d.pdf" % (g[0] + 1)) if singles else ("part %d.pdf" % n)
+        if name in used:
+            name = "part %d.pdf" % n
+        used.add(name)
+        p = os.path.join(out_dir, "split-" + name)
+        with open(p, "wb") as f:
+            w.write(f)
+        out.append(p)
+    return out
+
+
+def pdf_to_images(src_path, out_dir, dpi=150, max_pages=60, password=None):
+    """Each page as a JPG picture (as it's shown, turned pages included). Returns the paths."""
+    import pypdfium2 as pdfium
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        doc = pdfium.PdfDocument(src_path, password=password or None)
+    except Exception:
+        raise PdfEditError("This PDF couldn't be opened — if it has a password, type it first.")
+    try:
+        n = len(doc)
+        if n > max_pages:
+            raise PdfEditError(f"That's more than {max_pages} pages — please split the PDF first.")
+        out = []
+        for k in range(n):
+            img = doc[k].render(scale=dpi / 72.0).to_pil().convert("RGB")
+            p = os.path.join(out_dir, "page-%03d.jpg" % (k + 1))
+            img.save(p, "JPEG", quality=88)
+            out.append(p)
+        return out
+    finally:
+        doc.close()
+
+
+# ======================= 3.1: the Word editor (R17) =======================
+# Opening: the .docx as the blocks the editor shows — paragraphs (their words in runs, with the look each
+# run really has), tables, pictures — and, kept exactly as they are, the things that can't be typed over
+# safely ("atoms": footnote marks, fields, shapes, equations, page breaks). Paragraphs with tracked
+# changes or comments, a table of contents and content controls are shown but not editable here.
+# Every block has an id from its place in the file, so the same file read again gives the same ids.
+# Saving: the same file plus the editor's list of blocks. A block sent back by its id alone is kept
+# exactly; a changed paragraph is rebuilt from its own properties and its runs' own properties (fonts
+# and sizes kept), with only what was changed set; a new paragraph copies the one it came from. The rest
+# of the file — headers, footers, footnotes, comments, styles, settings — is left as it was.
+import base64 as _wd_b64
+import copy as _wd_copy
+import hashlib as _wd_hash
+import io as _wd_io
+
+
+class WordEditError(ConversionError):
+    pass
+
+
+_WD_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_WD_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_WD_V = "urn:schemas-microsoft-com:vml"
+_WD_MATH = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_WD_MAX_BLOCKS = 8000
+_WD_MAX_PICS = 80
+_WD_PIC_BUDGET = 9 * 1024 * 1024
+_WD_OFFER = ["Title", "Subtitle", "Heading1", "Heading2", "Heading3"]
+_WD_BAD = "The changes don't match this file — please open it again."
+_WD_RPR_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow",
+                 "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+                 "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs",
+                 "em", "lang", "eastAsianLayout", "specVanish", "oMath", "rPrChange"]
+_WD_PPR_ORDER = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl", "numPr",
+                 "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens", "kinsoku", "wordWrap",
+                 "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
+                 "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection",
+                 "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange"]
+_WD_ALIGN = {"center": "center", "right": "right", "end": "right", "both": "justify", "distribute": "justify",
+             "lowKashida": "justify", "mediumKashida": "justify", "highKashida": "justify", "thaiDistribute": "justify"}
+
+
+def _wd_qn(tag):
+    from docx.oxml.ns import qn
+    return qn(tag)
+
+
+def _wd_tag(el):
+    """(namespace URI, local name) of an element ('' for comments and the like)."""
+    t = el.tag
+    if not isinstance(t, str) or not t.startswith("{"):
+        return ("", "")
+    uri, local = t[1:].split("}", 1)
+    return (uri, local)
+
+
+def _wd_is(el, local, uri=_WD_W):
+    return _wd_tag(el) == (uri, local)
+
+
+def _wd_val(el, attr="w:val", default=None):
+    if el is None:
+        return default
+    v = el.get(_wd_qn(attr))
+    return default if v is None else v
+
+
+def _wd_toggle(el):
+    """<w:b/> and the like: None when absent, else on — unless its value says off."""
+    if el is None:
+        return None
+    return (el.get(_wd_qn("w:val")) or "true").lower() not in ("0", "false", "off", "none")
+
+
+def _wd_num(v, default=None):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _wd_text(el):
+    out = []
+    for e in el.iter():
+        uri, t = _wd_tag(e)
+        if (uri == _WD_W and t == "t") or (uri == _WD_MATH and t == "t"):
+            out.append(e.text or "")
+        elif uri == _WD_W and t == "tab":
+            out.append(" ")
+    return "".join(out).strip()
+
+
+def _wd_new(tag, **attrs):
+    from docx.oxml import OxmlElement
+    e = OxmlElement(tag)
+    for k, v in attrs.items():
+        e.set(_wd_qn("w:" + k), str(v))
+    return e
+
+
+def _wd_drop(parent, local):
+    for e in parent.findall(_wd_qn("w:" + local)):
+        parent.remove(e)
+
+
+def _wd_place(parent, el, order):
+    """Puts `el` into a properties element where the file format wants it (Word is strict about the order)."""
+    uri, local = _wd_tag(el)
+    _wd_drop(parent, local)
+    rank = order.index(local) if local in order else len(order)
+    for i, c in enumerate(parent):
+        cu, cl = _wd_tag(c)
+        cr = order.index(cl) if (cu == _WD_W and cl in order) else len(order) + 1
+        if cr > rank:
+            parent.insert(i, el)
+            return el
+    parent.append(el)
+    return el
+
+
+def _wd_clean(text):
+    import re
+    return re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]", "", str(text or ""))[:100000]
+
+
+def _wd_href(h):
+    h = str(h or "").strip()[:2000]
+    low = h.lower()
+    if low.startswith(("http://", "https://", "mailto:", "tel:")) or (h.startswith("#") and len(h) > 1):
+        return h
+    return None
+
+
+def _wd_load(path):
+    from docx import Document
+    try:
+        return Document(path)
+    except Exception:
+        raise WordEditError("This Word file couldn't be opened — it may be damaged, or not a .docx file.")
+
+
+def _wd_sig(path, doc):
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            return _wd_hash.sha256(z.read(str(doc.part.partname).lstrip("/"))).hexdigest()[:32]
+    except Exception:
+        return ""
+
+
+_WD_TEMPLATE = []
+
+
+def _wd_template():
+    if not _WD_TEMPLATE:
+        from docx import Document
+        _WD_TEMPLATE.append(Document())
+    return _WD_TEMPLATE[0]
+
+
+class _WdStyles:
+    def __init__(self, doc):
+        self.root = doc.styles.element
+        self.el, self.default_p = {}, None
+        for s in self.root.findall(_wd_qn("w:style")):
+            sid = s.get(_wd_qn("w:styleId"))
+            if not sid:
+                continue
+            self.el[sid] = s
+            if s.get(_wd_qn("w:type")) == "paragraph" and (s.get(_wd_qn("w:default")) or "").lower() in ("1", "true", "on"):
+                self.default_p = sid
+        dd = self.root.find(_wd_qn("w:docDefaults"))
+        self.rpr0 = dd.find(_wd_qn("w:rPrDefault") + "/" + _wd_qn("w:rPr")) if dd is not None else None
+        self.ppr0 = dd.find(_wd_qn("w:pPrDefault") + "/" + _wd_qn("w:pPr")) if dd is not None else None
+        self.theme = _wd_theme_fonts(doc)
+
+    def chain(self, sid):
+        out, seen = [], set()
+        while sid and sid in self.el and sid not in seen:
+            seen.add(sid)
+            out.append(self.el[sid])
+            sid = _wd_val(self.el[sid].find(_wd_qn("w:basedOn")))
+        return out
+
+    def name(self, sid):
+        s = self.el.get(sid)
+        return _wd_val(s.find(_wd_qn("w:name")) if s is not None else None) or sid
+
+    def font(self, e):
+        for a in ("w:ascii", "w:hAnsi"):
+            v = e.get(_wd_qn(a))
+            if v:
+                return v
+        for a in ("w:asciiTheme", "w:hAnsiTheme"):
+            v = e.get(_wd_qn(a))
+            if v:
+                return self.theme.get("major" if v.startswith("major") else "minor")
+        return None
+
+    def rlayers(self, pstyle, rpr=None, rstyle=None):
+        out = [rpr] if rpr is not None else []
+        if rstyle is None and rpr is not None:
+            rstyle = _wd_val(rpr.find(_wd_qn("w:rStyle")))
+        for s in self.chain(rstyle) + self.chain(pstyle or self.default_p):
+            x = s.find(_wd_qn("w:rPr"))
+            if x is not None:
+                out.append(x)
+        if self.rpr0 is not None:
+            out.append(self.rpr0)
+        return out
+
+    def players(self, pstyle, ppr=None):
+        out = [ppr] if ppr is not None else []
+        for s in self.chain(pstyle or self.default_p):
+            x = s.find(_wd_qn("w:pPr"))
+            if x is not None:
+                out.append(x)
+        if self.ppr0 is not None:
+            out.append(self.ppr0)
+        return out
+
+    def look(self, layers):
+        """How words look: bold, italic, underline, strike-out, size (pt), font, colour, highlight, raised/lowered."""
+        def first(tag, fn):
+            for L in layers:
+                e = L.find(_wd_qn("w:" + tag))
+                if e is not None:
+                    v = fn(e)
+                    if v is not None:
+                        return v
+            return None
+        sz = first("sz", lambda e: _wd_num(e.get(_wd_qn("w:val"))))
+        col = first("color", lambda e: "" if (e.get(_wd_qn("w:val")) or "auto").lower() == "auto" else e.get(_wd_qn("w:val")).upper())
+        hl = first("highlight", lambda e: "" if (e.get(_wd_qn("w:val")) or "none") == "none" else e.get(_wd_qn("w:val")))
+        va = first("vertAlign", lambda e: {"superscript": "sup", "subscript": "sub"}.get(e.get(_wd_qn("w:val")) or "", ""))
+        return {"b": bool(first("b", _wd_toggle)), "i": bool(first("i", _wd_toggle)),
+                "u": bool(first("u", lambda e: (e.get(_wd_qn("w:val")) or "single") != "none")),
+                "s": bool(first("strike", _wd_toggle) or first("dstrike", _wd_toggle)),
+                "sz": round(sz / 2.0, 2) if sz else 10.0, "f": first("rFonts", self.font),
+                "c": col or None, "hl": hl or None, "va": va or None, "caps": bool(first("caps", _wd_toggle))}
+
+    def plook(self, layers):
+        def attr(tag, a):
+            for L in layers:
+                e = L.find(_wd_qn("w:" + tag))
+                if e is not None and e.get(_wd_qn("w:" + a)) is not None:
+                    return e.get(_wd_qn("w:" + a))
+            return None
+
+        def child(tag, sub):
+            for L in layers:
+                e = L.find(_wd_qn("w:" + tag))
+                s = e.find(_wd_qn("w:" + sub)) if e is not None else None
+                if s is not None:
+                    return _wd_val(s)
+            return None
+        line, rule = _wd_num(attr("spacing", "line")), attr("spacing", "lineRule") or "auto"
+        hang = _wd_num(attr("ind", "hanging"))
+        first_line = -hang if hang else _wd_num(attr("ind", "firstLine"), 0.0)
+        return {"align": _WD_ALIGN.get(attr("jc", "val") or "", "left"),
+                "before": _wd_num(attr("spacing", "before"), 0.0) / 20.0, "after": _wd_num(attr("spacing", "after"), 0.0) / 20.0,
+                "line": (round(line / 240.0, 3) if rule == "auto" else -round(line / 20.0, 2)) if line else None,
+                "left": _wd_num(attr("ind", "left") or attr("ind", "start"), 0.0) / 20.0, "first": (first_line or 0.0) / 20.0,
+                "num": child("numPr", "numId"), "ilvl": int(_wd_num(child("numPr", "ilvl"), 0) or 0)}
+
+    def list_of(self, pstyle):
+        """The list a paragraph style makes its paragraphs part of: (numId, level), or None."""
+        pl = self.plook(self.players(pstyle))
+        return (pl["num"], pl["ilvl"]) if pl["num"] and pl["num"] != "0" else None
+
+
+def _wd_theme_fonts(doc):
+    out = {"minor": None, "major": None}
+    try:
+        from docx.oxml import parse_xml
+        for rel in doc.part.rels.values():
+            if rel.reltype.endswith("/theme") and not rel.is_external:
+                root = parse_xml(rel.target_part.blob)
+                a = "http://schemas.openxmlformats.org/drawingml/2006/main"
+                for kind in ("minor", "major"):
+                    e = root.find(".//{%s}%sFont/{%s}latin" % (a, kind, a))
+                    if e is not None:
+                        out[kind] = e.get("typeface")
+    except Exception:
+        pass
+    return out
+
+
+class _WdNumbering:
+    def __init__(self, doc, create=False):
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
+        self.root = None
+        try:
+            self.root = doc.part.part_related_by(RT.NUMBERING).element
+        except KeyError:
+            if create:
+                self.root = doc.part.numbering_part.element
+        self.made = {}
+        self.read()
+
+    def read(self):
+        self.abstract, self.nums = {}, {}
+        if self.root is None:
+            return
+        for a in self.root.findall(_wd_qn("w:abstractNum")):
+            self.abstract[a.get(_wd_qn("w:abstractNumId"))] = a
+        for n in self.root.findall(_wd_qn("w:num")):
+            over = {}
+            for o in n.findall(_wd_qn("w:lvlOverride")):
+                so = o.find(_wd_qn("w:startOverride"))
+                if so is not None:
+                    over[int(_wd_num(o.get(_wd_qn("w:ilvl")), 0))] = int(_wd_num(_wd_val(so), 1))
+            self.nums[n.get(_wd_qn("w:numId"))] = (_wd_val(n.find(_wd_qn("w:abstractNumId"))), over)
+
+    def level(self, num_id, ilvl):
+        """(format, text, start) of one level of a list — e.g. ('decimal', '%1.', 1) or ('bullet', '•', 1)."""
+        got = self.nums.get(str(num_id))
+        a = self.abstract.get(got[0]) if got else None
+        if a is None:
+            return None
+        for lv in a.findall(_wd_qn("w:lvl")):
+            if int(_wd_num(lv.get(_wd_qn("w:ilvl")), 0)) == ilvl:
+                return (_wd_val(lv.find(_wd_qn("w:numFmt")), default="decimal"), _wd_val(lv.find(_wd_qn("w:lvlText")), default=""),
+                        got[1].get(ilvl, int(_wd_num(_wd_val(lv.find(_wd_qn("w:start"))), 1))))
+        return None
+
+    def kind(self, num_id):
+        lv = self.level(num_id, 0)
+        return None if lv is None else ("bullet" if lv[0] in ("bullet", "none") else "number")
+
+    def pick(self, kind, num):
+        """The list a paragraph goes in: the one asked for, or a list of the right kind (a numbered list
+        asked for as new starts again at 1)."""
+        num = str(num) if num is not None else ""
+        if num in self.nums and self.kind(num) == kind:
+            return num
+        if num in self.made:
+            return self.made[num]
+        abstract = next((self.nums[n][0] for n in sorted(self.nums, key=lambda v: int(_wd_num(v, 0))) if self.kind(n) == kind), None)
+        if kind == "bullet" and abstract is not None:
+            got = next(n for n in sorted(self.nums, key=lambda v: int(_wd_num(v, 0))) if self.kind(n) == "bullet")
+            self.made[num] = got
+            return got
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+        if abstract is None:
+            abstract = str(max([int(_wd_num(a, 0)) for a in self.abstract] + [0]) + 1)
+            levels = []
+            for i in range(9):
+                if kind == "bullet":
+                    ch = ["•", "◦", "▪"][i % 3]
+                    levels.append('<w:lvl w:ilvl="%d"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="%s"/><w:lvlJc w:val="left"/>'
+                                  '<w:pPr><w:ind w:left="%d" w:hanging="360"/></w:pPr></w:lvl>' % (i, ch, 720 * (i + 1)))
+                else:
+                    fmt = ["decimal", "lowerLetter", "lowerRoman"][i % 3]
+                    levels.append('<w:lvl w:ilvl="%d"><w:start w:val="1"/><w:numFmt w:val="%s"/><w:lvlText w:val="%%%d."/><w:lvlJc w:val="left"/>'
+                                  '<w:pPr><w:ind w:left="%d" w:hanging="360"/></w:pPr></w:lvl>' % (i, fmt, i + 1, 720 * (i + 1)))
+            el = parse_xml('<w:abstractNum %s w:abstractNumId="%s"><w:multiLevelType w:val="hybridMultilevel"/>%s</w:abstractNum>'
+                           % (nsdecls("w"), abstract, "".join(levels)))
+            first_num = self.root.find(_wd_qn("w:num"))
+            if first_num is not None:
+                first_num.addprevious(el)
+            else:
+                self.root.append(el)
+        nid = str(max([int(_wd_num(n, 0)) for n in self.nums] + [0]) + 1)
+        el = parse_xml('<w:num %s w:numId="%s"><w:abstractNumId w:val="%s"/>%s</w:num>' % (
+            nsdecls("w"), nid, abstract, '<w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride>' if kind == "number" else ""))
+        nums = self.root.findall(_wd_qn("w:num"))
+        if nums:
+            nums[-1].addnext(el)
+        else:
+            self.root.append(el)
+        self.read()
+        self.made[num] = nid
+        return nid
+
+
+class _WdCtx:
+    """What a Word file has, by id: blocks, paragraphs, the runs words come from, atoms, bookmarks."""
+
+    def __init__(self, doc, view=True, assets=None):
+        self.doc, self.view, self.assets = doc, view, assets or {}
+        self.styles = _WdStyles(doc)
+        self.blocks, self.paras, self.runs, self.atoms, self.marks, self.locked = {}, {}, {}, {}, {}, set()
+        self.field_open, self.notes, self.endnotes, self.pics, self.pic_bytes = 0, 0, 0, 0, 0
+        self.used_styles, self.used_lists = set(), set()
+        self._num, self.link_rids, self.known_links = None, {}, set()
+
+    def numbering(self, create=False):
+        if self._num is None or (create and self._num.root is None):
+            self._num = _WdNumbering(self.doc, create=create)
+        return self._num
+
+    # ---------------------------------------------------------------- reading
+    def link_target(self, h):
+        rid = h.get(_wd_qn("r:id"))
+        if rid:
+            rel = self.doc.part.rels.get(rid)
+            if rel is not None and rel.is_external:
+                self.known_links.add(rel.target_ref)
+                return rel.target_ref
+        anchor = h.get(_wd_qn("w:anchor"))
+        return "#" + anchor if anchor else None
+
+    def preview(self, rid):
+        if not self.view or not rid or self.pics >= _WD_MAX_PICS:
+            return None
+        part = self.doc.part.related_parts.get(rid)
+        blob = getattr(part, "blob", None)
+        if not blob:
+            return None
+        try:
+            from PIL import Image
+            im = Image.open(_wd_io.BytesIO(blob))
+            im.load()
+            if max(im.size) > 1200:
+                im.thumbnail((1200, 1200))
+            buf = _wd_io.BytesIO()
+            if im.mode in ("RGBA", "LA", "P"):
+                im.convert("RGBA").save(buf, "PNG", optimize=True)
+                mime = "image/png"
+            else:
+                im.convert("RGB").save(buf, "JPEG", quality=80)
+                mime = "image/jpeg"
+        except Exception:
+            return None
+        data = buf.getvalue()
+        if self.pic_bytes + len(data) > _WD_PIC_BUDGET:
+            return None
+        self.pic_bytes += len(data)
+        self.pics += 1
+        return "data:%s;base64,%s" % (mime, _wd_b64.b64encode(data).decode("ascii"))
+
+    def atom_view(self, x):
+        uri, t = _wd_tag(x)
+        if (uri, t) in ((_WD_W, "drawing"), (_WD_W, "pict"), (_WD_MC, "AlternateContent"), (_WD_W, "object")):
+            blip = x.find(".//" + _wd_qn("a:blip"))
+            rid = blip.get(_wd_qn("r:embed")) or blip.get(_wd_qn("r:link")) if blip is not None else None
+            if rid is None:
+                vimg = x.find(".//{%s}imagedata" % _WD_V)
+                rid = vimg.get(_wd_qn("r:id")) if vimg is not None else None
+            ext = x.find(".//" + _wd_qn("wp:extent"))
+            out = {"k": "chip", "label": "Picture"}
+            if ext is not None:
+                out["w"] = round(_wd_num(ext.get("cx"), 0) / 12700.0, 1)
+                out["h"] = round(_wd_num(ext.get("cy"), 0) / 12700.0, 1)
+            if x.find(".//" + _wd_qn("wp:anchor")) is not None:
+                out["float"] = True
+            if rid is None:
+                gd = x.find(".//" + _wd_qn("a:graphicData"))
+                uri2 = (gd.get("uri") or "") if gd is not None else ""
+                txt = _wd_text(x)
+                out["label"] = ("Text box: " + txt[:80]) if txt else ("Chart" if "chart" in uri2 else ("Diagram" if "diagram" in uri2 else
+                                                                                                        ("Embedded object" if t == "object" else "Shape")))
+                return out
+            src = self.preview(rid)
+            if src:
+                out.update({"k": "img", "src": src})
+            return out
+        if (uri, t) == (_WD_W, "footnoteReference"):
+            self.notes += 1
+            return {"k": "note", "label": str(self.notes)}
+        if (uri, t) == (_WD_W, "endnoteReference"):
+            self.endnotes += 1
+            return {"k": "note", "label": "i ii iii iv v vi vii viii ix x".split()[(self.endnotes - 1) % 10]}
+        if (uri, t) == (_WD_W, "br"):
+            return {"k": "break", "label": "Page break" if x.get(_wd_qn("w:type")) == "page" else "Column break"}
+        if (uri, t) in ((_WD_MATH, "oMath"), (_WD_MATH, "oMathPara")):
+            return {"k": "math", "label": _wd_text(x)[:200] or "Equation"}
+        if (uri, t) == (_WD_W, "fldSimple"):
+            return {"k": "field", "label": _wd_text(x)[:200] or _wd_field_word(x.get(_wd_qn("w:instr")))}
+        if (uri, t) == (_WD_W, "sym"):
+            return {"k": "chip", "label": "◆"}
+        if (uri, t) == (_WD_W, "ptab"):
+            return {"k": "chip", "label": "⇥"}
+        return {"k": "chip", "label": _wd_text(x)[:200] or "•"}
+
+    def items(self, parent, ppr, href=None):
+        """A paragraph's content as one flat list: (kind, value, run properties, link, element)."""
+        out = []
+        for c in parent:
+            if c is ppr:
+                continue
+            uri, t = _wd_tag(c)
+            if uri != _WD_W:
+                out.append(("xel", None, None, None, c))
+            elif t == "r":
+                rpr = c.find(_wd_qn("w:rPr"))
+                for x in c:
+                    if x is rpr:
+                        continue
+                    xu, xt = _wd_tag(x)
+                    if xu == _WD_W and xt == "t":
+                        out.append(("t", x.text or "", rpr, href, x))
+                    elif xu == _WD_W and xt == "tab":
+                        out.append(("t", "\t", rpr, href, x))
+                    elif xu == _WD_W and (xt == "cr" or (xt == "br" and x.get(_wd_qn("w:type")) in (None, "textWrapping"))):
+                        out.append(("t", "\n", rpr, href, x))
+                    elif xu == _WD_W and xt == "softHyphen":
+                        out.append(("t", "­", rpr, href, x))
+                    elif xu == _WD_W and xt == "noBreakHyphen":
+                        out.append(("t", "‑", rpr, href, x))
+                    elif xu == _WD_W and xt == "lastRenderedPageBreak":
+                        continue
+                    elif xu == _WD_W and xt == "fldChar":
+                        out.append(("fld", x.get(_wd_qn("w:fldCharType")), rpr, href, x))
+                    elif xu == _WD_W and xt == "instrText":
+                        out.append(("instr", x.text or "", rpr, href, x))
+                    elif xu == _WD_W and xt in ("commentReference",):
+                        out.append(("lock", "comments", rpr, href, x))
+                    elif xu == _WD_W and xt in ("delText", "delInstrText"):
+                        out.append(("lock", "changes", rpr, href, x))
+                    else:
+                        out.append(("x", None, rpr, href, x))
+            elif t == "hyperlink" and href is None and self.simple_link(c):
+                out.extend(self.items(c, None, href=self.link_target(c) or ""))
+            elif t in ("bookmarkStart", "bookmarkEnd"):
+                out.append(("mark", None, None, None, c))
+            elif t in ("proofErr", "permStart", "permEnd"):
+                continue
+            elif t in ("ins", "del", "moveFrom", "moveTo", "moveFromRangeStart", "moveFromRangeEnd", "moveToRangeStart", "moveToRangeEnd"):
+                out.append(("lock", "changes", None, None, c))
+            elif t in ("commentRangeStart", "commentRangeEnd"):
+                out.append(("lock", "comments", None, None, c))
+            else:
+                out.append(("xel", None, None, None, c))
+        return out
+
+    @staticmethod
+    def simple_link(h):
+        for r in h:
+            uri, t = _wd_tag(r)
+            if uri == _WD_W and t == "proofErr":
+                continue
+            if uri != _WD_W or t != "r":
+                return False
+            for x in r:
+                xu, xt = _wd_tag(x)
+                if xu != _WD_W or xt not in ("rPr", "t", "tab", "cr", "br", "softHyphen", "noBreakHyphen", "lastRenderedPageBreak"):
+                    return False
+                if xt == "br" and x.get(_wd_qn("w:type")) not in (None, "textWrapping"):
+                    return False
+        return True
+
+    def para(self, p, pid):
+        self.blocks[pid] = self.paras[pid] = p
+        ppr = p.find(_wd_qn("w:pPr"))
+        pstyle = _wd_val(ppr.find(_wd_qn("w:pStyle")) if ppr is not None else None)
+        if pstyle not in self.styles.el:
+            pstyle = self.styles.default_p
+        why = "field" if self.field_open > 0 else None
+        if ppr is not None:
+            prpr = ppr.find(_wd_qn("w:rPr"))
+            if ppr.find(_wd_qn("w:pPrChange")) is not None or (prpr is not None and any(
+                    prpr.find(_wd_qn("w:" + t)) is not None for t in ("ins", "del", "moveFrom", "moveTo"))):
+                why = why or "changes"
+        items = self.items(p, ppr)
+        pieces, marks, k, i, n = [], [], 0, 0, len(items)
+        base = self.styles.look(self.styles.rlayers(pstyle)) if self.view else None
+        while i < n:
+            kind, val, rpr, href, x = items[i]
+            if kind == "mark":
+                marks.append(x)
+                i += 1
+                continue
+            if kind == "lock":
+                why = why or val
+                i += 1
+                continue
+            o = "%s:%d" % (pid, k)
+            if kind == "fld" and val == "begin":
+                depth, j = 0, i
+                while j < n:
+                    if items[j][0] == "fld" and items[j][1] == "begin":
+                        depth += 1
+                    elif items[j][0] == "fld" and items[j][1] == "end":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if depth > 0:                      # it goes on into the next paragraphs (a table of contents)
+                    why = why or "field"
+                    break
+                group = items[i:j + 1]
+                self.atoms[o] = ("items", group)
+                if self.view:
+                    pieces.append(dict({"a": o, "k": "field", "label": _wd_field_label(group)}))
+                k += 1
+                i = j + 1
+                continue
+            if kind == "fld" and val == "end" and self.field_open > 0:
+                self.field_open -= 1
+                why = why or "field"
+                i += 1
+                continue
+            if kind == "t":
+                text, j = val, i + 1
+                while j < n and items[j][0] == "t" and items[j][2] is rpr and items[j][3] == href:
+                    text += items[j][1]
+                    j += 1
+                self.runs[o] = rpr
+                if self.view:
+                    look = self.styles.look(self.styles.rlayers(pstyle, rpr))
+                    piece = {"x": text, "o": o}
+                    if href:
+                        piece["h"] = href
+                    for key in ("b", "i", "u", "s"):
+                        if look[key] != base[key]:
+                            piece[key] = look[key]
+                    for key in ("sz", "f", "c", "hl", "va"):
+                        if look[key] != base[key] and look[key] is not None:
+                            piece[key] = look[key]
+                    dc = rpr.find(_wd_qn("w:color")) if rpr is not None else None
+                    if dc is not None and (dc.get(_wd_qn("w:val")) or "auto").lower() != "auto":
+                        piece["dc"] = dc.get(_wd_qn("w:val")).upper()
+                    if look["caps"]:
+                        piece["caps"] = True
+                    pieces.append(piece)
+                k += 1
+                i = j
+                continue
+            # anything else is kept exactly as it is
+            self.atoms[o] = ("items", [items[i]]) if kind in ("x", "fld", "instr") else ("els", [x])
+            if self.view:
+                v = self.atom_view(x) if kind in ("x", "xel") else {"k": "field", "label": "Field"}
+                v["a"] = o
+                pieces.append(v)
+            k += 1
+            i += 1
+        # the rest of a field that started earlier still counts its ends
+        while i < n:
+            if items[i][0] == "fld" and items[i][1] == "begin":
+                self.field_open += 1
+            elif items[i][0] == "fld" and items[i][1] == "end" and self.field_open > 0:
+                self.field_open -= 1
+            i += 1
+        self.marks[pid] = marks
+        if why:
+            self.locked.add(pid)
+        if not self.view:
+            return None
+        self.used_styles.add(pstyle)
+        blk = {"id": pid, "t": "p", "style": pstyle, "runs": pieces}
+        if why:
+            blk["locked"] = why
+            blk["text"] = _wd_text(p)[:3000]
+        if ppr is not None:
+            d = self.styles.plook([ppr])
+            if ppr.find(_wd_qn("w:jc")) is not None:
+                blk["align"] = d["align"]
+            if ppr.find(_wd_qn("w:ind")) is not None:
+                blk["ind"] = [d["left"], d["first"]]
+            if ppr.find(_wd_qn("w:spacing")) is not None:
+                full = self.styles.plook(self.styles.players(pstyle, ppr))
+                blk["sp"] = [full["before"], full["after"], full["line"]]
+            if ppr.find(_wd_qn("w:sectPr")) is not None:
+                blk["sect"] = True
+        pl = self.styles.plook(self.styles.players(pstyle, ppr))
+        if pl["num"] and pl["num"] != "0":
+            lv = self.numbering().level(pl["num"], pl["ilvl"])
+            if lv is not None:
+                self.used_lists.add(pl["num"])
+                blk["list"] = {"kind": "bullet" if lv[0] in ("bullet", "none") else "number", "level": pl["ilvl"], "num": pl["num"]}
+        return blk
+
+    def table(self, tbl, tid):
+        self.blocks[tid] = tbl
+        why = None
+        if any(_wd_tag(c)[1] in ("sdt", "customXml") for c in tbl) or tbl.find(_wd_qn("w:tblPr") + "/" + _wd_qn("w:tblPrChange")) is not None:
+            why = "controls"
+        rows = []
+        trs = [c for c in tbl if _wd_is(c, "tr")]
+        for r, tr in enumerate(trs):
+            if any(_wd_tag(c)[1] in ("sdt", "customXml") for c in tr):
+                why = why or "controls"
+            trpr = tr.find(_wd_qn("w:trPr"))
+            col = int(_wd_num(_wd_val(trpr.find(_wd_qn("w:gridBefore")) if trpr is not None else None), 0) or 0)
+            cells = []
+            for c, tc in enumerate([x for x in tr if _wd_is(x, "tc")]):
+                tcpr = tc.find(_wd_qn("w:tcPr"))
+                span = int(_wd_num(_wd_val(tcpr.find(_wd_qn("w:gridSpan")) if tcpr is not None else None), 1) or 1)
+                vm = tcpr.find(_wd_qn("w:vMerge")) if tcpr is not None else None
+                cell = {"r": r, "c": c, "col": col, "span": span, "blocks": self.container(tc, "%s.%d.%d." % (tid, r, c))}
+                if vm is not None:
+                    cell["vm"] = "restart" if (vm.get(_wd_qn("w:val")) or "") == "restart" else "continue"
+                shd = tcpr.find(_wd_qn("w:shd")) if tcpr is not None else None
+                if shd is not None and (shd.get(_wd_qn("w:fill")) or "auto").lower() not in ("auto", "ffffff"):
+                    cell["fill"] = shd.get(_wd_qn("w:fill")).upper()
+                cells.append(cell)
+                col += span
+            rows.append(cells)
+        if why:
+            self.locked.add(tid)
+        if not self.view:
+            return None
+        for r, cells in enumerate(rows):          # merged cells, as rows they cover
+            for cell in cells:
+                if cell.get("vm") == "restart":
+                    n = 1
+                    for below in rows[r + 1:]:
+                        if any(x.get("vm") == "continue" and x["col"] == cell["col"] for x in below):
+                            n += 1
+                        else:
+                            break
+                    cell["rows"] = n
+        blk = {"id": tid, "t": "table", "rows": rows}
+        if why:
+            blk["locked"] = why
+        return blk
+
+    def container(self, parent, prefix):
+        out = []
+        for n, el in enumerate(parent):
+            uri, t = _wd_tag(el)
+            if uri != _WD_W:
+                continue
+            bid = prefix + str(n)
+            if t == "p":
+                b = self.para(el, bid)
+            elif t == "tbl":
+                b = self.table(el, bid)
+            elif t in ("sdt", "customXml", "altChunk"):
+                self.blocks[bid] = el
+                self.locked.add(bid)
+                b = {"id": bid, "t": "locked", "text": _wd_text(el)[:3000], "why": "control"} if self.view else None
+            else:
+                continue
+            if b is not None:
+                out.append(b)
+            if len(self.blocks) > _WD_MAX_BLOCKS:
+                raise WordEditError("This document is too long to edit here — more than %d paragraphs." % _WD_MAX_BLOCKS)
+        return out
+
+    # ---------------------------------------------------------------- writing
+    def ensure_style(self, sid):
+        if sid in self.styles.el:
+            return
+        tpl = _wd_template().styles.element
+        todo, have = [sid], dict((s.get(_wd_qn("w:styleId")), s) for s in tpl.findall(_wd_qn("w:style")))
+        if sid not in have:
+            raise WordEditError("That style isn't in this document — please choose another.")
+        while todo:
+            s = todo.pop()
+            if s in self.styles.el or s not in have:
+                continue
+            copy = _wd_copy.deepcopy(have[s])
+            self.styles.root.append(copy)
+            self.styles.el[s] = copy
+            for ref in ("w:basedOn", "w:link", "w:next"):
+                v = _wd_val(copy.find(_wd_qn(ref)))
+                if v and v not in self.styles.el:
+                    todo.append(v)
+
+    def build(self, items, used, within=None):
+        out = []
+        if not isinstance(items, list):
+            raise WordEditError(_WD_BAD)
+        for it in items[:_WD_MAX_BLOCKS * 2]:
+            if not isinstance(it, dict):
+                raise WordEditError(_WD_BAD)
+            bid = it.get("id")
+            if bid is not None:
+                bid = str(bid)
+                el = self.blocks.get(bid)
+                if el is None or bid in used or (within and not (bid.startswith(within) and "." not in bid[len(within):])) \
+                        or (not within and "." in bid):
+                    raise WordEditError(_WD_BAD)
+                used.add(bid)
+                if "p" in it:
+                    if not _wd_is(el, "p") or bid in self.locked:
+                        raise WordEditError(_WD_BAD)
+                    self.fill(el, it["p"], bid)
+                elif "cells" in it:
+                    if not _wd_is(el, "tbl") or bid in self.locked:
+                        raise WordEditError(_WD_BAD)
+                    self.cells(el, bid, it["cells"], used)
+                out.append((el, bid))
+                continue
+            p = _wd_new("w:p")
+            model = self.paras.get(str(it.get("from"))) if it.get("from") is not None else None
+            mp = model.find(_wd_qn("w:pPr")) if model is not None else None
+            if mp is not None:
+                np_ = _wd_copy.deepcopy(mp)
+                for t in ("sectPr", "pPrChange"):
+                    _wd_drop(np_, t)
+                prpr = np_.find(_wd_qn("w:rPr"))
+                if prpr is not None:
+                    for t in ("ins", "del", "moveFrom", "moveTo", "rPrChange"):
+                        _wd_drop(prpr, t)
+                p.append(np_)
+            self.fill(p, it.get("p") or {}, None)
+            out.append((p, None))
+        return out
+
+    def cells(self, tbl, tid, cells, used):
+        if not isinstance(cells, dict):
+            raise WordEditError(_WD_BAD)
+        trs = [c for c in tbl if _wd_is(c, "tr")]
+        for key, items in list(cells.items())[:20000]:
+            try:
+                r, c = [int(v) for v in str(key).split(".")]
+                tc = [x for x in trs[r] if _wd_is(x, "tc")][c]
+            except (ValueError, IndexError):
+                raise WordEditError(_WD_BAD)
+            built = self.build(items, used, within="%s.%d.%d." % (tid, r, c))
+            tcpr = tc.find(_wd_qn("w:tcPr"))
+            extras = [x for x in tc if x is not tcpr and _wd_tag(x)[1] not in ("p", "tbl", "sdt", "customXml", "altChunk")]
+            for x in list(tc):
+                if x is not tcpr:
+                    tc.remove(x)
+            for x in extras:
+                tc.append(x)
+            for el, _ in built:
+                tc.append(el)
+            if not built or not _wd_is(built[-1][0], "p"):
+                tc.append(_wd_new("w:p"))          # a cell always ends with a paragraph
+
+    def fill(self, p, P, pid):
+        if not isinstance(P, dict):
+            raise WordEditError(_WD_BAD)
+        ppr = p.find(_wd_qn("w:pPr"))
+        if ppr is None:
+            ppr = _wd_new("w:pPr")
+            p.insert(0, ppr)
+        cur = _wd_val(ppr.find(_wd_qn("w:pStyle"))) or self.styles.default_p
+        style = P.get("style")
+        if style is not None and str(style)[:120] != cur:
+            sid = str(style)[:120]
+            if sid == self.styles.default_p:
+                _wd_drop(ppr, "pStyle")
+            else:
+                self.ensure_style(sid)
+                _wd_place(ppr, _wd_new("w:pStyle", val=sid), _WD_PPR_ORDER)
+        pstyle = _wd_val(ppr.find(_wd_qn("w:pStyle"))) or self.styles.default_p
+        if "align" in P:
+            _wd_drop(ppr, "jc")
+            al = P.get("align")
+            if al in ("left", "center", "right", "justify") and al != self.styles.plook(self.styles.players(pstyle))["align"]:
+                _wd_place(ppr, _wd_new("w:jc", val={"justify": "both"}.get(al, al)), _WD_PPR_ORDER)
+        if "list" in P:
+            self.set_list(ppr, pstyle, P.get("list"))
+        keep = self.marks.get(pid, []) if pid else []
+        for c in list(p):
+            if c is not ppr:
+                p.remove(c)
+        for m in keep:
+            if _wd_is(m, "bookmarkStart"):
+                p.append(m)
+        for r in self.runs_xml(P.get("runs") or [], pstyle):
+            p.append(r)
+        for m in keep:
+            if _wd_is(m, "bookmarkEnd"):
+                p.append(m)
+        if len(ppr) == 0 and not ppr.attrib:
+            p.remove(ppr)
+
+    def set_list(self, ppr, pstyle, lst):
+        sl = self.styles.list_of(pstyle)
+        _wd_drop(ppr, "numPr")
+        if not lst:
+            if sl:
+                np_ = _wd_new("w:numPr")
+                np_.append(_wd_new("w:numId", val="0"))
+                _wd_place(ppr, np_, _WD_PPR_ORDER)
+            return
+        if not isinstance(lst, dict) or lst.get("kind") not in ("bullet", "number"):
+            raise WordEditError(_WD_BAD)
+        level = max(0, min(8, int(_wd_num(lst.get("level"), 0) or 0)))
+        num = self.numbering(create=True).pick(lst["kind"], lst.get("num"))
+        if sl and sl[0] == num and sl[1] == level:
+            return
+        np_ = _wd_new("w:numPr")
+        np_.append(_wd_new("w:ilvl", val=level))
+        np_.append(_wd_new("w:numId", val=num))
+        _wd_place(ppr, np_, _WD_PPR_ORDER)
+
+    def runs_xml(self, runs, pstyle):
+        out, link = [], None
+        for rs in runs[:50000]:
+            if not isinstance(rs, dict):
+                continue
+            if "a" in rs:
+                at = self.atoms.get(str(rs["a"]))
+                if at is None:
+                    raise WordEditError(_WD_BAD)
+                out.extend(_wd_atom_xml(at))
+                link = None
+                continue
+            if "pic" in rs:
+                out.append(self.picture(rs))
+                link = None
+                continue
+            text = _wd_clean(rs.get("x"))
+            if not text:
+                continue
+            base = self.runs.get(str(rs.get("o"))) if rs.get("o") is not None else None
+            h = str(rs.get("h") or "")
+            href = h if h in self.known_links else _wd_href(h)
+            r = self.run_xml(text, base, rs, pstyle, href)
+            if href:
+                if link is not None and link[0] == href:
+                    link[1].append(r)
+                else:
+                    hl = self.hyperlink(href)
+                    hl.append(r)
+                    out.append(hl)
+                    link = (href, hl)
+            else:
+                out.append(r)
+                link = None
+        return out
+
+    def run_xml(self, text, base, fmt, pstyle, href):
+        import re
+        r = _wd_new("w:r")
+        rpr = _wd_copy.deepcopy(base) if base is not None else _wd_new("w:rPr")
+        _wd_drop(rpr, "rPrChange")
+        if href and base is None:
+            # a new link looks like one (Word's own link colour, underlined)
+            _wd_place(rpr, _wd_new("w:color", val="0563C1"), _WD_RPR_ORDER)
+            _wd_place(rpr, _wd_new("w:u", val="single"), _WD_RPR_ORDER)
+        rstyle = _wd_val(rpr.find(_wd_qn("w:rStyle")))
+        d = self.styles.look(self.styles.rlayers(pstyle, None, rstyle))
+        for key, tag in (("b", "b"), ("i", "i"), ("s", "strike")):
+            if key not in fmt:
+                continue
+            want = fmt.get(key)
+            _wd_drop(rpr, tag)
+            if key == "s":
+                _wd_drop(rpr, "dstrike")
+            if want is not None and bool(want) != d[key]:
+                _wd_place(rpr, _wd_new("w:" + tag) if want else _wd_new("w:" + tag, val="0"), _WD_RPR_ORDER)
+        if "u" in fmt and not (href and base is None):
+            want, cur = fmt.get("u"), rpr.find(_wd_qn("w:u"))
+            had = cur is not None and (cur.get(_wd_qn("w:val")) or "single") != "none"
+            if want is None or bool(want) == d["u"]:
+                _wd_drop(rpr, "u")
+            elif want and not had:
+                _wd_place(rpr, _wd_new("w:u", val="single"), _WD_RPR_ORDER)
+            elif not want:
+                _wd_place(rpr, _wd_new("w:u", val="none"), _WD_RPR_ORDER)
+        if "c" in fmt and not (href and base is None):
+            c = str(fmt.get("c") or "").lstrip("#").upper()
+            cur = rpr.find(_wd_qn("w:color"))
+            if not re.fullmatch("[0-9A-F]{6}", c):
+                _wd_drop(rpr, "color")
+            elif cur is None or (cur.get(_wd_qn("w:val")) or "").upper() != c:
+                _wd_place(rpr, _wd_new("w:color", val=c), _WD_RPR_ORDER)
+        if "va" in fmt:
+            _wd_drop(rpr, "vertAlign")
+            if fmt.get("va") in ("sup", "sub"):
+                _wd_place(rpr, _wd_new("w:vertAlign", val="superscript" if fmt["va"] == "sup" else "subscript"), _WD_RPR_ORDER)
+        if len(rpr):
+            r.append(rpr)
+        for part in re.split("(\t|\n)", text):
+            if part == "\t":
+                r.append(_wd_new("w:tab"))
+            elif part == "\n":
+                r.append(_wd_new("w:br"))
+            elif part:
+                t = _wd_new("w:t")
+                t.text = part
+                t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                r.append(t)
+        return r
+
+    def hyperlink(self, href):
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
+        hl = _wd_new("w:hyperlink")
+        if href.startswith("#"):
+            hl.set(_wd_qn("w:anchor"), href[1:200])
+        else:
+            rid = self.link_rids.get(href)
+            if rid is None:
+                rid = self.link_rids[href] = self.doc.part.relate_to(href, RT.HYPERLINK, is_external=True)
+            hl.set(_wd_qn("r:id"), rid)
+        hl.set(_wd_qn("w:history"), "1")
+        return hl
+
+    def text_width(self):
+        sp = self.doc.element.body.find(_wd_qn("w:sectPr"))
+        pg = sp.find(_wd_qn("w:pgSz")) if sp is not None else None
+        mar = sp.find(_wd_qn("w:pgMar")) if sp is not None else None
+        w = _wd_num(pg.get(_wd_qn("w:w")), 12240) if pg is not None else 12240
+        m = (_wd_num(mar.get(_wd_qn("w:left")), 1440) + _wd_num(mar.get(_wd_qn("w:right")), 1440)) if mar is not None else 2880
+        return max(72.0, (w - m) / 20.0)
+
+    def picture(self, rs):
+        from docx.shared import Emu
+        name = str(rs.get("pic") or "")
+        path = self.assets.get(name)
+        if not path or not os.path.exists(path):
+            raise WordEditError("A picture you added is missing — please add it again.")
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                iw, ih = im.size
+        except Exception:
+            raise WordEditError("A picture you added couldn't be read — please add another.")
+        w = _wd_num(rs.get("w")) or 0
+        w = min(w if w > 0 else 300.0, self.text_width())
+        h = w * ih / max(1, iw)
+        inline = self.doc.part.new_pic_inline(path, Emu(int(w * 12700)), Emu(int(h * 12700)))
+        r = _wd_new("w:r")
+        d = _wd_new("w:drawing")
+        d.append(inline)
+        r.append(d)
+        return r
+
+
+def _wd_field_word(instr):
+    word = (str(instr or "").strip().split() or ["Field"])[0].upper()
+    return {"PAGE": "Page number", "NUMPAGES": "Number of pages", "DATE": "Date", "TIME": "Time", "TOC": "Table of contents",
+            "REF": "Cross-reference", "PAGEREF": "Page reference", "HYPERLINK": "Link", "SEQ": "Number", "CITATION": "Citation",
+            "BIBLIOGRAPHY": "Bibliography"}.get(word, "Field")
+
+
+def _wd_field_label(group):
+    depth, shown, result, instr = 0, False, [], []
+    for kind, val, rpr, href, x in group:
+        if kind == "fld":
+            if val == "begin":
+                depth += 1
+            elif val == "end":
+                depth -= 1
+            elif val == "separate" and depth == 1:
+                shown = True
+        elif kind == "instr" and depth == 1:
+            instr.append(val)
+        elif kind == "t" and shown and depth == 1:
+            result.append(val)
+    text = "".join(result).strip()
+    return text[:200] if text else _wd_field_word("".join(instr))
+
+
+def _wd_atom_xml(atom):
+    """An atom back as file content: the elements it was, or its pieces each in a run of their own."""
+    kind, data = atom
+    if kind == "els":
+        return [_wd_copy.deepcopy(e) for e in data]
+    out = []
+    for k, val, rpr, href, x in data:
+        if k == "mark":
+            out.append(_wd_copy.deepcopy(x))
+            continue
+        r = _wd_new("w:r")
+        if rpr is not None:
+            r.append(_wd_copy.deepcopy(rpr))
+        r.append(_wd_copy.deepcopy(x))
+        out.append(r)
+    return out
+
+
+def _wd_page(body):
+    """The first section's page (where a document's words mostly start)."""
+    out = {"w": 612.0, "h": 792.0, "ml": 72.0, "mr": 72.0, "mt": 72.0, "mb": 72.0}
+    sp = next(iter(body.iter(_wd_qn("w:sectPr"))), None)
+    pg = sp.find(_wd_qn("w:pgSz")) if sp is not None else None
+    mar = sp.find(_wd_qn("w:pgMar")) if sp is not None else None
+    if pg is not None:
+        out["w"] = _wd_num(pg.get(_wd_qn("w:w")), 12240) / 20.0
+        out["h"] = _wd_num(pg.get(_wd_qn("w:h")), 15840) / 20.0
+    if mar is not None:
+        for k, a in (("ml", "w:left"), ("mr", "w:right"), ("mt", "w:top"), ("mb", "w:bottom")):
+            out[k] = abs(_wd_num(mar.get(_wd_qn(a)), 1440)) / 20.0
+    return out
+
+
+def _wd_style_view(ctx, sid, missing=False):
+    st = ctx.styles if not missing else _WdStyles(_wd_template())
+    rl = st.look(st.rlayers(sid))
+    pl = st.plook(st.players(sid))
+    nxt = _wd_val(st.el[sid].find(_wd_qn("w:next"))) if sid in st.el else None
+    lst = None
+    if not missing and pl["num"] and pl["num"] != "0":
+        lv = ctx.numbering().level(pl["num"], pl["ilvl"])
+        if lv is not None:
+            ctx.used_lists.add(pl["num"])
+            lst = {"kind": "bullet" if lv[0] in ("bullet", "none") else "number", "level": pl["ilvl"], "num": pl["num"]}
+    v = {"name": st.name(sid), "b": rl["b"], "i": rl["i"], "u": rl["u"], "sz": rl["sz"], "f": rl["f"], "c": rl["c"],
+         "caps": rl["caps"], "align": pl["align"], "before": pl["before"], "after": pl["after"], "line": pl["line"],
+         "left": pl["left"], "first": pl["first"], "next": nxt if nxt in st.el else None, "list": lst}
+    if missing:
+        v["missing"] = True
+    return v
+
+
+def word_open(path):
+    """A .docx for the Word editor: its blocks, styles, lists and page, as plain data (see _WdCtx)."""
+    if path:
+        doc = _wd_load(path)
+    else:
+        from docx import Document
+        doc = Document()
+    ctx = _WdCtx(doc, view=True)
+    blocks = ctx.container(doc.element.body, "b")
+    styles = {}
+    offer = [ctx.styles.default_p] + [s for s in _WD_OFFER if s != ctx.styles.default_p]
+    for sid in [s for s in offer if s] + sorted(s for s in ctx.used_styles if s):
+        if sid in styles:
+            continue
+        if sid in ctx.styles.el:
+            styles[sid] = _wd_style_view(ctx, sid)
+        elif sid in _WdStyles(_wd_template()).el:
+            styles[sid] = _wd_style_view(ctx, sid, missing=True)
+    lists = {}
+    num = ctx.numbering()
+    for nid in sorted(ctx.used_lists):
+        lists[nid] = {str(l): list(num.level(nid, l) or ("decimal", "%" + str(l + 1) + ".", 1)) for l in range(9)}
+    return {"sig": _wd_sig(path, doc) if path else "", "blocks": blocks, "styles": styles, "default": ctx.styles.default_p,
+            "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body)}
+
+
+def word_save(src_path, plan, out_dir, assets=None):
+    """The Word editor's Save: the original .docx (or none, for a new document) plus the plan → the new .docx."""
+    from docx import Document
+    if not isinstance(plan, dict) or not isinstance(plan.get("body"), list):
+        raise WordEditError(_WD_BAD)
+    if src_path:
+        doc = _wd_load(src_path)
+        if plan.get("sig") and plan.get("sig") != _wd_sig(src_path, doc):
+            raise WordEditError("This isn't the file that was opened — please open it again.")
+    else:
+        doc = Document()
+    ctx = _WdCtx(doc, view=False, assets=assets)
+    body = doc.element.body
+    original = [c for c in body]
+    sect = original[-1] if original and _wd_is(original[-1], "sectPr") else None
+    ctx.container(body, "b")
+    follow, pending = {}, []                     # bookmarks and the like between blocks stay before the next block
+    for n, c in enumerate(original):
+        if c is sect:
+            continue
+        bid = "b%d" % n
+        if bid in ctx.blocks:
+            follow[bid], pending = pending, []
+        else:
+            pending.append(c)
+    used = set()
+    built = ctx.build(plan["body"], used)
+    for c in original:
+        body.remove(c)
+    kept = set()
+    for el, bid in built:
+        for x in follow.get(bid, []):
+            body.append(x)
+        body.append(el)
+        kept.add(bid)
+    for bid, xs in follow.items():
+        if bid not in kept:
+            for x in xs:
+                body.append(x)
+    for x in pending:
+        body.append(x)
+    if not any(_wd_is(c, "p") or _wd_is(c, "tbl") for c in body):
+        body.append(_wd_new("w:p"))
+    if sect is not None:
+        body.append(sect)
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "edited.docx")
+    doc.save(out)
+    return out
+
+
 CONVERTERS = {
     ("docx", "pdf"): docx_to_pdf,
     ("docx", "pptx"): docx_to_pptx,

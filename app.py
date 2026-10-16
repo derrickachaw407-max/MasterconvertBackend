@@ -39,6 +39,8 @@ from converters import (
     warm_up_libreoffice,
 )
 from converters import _soffice_convert   # the server's own LibreOffice runner
+from converters import pdf_apply_plan, pdf_plan_needs_pro, pdf_to_images   # 3.1: the PDF editor
+from converters import word_open, word_save   # 3.1: the Word editor
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
 
 # Load LibreOffice into memory in the background as each worker starts, so
@@ -1365,6 +1367,47 @@ def search_web_sources(topic, max_results=4):
     return sources[:max_results], diag
 
 
+# Semantic Scholar's key allows one request a second — counted across every worker process of this
+# server through a small lock file holding the time of the last request.
+_S2_GAP = 1.05
+_S2_LOCK = os.path.join(tempfile.gettempdir(), "docente-s2.lock")
+_S2_BUSY = "Semantic Scholar was busy (one request a second), so the other sources were used"
+
+
+def _s2_slot(max_wait=1.2):
+    """Waits for this server's next turn at Semantic Scholar. False when no turn comes within
+    max_wait seconds — the caller then goes on without it."""
+    import fcntl
+    deadline = time.time() + max_wait
+    while True:
+        try:
+            fd = os.open(_S2_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return True                      # no shared file: never block a search over it
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                last = float(os.pread(fd, 40, 0).decode("ascii", "ignore").strip() or 0)
+            except ValueError:
+                last = 0.0
+            now = time.time()
+            if last > now + 60:              # a clock that went back: start again
+                last = 0.0
+            wait = last + _S2_GAP - now
+            if wait <= 0:
+                os.ftruncate(fd, 0)
+                os.pwrite(fd, repr(now).encode("ascii"), 0)
+                return True
+            if now + wait > deadline:
+                return False
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        time.sleep(min(wait, 0.25))           # wait outside the lock, then look again
+
+
 def search_semantic_scholar(query, max_results=4):
     """Searches Semantic Scholar's free public API for real peer-reviewed papers.
     Sends SEMANTIC_SCHOLAR_API_KEY when configured — without one, the anonymous
@@ -1384,6 +1427,8 @@ def search_semantic_scholar(query, max_results=4):
     params = {"query": query[:300], "limit": max(max_results * 3, 15), "fields": "title,url,year,authors,abstract,venue"}
     resp = None
     for attempt in range(2):
+        if not _s2_slot():
+            return [], _S2_BUSY
         try:
             resp = requests.get(
                 "https://api.semanticscholar.org/graph/v1/paper/search",
@@ -1624,9 +1669,13 @@ def _s2_papers(query, n, since=None):
               "fields": "title,url,year,authors,abstract,venue,openAccessPdf,externalIds,citationCount,journal"}
     if since:
         params["year"] = f"{since}-"
+    if not _s2_slot():
+        return [], _S2_BUSY
     resp = requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params=params, headers=headers, timeout=_PAPER_TIMEOUT)
     if resp.status_code == 400:      # the "has a PDF" filter refused: ask without it (each paper is still checked below)
         params.pop("openAccessPdf", None)
+        if not _s2_slot():
+            return [], _S2_BUSY
         resp = requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params=params, headers=headers, timeout=_PAPER_TIMEOUT)
     if resp.status_code != 200:
         return [], f"Semantic Scholar HTTP {resp.status_code}"
@@ -2075,7 +2124,7 @@ def add_cors_headers(resp):
         resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary"
+    resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note"
     return resp
 
 
@@ -4168,6 +4217,194 @@ def images_to_pdf_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _is_pro(user):
+    return (user or {}).get("plan") in ("monthly", "yearly")
+
+
+@app.route("/api/pdf/apply", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def pdf_apply_endpoint():
+    """3.1 — the PDF editor's Save: 'file' (the original PDF), 'plan' (JSON: pages, items, form,
+    output — see pdf_apply_plan), 'assets' (pictures, signatures and added PDFs, each named by its
+    own filename in the plan) and, for a locked PDF, 'password'. Returns the edited PDF — or, when
+    the plan splits it (output.split), a zip of the parts."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in (file.filename or "") else ""
+    if ext != "pdf":
+        return jsonify({"error": "The file must be a PDF."}), 400
+    try:
+        plan = json.loads(request.form.get("plan") or "{}")
+    except json.JSONDecodeError:
+        return jsonify({"error": "The changes couldn't be read — please try again."}), 400
+    if not isinstance(plan, dict):
+        return jsonify({"error": "The changes couldn't be read — please try again."}), 400
+    if pdf_plan_needs_pro(plan) and not _is_pro(request.current_user):
+        return jsonify({"error": "Redacting and protecting PDFs are part of Docente Pro.", "pro": True}), 403
+    try:
+        _log_conversion_and_consume(request.current_user, "pdf", "pdf-edit")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+    work_dir = tempfile.mkdtemp(prefix=f"mc_pdfapply_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, "source.pdf")
+        file.save(src_path)
+        assets = {}
+        for n, a in enumerate(request.files.getlist("assets")[:60]):
+            if not a.filename:
+                continue
+            safe, _e = safe_upload_filename(a.filename)
+            p = os.path.join(work_dir, f"asset{n}_{safe}")
+            a.save(p)
+            assets[a.filename] = p
+        try:
+            result, notes = pdf_apply_plan(src_path, plan, work_dir, assets, password=request.form.get("password") or None)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        base = safe_download_name(file.filename).rsplit(".", 1)[0]
+        if isinstance(result, list):
+            # split into files: they come back together in one zip, each named after the PDF
+            zip_path = os.path.join(work_dir, "parts.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in result:
+                    zf.write(p, arcname=f"{base} - " + os.path.basename(p)[len("split-"):])
+            resp = send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name=f"{base} (split).zip")
+        else:
+            resp = send_file(result, mimetype="application/pdf", as_attachment=True, download_name=f"{base} (edited).pdf")
+        if notes:
+            resp.headers["X-Docente-Note"] = " ".join(notes)[:300]
+        return resp
+    except Exception as e:
+        logger.error(f"PDF editor save failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Saving the PDF failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/pdf/to-images", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def pdf_to_images_endpoint():
+    """3.1 — PDF → pictures: one JPG per page (a single page comes back as the JPG itself, more as a zip)."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files["file"]
+    try:
+        _log_conversion_and_consume(request.current_user, "pdf", "jpg")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+    work_dir = tempfile.mkdtemp(prefix=f"mc_pdfimg_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, "source.pdf")
+        file.save(src_path)
+        try:
+            paths = pdf_to_images(src_path, os.path.join(work_dir, "pages"), password=request.form.get("password") or None)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        base = safe_download_name(file.filename).rsplit(".", 1)[0]
+        if len(paths) == 1:
+            return send_file(paths[0], mimetype="image/jpeg", as_attachment=True, download_name=f"{base}.jpg")
+        zip_path = os.path.join(work_dir, "pages.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for n, p in enumerate(paths, 1):
+                zf.write(p, arcname=f"{base} - page {n}.jpg")
+        return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name=f"{base} (pages).zip")
+    except Exception as e:
+        logger.error(f"PDF to pictures failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Turning the PDF into pictures failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/word/open", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def word_open_endpoint():
+    """3.1 — the Word editor opens a file: 'file' (.docx; a .doc, .odt or .rtf is made into a .docx first,
+    and that .docx comes back too, as 'docx', to be saved from). No file: a new, empty document."""
+    work_dir = tempfile.mkdtemp(prefix=f"mc_wordopen_{uuid.uuid4().hex[:8]}_")
+    try:
+        file = request.files.get("file")
+        path, made = None, None
+        if file is not None and file.filename:
+            ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+            if ext not in ("docx", "doc", "odt", "rtf"):
+                return jsonify({"error": "Choose a Word file (.docx or .doc)."}), 400
+            path = os.path.join(work_dir, "source." + ext)
+            file.save(path)
+            if ext != "docx":
+                try:
+                    path = _soffice_convert(path, "docx", os.path.join(work_dir, "made"))
+                except ConversionError:
+                    return jsonify({"error": "This file couldn't be opened — please save it as .docx in Word, then try again."}), 422
+                with open(path, "rb") as fh:
+                    made = base64.b64encode(fh.read()).decode("ascii")
+        try:
+            data = word_open(path)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        if made:
+            data["docx"] = made
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Word editor open failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Opening the Word file failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.route("/api/word/save", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def word_save_endpoint():
+    """3.1 — the Word editor's Save: 'file' (the .docx that was opened; none for a new document), 'plan'
+    (JSON, see word_save), 'assets' (pictures added, by their names in the plan) and, for a new
+    document, 'name'. Returns the new .docx — "<name> (edited).docx" for a file that was opened."""
+    try:
+        plan = json.loads(request.form.get("plan") or "{}")
+    except json.JSONDecodeError:
+        return jsonify({"error": "The changes couldn't be read — please try again."}), 400
+    file = request.files.get("file")
+    has_file = file is not None and bool(file.filename)
+    if has_file and not file.filename.lower().endswith(".docx"):
+        return jsonify({"error": "The file must be a .docx Word file."}), 400
+    try:
+        _log_conversion_and_consume(request.current_user, "docx", "docx-edit")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 402
+    work_dir = tempfile.mkdtemp(prefix=f"mc_wordsave_{uuid.uuid4().hex[:8]}_")
+    try:
+        src = None
+        if has_file:
+            src = os.path.join(work_dir, "source.docx")
+            file.save(src)
+        assets = {}
+        for n, a in enumerate(request.files.getlist("assets")[:60]):
+            if not a.filename:
+                continue
+            safe, _e = safe_upload_filename(a.filename)
+            p = os.path.join(work_dir, f"asset{n}_{safe}")
+            a.save(p)
+            assets[a.filename] = p
+        try:
+            result = word_save(src, plan, os.path.join(work_dir, "out"), assets)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        if has_file:
+            name = safe_download_name(file.filename).rsplit(".", 1)[0] + " (edited).docx"
+        else:
+            name = safe_download_name(str(request.form.get("name") or "Document")[:80] + ".docx")
+        return send_file(result, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                         as_attachment=True, download_name=name)
+    except Exception as e:
+        logger.error(f"Word editor save failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Saving the Word file failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @app.route("/api/text-to-pptx", methods=["POST", "OPTIONS"])
 @auth_required
 def text_to_pptx_endpoint():
@@ -6042,6 +6279,12 @@ def render_drawing(spec):
 _DECK_MAX = 16
 _DRAW_WORDS = re.compile(r"\b(draw\w*|diagram\w*|illustrat\w*|stick ?(?:man|men|figures?)|sketch\w*|picture\w*|visual\w*|figure\w*|image\w*)\b", re.I)
 _CHART_WORDS = re.compile(r"\b(chart\w*|graph\w*|data|statistic\w*|figures?|numbers?)\b", re.I)
+_DECK_ORDER_FIELDS = {
+    "student": ('presenters: the presenters\' names with their index numbers, as strings, ONLY if the request gives them; '
+                'otherwise [].\n'),
+    "tutor": ('objectives: 3 to 5 learning objectives for the lecture, each starting with a verb ("Explain ...", "Compare ...") '
+              'and at most 14 words.\ndiscussion: 2 or 3 short questions for a class discussion at the end.\n'),
+}
 _DECK_SYSTEM = (
     "You are Remy, the assistant in Docente, writing a COMPLETE slide deck from a short request, for a {group} to present. "
     "Reply with ONE JSON object only — no preamble, no code fences: {{\"title_slide\": {{...}}, \"slides\": [...]}}.\n"
@@ -6054,7 +6297,8 @@ _DECK_SYSTEM = (
     "— for a comparison, 2 to 4 points a side;\n"
     '  {{"kind": "section", "title": "...", "sub": "..."}} — a divider between big parts, only in decks of 10 or more slides.\n'
     "Every title names its slide's real topic (never \"Slide 3\", \"Continued\" or \"Overview\" twice). \"notes\": 2 or 3 sentences "
-    "of what to say on that slide. Don't add a cover, a references slide or a thank-you slide — they are added for you.\n"
+    "of what to say on that slide. Don't add a cover, a presenters slide, an outline, objectives, a discussion, a references "
+    "slide or a thank-you slide as slides — they are added for you, in their places.\n"
     "Rules: never invent statistics, dates, named studies or quotations; write in the request's own language; leave a "
     "title-slide field blank rather than inventing a course, code, lecturer or institution the request didn't mention."
 )
@@ -6202,12 +6446,26 @@ def _parse_full_deck(raw, group, sources, style="apa"):
     if not any(s["kind"] != "section" for s in body):
         raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
     refs = build_references_list(sources, cited) if sources else []
-    for i in range(0, len(refs), 4):
-        body.append({"kind": "content", "title": "References", "list_style": "bullets", "bullets": [
-            {"text": re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else ""), "level": 0} for r in refs[i:i + 4]]})
-    body.append({"kind": "end", "title": "Any questions" if group == "tutor" else "Thank you for listening", "big": "Thank you"})
+    lines = lambda rs: [re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else "") for r in rs]
+
+    def plain(title, items, per=5):
+        return [{"kind": "content", "title": title, "list_style": "bullets", "bullets": [{"text": t, "level": 0} for t in items[i:i + per]]}
+                for i in range(0, len(items), per)]
+    # the outline is the deck's own parts: its sections when it has them, else its slide titles
+    sections = [s["title"] for s in body if s["kind"] == "section" and s.get("title")]
+    outline = sections if len(sections) >= 2 else list(dict.fromkeys(s["title"] for s in body if s["kind"] in ("content", "columns") and s.get("title")))
+    items = lambda key, n, cap: [clip(x, cap) for x in (data.get(key) or []) if isinstance(x, (str, int, float)) and clip(x, cap)][:n]
+    if group == "tutor":
+        # every paper found is worth reading (those the slides cite, and the others), all of them real
+        reading = lines(build_references_list(sources, None)) if sources else []
+        out = plain("References & Recommended Books", reading, 4) + plain("Learning Objectives", items("objectives", 6, 160))
+        out += plain("Presentation Outline", outline, 6) + body + plain("Discussion", items("discussion", 4, 200))
+        out.append({"kind": "end", "title": "Thank you", "big": "Thank you"})
+    else:
+        out = plain("Presented by", items("presenters", 10, 120) or ["Name \u2014 Index number"], 6)
+        out += plain("Presentation Outline", outline, 6) + body + plain("References", lines(refs), 4)
     return {"template": ("tutor" if group == "tutor" else "student") + "-plain", "title_slide": title_slide, "slide_numbers": True,
-            "slides": body}, refs
+            "slides": out}, refs
 
 
 @app.route("/api/slides/draft", methods=["POST", "OPTIONS"])
@@ -6228,7 +6486,7 @@ def slides_draft_endpoint():
     sources = enrich_sources(papers, "apa") if papers else []
     system = _DECK_SYSTEM.format(
         group="tutor preparing a lecture" if group == "tutor" else "student preparing a presentation or report",
-        title_fields=_DRAFT_TITLE_FIELDS[group], min_slides=8, max_slides=_DECK_MAX - 2,
+        title_fields=_DRAFT_TITLE_FIELDS[group] + _DECK_ORDER_FIELDS[group], min_slides=8, max_slides=_DECK_MAX - 2,
     )
     if sources:
         system += _DECK_EVIDENCE.format(example=sources[0]["citation_key"], papers="\n".join(
