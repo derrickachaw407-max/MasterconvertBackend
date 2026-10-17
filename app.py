@@ -1236,6 +1236,55 @@ def _log_ai_use(model, usage, feature):
         pass
 
 
+# 3.3.1: what people see when the AI can't answer. Never the AI service's own words — they can name this account's
+# credit balance or keys. The real reason goes to the server log for the owner (see _ai_failure).
+AI_MSG_UNAVAILABLE = "Remy isn\u2019t available right now. Please try again a little later."
+AI_MSG_BUSY = "Remy is busy right now. Please try again in a minute."
+AI_MSG_SLOW = "Remy took too long to answer. Please try again."
+AI_MSG_TOO_BIG = "That\u2019s more than Remy can read at once. Please try a shorter message or file."
+AI_MSG_FAILED = "Remy couldn\u2019t answer just now. Please try again."
+AI_MSG_NOT_COUNTED = " This didn\u2019t use any of your messages."
+
+
+def _ai_failure(status, body, feature=None):
+    """The AI service answered with an error: log the real reason for the owner, and return the plain words the
+    person sees instead."""
+    err = {}
+    try:
+        err = (json.loads(body or "{}") or {}).get("error") or {}
+    except (ValueError, AttributeError):
+        err = {}
+    if not isinstance(err, dict):
+        err = {}
+    kind = str(err.get("type") or "")
+    detail = str(err.get("message") or "") or str(body or "")[:300]
+    low = detail.lower()
+    where = feature or "-"
+    if "credit balance" in low or "purchase credits" in low or kind == "billing_error" or status == 402:
+        logger.error(f"AI is OFF for everyone: the Anthropic account has run out of credit. Add credit in the Anthropic "
+                     f"Console (Plans & Billing); people see \"{AI_MSG_UNAVAILABLE}\" until then. ({where})")
+        return AI_MSG_UNAVAILABLE
+    if "usage limit" in low or "spend limit" in low:
+        logger.error(f"AI is OFF for everyone: the Anthropic account reached its spending limit. Raise it in the Anthropic "
+                     f"Console (Limits). ({where}): {detail[:200]}")
+        return AI_MSG_UNAVAILABLE
+    if status in (401, 403) or kind in ("authentication_error", "permission_error"):
+        logger.error(f"AI is OFF for everyone: the AI service refused the key ({status} {kind}). Check ANTHROPIC_API_KEY "
+                     f"on Render. ({where})")
+        return AI_MSG_UNAVAILABLE
+    if status == 429 or kind == "rate_limit_error":
+        logger.warning(f"AI: rate limit reached ({where}): {detail[:200]}")
+        return AI_MSG_BUSY
+    if status == 413 or kind == "request_too_large" or "too long" in low:
+        logger.warning(f"AI: the request was too large ({where}): {detail[:200]}")
+        return AI_MSG_TOO_BIG
+    if status >= 500 or kind in ("overloaded_error", "api_error"):
+        logger.warning(f"AI: the AI service is having trouble ({status} {kind}) ({where})")
+        return AI_MSG_BUSY
+    logger.error(f"AI request failed ({status} {kind}) ({where}): {detail[:300]}")
+    return AI_MSG_FAILED
+
+
 def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None,
                 timeout=None, feature=None):
     """messages, when given, is sent to the API exactly as the native
@@ -1248,7 +1297,8 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     gets the native form; user_message alone still works unchanged for
     every existing single-shot caller."""
     if not ANTHROPIC_API_KEY:
-        raise ConversionError("AI features need ANTHROPIC_API_KEY set on the server")
+        logger.error("AI is OFF for everyone: ANTHROPIC_API_KEY isn't set on Render.")
+        raise ConversionError(AI_MSG_UNAVAILABLE)
     payload = {
         "model": model or ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
@@ -1269,12 +1319,18 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
             timeout=timeout or (140 if use_search else 110),
         )
     except requests.exceptions.Timeout:
-        raise ConversionError("AI request timed out — try again, or try a narrower topic")
+        logger.warning(f"AI: no answer in time ({feature or '-'})")
+        raise ConversionError(AI_MSG_SLOW)
     except requests.exceptions.RequestException as e:
-        raise ConversionError(f"AI request failed: {e}")
+        logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {e}")
+        raise ConversionError(AI_MSG_FAILED)
     if resp.status_code != 200:
-        raise ConversionError(f"AI request failed ({resp.status_code}): {resp.text[:200]}")
-    data = resp.json()
+        raise ConversionError(_ai_failure(resp.status_code, resp.text, feature))
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning(f"AI: the answer wasn't readable ({feature or '-'})")
+        raise ConversionError(AI_MSG_FAILED)
     _log_ai_use(payload["model"], data.get("usage"), feature)
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     if return_meta:
@@ -4916,7 +4972,7 @@ def sage_endpoint():
         # spent another.
         _refund_sage_message(request.current_user, charged_from)
         if isinstance(e, ConversionError):
-            return jsonify({"error": str(e)}), 502
+            return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
         raise
     thinking, result = split_thinking_anywhere(result or "")
     note, reply = split_memory_note(result or "")
@@ -6553,11 +6609,11 @@ def slides_draft_endpoint():
         return jsonify({"deck": deck, "references": refs})
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from)
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
     except Exception as e:
         _refund_sage_message(request.current_user, charged_from)
         logger.error(f"Slide draft failed unexpectedly: {e}", exc_info=True)
-        return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
+        return jsonify({"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}), 502
 
 
 # ------------------------------------------- the stores' notices to this server
