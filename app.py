@@ -78,7 +78,16 @@ Compress(app)
 # up to twice its number. That's fine for what these limits are for —
 # stopping scripts making hundreds or thousands of requests — not precise
 # quotas (Remy's monthly allowance is exact; it's counted in the database).
-limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
+def _client_ip():
+    """The visitor's own address. Render's edge sets True-Client-IP to it (replacing any value a visitor sends);
+    elsewhere (a computer, the tests) the connection's own address."""
+    v = (request.headers.get("True-Client-IP") or request.headers.get("CF-Connecting-IP") or "").strip()
+    if v and len(v) <= 45 and re.fullmatch(r"[0-9A-Fa-f:.]+", v):
+        return v
+    return get_remote_address()
+
+
+limiter = Limiter(_client_ip, app=app, storage_uri="memory://")
 
 
 def _account_or_ip_key():
@@ -90,7 +99,7 @@ def _account_or_ip_key():
         uid = verify_token(auth[7:])
         if uid:
             return f"user:{uid}"
-    return get_remote_address()
+    return _client_ip()
 
 
 # Per-account ceilings for the features that cost real money or heavy
@@ -117,7 +126,7 @@ def _exempt_cors_preflight():
 
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("docente")
+logger = logging.getLogger("academic-home")
 if not (os.environ.get("EMAIL_ADDRESS") and (os.environ.get("EMAIL_APP_PASSWORD") or os.environ.get("BREVO_API_KEY"))):
     logger.warning("Email: NOT set up — add EMAIL_ADDRESS and EMAIL_APP_PASSWORD on Render so new accounts can confirm their email")
 
@@ -282,7 +291,7 @@ STORE_PRODUCT_TO_PLAN = {
     #   consumed after it's granted). Each store transaction is credited
     #   once only (store_purchases).
     #   Monthly / Yearly — auto-renewable subscriptions in one group
-    #   ("Docente Pro"); renewal and cancellation are handled by the stores.
+    #   ("Academic-Home Pro"); renewal and cancellation are handled by the stores.
     "com.docente.app.payperuse": "payperuse",
     "com.docente.app.pass30": "payperuse",
     "com.docente.app.pro.monthly": "monthly",
@@ -470,6 +479,7 @@ def init_db():
                 )
                 """
             )
+            _meet_tables(cur)
     except Exception as e:
         logger.error("init_db: table setup failed: %s", e)
     finally:
@@ -869,7 +879,7 @@ def send_email(to_email, subject, body, html=None):
     if not _email_ready():
         raise ConversionError("Email sending isn't configured on the server yet")
     if BREVO_API_KEY:
-        payload = {"sender": {"name": "Docente", "email": EMAIL_ADDRESS}, "to": [{"email": to_email}],
+        payload = {"sender": {"name": "Academic-Home", "email": EMAIL_ADDRESS}, "to": [{"email": to_email}],
                    "subject": subject, "textContent": body}
         if html:
             payload["htmlContent"] = html
@@ -893,7 +903,7 @@ def send_email(to_email, subject, body, html=None):
     else:
         msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = formataddr(("Docente", EMAIL_ADDRESS))
+    msg["From"] = formataddr(("Academic-Home", EMAIL_ADDRESS))
     msg["To"] = to_email
     for attempt in (1, 2):
         try:
@@ -926,20 +936,20 @@ def _cancel_code(cur, user_id):
 
 def _code_email(name, code):
     first = (str(name or "").strip().split() or ["there"])[0]
-    text = (f"Hi {first},\n\nYour Docente confirmation code is:\n\n    {code}\n\n"
+    text = (f"Hi {first},\n\nYour Academic-Home confirmation code is:\n\n    {code}\n\n"
             f"It expires in {EMAIL_CODE_MINUTES} minutes. Enter it in the app to confirm this is your email address.\n\n"
-            "If you didn't create a Docente account, you can ignore this email.\n\n— Docente")
+            "If you didn't create an Academic-Home account, you can ignore this email.\n\n— Academic-Home")
     spaced = " ".join(code)
     html = (
         '<div style="background:#f2f3f7;padding:32px 12px;font-family:Segoe UI,Helvetica,Arial,sans-serif;color:#14161c">'
         '<div style="max-width:440px;margin:0 auto;background:#ffffff;border-radius:18px;padding:30px 26px;border:1px solid #e3e5ec">'
-        '<div style="font-size:20px;font-weight:800;letter-spacing:-.01em">Docente</div>'
+        '<div style="font-size:20px;font-weight:800;letter-spacing:-.01em">Academic-Home</div>'
         f'<p style="font-size:16px;line-height:1.5;margin:18px 0 6px">Hi {first},</p>'
         '<p style="font-size:16px;line-height:1.5;margin:0 0 18px">Here is your confirmation code:</p>'
         f'<div style="font-size:34px;font-weight:800;letter-spacing:.18em;text-align:center;background:#fff7e6;border:1px solid #f1d38a;'
         f'border-radius:14px;padding:16px 8px;color:#14161c">{spaced}</div>'
         f'<p style="font-size:14px;line-height:1.5;color:#4b5060;margin:18px 0 0">It expires in {EMAIL_CODE_MINUTES} minutes. '
-        "If you didn't create a Docente account, you can ignore this email.</p>"
+        "If you didn't create an Academic-Home account, you can ignore this email.</p>"
         '</div></div>')
     return text, html
 
@@ -979,7 +989,7 @@ def _send_verification_code(row, force=False, to=None):
         conn.close()
     text, html = _code_email(row.get("name"), code)
     try:
-        send_email(to or row["email"], f"{code} is your Docente code", text, html)
+        send_email(to or row["email"], f"{code} is your Academic-Home code", text, html)
     except Exception as e:
         logger.warning(f"Couldn't send a confirmation code to user {uid}: {e}")
         _email_send_result(False, e, to or row["email"])
@@ -1335,7 +1345,8 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     if return_meta:
         sources, queries = _search_trail(data.get("content") or [])
-        return {"text": text, "stop_reason": data.get("stop_reason"), "sources": sources, "queries": queries}
+        return {"text": text, "stop_reason": data.get("stop_reason"), "sources": sources, "queries": queries,
+                "content": data.get("content") or []}
     return text
 
 
@@ -1615,7 +1626,7 @@ _INSTRUCTION_PREFIX = re.compile(
     re.IGNORECASE)
 _SMALL_TALK = re.compile(
     r"^(?:hi+|hello|hey|good (?:morning|afternoon|evening|night)|thanks?|thank you|ok(?:ay)?|yes|no|bye|goodbye|"
-    r"how are you|good|great|cool|nice)\b[\s!.?,]*(?:remy|docente)?[\s!.?]*$", re.IGNORECASE)
+    r"how are you|good|great|cool|nice)\b[\s!.?,]*(?:remy|docente|academic[\s-]?home)?[\s!.?]*$", re.IGNORECASE)
 
 
 def _search_topic(text):
@@ -1654,7 +1665,7 @@ import math as _math
 
 OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 _PAPER_TIMEOUT = 9
-_PAPER_UA = {"User-Agent": "Docente/3.0 (study app; https://getdocente.vercel.app)"}
+_PAPER_UA = {"User-Agent": "Academic-Home/3.4 (study app; https://getdocente.vercel.app)"}
 _PAPER_STOP = set((
     "a an and are as at be been being but by can could do does for from had has have how i if in into is it its "
     "me my of on or our so than that the their them then there these they this those to was we were what when "
@@ -2210,6 +2221,15 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note"
+    # 3.4: how a browser may treat this reply
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    if resp.mimetype == "application/json":
+        resp.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+    if request.headers.get("Authorization") and "Cache-Control" not in resp.headers:
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -2406,9 +2426,9 @@ def forgot_password():
         try:
             send_email(
                 email,
-                "Reset your Docente password",
+                "Reset your Academic-Home password",
                 f"Hi {row['name'] or ''},\n\n"
-                "We received a request to reset your Docente password. "
+                "We received a request to reset your Academic-Home password. "
                 "This link expires in 1 hour:\n\n"
                 f"{reset_link}\n\n"
                 "If you didn't request this, you can safely ignore this email — "
@@ -2524,7 +2544,7 @@ def google_signin():
                 cur.execute("SELECT * FROM users WHERE email = %s", (email,))
                 row = cur.fetchone()
                 if row and not google_checked:
-                    return jsonify({"error": "This email already has a Docente account — log in with your password."}), 409
+                    return jsonify({"error": "This email already has an Academic-Home account — log in with your password."}), 409
                 keep_ref = None
                 if row and not row.get("email_proven"):
                     # An account holding this address that never proved it was theirs — made with a
@@ -2643,7 +2663,7 @@ def verify_email():
                     cur.execute("UPDATE users SET pending_email = NULL WHERE id = %s", (row["id"],))
                     cur.execute("DELETE FROM email_codes WHERE user_id = %s", (row["id"],))
                     conn.commit()
-                    return jsonify({"error": "That address now belongs to another Docente account, so your email wasn't changed.",
+                    return jsonify({"error": "That address now belongs to another Academic-Home account, so your email wasn't changed.",
                                     "taken": True}), 409
             user = cur.fetchone()
             cur.execute("DELETE FROM email_codes WHERE user_id = %s", (row["id"],))
@@ -3210,7 +3230,7 @@ def paystack_initialize():
     if not _paystack_on():
         return jsonify({"error": "Payments aren't set up yet — please try again later."}), 503
     if _from_store_app():
-        return jsonify({"error": "In the Docente app, Pro is bought through the App Store or Google Play."}), 403
+        return jsonify({"error": "In the Academic-Home app, Pro is bought through the App Store or Google Play."}), 403
     plan = str((request.get_json(silent=True) or {}).get("plan") or "")
     if plan not in PAYSTACK_ON_SALE:
         return jsonify({"error": "Choose 6 months or 1 month of Pro, or a Remy Pack."}), 400
@@ -3235,12 +3255,12 @@ def paystack_initialize():
             "email": user["email"], "amount": amount, "currency": "GHS", "reference": reference,
             "callback_url": f"{FRONTEND_URL.rstrip('/')}/?paystack=return",
             "metadata": {"user_id": user["id"], "plan": plan,
-                         "custom_fields": [{"display_name": "Docente plan", "variable_name": "plan", "value": plan}]},
+                         "custom_fields": [{"display_name": "Academic-Home plan", "variable_name": "plan", "value": plan}]},
         })
     except Exception as e:
-        logger.warning(f"Paystack initialize failed for {reference}: {e}")
-        reason = str(e)[:120]
-        return jsonify({"error": "Paystack couldn't start the payment" + (f" ({reason})" if reason else "") + " — please try again in a moment."}), 502
+        logger.error(f"Paystack couldn't start payment {reference}: {e} \u2014 if this repeats, check PAYSTACK_SECRET_KEY "
+                     "and the Paystack account's settings (GHS payments switched on).")
+        return jsonify({"error": "Paystack couldn't start the payment just now. Please try again in a moment."}), 502
     return jsonify({"authorization_url": data.get("authorization_url"), "access_code": data.get("access_code"), "reference": reference})
 
 
@@ -3879,7 +3899,7 @@ def convert_endpoint():
                 return jsonify({"error": "'title_align' must be left, center, or right"}), 400
             pptx_options["title_align"] = title_align
 
-    # Quick automatic fix into one of Docente's templates: the deck is read
+    # Quick automatic fix into one of Academic-Home's templates: the deck is read
     # and rebuilt by the same engine as Slide Studio (slides, pictures, logo
     # and notes kept). Without this field the original tidy-up runs as before.
     studio_template = None
@@ -3978,7 +3998,7 @@ def preview_file_endpoint():
 
 def _pptx_fix_form(form):
     """Fix slides' choices, read and checked once for one file or a batch:
-    Keep my design (sizes, fonts, colours, heading alignment) or a Docente
+    Keep my design (sizes, fonts, colours, heading alignment) or an Academic-Home
     template. Returns (pptx_options, studio_template, error)."""
     pptx_options = {}
     for size_field in ("title_size", "body_size"):
@@ -4329,7 +4349,7 @@ def pdf_apply_endpoint():
     if not isinstance(plan, dict):
         return jsonify({"error": "The changes couldn't be read — please try again."}), 400
     if pdf_plan_needs_pro(plan) and not _is_pro(request.current_user):
-        return jsonify({"error": "Redacting and protecting PDFs are part of Docente Pro.", "pro": True}), 403
+        return jsonify({"error": "Redacting and protecting PDFs are part of Academic-Home Pro.", "pro": True}), 403
     try:
         _log_conversion_and_consume(request.current_user, "pdf", "pdf-edit")
     except ConversionError as e:
@@ -4746,10 +4766,10 @@ def _parse_summary_json(raw_text):
 
 
 SAGE_SYSTEM_PROMPT = (
-    "You are Remy, Docente's built-in AI assistant — not a narrow, single-purpose tool "
+    "You are Remy, Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant anyone can "
     "bring almost anything to: students and teachers, people at work, and anyone with an "
-    "everyday question. Docente also has three purpose-built AI "
+    "everyday question. Academic-Home also has three purpose-built AI "
     "tools you can point people toward when they'd genuinely help more than a chat "
     "answer would: Smart Summarize (condenses a document into a slide deck), Practice "
     "Quiz (generates a quiz with an answer key from source material), and Evidence-"
@@ -4777,6 +4797,20 @@ SAGE_SYSTEM_PROMPT = (
     "work through a proof or a step-by-step problem earns the space that takes. When "
     "someone's question is ambiguous, make the most reasonable assumption and say so "
     "briefly rather than stalling on a clarifying question."
+)
+
+
+# 3.4: a source for every sentence that states something.
+SAGE_SYSTEM_PROMPT += (
+    "\n\nEvidence, sentence by sentence: when someone asks about facts \u2014 explaining or defining something, how or "
+    "why something happens, history, science, health, law, figures, or anything current \u2014 every sentence of your "
+    "answer that states something must be backed by a source: a numbered paper [n] when papers are listed below, or a "
+    "page you found with web search (search whenever the papers don't cover it, and write from what the pages say). "
+    "Don't write a sentence you can't back with a source; if the evidence doesn't cover part of the question, say so in "
+    "one sentence. A short lead-in that states nothing (\"Here's how it works:\") or a question back to the person "
+    "needs no source. When the request doesn't call for evidence \u2014 small talk, writing or improving the person's own "
+    "email, letter, post or story, translating, planning, brainstorming, code, or working through a calculation they "
+    "gave you \u2014 answer as usual, with no citations."
 )
 
 
@@ -4820,8 +4854,7 @@ def _remy_papers_block(papers):
     return ("EVIDENCE FIRST: below are real, open-access research papers found for this question (each one can be downloaded "
             "free), numbered. Ground your answer in them first — explain in your own words, never copy — and cite them "
             "inline as [1], [2] right after the sentences they support, using only these numbers. Cite a paper only for what its "
-            "title or abstract actually supports. For anything they don't cover, use your own knowledge (or web search for current "
-            "facts) without a number. Never invent a paper, an author, a statistic or a quotation. Don't list the papers at the end "
+            "title or abstract actually supports. For anything they don't cover, search the web and write from what the pages say — never state a fact without a source. Never invent a paper, an author, a statistic or a quotation. Don't list the papers at the end "
             "— the app shows them under your answer.\n\nPAPERS:\n" + "\n".join(lines))
 
 
@@ -4888,9 +4921,370 @@ def _topic_title(message):
     return " ".join(out)
 
 
+# ------------------------------------------------ 3.4: a source for every sentence
+C34_WMARK = re.compile(r"\u27e6w:(\d+)\u27e7")      # \u27e6w:i\u27e7 \u2014 a passage the web search grounded in page i (private, never shown)
+_C34_SKIP_LINE = re.compile(r"^\s*(?:#{1,6}\s|\||```|~~~|\$\$|[-*_]{3,}\s*$|!\[|<|\u27e6sec:)")
+_C34_ITEM = re.compile(r"^\s*(?:[-*+\u2022]|\d{1,3}[.)])\s+")
+_C34_LABEL = re.compile(r"^\s*(?:\*\*|__)[^*_\n]{1,140}(?:\*\*|__)\s*:?\s*$")
+_C34_OFFER = re.compile(r"^\W*(?:let me know|if you(?:'d|\u2019d| would)? like|would you like|do you want|want me to|"
+                        r"i can (?:also )?|i could|feel free|here(?:'s|\u2019s| is| are)\b|below (?:is|are)\b|happy to|hope this)", re.I)
+_C34_ABBR = re.compile(r"(?:\b(?:e\.g|i\.e|et al|etc|vs|cf|approx|ca|fig|figs|no|nos|vol|pp?|eds?|dr|mr|mrs|ms|prof|st|jr|sr|"
+                       r"inc|ltd|co|u\.s|u\.k)|(?<![\w.])[A-Za-z])\.$", re.I)
+_C34_END = re.compile(r"[.!?]+[\"\u201d\u2019')\]*_]*")
+_C34_AFTER = re.compile(r"([.!?])((?:[ \t]*(?:\[\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*\]|\u27e6w:\d+\u27e7))+)")
+
+
+def _c34_sentences(text):
+    """Every sentence of the answer's prose, as (start, end) spans in text. Headings, tables, code, pictures and
+    bold labels aren't sentences; a list item's marker isn't part of its sentence."""
+    out, pos, fence = [], 0, False
+    for line in text.split("\n"):
+        start = pos
+        pos += len(line) + 1
+        st = line.strip()
+        if st.startswith("```") or st.startswith("~~~"):
+            fence = not fence
+            continue
+        if fence or not st or _C34_SKIP_LINE.match(line) or _C34_LABEL.match(line):
+            continue
+        m = _C34_ITEM.match(line)
+        off = m.end() if m else len(line) - len(line.lstrip())
+        body, b0 = line[off:], 0
+        for e in _C34_END.finditer(body):
+            end = e.end()
+            if end < len(body) and not body[end].isspace():
+                continue                                   # 3.5, e.g.,…
+            rest = body[end:].lstrip()
+            if rest and rest[0].islower():
+                continue                                   # "… et al. (2020) found" carries on
+            if e.group(0)[0] == "." and _C34_ABBR.search(body[max(b0, e.start() - 12):e.start() + 1]):
+                continue
+            if body[b0:end].strip():
+                out.append([start + off + b0, start + off + end])
+            b0 = end
+        if body[b0:].strip():
+            out.append([start + off + b0, start + off + len(body)])
+    for s in out:
+        while s[0] < s[1] and text[s[0]].isspace():
+            s[0] += 1
+    return [tuple(s) for s in out if s[0] < s[1]]
+
+
+def _c34_needs(s):
+    """A sentence that states something, so it needs a source: not a lead-in ending in ':', not a question, not a
+    fragment of a few words, not an offer to help."""
+    plain = re.sub(r"[*_`#>]|\[\d[^\]]*\]|\u27e6w:\d+\u27e7|\([^()]*\b(?:1[5-9]|20)\d{2}[a-z]?\b[^()]*\)", " ", s).strip()
+    if len(re.findall(r"[^\W\d_]+(?:['\u2019-][^\W\d_]+)*|\d+(?:[.,]\d+)*", plain)) < 4:
+        return False
+    t = plain.rstrip(" \"'\u201d\u2019)")
+    if t.endswith("?") or t.endswith(":") or _C34_OFFER.match(plain):
+        return False
+    return True
+
+
+def _c34_cut(text, a, b):
+    """Takes the sentence at [a, b) out, with the space next to it; a line (or list item) left empty goes too."""
+    if b < len(text) and text[b] in " \t":
+        b += 1
+    elif a > 0 and text[a - 1] in " \t":
+        a -= 1
+    text = text[:a] + text[b:]
+    ls = text.rfind("\n", 0, a) + 1
+    le = text.find("\n", a)
+    le = len(text) if le == -1 else le
+    line = text[ls:le]
+    if not line.strip() or (_C34_ITEM.match(line) and not line[_C34_ITEM.match(line).end():].strip()):
+        text = text[:ls] + text[le + 1:]
+    return text
+
+
+def _c34_tidy(text):
+    text = re.sub(r"[ \t]+(?=\n|$)", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _c34_put(sentence, mark):
+    """The sentence with its source put just before its full stop."""
+    m = re.search(r"[.!?]+[\"\u201d\u2019')\]*_]*$", sentence)
+    cut = m.start() if m else len(sentence.rstrip())
+    return sentence[:cut].rstrip() + " " + mark + sentence[cut:]
+
+
+def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline):
+    """Asks the AI, sentence by sentence, which listed evidence supports each one, or that none does.
+    Returns {"skip": bool, "cite": {i: [ids]}, "drop": {i}} \u2014 or None when the check couldn't run."""
+    if not sentences or not evidence_lines or time.time() > deadline - 4:
+        return None
+    system = (
+        "You check an answer so that every sentence that states something is backed by evidence. Below: the EVIDENCE "
+        "(each item with an id), then the person's REQUEST, then numbered SENTENCES from the answer that have no source "
+        "yet. For each sentence: if one or more evidence items directly support what it says, give their ids (at most "
+        "3); if none does, mark it drop. Never pair a sentence with evidence that doesn't support it. If the request "
+        "doesn't call for evidence at all (small talk, the person's own email, letter or story, editing their text, "
+        "translating, planning, brainstorming, code, a calculation), answer {\"skip\": true}. Reply with JSON only, "
+        "like {\"skip\": false, \"sentences\": [{\"n\": 1, \"cite\": [\"P2\"]}, {\"n\": 2, \"drop\": true}]}.\n\n"
+        "EVIDENCE:\n" + "\n".join(evidence_lines))
+    user = ("REQUEST:\n" + str(request_text or "")[:1500] + "\n\nSENTENCES:\n"
+            + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+            + "\n\nTHE WHOLE ANSWER, for context:\n" + str(context or "")[:6000])
+    try:
+        raw = str(call_claude(system_prompt=system, user_message=user, max_tokens=min(1500, 60 * len(sentences) + 150),
+                              timeout=max(5, min(25, deadline - time.time())), feature=kind + "-check") or "")
+        a, b = raw.find("{"), raw.rfind("}")
+        obj = json.loads(raw[a:b + 1]) if 0 <= a < b else None
+        if not isinstance(obj, dict):
+            raise ValueError("its reply wasn't the JSON asked for")
+    except Exception as e:
+        logger.warning(f"Citations ({kind}): the sentence check didn't run ({str(e)[:100]})")
+        return None
+    out = {"skip": obj.get("skip") is True, "cite": {}, "drop": set()}
+    for it in obj.get("sentences") or []:
+        if not isinstance(it, dict):
+            continue
+        try:
+            i = int(it.get("n")) - 1
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= i < len(sentences):
+            continue
+        ids = [str(x).strip().upper() for x in (it.get("cite") or []) if str(x).strip()][:3]
+        if ids and not it.get("drop"):
+            out["cite"][i] = ids
+        else:
+            out["drop"].add(i)
+    return out
+
+
+def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, deadline, allow_skip):
+    """Every sentence that states something gets a source or goes. Returns (text, unsourced): unsourced counts the
+    sentences left without one \u2014 only when taking them out would remove most of the answer."""
+    need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+    todo = [s for s in need if not is_cited(text[s[0]:s[1]])]
+    if not todo:
+        return text, 0
+    todo = todo[:30]
+    any_cited = len(todo) < len(need)
+    dec = _c34_check(kind, request_text, evidence_lines, [text[a:b] for a, b in todo], text, deadline)
+    if dec and dec["skip"] and allow_skip and not any_cited:
+        logger.info(f"Citations ({kind}): the request doesn't call for evidence \u2014 left as it is")
+        return text, 0
+    fixed = dropped = 0
+    if dec:
+        for i in sorted(range(len(todo)), key=lambda i: -todo[i][0]):
+            a, b = todo[i]
+            mark = make_mark(dec["cite"][i]) if i in dec["cite"] else None
+            if mark:
+                text = text[:a] + _c34_put(text[a:b], mark) + text[b:]
+                fixed += 1
+            elif i in dec["drop"] or i in dec["cite"]:
+                text = _c34_cut(text, a, b)
+                dropped += 1
+        text = _c34_tidy(text)
+    need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+    left = [s for s in need if not is_cited(text[s[0]:s[1]])]
+    unsourced = 0
+    if left:
+        if not dec and not any_cited and allow_skip:
+            left = []                    # the check couldn't run and nothing is cited: most likely not a request for evidence
+        elif len(left) * 2 <= len(need):
+            for a, b in sorted(left, key=lambda s: -s[0]):
+                text = _c34_cut(text, a, b)
+            text = _c34_tidy(text)
+            dropped += len(left)
+            left = []
+        else:
+            unsourced = len(left)
+    logger.info(f"Citations ({kind}): {len(need) + dropped} sentences, {len(todo)} had no source \u2192 {fixed} given one, "
+                f"{dropped} taken out, {unsourced} kept with a note")
+    return text, unsourced
+
+
+# ---- Remy
+def _c34_marked_text(content):
+    """The answer's text with a private mark after each passage the web search grounded (its page's index), and the
+    pages: title, address, and the lines the answer drew on."""
+    pages, idx, out = [], {}, []
+    for b in content or []:
+        if not isinstance(b, dict) or b.get("type") != "text":
+            continue
+        t, marks = str(b.get("text") or ""), []
+        for c in b.get("citations") or []:
+            url = str((c or {}).get("url") or "")[:600]
+            if not url.startswith("http"):
+                continue
+            if url not in idx:
+                idx[url] = len(pages)
+                pages.append({"url": url, "title": str(c.get("title") or url).strip()[:200], "quotes": []})
+            q = re.sub(r"\s+", " ", str(c.get("cited_text") or "")).strip()
+            if q and len(pages[idx[url]]["quotes"]) < 3 and q not in pages[idx[url]]["quotes"]:
+                pages[idx[url]]["quotes"].append(q[:320])
+            if idx[url] not in marks:
+                marks.append(idx[url])
+        if marks:
+            core = t.rstrip()
+            t = core + "".join(f"\u27e6w:{i}\u27e7" for i in marks) + t[len(core):]
+        out.append(t)
+    return "".join(out), pages
+
+
+def _c34_nums(group):
+    out = []
+    for part in re.split(r"\s*,\s*", group):
+        r = re.match(r"^(\d+)\s*[\u2013\-]\s*(\d+)$", part)
+        if r:
+            a, b = int(r.group(1)), int(r.group(2))
+            out += list(range(a, b + 1)) if a <= b and b - a < 10 else [a, b]
+        elif part.strip().isdigit():
+            out.append(int(part))
+    return out
+
+
+def _c34_remy_cited(papers):
+    def cited(s):
+        if C34_WMARK.search(s):
+            return True
+        return bool(papers) and any(1 <= k <= len(papers) for m in _REMY_CITE.finditer(s) for k in _c34_nums(m.group(1)))
+    return cited
+
+
+def _c34_number(text, papers, pages):
+    """Papers and web pages numbered 1, 2, 3\u2026 in one series, in the order the answer first cites them. A number
+    that matches no paper is taken out (when there are papers). Returns (text, papers cited, pages cited)."""
+    pat = re.compile(r"\u27e6w:(\d+)\u27e7|(?<![\w\]\[])\[(\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*)\]")
+
+    def keys(m):
+        if m.group(1) is not None:
+            i = int(m.group(1))
+            return [("w", i)] if 0 <= i < len(pages) else []
+        return [("p", k) for k in _c34_nums(m.group(2)) if 1 <= k <= len(papers)]
+
+    order, new = [], {}
+    for m in pat.finditer(text):
+        if m.group(2) is not None and not papers:
+            continue
+        for k in keys(m):
+            if k not in new:
+                new[k] = len(order) + 1
+                order.append(k)
+
+    def rewrite(m):
+        if m.group(2) is not None and not papers:
+            return m.group(0)
+        nums = sorted({new[k] for k in keys(m)})
+        if not nums:
+            return ""
+        pre = m.string[m.start() - 1] if m.start() else " "
+        return ("" if pre.isspace() or pre in "([\u27e7" else " ") + "\u27e6c:" + ",".join(map(str, nums)) + "\u27e7"
+
+    out = pat.sub(rewrite, text)
+    # side-by-side numbers become one group: [1][3] -> [1, 3]
+    join = re.compile(r"\u27e6c:([\d,]+)\u27e7\s*\u27e6c:([\d,]+)\u27e7")
+    while join.search(out):
+        out = join.sub(lambda m: "\u27e6c:" + ",".join(str(n) for n in sorted({int(x) for x in (m.group(1) + "," + m.group(2)).split(",")})) + "\u27e7", out)
+    out = re.sub(r"\u27e6c:([\d,]+)\u27e7", lambda m: "[" + ", ".join(m.group(1).split(",")) + "]", out)
+    out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    used, web = [], []
+    for k in order:
+        n = new[k]
+        if k[0] == "p":
+            p = papers[k[1] - 1]
+            used.append({"n": n, "title": p["title"], "authors": (p.get("authors") or [])[:6], "year": p.get("year"),
+                         "venue": p.get("venue"), "url": p["url"], "pdf": p.get("pdf"), "doi": p.get("doi"), "text": _paper_reference(p)})
+        else:
+            pg = pages[k[1]]
+            web.append({"n": n, "title": pg["title"], "url": pg["url"], "cited": True})
+    return out, used, web
+
+
+def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment):
+    """Remy's answer with a source on every sentence that states something (see the top of this patch).
+    Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced)."""
+    text = _C34_AFTER.sub(lambda m: (" " if m.group(2).strip().startswith("[") else "") + m.group(2).strip() + m.group(1), text)
+    is_cited = _c34_remy_cited(papers)
+    has_cite = bool(C34_WMARK.search(text)) or (bool(papers) and any(is_cited(m.group(0)) for m in _REMY_CITE.finditer(text)))
+    unsourced = 0
+    if not attachment and (papers or pages) and (has_cite or topic_q):
+        lines = []
+        for i, p in enumerate(papers, 1):
+            lines.append(f"[P{i}] {p.get('title', '')} ({p.get('year') or 'n.d.'})" + (f" \u2014 {str(p.get('abstract'))[:600]}" if p.get("abstract") else ""))
+        for i, pg in enumerate(pages, 1):
+            if pg["quotes"]:
+                lines.append(f"[W{i}] {pg['title']} \u2014 " + " / ".join(f"\u201c{q}\u201d" for q in pg["quotes"]))
+
+        def mark(ids):
+            ms = []
+            for x in ids:
+                if x[:1] == "P" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(papers):
+                    ms.append(f"[{int(x[1:])}]")
+                elif x[:1] == "W" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(pages) and pages[int(x[1:]) - 1]["quotes"]:
+                    ms.append(f"\u27e6w:{int(x[1:]) - 1}\u27e7")
+            return "".join(ms) or None
+
+        text, unsourced = _c34_enforce("remy", text, message, is_cited, lines, mark, started + 50, allow_skip=not has_cite)
+    elif topic_q and not has_cite:
+        # a question about facts, and nothing found to back the answer: it stays, and says so
+        need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+        unsourced = len(need) if len(need) >= 2 else 0
+        if unsourced:
+            logger.info(f"Citations (remy): no evidence found for a question about facts — {unsourced} sentences kept with a note")
+    text, used, web = _c34_number(text, papers, pages)
+    seen = {w["url"] for w in web}
+    rest = [dict(s, cited=False) for s in (found or []) if isinstance(s, dict) and s.get("url") not in seen]
+    return text, used, (web + rest)[:max(8, len(web))], unsourced
+
+
+# ---- Evidence-Based Writing
+def _c34_write_parts(sources):
+    lines = []
+    for i, s in enumerate(sources or [], 1):
+        line = f"[S{i}] {s.get('citation_key', '')} {s.get('title', '')}"
+        if s.get("abstract"):
+            line += f" \u2014 {str(s['abstract'])[:600]}"
+        lines.append(line)
+
+    def mark(ids):
+        inner = []
+        for x in ids:
+            if x[:1] == "S" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources):
+                key = str(sources[int(x[1:]) - 1].get("citation_key") or "")
+                if key.startswith("(") and key.endswith(")") and key[1:-1] not in inner:
+                    inner.append(key[1:-1])
+        return "(" + "; ".join(inner) + ")" if inner else None
+    return lines, mark
+
+
+def _c34_write(text, sources, style, request_text, note, started):
+    """Evidence-Based Writing: every sentence cited (see the top of this patch). Returns (text, cited indices)."""
+    if not sources or not text:
+        return text, keep_known_citations(text, sources, style)[1] if text else set()
+    is_cited = lambda s: bool(keep_known_citations(s, sources, style)[1])
+    lines, mark = _c34_write_parts(sources)
+    has_cite = bool(keep_known_citations(text, sources, style)[1])
+    text, unsourced = _c34_enforce("writing", text, request_text, is_cited, lines, mark, started + 150, allow_skip=not has_cite)
+    if unsourced:
+        note["text"] = (note["text"] + " " if note["text"] else "") + \
+            "Some sentences in this piece have no source \u2014 check them before you use it."
+    return keep_known_citations(text, sources, style)
+
+
+def _c34_write_sections(outline, sources, style, request_text, note, started):
+    """The same for an outline's subsections, checked together. Returns the cited indices."""
+    joined = "\n\n".join(f"\u27e6sec:{i}\u27e7\n\n" + str(s.get("text") or "") for i, s in enumerate(outline))
+    text, cited = _c34_write(joined, sources, style, request_text, note, started)
+    parts = re.split(r"\u27e6sec:(\d+)\u27e7", text)
+    for j in range(1, len(parts) - 1, 2):
+        i = int(parts[j])
+        if 0 <= i < len(outline):
+            outline[i]["text"] = parts[j + 1].strip() or "(No sentence here could be backed by the sources.)"
+    return cited
+
+
 @app.route("/api/sage", methods=["POST", "OPTIONS"])
 @auth_required
 def sage_endpoint():
+    started = time.time()
     data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
     if not message:
@@ -4946,7 +5340,8 @@ def sage_endpoint():
     system_prompt += "\n\n" + THINKING_INSTRUCTION
     # Evidence first (3.0): a question about a topic gets real open papers to ground the answer.
     papers = []
-    if not attachment and _remy_wants_papers(message):
+    topic_q = not attachment and _remy_wants_papers(message)
+    if topic_q:
         try:
             papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
         except Exception as e:
@@ -4964,7 +5359,8 @@ def sage_endpoint():
             return_meta=True,
             feature="remy",
         )
-        result = meta["text"]
+        marked, pages = _c34_marked_text(meta.get("content"))
+        result = marked if marked.strip() else meta["text"]
     except Exception as e:
         # The message was counted above, before the AI call — but no reply
         # arrived, so give it back. Otherwise a timeout or AI outage quietly
@@ -4975,12 +5371,16 @@ def sage_endpoint():
             return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
         raise
     thinking, result = split_thinking_anywhere(result or "")
+    thinking = C34_WMARK.sub("", thinking) if thinking else thinking
     note, reply = split_memory_note(result or "")
+    note = C34_WMARK.sub("", note).strip() if note else note
     if note and memory_on:
         add_user_memory(request.current_user["id"], note)
-    reply, used = _number_cited_papers((reply or "").strip() or result, papers)
+    reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
+                                           message, topic_q, started, bool(attachment))
+    reply = C34_WMARK.sub("", reply)
     return jsonify({"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
-                    "sources": (meta.get("sources") or [])[:8], "searched": (meta.get("queries") or [])[:5]})
+                    "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
@@ -5430,7 +5830,7 @@ def quiz_export_docx_endpoint():
 
 
 ROLE_DESCRIPTION = (
-    "You're Docente's academic writing partner for a student or researcher — help with "
+    "You're Academic-Home's academic writing partner for a student or researcher — help with "
     "whatever the work actually needs: drafting a proposal, lit review, or full paper; "
     "tightening grammar and tone in something they've pasted in; formatting APA citations; "
     "talking through gaps in an argument or methodology; explaining a concept or a study in "
@@ -5545,6 +5945,7 @@ def split_memory_note(text):
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def write_endpoint():
+    started = time.time()
     data = request.get_json(silent=True) or {}
     topic = (data.get("topic") or "").strip()
     if not topic:
@@ -5660,8 +6061,7 @@ def write_endpoint():
                     f"topic, each labeled with its exact {CS['name']} in-text citation, e.g. "
                     f"{CS['example']}, listed most-recent-first. Continue writing directly from "
                     "where the previous text left off — do not repeat, restate, or summarize "
-                    "anything already written. Keep citing EVERY sentence that makes a claim "
-                    "using the EXACT citation key next to its supporting source, copied "
+                    "anything already written. Keep citing EVERY sentence using the EXACT citation key next to its supporting source, copied "
                     "exactly, preferring the most recent source when more than one could "
                     "support a claim; never invent a citation. If a sentence can't be tied to "
                     "a source, leave that claim out rather than writing it uncited. Do not "
@@ -5689,6 +6089,7 @@ def write_endpoint():
             if not cont_text:
                 raise ConversionError("Couldn't continue — try again")
             cont_text, cont_cited = keep_known_citations(cont_text, cont_sources, style)
+            cont_text, cont_cited = _c34_write(cont_text, cont_sources, style, topic, note, started)
             return jsonify({
                 "type": "result",
                 "text": cont_text,
@@ -5721,9 +6122,7 @@ def write_endpoint():
                     "the way you actually would — ground every factual or evidentiary claim in "
                     "one of these sources, using the EXACT key next to it, copied exactly — "
                     "never alter an author name or year, and never invent a citation not in "
-                    "this list. Let the writing read naturally: a claim gets a citation, a "
-                    "transition or synthesis sentence doesn't need one bolted on for its own "
-                    "sake. When more than one source could support the same claim, prefer the "
+                    "this list. Every sentence you write must carry at least one of these citations — openings, links between ideas and conclusions too: a sentence that draws sources together cites each of them. Write no sentence you can't cite; leave it out instead. When more than one source could support the same claim, prefer the "
                     "most recent one. If a claim can't be tied to one of the given sources, "
                     "leave it out rather than writing it uncited or attaching a fabricated "
                     "citation — keep the subsection only as long as what the sources genuinely "
@@ -5753,6 +6152,8 @@ def write_endpoint():
             for sec in outline:
                 sec["text"], c = keep_known_citations(sec["text"], sources, style)
                 cited_all |= c
+            if sources:
+                cited_all = _c34_write_sections(outline, sources, style, topic, note, started)
 
             return jsonify({
                 "type": "result",
@@ -5801,9 +6202,7 @@ def write_endpoint():
                     "write the way you actually would — ground every factual or evidentiary "
                     "claim in one of these sources, using the EXACT citation key next to it, "
                     "copied exactly, never altering an author name or year, and never "
-                    "inventing a citation not in this list. Let the writing read naturally: a "
-                    "claim gets a citation, a transition or synthesis sentence doesn't need "
-                    "one bolted on for its own sake. When more than one source could support "
+                    "inventing a citation not in this list. Every sentence you write must carry at least one of these citations — openings, links between ideas and conclusions too: a sentence that draws sources together cites each of them. Write no sentence you can't cite; leave it out instead. When more than one source could support "
                     "the same claim, prefer the most recent one. If a claim can't be tied to "
                     "one of the given sources, leave it out rather than writing it uncited or "
                     "attaching a fabricated citation — keep the response only as long as what "
@@ -5839,9 +6238,7 @@ def write_endpoint():
                     "actually would — ground every factual or evidentiary claim in one of "
                     "these sources, using the EXACT citation key next to it, copied exactly, "
                     "never altering an author name or year, and never inventing a citation "
-                    "not in this list. Let the writing read naturally: a claim gets a "
-                    "citation, a transition or synthesis sentence doesn't need one bolted on "
-                    "for its own sake. When more than one source could support the same "
+                    "not in this list. Every sentence you write must carry at least one of these citations — openings, links between ideas and conclusions too: a sentence that draws sources together cites each of them. Write no sentence you can't cite; leave it out instead. When more than one source could support the same "
                     "claim, prefer the most recent one. If a claim can't be tied to one of "
                     "the given sources, leave it out rather than writing it uncited or "
                     "attaching a fabricated citation — keep the response only as long as "
@@ -5889,6 +6286,7 @@ def write_endpoint():
             return jsonify({"type": "clarify", "text": text, "thinking": thinking})
 
         text, cited = keep_known_citations(text, sources, style)
+        text, cited = _c34_write(text, sources, style, topic, note, started)
         return jsonify({
             "type": "result",
             "text": text,
@@ -5915,7 +6313,8 @@ def write_export_docx_endpoint():
     work_dir = tempfile.mkdtemp(prefix=f"mc_docx_{uuid.uuid4().hex[:8]}_")
     try:
         result_path = academic_essay_to_docx(
-            {"title": title, "text": text, "sections": sections, "references": references, "references_title": str(data.get("references_title") or "References")[:40]},
+            {"title": title, "text": text, "sections": sections, "references": references, "references_title": str(data.get("references_title") or "References")[:40],
+             "numbered": data.get("numbered") is True},
             work_dir,
         )
         return send_file(
@@ -6025,7 +6424,7 @@ _ASSIST_ACTIONS = {
               "of natural spoken English, about 80 to 150 words, covering each point.", 900),
 }
 _ASSIST_SYSTEM = (
-    "You are Remy, the study assistant in Docente, improving one slide of a student's or lecturer's presentation. "
+    "You are Remy, the study assistant in Academic-Home, improving one slide of a student's or lecturer's presentation. "
     "Reply with one JSON object only — no preamble and no code fences. For points reply "
     '{"bullets": [{"text": "...", "level": 0}]} (level 0 for main points, 1 for sub-points); for speaker notes reply '
     '{"notes": "..."}. Only rework what the slide already says or clearly implies: never invent statistics, dates, '
@@ -6119,7 +6518,7 @@ def slides_assist_endpoint():
 # Remy's per-slide help, stay free.
 _DRAFT_MAX_SLIDES = 10
 _DRAFT_SYSTEM = (
-    "You are Remy, the study assistant in Docente, drafting a full slide-deck outline from a short topic someone "
+    "You are Remy, the study assistant in Academic-Home, drafting a full slide-deck outline from a short topic someone "
     "gives you, for a {group} to open and edit. Reply with one JSON object only — no preamble, no code fences: "
     '{{"title_slide": {{...}}, "slides": [...]}}.\n'
     "{title_fields}"
@@ -6377,7 +6776,7 @@ _DECK_ORDER_FIELDS = {
               'and at most 14 words.\ndiscussion: 2 or 3 short questions for a class discussion at the end.\n'),
 }
 _DECK_SYSTEM = (
-    "You are Remy, the assistant in Docente, writing a COMPLETE slide deck from a short request, for a {group} to present. "
+    "You are Remy, the assistant in Academic-Home, writing a COMPLETE slide deck from a short request, for a {group} to present. "
     "Reply with ONE JSON object only — no preamble, no code fences: {{\"title_slide\": {{...}}, \"slides\": [...]}}.\n"
     "{title_fields}"
     "slides: {min_slides} to {max_slides} items in teaching order: an introduction or overview first, then the content, then key "
@@ -6395,8 +6794,9 @@ _DECK_SYSTEM = (
 )
 _DECK_EVIDENCE = (
     "\n\nEVIDENCE: base the content on these real, open-access papers first. When a point uses a paper, end that point with "
-    "the paper's exact citation key, e.g. \"Short naps improve recall {example}\". Use only these keys, copied exactly; points "
-    "from general knowledge carry no citation.\nPAPERS:\n{papers}"
+    "the paper's exact citation key, e.g. \"Short naps improve recall {example}\". Use only these keys, copied exactly. Every "
+    "point that states a fact carries the key of the paper behind it; leave out a fact no paper here supports \u2014 make fewer points "
+    "rather than uncited ones (a title, a section divider, an agenda or a closing slide needs no key).\nPAPERS:\n{papers}"
 )
 _DECK_DRAWINGS = (
     "\n\nDRAWINGS: the request asks for drawings or visuals, so give the slides that need one (an experiment with stick "
@@ -6942,6 +7342,882 @@ def client_error_report():
     agent = clip(request.headers.get("User-Agent"), 160)
     logger.warning(f"[app error] v{version} | {message} | at {where} | {stack} | {agent}")
     return jsonify({"ok": True})
+
+# ============================================================ 3.4: Academic-Home Meet
+# Sound and video go through LiveKit; this server is the front desk (see patches/server_meet34.py).
+def _meet_env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "").strip().rstrip("/")
+LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "").strip()
+LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "").strip()
+LIVEKIT_HTTP = re.sub(r"^ws", "http", LIVEKIT_URL)                  # wss://x → https://x for the server API
+MEET_MAX_PEOPLE = _meet_env_int("MEET_MAX_PEOPLE", 100)             # in one meeting
+MEET_GLOBAL_MAX = _meet_env_int("MEET_GLOBAL_MAX", 100)             # across every meeting at once (LiveKit Build: 100)
+MEET_MONTH_MINUTES = _meet_env_int("MEET_MONTH_MINUTES", 5000)      # participant-minutes a month (LiveKit Build: 5,000)
+MEET_FREE_MINUTES = _meet_env_int("MEET_FREE_MINUTES", 60)          # how long a meeting lasts, hosted on Free
+MEET_PRO_MINUTES = _meet_env_int("MEET_PRO_MINUTES", 300)           # … and on Pro
+MEET_AUDIENCE_OVER = _meet_env_int("MEET_AUDIENCE_OVER", 30)        # bigger than this, newcomers listen until let speak
+MEET_KEEP_DAYS = 90                                                  # meetings and attendance are deleted after this
+MEET_LIVE_PER_HOST = 3                                               # meetings one person can have running at once
+MEET_TOKEN_TTL = 600                                                 # a pass is good for joining within 10 minutes
+MEET_WAIT_MINUTES = 30                                               # how long someone can wait in the lobby
+
+MEET_MSG_OFF = "Meetings aren’t switched on yet."
+MEET_MSG_DOWN = "Meetings can’t be reached right now. Please try again in a moment."
+MEET_MSG_BUSY = "Meetings are very busy right now. Please try again in a few minutes."
+MEET_MSG_MONTH = "Meetings have reached this month’s limit. They’ll be back next month."
+MEET_MSG_NOCODE = "That meeting code doesn’t exist. Check it and try again."
+MEET_MSG_ENDED = "This meeting has ended."
+MEET_MSG_LOCKED = "The host has locked this meeting."
+MEET_MSG_PASS = "That passcode isn’t right."
+MEET_MSG_FULL = "This meeting is full ({n} people)."
+MEET_MSG_DENIED = "The host didn’t let you in."
+MEET_MSG_REMOVED = "The host removed you from this meeting."
+MEET_LETTERS = "abcdefghjkmnpqrstuvwxyz"                             # no i, l or o: nothing to mix up when read aloud
+MEET_ROLES = ("host", "cohost", "speaker", "attendee", "listener")   # listener: a big meeting's newcomer, until let speak
+
+
+class MeetError(Exception):
+    def __init__(self, message, status=400, **extra):
+        super().__init__(message)
+        self.status, self.extra = status, extra
+
+
+def _meet_on():
+    return bool(LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET and DATABASE_URL)
+
+
+def _meet_tables(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meetings (
+            id SERIAL PRIMARY KEY,
+            code TEXT UNIQUE NOT NULL,
+            room TEXT UNIQUE NOT NULL,
+            host_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL DEFAULT '',
+            passcode_hash TEXT,
+            lobby BOOLEAN NOT NULL DEFAULT TRUE,
+            locked BOOLEAN NOT NULL DEFAULT FALSE,
+            e2ee BOOLEAN NOT NULL DEFAULT FALSE,
+            speak TEXT NOT NULL DEFAULT 'all',
+            chat BOOLEAN NOT NULL DEFAULT TRUE,
+            max_people INTEGER NOT NULL DEFAULT 100,
+            limit_minutes INTEGER NOT NULL DEFAULT 60,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            started_at TIMESTAMPTZ,
+            ends_at TIMESTAMPTZ,
+            ended_at TIMESTAMPTZ,
+            peak INTEGER NOT NULL DEFAULT 0,
+            seconds BIGINT NOT NULL DEFAULT 0
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS meeting_people (
+            id SERIAL PRIMARY KEY,
+            meeting_id INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+            identity TEXT UNIQUE NOT NULL,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'attendee',
+            status TEXT NOT NULL DEFAULT 'waiting',
+            ticket_hash TEXT,
+            seat_hash TEXT,
+            asked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            admitted_at TIMESTAMPTZ,
+            joined_at TIMESTAMPTZ,
+            left_at TIMESTAMPTZ,
+            in_since TIMESTAMPTZ,
+            seconds INTEGER NOT NULL DEFAULT 0
+        )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS meeting_people_meeting ON meeting_people (meeting_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS meetings_host ON meetings (host_id)")
+    cur.execute("CREATE TABLE IF NOT EXISTS meeting_usage (month TEXT PRIMARY KEY, seconds BIGINT NOT NULL DEFAULT 0)")
+
+
+def _meet_hash(secret):
+    return hashlib.sha256(("meet|" + str(secret or "")).encode()).hexdigest()
+
+
+def _meet_month():
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _meet_clean_name(v, fallback="Guest"):
+    v = re.sub(r"[\x00-\x1f\x7f<>]", "", _text(v)).strip()
+    v = re.sub(r"\s+", " ", v)[:40]
+    return v or fallback
+
+
+# ------------------------------------------------------------ LiveKit: passes and the room API
+def _lk_jwt(extra, ttl):
+    now = int(time.time())
+    claims = {"iss": LIVEKIT_API_KEY, "nbf": now - 30, "exp": now + int(ttl)}
+    claims.update(extra)
+    tok = pyjwt.encode(claims, LIVEKIT_API_SECRET, algorithm="HS256")
+    return tok.decode() if isinstance(tok, bytes) else tok
+
+
+def _meet_can_talk(m, role):
+    return role in ("host", "cohost", "speaker") or (role == "attendee" and m["speak"] == "all")
+
+
+def _meet_grant(m, p):
+    talk = _meet_can_talk(m, p["role"])
+    # canUpdateOwnMetadata off: nobody can rename themselves (to look like the host, say) or change their own details;
+    # a raised hand and what someone presents are set by the server (POST /me), which checks they may
+    g = {"room": m["room"], "roomJoin": True, "canSubscribe": True, "canPublishData": True,
+         "canUpdateOwnMetadata": False, "canPublish": talk}
+    if talk:
+        g["canPublishSources"] = ["camera", "microphone", "screen_share", "screen_share_audio"]
+    return g
+
+
+def _meet_token(m, p):
+    return _lk_jwt({"sub": p["identity"], "name": p["name"], "video": _meet_grant(m, p),
+                    "metadata": json.dumps({"role": p["role"]})}, MEET_TOKEN_TTL)
+
+
+def _lk_call(method, body, room=None, timeout=8):
+    """One call to LiveKit's room API. Not found answers as empty; anything else wrong is logged for the
+    owner and met with plain words."""
+    grant = {"roomCreate": True, "roomList": True, "roomAdmin": True}
+    if room:
+        grant["room"] = room
+    tok = _lk_jwt({"video": grant}, 120)
+    try:
+        r = requests.post(f"{LIVEKIT_HTTP}/twirp/livekit.RoomService/{method}", json=body, timeout=timeout,
+                          headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Meet: couldn't reach LiveKit ({method}): {e}")
+        raise MeetError(MEET_MSG_DOWN, 503)
+    if r.status_code == 404:
+        return {}
+    if r.status_code != 200:
+        detail = (r.text or "")[:300]
+        low = detail.lower()
+        if r.status_code in (401, 403) and "permission" not in low:
+            logger.error(f"Meet is OFF for everyone: LiveKit refused the key ({r.status_code}). Check LIVEKIT_API_KEY and "
+                         f"LIVEKIT_API_SECRET on Render. ({method})")
+        elif "limit" in low or "quota" in low or r.status_code == 429:
+            logger.error(f"Meet: LiveKit says a limit was reached ({method} {r.status_code}): {detail[:200]}. Upgrade the "
+                         "LiveKit plan, or lower MEET_GLOBAL_MAX / MEET_MONTH_MINUTES on Render to match it.")
+            raise MeetError(MEET_MSG_BUSY, 503)
+        else:
+            logger.warning(f"Meet: LiveKit {method} -> {r.status_code}: {detail}")
+        raise MeetError(MEET_MSG_DOWN, 503)
+    try:
+        return r.json() if r.content else {}
+    except ValueError:
+        return {}
+
+
+_meet_rooms_cache = {"at": 0.0, "total": 0}
+
+
+def _meet_people_now(room):
+    """How many people are in one meeting right now (LiveKit's own count)."""
+    return len(_lk_call("ListParticipants", {"room": room}, room=room).get("participants") or [])
+
+
+def _meet_everyone_now():
+    """How many people are in all meetings right now — asked at most every 5 seconds."""
+    if time.time() - _meet_rooms_cache["at"] > 5:
+        rooms = _lk_call("ListRooms", {}).get("rooms") or []
+        _meet_rooms_cache.update(at=time.time(), total=sum(int(r.get("num_participants") or r.get("numParticipants") or 0) for r in rooms))
+    return _meet_rooms_cache["total"]
+
+
+def _meet_month_seconds(cur):
+    cur.execute("SELECT seconds FROM meeting_usage WHERE month = %s", (_meet_month(),))
+    row = cur.fetchone()
+    return int(row["seconds"]) if row else 0
+
+
+def _meet_check_traffic(cur, m, joining_role, here=None):
+    """Turn people away kindly before LiveKit would: this month's minutes, everyone in meetings now, this meeting."""
+    used = _meet_month_seconds(cur) // 60
+    if used >= MEET_MONTH_MINUTES:
+        logger.error(f"Meet: this month's {MEET_MONTH_MINUTES} participant-minutes are used up — new joins are turned away "
+                     "until next month. Upgrade the LiveKit plan and raise MEET_MONTH_MINUTES on Render to allow more.")
+        raise MeetError(MEET_MSG_MONTH, 503)
+    if used >= MEET_MONTH_MINUTES * 0.8:
+        logger.warning(f"Meet: {used} of this month's {MEET_MONTH_MINUTES} participant-minutes used.")
+    if _meet_everyone_now() >= MEET_GLOBAL_MAX:
+        logger.warning(f"Meet: {MEET_GLOBAL_MAX} people are in meetings at once (MEET_GLOBAL_MAX) — a newcomer was asked to try later.")
+        raise MeetError(MEET_MSG_BUSY, 503)
+    if joining_role != "host" and _meet_running(m):
+        if here is None:
+            here = _meet_people_now(m["room"])
+        if here >= m["max_people"]:
+            raise MeetError(MEET_MSG_FULL.format(n=m["max_people"]), 409)
+
+
+def _meet_meta(cur, m):
+    """The meeting's shared state, as only this server can set it (LiveKit room metadata)."""
+    cur.execute("SELECT identity, role FROM meeting_people WHERE meeting_id = %s AND status = 'admitted' AND role <> 'attendee'", (m["id"],))
+    roles = {r["identity"]: r["role"] for r in cur.fetchall()}
+    return json.dumps({"title": m["title"], "locked": m["locked"], "lobby": m["lobby"], "speak": m["speak"], "chat": m["chat"],
+                       "e2ee": m["e2ee"], "endsAt": m["ends_at"].isoformat() if m.get("ends_at") else None, "roles": roles,
+                       "v": int(time.time() * 1000)})
+
+
+def _meet_push(cur, m):
+    if _meet_running(m):
+        _lk_call("UpdateRoomMetadata", {"room": m["room"], "metadata": _meet_meta(cur, m)}, room=m["room"])
+
+
+def _meet_open_room(cur, m):
+    _lk_call("CreateRoom", {"name": m["room"], "empty_timeout": 600, "departure_timeout": 600,
+                            "max_participants": m["max_people"] + 2, "metadata": _meet_meta(cur, m)}, room=m["room"])
+
+
+# ------------------------------------------------------------ who is asking
+def _meet_user():
+    """The signed-in Academic-Home account behind this request, or None (guests may join meetings)."""
+    header = request.headers.get("Authorization", "")
+    token = header.split(" ", 1)[1] if header.startswith("Bearer ") else None
+    uid = verify_token(token) if token else None
+    if not uid:
+        return None
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row or _token_version(token) != (row.get("token_version") or 0):
+        return None
+    return _with_promo(row)
+
+
+def _meet_get(cur, code, lock=False):
+    code = _text(code).strip().lower()
+    if not re.fullmatch(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", code):
+        raise MeetError(MEET_MSG_NOCODE, 404)
+    cur.execute("SELECT * FROM meetings WHERE code = %s" + (" FOR UPDATE" if lock else ""), (code,))
+    m = cur.fetchone()
+    if not m:
+        raise MeetError(MEET_MSG_NOCODE, 404)
+    return m
+
+
+def _meet_actor(cur, m, data):
+    """Host controls: the host's own account, or a co-host's seat."""
+    user = _meet_user()
+    if user and user["id"] == m["host_id"]:
+        cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND user_id = %s AND role = 'host' ORDER BY id DESC LIMIT 1",
+                    (m["id"], user["id"]))
+        return cur.fetchone() or {"identity": None, "role": "host", "user_id": user["id"]}
+    seat = _text(data.get("seat") or request.headers.get("X-Meet-Seat"))
+    if seat:
+        cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND seat_hash = %s AND status = 'admitted'",
+                    (m["id"], _meet_hash(seat)))
+        p = cur.fetchone()
+        if p and p["role"] in ("host", "cohost"):
+            return p
+    raise MeetError("Only the host can do that.", 403)
+
+
+def _meet_admit(cur, m, p):
+    """Let someone in: a seat (for coming back and co-host controls) and a pass to LiveKit."""
+    seat = secrets.token_urlsafe(24)
+    cur.execute("UPDATE meeting_people SET status = 'admitted', admitted_at = COALESCE(admitted_at, now()), seat_hash = %s, "
+                "ticket_hash = NULL WHERE id = %s RETURNING *", (_meet_hash(seat), p["id"]))
+    p = cur.fetchone()
+    return {"status": "admitted", "seat": seat, "token": _meet_token(m, p), "url": LIVEKIT_URL, "identity": p["identity"],
+            "role": p["role"], "name": p["name"], "e2ee": m["e2ee"], "title": m["title"], "code": m["code"]}
+
+
+def _meet_running(m):
+    return bool(m.get("started_at") and not m.get("ended_at"))
+
+
+def _meet_public(m, host_name=None):
+    state = "live" if _meet_running(m) else ("ended" if m["ended_at"] else "waiting")
+    return {"code": m["code"], "title": m["title"], "host": host_name, "state": state, "passcode": bool(m["passcode_hash"]),
+            "lobby": m["lobby"], "e2ee": m["e2ee"], "locked": m["locked"], "maxPeople": m["max_people"],
+            "minutes": m["limit_minutes"], "endsAt": m["ends_at"].isoformat() if m["ends_at"] else None}
+
+
+def _meet_reply(fn):
+    """Meeting endpoints: switched off, plain-words errors, one database connection."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return "", 204
+        if not _meet_on():
+            return jsonify({"error": MEET_MSG_OFF, "off": True}), 503
+        conn = get_db()
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                out = fn(cur, *args, **kwargs)
+            conn.commit()
+            return out
+        except MeetError as e:
+            conn.rollback()
+            return jsonify(dict({"error": str(e)}, **e.extra)), e.status
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    return wrapper
+
+
+_meet_misses = {}
+
+
+def _meet_miss(code_ok):
+    """Guessing codes is pointless (23^10 of them), and one network trying many wrong ones is slowed down."""
+    ip, now = _client_ip(), time.time()
+    hits = [t for t in _meet_misses.get(ip, []) if now - t < 3600]
+    if not code_ok:
+        hits.append(now)
+    _meet_misses[ip] = hits
+    if len(_meet_misses) > 5000:
+        _meet_misses.clear()
+    if len(hits) > 40:
+        raise MeetError("Too many wrong meeting codes from this network. Please wait a while, then try again.", 429)
+
+
+def _meet_code_key():
+    return f"{_client_ip()}|{(request.view_args or {}).get('code', '')}"
+
+
+def _meet_person_key():
+    """One person in one meeting: their waiting ticket or seat (both secret), else their network."""
+    data = request.get_json(silent=True) or {}
+    secret = _text(data.get("ticket") or data.get("seat") or request.headers.get("X-Meet-Seat") or request.headers.get("Authorization"))
+    if secret:
+        return "meet-person:" + hashlib.sha256(secret.encode()).hexdigest()[:24]
+    return _meet_code_key()
+
+
+# ------------------------------------------------------------ the endpoints
+@app.route("/api/meet/config", methods=["GET", "OPTIONS"])
+def meet_config():
+    if request.method == "OPTIONS":
+        return "", 204
+    return jsonify({"enabled": _meet_on(), "maxPeople": MEET_MAX_PEOPLE, "freeMinutes": MEET_FREE_MINUTES,
+                    "proMinutes": MEET_PRO_MINUTES, "audienceOver": MEET_AUDIENCE_OVER})
+
+
+@app.route("/api/meet", methods=["POST", "OPTIONS"])
+@limiter.limit("20 per hour", key_func=_account_or_ip_key)
+@auth_required
+@_meet_reply
+def meet_create(cur):
+    user = request.current_user
+    data = _json_body()
+    cur.execute("SELECT count(*) AS n FROM meetings WHERE host_id = %s AND started_at IS NOT NULL AND ended_at IS NULL", (user["id"],))
+    if (cur.fetchone() or {}).get("n", 0) >= MEET_LIVE_PER_HOST:
+        raise MeetError(f"You already have {MEET_LIVE_PER_HOST} meetings running. End one first.", 409)
+    title = _meet_clean_name(data.get("title"), fallback=f"{(user.get('name') or 'Academic-Home').split()[0]}’s meeting")[:80]
+    passcode = re.sub(r"\s+", "", _text(data.get("passcode")))[:20]
+    speak = "chosen" if data.get("speak") == "chosen" else "all"
+    minutes = MEET_PRO_MINUTES if _is_pro(user) else MEET_FREE_MINUTES
+    for _ in range(5):
+        code = "".join(secrets.choice(MEET_LETTERS) for _ in range(10))
+        code = f"{code[:3]}-{code[3:7]}-{code[7:]}"
+        cur.execute("SELECT 1 FROM meetings WHERE code = %s", (code,))
+        if not cur.fetchone():
+            break
+    cur.execute("INSERT INTO meetings (code, room, host_id, title, passcode_hash, lobby, e2ee, speak, max_people, limit_minutes) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING *",
+                (code, "m_" + secrets.token_hex(12), user["id"], title,
+                 generate_password_hash(passcode) if passcode else None, data.get("lobby", True) is not False,
+                 bool(data.get("e2ee")), speak, MEET_MAX_PEOPLE, minutes))
+    m = cur.fetchone()
+    logger.info(f"Meet: meeting {m['id']} made (lobby={m['lobby']} e2ee={m['e2ee']} speak={speak} minutes={minutes})")
+    return jsonify({"meeting": _meet_public(m, user.get("name")), "link": f"{FRONTEND_URL}/?meet={code}"})
+
+
+@app.route("/api/meet/mine", methods=["GET", "OPTIONS"])
+@auth_required
+@_meet_reply
+def meet_mine(cur):
+    user = request.current_user
+    cur.execute("SELECT m.*, (SELECT count(*) FROM meeting_people p WHERE p.meeting_id = m.id AND p.joined_at IS NOT NULL) AS came "
+                "FROM meetings m WHERE host_id = %s ORDER BY created_at DESC LIMIT 30", (user["id"],))
+    out = []
+    for m in cur.fetchall():
+        d = _meet_public(m, user.get("name"))
+        d.update(created=m["created_at"].isoformat(), came=int(m["came"] or 0), peak=m["peak"])
+        out.append(d)
+    return jsonify({"meetings": out})
+
+
+@app.route("/api/meet/<code>", methods=["GET", "OPTIONS"])
+@limiter.limit("240 per hour", key_func=_meet_code_key)
+@_meet_reply
+def meet_info(cur, code):
+    try:
+        m = _meet_get(cur, code)
+    except MeetError:
+        _meet_miss(False)
+        raise
+    cur.execute("SELECT name FROM users WHERE id = %s", (m["host_id"],))
+    host = ((cur.fetchone() or {}).get("name") or "").split(" ")[0] or None
+    user = _meet_user()
+    d = _meet_public(m, host)
+    d["youHost"] = bool(user and user["id"] == m["host_id"])
+    return jsonify({"meeting": d})
+
+
+@app.route("/api/meet/<code>/join", methods=["POST", "OPTIONS"])
+@limiter.limit("300 per hour", key_func=_meet_code_key)
+@_meet_reply
+def meet_join(cur, code):
+    data = _json_body()
+    try:
+        m = _meet_get(cur, code, lock=True)
+    except MeetError:
+        _meet_miss(False)
+        raise
+    user = _meet_user()
+    is_host = bool(user and user["id"] == m["host_id"])
+    # coming back with a seat (a dropped connection, a reload): no waiting room again
+    seat = _text(data.get("seat"))
+    if seat:
+        cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND seat_hash = %s", (m["id"], _meet_hash(seat)))
+        p = cur.fetchone()
+        if p and p["status"] == "removed":
+            raise MeetError(MEET_MSG_REMOVED, 403)
+        if p and p["status"] == "admitted" and _meet_running(m):
+            _meet_check_traffic(cur, m, p["role"])
+            return jsonify(_meet_admit(cur, m, p))
+    if not is_host:
+        if m["locked"]:
+            raise MeetError(MEET_MSG_LOCKED, 423)
+        if m["passcode_hash"] and not check_password_hash(m["passcode_hash"], re.sub(r"\s+", "", _text(data.get("passcode")))):
+            raise MeetError(MEET_MSG_PASS, 403, passcode=True)
+    if user and not is_host:
+        cur.execute("SELECT 1 FROM meeting_people WHERE meeting_id = %s AND user_id = %s AND status = 'removed' "
+                    "AND asked_at > COALESCE(%s, now())", (m["id"], user["id"], m["started_at"]))
+        if cur.fetchone():
+            raise MeetError(MEET_MSG_REMOVED, 403)
+    name = _meet_clean_name(user.get("name") if user else data.get("name"))
+    if user and data.get("name"):
+        name = _meet_clean_name(data.get("name"), fallback=name)
+    here = None
+    if is_host:
+        role = "host"
+    else:
+        role = "attendee"
+        if _meet_running(m):
+            here = _meet_people_now(m["room"])
+            if m["speak"] == "all" and here >= MEET_AUDIENCE_OVER:
+                role = "listener"     # a big meeting: newcomers listen (and chat, and raise a hand) until let speak
+    _meet_check_traffic(cur, m, role, here)
+    identity = ("m" if user else "g") + secrets.token_hex(8)    # m: an Academic-Home account, g: a guest
+    cur.execute("INSERT INTO meeting_people (meeting_id, identity, user_id, name, role) VALUES (%s, %s, %s, %s, %s) RETURNING *",
+                (m["id"], identity, user["id"] if user else None, name, role))
+    p = cur.fetchone()
+    if is_host:
+        if not _meet_running(m):       # start it — or start it again: a meeting's link can be used for the next class too
+            cur.execute("UPDATE meetings SET started_at = now(), ends_at = now() + make_interval(mins => limit_minutes), "
+                        "ended_at = NULL WHERE id = %s RETURNING *", (m["id"],))
+            m = cur.fetchone()
+            logger.info(f"Meet: meeting {m['id']} started by its host")
+        reply = _meet_admit(cur, m, p)
+        _meet_open_room(cur, m)
+        return jsonify(reply)
+    if not _meet_running(m) or m["lobby"]:
+        ticket = secrets.token_urlsafe(24)
+        cur.execute("UPDATE meeting_people SET ticket_hash = %s WHERE id = %s", (_meet_hash(ticket), p["id"]))
+        return jsonify({"status": "waiting", "ticket": ticket, "started": _meet_running(m), "title": m["title"]}), 202
+    return jsonify(_meet_admit(cur, m, p))
+
+
+@app.route("/api/meet/<code>/wait", methods=["POST", "OPTIONS"])
+@limiter.limit("1500 per hour", key_func=_meet_person_key)
+@_meet_reply
+def meet_wait(cur, code):
+    """Someone in the waiting room asks how it's going (every few seconds)."""
+    data = _json_body()
+    m = _meet_get(cur, code)
+    cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND ticket_hash = %s", (m["id"], _meet_hash(_text(data.get("ticket")))))
+    p = cur.fetchone()
+    if not p:
+        raise MeetError("You’re no longer waiting for this meeting. Please ask to join again.", 404)
+    if p["status"] == "denied":
+        raise MeetError(MEET_MSG_DENIED, 403)
+    if datetime.now(timezone.utc) - p["asked_at"] > timedelta(minutes=MEET_WAIT_MINUTES):
+        raise MeetError("You waited a long time, so we stopped. Please ask to join again.", 408)
+    if p["status"] == "removed":
+        raise MeetError(MEET_MSG_REMOVED, 403)
+    if _meet_running(m) and (p["status"] == "admitted" or not m["lobby"]):
+        _meet_check_traffic(cur, m, p["role"])
+        return jsonify(_meet_admit(cur, m, p))
+    return jsonify({"status": "waiting", "started": _meet_running(m)}), 202
+
+
+@app.route("/api/meet/<code>/lobby", methods=["POST", "OPTIONS"])
+@limiter.limit("1500 per hour", key_func=_meet_person_key)
+@_meet_reply
+def meet_lobby(cur, code):
+    """The host's view of the waiting room."""
+    data = _json_body()
+    m = _meet_get(cur, code)
+    _meet_actor(cur, m, data)
+    cur.execute("SELECT identity, name, asked_at, user_id IS NOT NULL AS member FROM meeting_people WHERE meeting_id = %s "
+                "AND status = 'waiting' AND ticket_hash IS NOT NULL AND asked_at > now() - make_interval(mins => %s) ORDER BY asked_at",
+                (m["id"], MEET_WAIT_MINUTES))
+    return jsonify({"waiting": [{"identity": r["identity"], "name": r["name"], "member": r["member"],
+                                 "since": r["asked_at"].isoformat()} for r in cur.fetchall()]})
+
+
+@app.route("/api/meet/<code>/me", methods=["POST", "OPTIONS"])
+@limiter.limit("2400 per hour", key_func=_meet_person_key)
+@_meet_reply
+def meet_me(cur, code):
+    """Your raised hand, and what you're presenting (and its page) \u2014 set by the server, so nobody can set anyone
+    else's, or present when the host has made them a listener."""
+    data = _json_body()
+    m = _meet_get(cur, code)
+    seat, p = _text(data.get("seat") or request.headers.get("X-Meet-Seat")), None
+    if seat:
+        cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND seat_hash = %s AND status = 'admitted'",
+                    (m["id"], _meet_hash(seat)))
+        p = cur.fetchone()
+    if not p or not _meet_running(m):
+        raise MeetError("You\u2019re not in this meeting.", 403)
+    attrs = {}
+    if "hand" in data:
+        attrs["hand"] = str(int(time.time() * 1000)) if data.get("hand") else ""
+    if "present" in data:
+        v = data.get("present") or ""
+        if v:
+            if not _meet_can_talk(m, p["role"]):
+                raise MeetError("The host has made you a listener \u2014 raise your hand to ask to present.", 403)
+            try:
+                s = json.loads(v) if isinstance(v, str) else v
+                s = {"id": re.sub(r"[^a-z0-9]", "", str(s.get("id") or ""))[:16], "kind": "pdf",
+                     "name": _meet_clean_name(s.get("name"), fallback="Slides")[:80],
+                     "page": max(0, min(int(s.get("page") or 0), 5000)), "pages": max(1, min(int(s.get("pages") or 1), 5000))}
+            except (TypeError, ValueError, AttributeError):
+                raise MeetError("That presentation couldn\u2019t be shown.", 400)
+            if not s["id"]:
+                raise MeetError("That presentation couldn\u2019t be shown.", 400)
+            v = json.dumps(s, separators=(",", ":"))
+        attrs["present"] = v
+    if attrs:
+        _lk_call("UpdateParticipant", {"room": m["room"], "identity": p["identity"], "attributes": attrs}, room=m["room"])
+    return jsonify({"ok": True})
+
+
+def _meet_find_track(room, identity, kind):
+    for part in _lk_call("ListParticipants", {"room": room}, room=room).get("participants") or []:
+        if part.get("identity") == identity:
+            for t in part.get("tracks") or []:
+                src = str(t.get("source") or "").upper()
+                if (kind == "audio" and src == "MICROPHONE") or (kind == "video" and src in ("CAMERA", "SCREEN_SHARE")):
+                    yield t.get("sid")
+
+
+def _meet_set_talk(m, identity, role):
+    talk = _meet_can_talk(m, role)
+    perm = {"can_subscribe": True, "can_publish_data": True, "can_update_metadata": False, "can_publish": talk}
+    if talk:
+        perm["can_publish_sources"] = ["CAMERA", "MICROPHONE", "SCREEN_SHARE", "SCREEN_SHARE_AUDIO"]
+    body = {"room": m["room"], "identity": identity, "permission": perm, "metadata": json.dumps({"role": role})}
+    if not talk:
+        body["attributes"] = {"present": ""}      # someone who may no longer speak stops presenting too
+    _lk_call("UpdateParticipant", body, room=m["room"])
+
+
+@app.route("/api/meet/<code>/control", methods=["POST", "OPTIONS"])
+@limiter.limit("900 per hour", key_func=_meet_person_key)
+@_meet_reply
+def meet_control(cur, code):
+    """What the host (or a co-host) can do."""
+    data = _json_body()
+    m = _meet_get(cur, code, lock=True)
+    actor = _meet_actor(cur, m, data)
+    action, who = _text(data.get("action")), _text(data.get("identity"))
+    if not _meet_running(m) and action not in ("end", "delete", "lock", "unlock", "lobby_on", "lobby_off", "chat_on", "chat_off",
+                                               "speak_all", "speak_chosen", "admit", "deny", "admit_all"):
+        raise MeetError("This meeting isn’t running.", 409)
+    target = None
+    if who:
+        cur.execute("SELECT * FROM meeting_people WHERE meeting_id = %s AND identity = %s", (m["id"], who))
+        target = cur.fetchone()
+        if not target:
+            raise MeetError("That person isn’t in this meeting.", 404)
+        if target["role"] == "host" and (action != "mute" or actor["role"] != "host"):
+            raise MeetError("The host can’t be changed.", 403)
+        if target["role"] == "cohost" and actor["role"] != "host" and action in ("remove", "attendee", "speaker", "listener", "cohost"):
+            raise MeetError("Only the host can change a co-host.", 403)
+    if action in ("end", "delete", "cohost") and actor["role"] != "host":
+        raise MeetError("Only the host can do that.", 403)
+    flags = {"lock": ("locked", True), "unlock": ("locked", False), "lobby_on": ("lobby", True), "lobby_off": ("lobby", False),
+             "chat_on": ("chat", True), "chat_off": ("chat", False)}
+    if action in flags:
+        col, val = flags[action]
+        cur.execute(f"UPDATE meetings SET {col} = %s WHERE id = %s RETURNING *", (val, m["id"]))
+        m = cur.fetchone()
+        if action == "lobby_off":    # everyone waiting comes in
+            cur.execute("UPDATE meeting_people SET status = 'admitted' WHERE meeting_id = %s AND status = 'waiting'", (m["id"],))
+        _meet_push(cur, m)
+    elif action in ("speak_all", "speak_chosen"):
+        cur.execute("UPDATE meetings SET speak = %s WHERE id = %s RETURNING *", ("all" if action == "speak_all" else "chosen", m["id"]))
+        m = cur.fetchone()
+        cur.execute("SELECT identity, role FROM meeting_people WHERE meeting_id = %s AND status = 'admitted' AND role = 'attendee' "
+                    "AND in_since IS NOT NULL", (m["id"],))
+        for p in cur.fetchall()[:300]:
+            try:
+                _meet_set_talk(m, p["identity"], p["role"])
+            except MeetError:
+                pass
+        _meet_push(cur, m)
+    elif action in ("admit", "deny", "admit_all"):
+        if action == "admit_all":
+            cur.execute("UPDATE meeting_people SET status = 'admitted' WHERE meeting_id = %s AND status = 'waiting'", (m["id"],))
+        elif target:
+            cur.execute("UPDATE meeting_people SET status = %s WHERE id = %s AND status = 'waiting'",
+                        ("admitted" if action == "admit" else "denied", target["id"]))
+    elif action == "mute" and target:
+        for sid in list(_meet_find_track(m["room"], target["identity"], _text(data.get("kind")) or "audio")):
+            _lk_call("MutePublishedTrack", {"room": m["room"], "identity": target["identity"], "track_sid": sid, "muted": True}, room=m["room"])
+    elif action == "remove" and target:
+        cur.execute("UPDATE meeting_people SET status = 'removed' WHERE id = %s", (target["id"],))
+        _lk_call("RemoveParticipant", {"room": m["room"], "identity": target["identity"]}, room=m["room"])
+        if not target["user_id"] and not m["lobby"]:
+            # a guest can't be recognised if they come back with the link — so the waiting room goes on
+            cur.execute("UPDATE meetings SET lobby = TRUE WHERE id = %s RETURNING *", (m["id"],))
+            m = cur.fetchone()
+            _meet_push(cur, m)
+    elif action in ("speaker", "attendee", "listener", "cohost") and target:
+        cur.execute("UPDATE meeting_people SET role = %s WHERE id = %s", (action, target["id"]))
+        _meet_set_talk(m, target["identity"], action)
+        _meet_push(cur, m)
+    elif action == "end":
+        _meet_end(cur, m, "the host ended it")
+    elif action == "delete":
+        _meet_end(cur, m, "the host deleted it")
+        cur.execute("DELETE FROM meetings WHERE id = %s", (m["id"],))
+        return jsonify({"ok": True, "deleted": True})
+    else:
+        raise MeetError("Unknown meeting control.", 400)
+    cur.execute("SELECT * FROM meetings WHERE id = %s", (m["id"],))
+    return jsonify({"ok": True, "meeting": _meet_public(cur.fetchone())})
+
+
+def _meet_end(cur, m, why):
+    if _meet_running(m):
+        cur.execute("UPDATE meetings SET ended_at = now() WHERE id = %s", (m["id"],))
+        logger.info(f"Meet: meeting {m['id']} ended ({why}) — peak {m['peak']} people")
+    _meet_settle(cur, m)
+    try:
+        _lk_call("DeleteRoom", {"room": m["room"]}, room=m["room"])
+    except MeetError:
+        pass
+
+
+def _meet_settle(cur, m, identity=None):
+    """Time spent in the meeting so far is added up: for each person who left (or everyone), for the meeting, and for
+    this month's participant-minutes."""
+    q = ("UPDATE meeting_people SET left_at = now(), seconds = seconds + GREATEST(0, EXTRACT(EPOCH FROM now() - in_since))::int, "
+         "in_since = NULL WHERE meeting_id = %s AND in_since IS NOT NULL")
+    args = [m["id"]]
+    if identity:
+        q += " AND identity = %s"
+        args.append(identity)
+    cur.execute(q, args)
+    cur.execute("SELECT seconds FROM meetings WHERE id = %s FOR UPDATE", (m["id"],))
+    before = int((cur.fetchone() or {}).get("seconds") or 0)
+    cur.execute("SELECT COALESCE(SUM(seconds), 0) AS s FROM meeting_people WHERE meeting_id = %s", (m["id"],))
+    total = int((cur.fetchone() or {}).get("s") or 0)
+    if total > before:
+        cur.execute("UPDATE meetings SET seconds = %s WHERE id = %s", (total, m["id"]))
+        cur.execute("INSERT INTO meeting_usage (month, seconds) VALUES (%s, %s) ON CONFLICT (month) DO UPDATE SET "
+                    "seconds = meeting_usage.seconds + EXCLUDED.seconds", (_meet_month(), total - before))
+
+
+@app.route("/api/meet/<code>/attendance", methods=["POST", "OPTIONS"])
+@_meet_reply
+def meet_attendance(cur, code):
+    """Who came, when, and for how long — for the host, as a spreadsheet file (CSV)."""
+    import csv as _csv
+    import io as _io
+    data = _json_body()
+    m = _meet_get(cur, code)
+    _meet_actor(cur, m, data)
+    cur.execute("SELECT name, role, joined_at, left_at, seconds, in_since, user_id IS NOT NULL AS member FROM meeting_people "
+                "WHERE meeting_id = %s AND joined_at IS NOT NULL ORDER BY joined_at", (m["id"],))
+    rows = cur.fetchall()
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["Name", "Role", "Academic-Home account", "First joined (UTC)", "Last left (UTC)", "Minutes"])
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        secs = int(r["seconds"] or 0) + (int((now - r["in_since"]).total_seconds()) if r["in_since"] else 0)
+        w.writerow([("'" + r["name"]) if r["name"][:1] in "=+-@\t\r" else r["name"], r["role"], "yes" if r["member"] else "guest",
+                    r["joined_at"].strftime("%Y-%m-%d %H:%M"), r["left_at"].strftime("%Y-%m-%d %H:%M") if r["left_at"] and not r["in_since"] else "still in",
+                    round(secs / 60, 1)])
+    name = re.sub(r"[^\w \-]+", "", m["title"]).strip()[:50] or "Meeting"
+    resp = app.response_class(buf.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{name} attendance.csv"'
+    return resp
+
+
+@app.route("/api/meet/<code>/notes", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+@_meet_reply
+def meet_notes(cur, code):
+    """Remy's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
+    data = _json_body()
+    m = _meet_get(cur, code)
+    if request.current_user["id"] != m["host_id"]:
+        raise MeetError("Only the host can ask Remy for the notes.", 403)
+    lines = []
+    for it in (data.get("chat") or [])[:400]:
+        if isinstance(it, dict) and _text(it.get("text")).strip():
+            lines.append(f"[{_text(it.get('time'))[:5]} {_meet_clean_name(it.get('name'))}] {_text(it.get('text'))[:600]}")
+    slides = [f"Slide {i + 1}: {_text(s)[:200]}" for i, s in enumerate((data.get("slides") or [])[:200]) if _text(s).strip()]
+    if not lines and not slides:
+        raise MeetError("There’s nothing to make notes from yet — no chat or slides.", 400)
+    material = "\n".join(lines)[:30000] + ("\n\nSLIDES SHOWN:\n" + "\n".join(slides) if slides else "")
+    try:
+        charged = _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        raise MeetError(str(e), 429)
+    system = ("You write clear meeting notes for an Academic-Home meeting called \"" + m["title"] + "\" from its chat and the titles of the "
+              "slides that were shown. Use only that material — never add facts it doesn't contain. Every point ends with where it "
+              "came from in square brackets: the person and time for chat — like [Ama 10:42] — or the slide, like [Slide 3]. Sections: "
+              "## Summary (3–5 points), ## Decisions, ## Questions asked (with the answers given, if any), ## Next steps (who does "
+              "what, by when, if said). Leave a section out when there's nothing for it. Plain, short sentences.")
+    try:
+        notes = call_claude(system, material, max_tokens=1800, feature="meet-notes")
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged)
+        raise MeetError(str(e) + AI_MSG_NOT_COUNTED, 502)
+    return jsonify({"notes": (notes or "").strip()})
+
+
+@app.route("/api/meet/webhook", methods=["POST"])
+@limiter.exempt
+def meet_webhook():
+    """LiveKit tells us who joined and left (attendance, minutes this month). Only LiveKit can sign these."""
+    if not _meet_on():
+        return jsonify({"ok": False}), 503
+    body = request.get_data(cache=True) or b""
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1] if auth.startswith("Bearer ") else auth
+    try:
+        claims = pyjwt.decode(token, LIVEKIT_API_SECRET, algorithms=["HS256"], leeway=120, options={"verify_aud": False})
+    except Exception:
+        return jsonify({"error": "bad signature"}), 401
+    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    if claims.get("iss") != LIVEKIT_API_KEY or not hmac.compare_digest(str(claims.get("sha256") or ""), digest):
+        return jsonify({"error": "bad signature"}), 401
+    try:
+        ev = json.loads(body.decode("utf-8") or "{}")
+    except ValueError:
+        return jsonify({"error": "bad body"}), 400
+    kind = ev.get("event")
+    room = (ev.get("room") or {}).get("name") or ""
+    who = (ev.get("participant") or {}).get("identity") or ""
+    if not room.startswith("m_"):
+        return jsonify({"ok": True})
+    conn = get_db()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM meetings WHERE room = %s FOR UPDATE", (room,))
+            m = cur.fetchone()
+            if not m:
+                return jsonify({"ok": True})
+            if kind == "participant_joined" and who:
+                cur.execute("UPDATE meeting_people SET joined_at = COALESCE(joined_at, now()), in_since = COALESCE(in_since, now()), "
+                            "left_at = NULL WHERE meeting_id = %s AND identity = %s", (m["id"], who))
+                cur.execute("UPDATE meetings SET peak = GREATEST(peak, (SELECT count(*) FROM meeting_people WHERE meeting_id = %s "
+                            "AND in_since IS NOT NULL)) WHERE id = %s", (m["id"], m["id"]))
+            elif kind in ("participant_left", "participant_connection_aborted") and who:
+                _meet_settle(cur, m, who)
+            elif kind == "room_finished":
+                _meet_settle(cur, m)
+                if _meet_running(m):
+                    cur.execute("UPDATE meetings SET ended_at = now() WHERE id = %s", (m["id"],))
+                    logger.info(f"Meet: meeting {m['id']} closed (everyone left) — peak {m['peak']} people")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return jsonify({"ok": True})
+
+
+_meet_hook_warned = {"at": 0}
+
+
+def _meet_webhook_check(cur, rooms):
+    """Attendance, and the monthly minutes limit, come from LiveKit's webhooks. People in a meeting for a while with
+    none of them counted means the webhooks aren't arriving: say so in the owner's log (at most once an hour)."""
+    busy = [r.get("name") for r in rooms if int(r.get("num_participants") or r.get("numParticipants") or 0) > 0]
+    if not busy or time.time() - _meet_hook_warned["at"] < 3600:
+        return
+    cur.execute("SELECT m.room FROM meetings m WHERE m.room = ANY(%s) AND m.ended_at IS NULL AND m.started_at < now() - interval '3 minutes' "
+                "AND NOT EXISTS (SELECT 1 FROM meeting_people p WHERE p.meeting_id = m.id AND p.joined_at IS NOT NULL)", (busy,))
+    if cur.fetchone():
+        _meet_hook_warned["at"] = time.time()
+        logger.error("Meet: LiveKit's webhooks aren't arriving, so attendance and the monthly minutes limit aren't counted. In LiveKit "
+                     "Cloud open Settings \u2192 Webhooks, add https://<this server>/api/meet/webhook and sign it with the same API key "
+                     "as LIVEKIT_API_KEY on Render.")
+
+
+def _meet_reap_once():
+    """Meetings past their time end; meetings LiveKit no longer has close; old ones are deleted."""
+    if not _meet_on():
+        return
+    conn = get_db()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM meetings WHERE ended_at IS NULL AND ends_at < now() LIMIT 50")
+            for m in cur.fetchall():
+                _meet_end(cur, m, "its time was up")
+            cur.execute("SELECT * FROM meetings WHERE ended_at IS NULL AND started_at IS NOT NULL AND started_at < now() - interval '15 minutes' LIMIT 200")
+            open_ = cur.fetchall()
+            if open_:
+                rooms = _lk_call("ListRooms", {}).get("rooms") or []
+                live = {r.get("name") for r in rooms}
+                for m in open_:
+                    if m["room"] not in live:
+                        _meet_end(cur, m, "no one was left in it")
+                _meet_webhook_check(cur, rooms)
+            cur.execute("DELETE FROM meetings WHERE (ended_at IS NOT NULL OR started_at IS NULL) "
+                        "AND COALESCE(started_at, created_at) < now() - make_interval(days => %s)", (MEET_KEEP_DAYS,))
+        conn.commit()
+    except MeetError:
+        conn.rollback()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _meet_reap_loop():
+    time.sleep(30)
+    while True:
+        try:
+            _meet_reap_once()
+        except Exception as e:
+            logger.warning(f"Meet: tidy-up pass failed: {e}")
+        time.sleep(60)
+
+
+if _meet_on() and "fake" not in os.environ.get("DATABASE_URL", "fake"):
+    _threading.Thread(target=_meet_reap_loop, daemon=True, name="meet-tidy").start()
 
 
 init_db()

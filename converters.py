@@ -392,7 +392,8 @@ _PLAIN_LINE = 1.22        # Calibri's line height, in ems
 _EMU_PT = 12700
 _PPTX_INSETS = 91440      # a text box's inner margins: 0.05 in above and below, 0.1 in each side
 _PPTX_MARL = (342900, 742950, 1143000, 1600200, 2057400)   # each level's text indent (default layouts)
-_PPTX_TABLE_CONT = "Docente table (continued)"
+_PPTX_TABLE_CONT = "Academic-Home table (continued)"
+_PPTX_TABLE_CONT_OLD = "Docente table (continued)"     # decks made before 3.4 (the app was called Docente)
 
 # Calibri's character widths (Carlito's are the same), " " to "~", in thousandths of an em.
 _CALIBRI_W = (226, 326, 401, 498, 507, 715, 682, 221, 303, 303, 498, 498, 250, 306, 252, 386,
@@ -963,7 +964,37 @@ def _lo_profile_dir():
     return d
 
 
+# 3.4: LibreOffice slots, shared by every worker process on this server (see server_soffice34.py)
+_SOFFICE_SLOTS = max(1, min(8, int(os.environ.get("SOFFICE_AT_ONCE", "1") or 1)))
+
+
+def _soffice_slot(wait=150):
+    """Waits for a free LibreOffice slot and returns its open lock file (closing it frees the slot)."""
+    import fcntl
+    import time as _time
+    deadline = _time.time() + wait
+    while True:
+        for i in range(_SOFFICE_SLOTS):
+            fh = open(os.path.join(tempfile.gettempdir(), f"docente-soffice-{i}.lock"), "w")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fh
+            except OSError:
+                fh.close()
+        if _time.time() > deadline:
+            raise ConversionError("The converter is busy right now. Please try again in a minute.")
+        _time.sleep(0.25)
+
+
 def _soffice_convert(src_path, target_format, out_dir):
+    slot = _soffice_slot()
+    try:
+        return _soffice_convert_now(src_path, target_format, out_dir)
+    finally:
+        slot.close()
+
+
+def _soffice_convert_now(src_path, target_format, out_dir):
     """Use headless LibreOffice for true rendering-based conversions
     (docx->pdf, any supported format -> pdf for preview, recalculating
     spreadsheets). Raises ConversionError on failure.
@@ -2022,7 +2053,7 @@ def _pptx_fix_add_agenda_slide(prs, title_size, body_size, title_font, body_font
     skipped (rather than spilling onto a second agenda slide) once there
     are more sections than a single overview slide can usefully list —
     an agenda that itself needs "(cont.)" defeats its own purpose."""
-    # Conversions mirror the original: Docente never adds a slide — not
+    # Conversions mirror the original: Academic-Home never adds a slide — not
     # even an agenda built from the deck's own titles.
     return
     slides = list(prs.slides)
@@ -4638,7 +4669,7 @@ def pptx_to_docx(src_path, out_dir, style="clean"):
         src_rows = [list(row.cells) for row in shape.table.rows]
         if not src_rows:
             return
-        if (shape.name or "") == _PPTX_TABLE_CONT and kids() and kids()[-1].tag == qn("w:tbl"):
+        if (shape.name or "") in (_PPTX_TABLE_CONT, _PPTX_TABLE_CONT_OLD) and kids() and kids()[-1].tag == qn("w:tbl"):
             # the rest of a table carried over from the slide before (its first row repeated there)
             word_table = DocxTable(kids()[-1], doc)
             n_cols = len(word_table.columns)
@@ -9547,7 +9578,7 @@ def academic_essay_to_docx(payload, out_dir):
                                     [(bm, label, f"{n} {cap}") for bm, label, n, cap in caps])
         except Exception as e:
             import logging as _logging
-            _logging.getLogger("docente").warning(f"Contents page numbers not worked out: {e}")
+            _logging.getLogger("academic-home").warning(f"Contents page numbers not worked out: {e}")
         doc, heads, caps = _build_word(payload, pages)
         wanted = [bm for bm, _ in heads] if len(heads) >= 3 else []
         wanted += [bm for bm, _, _, _ in caps]

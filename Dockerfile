@@ -30,4 +30,7 @@ EXPOSE 8000
 # conversion occupies one thread (subprocess calls release the GIL while
 # waiting on the OS), not the whole worker, so quick requests (auth, chat,
 # status checks) don't queue behind someone else's file conversion.
-CMD gunicorn --bind 0.0.0.0:${PORT:-8000} --timeout 240 --workers 2 --worker-class gthread --threads 4 app:app
+# 3.4: 6 threads per worker (12 requests in flight): meetings add many quick requests (joining, the waiting room),
+# which shouldn't wait behind Remy's longer answers. LibreOffice itself runs one conversion at a time
+# (SOFFICE_AT_ONCE, in converters.py), so more threads don't mean more memory for conversions.
+CMD gunicorn --bind 0.0.0.0:${PORT:-8000} --timeout 240 --workers 2 --worker-class gthread --threads 6 app:app

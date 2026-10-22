@@ -1,70 +1,69 @@
-# MasterConvert — Conversion Backend
+# Academic-Home — server
 
-Real document conversion API. Handles:
-Word↔PowerPoint, PDF↔Word, PDF→PowerPoint, Word↔Excel, Word→PDF.
+The server behind Academic-Home (formerly Docente), the study app at
+[getdocente.vercel.app](https://getdocente.vercel.app). The app itself (the web pages) is uploaded to Vercel
+separately; this repository is only the server, and Render builds it from the `Dockerfile` on every push.
 
-## What each conversion actually does
+## What it does
 
-| Pair | Method | Fidelity |
-|---|---|---|
-| Word → PDF | LibreOffice headless rendering | Exact — true rendering, not reconstruction |
-| Word → PowerPoint | Reads headings as slide titles, paragraphs as bullets | Structural rebuild — works well for notes-style docs |
-| PowerPoint → Word | Reads slide titles/text into headings + bullets | Structural rebuild |
-| PDF → Word | Extracts real text per page (pypdf) | Text only — layout/images aren't preserved. Scanned PDFs with no text layer will say so per page rather than guessing |
-| PDF → PowerPoint | Each page becomes a full-image slide, with OCR'd text (Tesseract) attached as speaker notes | Visual fidelity is exact; slide text is notes, not editable text boxes (see below) |
-| Excel → Word | Each sheet becomes a heading + table | Exact |
-| Word → Excel | Tables copy directly; a table-less doc falls back to one paragraph per row | Exact for tables |
-
-**Why PDF→PowerPoint uses notes instead of live text:** OCR is not 100% reliable, especially on
-diagrams, equations, or unusual fonts. Silently putting OCR guesses into the visible slide risks
-corrupting content without anyone noticing. Putting it in speaker notes gives you the extracted text
-to copy from deliberately, while the slide itself stays a perfect visual copy of the original.
-
-## AI endpoints (added since the original conversion-only version)
-
-| Endpoint | Does |
+| Area | What happens here |
 |---|---|
-| `/api/extract-text` | Pulls plain text from an uploaded file for the AI tools — real extraction, no AI involved |
-| `/api/summarize` | Calls Claude to condense pasted/uploaded text into slide bullets |
-| `/api/write` | Calls Claude to draft an explanatory paragraph on a topic. Deliberately never generates citations — an AI has no way to verify a specific source is real, and a fabricated citation in a student's work is a genuine harm, not a cosmetic bug |
+| Conversions | Word, PDF, PowerPoint and Excel, both ways, with LibreOffice, pdf tools and Tesseract. A conversion mirrors the original: nothing is added, and converting back gives the original's words. |
+| Slide Studio | Builds decks in the app's own templates, or keeps an imported deck's own design. |
+| PDF and Word editors | Edits, signatures, forms, redaction and password protection (the last two on Pro). |
+| Remy and Evidence-Based Writing | AI answers and drafts from Claude. When the question is about facts, every sentence carries its source — a real paper (OpenAlex, Semantic Scholar, Europe PMC) or a web page — and anything no source backs is left out. |
+| Quizzes and decks | Practice quizzes, summaries and full decks drafted from notes. |
+| Accounts | Email and password (codes by email), Google sign-in, password reset, account deletion. |
+| Plans | Paystack on the web; the App Store and Google Play in the store apps. |
+| Meetings | Academic-Home Meet, on LiveKit: waiting room, passcodes, encryption, presenting files, live quizzes, attendance. |
 
-These need `ANTHROPIC_API_KEY` set as an environment variable — see deployment
-steps below. Without it, both endpoints return a clear error instead of
-crashing, and the app shows that error as a toast.
+Check it's running: `https://<your server>/api/health` answers `{"status": "ok", …}`.
 
-## Deploying on Render (matches your original plan)
+## Settings on Render (Environment)
 
-1. Push this folder to a GitHub repo (Render deploys from Git, not file upload)
-2. In Render: **New → Web Service** → connect the repo
-3. Render will detect the `Dockerfile` automatically — leave the environment as **Docker**
-4. Instance type: at least the smallest **paid** tier. The free tier's ~512MB RAM is tight for
-   LibreOffice; expect slow or failing conversions on Free specifically
-5. In **Environment**, add `ANTHROPIC_API_KEY` with your real key — get one at
-   [console.anthropic.com](https://console.anthropic.com)
-6. Deploy. Render assigns a URL like `https://masterconvert-api.onrender.com`
+Keys and passwords go **only** into Render's Environment page — never into a file in this repository.
 
-## Deploying on Railway (alternative)
+| Setting | Needed for |
+|---|---|
+| `DATABASE_URL` | Required: the Postgres database. |
+| `SECRET_KEY` | Required: signs sign-in tokens. |
+| `ANTHROPIC_API_KEY` | Remy, writing, quizzes, summaries and decks. |
+| `EMAIL_ADDRESS`, and `BREVO_API_KEY` or `EMAIL_APP_PASSWORD` | Confirmation codes and password-reset emails. |
+| `PAYSTACK_SECRET_KEY`, `PAYSTACK_PUBLIC_KEY` | Paying for Pro on the web. |
+| `GOOGLE_CLIENT_ID` | Google sign-in. |
+| `SEMANTIC_SCHOLAR_API_KEY`, `OPENALEX_API_KEY` | Optional: faster, steadier paper searches. |
+| `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Meetings (they stay switched off until all three are set). |
+| `APPLE_*`, `GOOGLE_PLAY_*`, `GOOGLE_RTDN_TOKEN` | Purchases in the store apps. |
+| `FRONTEND_URL` | Optional: the app's address in emails (default `https://getdocente.vercel.app`). |
+| `EXTRA_ALLOWED_ORIGINS` | Optional: a custom domain for the app (any `*.vercel.app` address is already accepted). |
+| `PROMO_PRO_UNTIL` | Optional: free Pro for everyone until this date and time (`off` to stop). |
+| `SOFFICE_AT_ONCE` | Optional: LibreOffice conversions at the same time (default 1, for a 512 MB server). |
 
-Same idea: push to GitHub, **New Project → Deploy from GitHub repo**, Railway detects the
-Dockerfile automatically. Add `ANTHROPIC_API_KEY` under Variables. Railway injects
-`PORT` itself — already handled in this Dockerfile.
+## Meetings (LiveKit)
 
-## After deploying
+1. Make a free project at [cloud.livekit.io](https://cloud.livekit.io) and create an API key.
+2. On Render, add `LIVEKIT_URL` (the project's `wss://…` address), `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET`.
+3. In LiveKit Cloud, under Settings → Webhooks, add `https://<your server>/api/meet/webhook`, signed with the same
+   API key. Attendance and the monthly minutes count come from these webhooks; if none arrive while people are in a
+   meeting, the server says so in its log.
 
-Copy the live URL Render/Railway gives you and paste it into `API_BASE` near the top of the
-frontend's script block in `index.html`. Until that's set, the app will show a toast telling
-you it's not configured yet, rather than failing silently.
+Limits, all changeable on Render without a code change (defaults match LiveKit Cloud's free Build plan):
+`MEET_MAX_PEOPLE` (100 in one meeting), `MEET_GLOBAL_MAX` (100 across all meetings at once),
+`MEET_MONTH_MINUTES` (5,000 participant-minutes a month), `MEET_FREE_MINUTES` (60-minute meetings on Free),
+`MEET_PRO_MINUTES` (300 on Pro) and `MEET_AUDIENCE_OVER` (above 30 people, newcomers listen until let speak).
 
-## Testing your deployment
+## Security
 
-```
-curl https://your-backend-url.onrender.com/api/health
-# should return {"status":"ok"}
-```
+- Sign-in travels as a token in the `Authorization` header, never a cookie.
+- Rate limits use the visitor's real address from Render's edge (`True-Client-IP`), which visitors can't fake.
+- Every answer carries `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and HSTS; signed-in
+  answers aren't stored by caches.
+- Meeting rooms are made only by the server. Only the host and the co-hosts they choose can let people in, mute or
+  remove them; only the host can end or delete a meeting or name co-hosts. Files presented in a meeting are PDFs only.
+- Payment errors never show Paystack's own messages or keys.
 
-## Security note before going further
+## Running the tests
 
-This API currently accepts requests from anywhere (`Access-Control-Allow-Origin: *`) and has no
-rate limiting or auth. Fine for testing. Before real customers hit it, lock `ALLOWED_ORIGIN` in
-`app.py` to your actual domain, and add basic rate limiting — otherwise anyone who finds the URL
-can run unlimited free conversions through it.
+The tests live with the app's source, outside this repository. Each release runs the full set — the app in a real
+browser (light and dark, phone and laptop, contrast and accessibility checks) and this server against a real
+Postgres and a real LiveKit server.

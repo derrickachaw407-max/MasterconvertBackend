@@ -1,4 +1,4 @@
-# MasterConvert — Google Play Store Readiness Checklist
+# Academic-Home — Google Play Store Readiness Checklist
 
 Based on current Google Play policy (checked August 2026). This covers what's
 done, what's genuinely required, and what only you can do from here — none of
@@ -37,17 +37,17 @@ that talk back to this function).
 
 ## 🔧 Steps only you can do (need your own accounts/tools)
 
-1. **Host `privacy.html`** at a real URL (e.g. `masterconvert.app/privacy`) —
+1. **Host `privacy.html`** at a real URL (it is: `getdocente.vercel.app/privacy`) —
    Play Console requires a privacy policy *URL* in the store listing, not
    just in-app text.
 2. **Package as a TWA.** The standard no-code-adjacent path:
    [PWABuilder.com](https://pwabuilder.com) — point it at your deployed
-   masterconvert.app URL, it generates the Android project for you. The more
+   getdocente.vercel.app URL, it generates the Android project for you. The more
    manual path is Google's own [Bubblewrap CLI](https://github.com/GoogleChromeLabs/bubblewrap).
    Either way you'll need Android Studio installed to build the final signed
    `.aab` file.
 3. **Digital Asset Links** — both tools above generate an `assetlinks.json`
-   file. It must be hosted at `masterconvert.app/.well-known/assetlinks.json`
+   file. It must be hosted at `getdocente.vercel.app/.well-known/assetlinks.json`
    — this is what cryptographically proves you own the site the TWA wraps.
 4. **Google Play Console account** — $25 one-time fee, real ID verification.
 5. **Content rating questionnaire** — mandatory; Google no longer allows

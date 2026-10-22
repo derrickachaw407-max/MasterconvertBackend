@@ -1,5 +1,5 @@
 """
-Slide Studio — builds presentations in Docente's own templates from a simple
+Slide Studio — builds presentations in Academic-Home's own templates from a simple
 description of a deck (the "deck model" the in-app slide editor edits).
 
 Two families of templates, each built from a real deck its users shared, with
@@ -3220,7 +3220,7 @@ def _m_number(slide, number, tpl, on_colour=False):
     import uuid
     if tpl.get("plain"):
         box = slide.shapes.add_textbox(Inches(11.9), Inches(6.88), Inches(0.87), Inches(0.38))
-        box.name = "Docente slide number"
+        box.name = "Academic-Home slide number"
         tf = box.text_frame
         tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
         tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -3240,7 +3240,7 @@ def _m_number(slide, number, tpl, on_colour=False):
     fill = "FFFFFF" if on_colour else tpl["ink"]
     text_hex = tpl["ink"] if on_colour else "FFFFFF"
     badge = _m_shape(slide, MSO_SHAPE.ROUNDED_RECTANGLE, 12.15, 6.88, 0.62, 0.38, fill, back=False)
-    badge.name = "Docente slide number"
+    badge.name = "Academic-Home slide number"
     badge.adjustments[0] = 0.5
     tf = badge.text_frame
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
@@ -3262,7 +3262,7 @@ def _m_number(slide, number, tpl, on_colour=False):
 def _m_footer(slide, tpl, deck, number, on_colour=False):
     foot = _tutor_footer(deck)
     if foot and not on_colour:
-        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"]).name = "Docente footer"
+        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"]).name = "Academic-Home footer"
     if deck.get("slide_numbers", True):
         _m_number(slide, number, tpl, on_colour)
 
@@ -3612,7 +3612,7 @@ def _picture_data_url(image_blob):
 def _furniture_box(sh, slide_h):
     # A footer or slide number drawn as an ordinary text box: one this builder named, or a lone
     # number along the very bottom of the slide.
-    if (sh.name or "").startswith("Docente "):
+    if (sh.name or "").startswith(("Academic-Home ", "Docente ")):     # "Docente …": decks made before 3.4
         return True
     text = sh.text_frame.text.strip()
     return bool(re.fullmatch(r"\d{1,3}", text)) and sh.top is not None and bool(slide_h) and sh.top >= slide_h * 0.88
