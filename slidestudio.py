@@ -2386,36 +2386,52 @@ def _add_media(slide, media, box):
 
 def _student_title_slide(prs, deck):
     """Mirrors the student deck: institution, department and programme in
-    white capitals across the top of the navy slide; logo centred; the main
-    line and a second line below; an optional small label top-right."""
+    white capitals across the top of the navy slide; logo centred; the topic,
+    and the lines under it (each its own line, smaller as there are more); an
+    optional small label top-right. (3.5: a cover without institution lines
+    has no "YOUR INSTITUTION" — the topic itself is the slide's title.)"""
     ts = deck.get("title_slide") or {}
     s = prs.slides.add_slide(_layout(prs, "Title Slide"))
     for ph in list(s.placeholders):
         if ph.placeholder_format.type not in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE):
             _remove(ph)
     # The topic is the headline: the institution is a small spaced-out line
-    # at the top, a short accent bar leads down to the topic, and "presented
-    # by" sits under it in the accent colour. (Measurements match the app's
-    # preview.)
-    lines = [str(l).strip()[:120] for l in (ts.get("lines") or []) if str(l).strip()][:4] or ["Your institution"]
-    t = s.shapes.title
-    t.left, t.top, t.width, t.height = 0, Inches(0.45), SLIDE_W, Inches(1.5)
-    tf = t.text_frame
-    tf.word_wrap = True
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf.text = ""
-    for i, line in enumerate(lines):
-        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.alignment = PP_ALIGN.CENTER
-        r = p.add_run()
-        r.text = line.upper()
-        r.font.name = "Arial Black"
-        r.font.bold = False
-        r.font.size = Pt(16 if len(lines) <= 2 else 14)
-        r.font.color.rgb = RGBColor(0xD9, 0xDE, 0xE8)
-        r._r.get_or_add_rPr().set("spc", "150")
+    # at the top, a short accent bar leads down to the topic, and the lines
+    # under it sit in the accent colour. (Measurements match the app's preview.)
+    lines = [str(l).strip()[:120] for l in (ts.get("lines") or []) if str(l).strip()][:4]
     logo = _image_bytes(deck.get("logo"))
     top = 3.45 if logo else 2.45
+    main = str(ts.get("main") or "").strip()[:200]
+    t = s.shapes.title
+
+    def topic_style(p, r):
+        p.alignment = PP_ALIGN.CENTER
+        r.font.size = Pt(40 if len(main) <= 40 else 34 if len(main) <= 70 else 28)
+        r.font.bold = False
+        r.font.color.rgb = WHITE
+        # the topic in its own look even inside the title box (whose layout sets spaced capitals): the
+        # theme's body font, ordinary capitals, no letter spacing
+        r.font.name = "+mn-lt"
+        rpr = r._r.get_or_add_rPr()
+        rpr.set("cap", "none")
+        rpr.set("spc", "0")
+
+    if lines:
+        t.left, t.top, t.width, t.height = 0, Inches(0.45), SLIDE_W, Inches(1.5)
+        tf = t.text_frame
+        tf.word_wrap = True
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        tf.text = ""
+        for i, line in enumerate(lines):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.alignment = PP_ALIGN.CENTER
+            r = p.add_run()
+            r.text = line.upper()
+            r.font.name = "Arial Black"
+            r.font.bold = False
+            r.font.size = Pt(16 if len(lines) <= 2 else 14)
+            r.font.color.rgb = RGBColor(0xD9, 0xDE, 0xE8)
+            r._r.get_or_add_rPr().set("spc", "150")
     if logo:
         _fit_picture(s, logo, SLIDE_W // 2 - Inches(0.65), Inches(2.15), Inches(1.3), Inches(1.1))
     bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(6.215), Inches(top), Inches(0.9), Inches(0.08))
@@ -2423,31 +2439,43 @@ def _student_title_slide(prs, deck):
     bar.fill.fore_color.theme_color = MSO_THEME_COLOR.ACCENT_2
     bar.line.fill.background()
     bar.shadow.inherit = False
-    main = str(ts.get("main") or "").strip()[:200]
     if main:
-        box = s.shapes.add_textbox(Inches(0.79), Inches(top + 0.2), Inches(11.75), Inches(1.7 if logo else 2.2))
+        if lines:
+            box = s.shapes.add_textbox(Inches(0.79), Inches(top + 0.2), Inches(11.75), Inches(1.7 if logo else 2.2))
+        else:      # no institution lines: the topic is the slide's title, where the topic goes
+            box = t
+            box.left, box.top, box.width, box.height = Inches(0.79), Inches(top + 0.2), Inches(11.75), Inches(1.7 if logo else 2.2)
+            bp = box.text_frame._txBody.find(qn("a:bodyPr"))
+            if bp is not None:              # never shrunk (the layout's title would shrink it)
+                for tag in ("a:normAutofit", "a:spAutoFit", "a:noAutofit"):
+                    for el in bp.findall(qn(tag)):
+                        bp.remove(el)
+                bp.append(etree.Element(qn("a:noAutofit")))
         tfm = box.text_frame
         tfm.word_wrap = True
         tfm.vertical_anchor = MSO_ANCHOR.MIDDLE
+        tfm.text = ""
         p = tfm.paragraphs[0]
-        p.alignment = PP_ALIGN.CENTER
         r = p.add_run()
         r.text = main
-        r.font.size = Pt(40 if len(main) <= 40 else 34 if len(main) <= 70 else 28)
-        r.font.bold = False
-        r.font.color.rgb = WHITE
-    sub = str(ts.get("sub") or "").strip()[:200]
-    if sub:
-        box = s.shapes.add_textbox(Inches(0.79), Inches(top + (2.0 if logo else 2.5)), Inches(11.75), Inches(0.8))
+        topic_style(p, r)
+    elif not lines:
+        _remove(t)
+    under = [l.strip()[:200] for l in str(ts.get("sub") or "").split("\n") if l.strip()][:6]
+    if under:
+        y = top + (2.0 if logo else 2.5)
+        size = STUDENT_UNDER_SIZES[min(len(under), len(STUDENT_UNDER_SIZES)) - 1]
+        box = s.shapes.add_textbox(Inches(0.79), Inches(y), Inches(11.75), Inches(max(0.8, 6.45 - y)))
         tfs = box.text_frame
         tfs.word_wrap = True
-        p = tfs.paragraphs[0]
-        p.alignment = PP_ALIGN.CENTER
-        r = p.add_run()
-        r.text = sub
-        r.font.size = Pt(20)
-        r.font.bold = False
-        r.font.color.theme_color = MSO_THEME_COLOR.ACCENT_2
+        for i, line in enumerate(under):
+            p = tfs.paragraphs[0] if i == 0 else tfs.add_paragraph()
+            p.alignment = PP_ALIGN.CENTER
+            r = p.add_run()
+            r.text = line
+            r.font.size = Pt(size)
+            r.font.bold = False
+            r.font.color.theme_color = MSO_THEME_COLOR.ACCENT_2
     tag = str(ts.get("tag") or "").strip()[:40]
     if tag:
         box = s.shapes.add_textbox(Inches(10.4), Inches(0.08), Inches(2.8), Inches(0.36))
@@ -2458,6 +2486,9 @@ def _student_title_slide(prs, deck):
         r.font.size = Pt(12)
         r.font.color.rgb = WHITE
 
+
+# The lines under a student cover's topic: 20 pt for one, smaller as there are more (the app's own numbers).
+STUDENT_UNDER_SIZES = (20, 18, 16, 14, 13, 12)
 
 # Classic lecture covers in four styles ("look"), each with one accent carried
 # onto its content slides. The editor uses the very same numbers.
@@ -3337,7 +3368,8 @@ def _modern_title_slide(prs, deck, tpl):
         # A student's cover keeps the student's own words: the topic as the big
         # title, the presenter line beneath, institution lines small.
         lines = [str(x).strip() for x in (ts.get("lines") or []) if str(x).strip()]
-        ts = {"course": ts.get("main") or "", "subtitle": ts.get("sub") or "", "code": "  \u00b7  ".join(lines[:3]),
+        under = [x.strip() for x in str(ts.get("sub") or "").split("\n") if x.strip()]     # 3.5: several lines under the title
+        ts = {"course": ts.get("main") or "", "subtitle": under[0] if under else "", "code": "  \u00b7  ".join(under[1:] + lines[:3]),
               "lecturer": ts.get("tag") or "", "picture": ts.get("picture")}
     s = prs.slides.add_slide(_layout(prs, "Blank"))
     course = str(ts.get("course") or "").strip()[:80] or " "
@@ -3799,6 +3831,89 @@ def _prominent_title_shape(texts, slide_h, max_top=0.28):
     return best
 
 
+_DATE_WORDS = re.compile(r"\b(?:19|20)\d{2}\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s*\d|\d\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)|"
+                         r"\bsemester\b|\bterm\b|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b", re.I)
+
+
+_INSTITUTION = re.compile(r"\b(?:college|university|polytechnic|institute|academy|seminary|school of|faculty of|department of|ministry of)\b", re.I)
+
+
+def _cover_fields(prs, shapes, title_shape):
+    """A cover's words, read into the fields every design uses — nothing dropped (3.5).
+
+    Every text on the slide is a block with its lines, its size and where it sits. The biggest
+    words are the topic (on a tie, the title box; then the one nearest the middle; a college's or
+    university's name across the top never is, however big it is printed). Words above
+    the topic are the institution lines — a student cover's college, department and programme;
+    everything below it, line by line, goes under the title: the hospital, "Presented by …", a
+    preceptor, an index number. A short label in the top-right corner is the corner label. The
+    tutor designs read the same blocks: the topic is the course (a line in brackets is its code),
+    the first block under it the lecture title, and the rest the lecturer (and a date, when the
+    last part reads like one)."""
+    W, H = (prs.slide_width or 1), (prs.slide_height or 1)
+    th, blocks = None, []
+    for sh in shapes:
+        if not getattr(sh, "has_text_frame", False) or not sh.text_frame.text.strip():
+            continue
+        if getattr(sh, "is_placeholder", False) and sh.placeholder_format.type in (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER):
+            continue
+        if _furniture_box(sh, H):
+            continue
+        lines = [re.sub(r"\s+", " ", l).strip() for l in sh.text_frame.text.replace("\v", "\n").split("\n")]
+        lines = [l for l in lines if l]
+        if not lines:
+            continue
+        is_title = title_shape is not None and sh.shape_id == title_shape.shape_id
+        sizes = [r.font.size.pt for p in sh.text_frame.paragraphs for r in p.runs if r.font.size is not None]
+        if sizes:
+            size = max(sizes)
+        else:
+            try:     # no size of its own: the one its layout, master and theme give it
+                if th is None:
+                    th = _o_theme(prs)
+                kind = "title" if is_title else ("body" if getattr(sh, "is_placeholder", False) else "other")
+                size = float(_o_box(sh, prs, th, kind)["lv"][0].get("sz") or 18)
+            except Exception:
+                size = 44.0 if is_title else 18.0
+        top, height = (sh.top or 0), (sh.height or 0)
+        blocks.append({"lines": lines, "size": size, "top": top, "mid": top + height / 2.0, "left": sh.left or 0,
+                       "width": sh.width or 0, "title": is_title})
+    empty = {"lines": [], "main": "", "sub": "", "tag": "", "course": "", "code": "", "subtitle": "", "lecturer": "", "date": ""}
+    if not blocks:
+        return empty
+    # A college's name printed big across the top is still the institution, not the topic.
+    def institution(b):
+        return b["mid"] < H * 0.3 and bool(_INSTITUTION.search(" ".join(b["lines"])))
+    candidates = [b for b in blocks if not institution(b)] or blocks
+    topic = max(candidates, key=lambda b: (round(b["size"]), b["title"], -abs(b["mid"] - H * 0.5)))
+
+    def corner(b):
+        return (b is not topic and b["top"] < H * 0.12 and b["left"] > W * 0.55 and b["width"] < W * 0.4
+                and b["size"] <= 14 and len(" ".join(b["lines"])) <= 40)
+    tag = next((b for b in sorted(blocks, key=lambda b: b["top"]) if corner(b)), None)
+    rest = sorted([b for b in blocks if b is not topic and b is not tag], key=lambda b: (b["top"], b["left"]))
+    above = [b for b in rest if b["mid"] < topic["mid"]]
+    below = [b for b in rest if b["mid"] >= topic["mid"]]
+    lines = [l for b in above for l in b["lines"]]
+    if len(lines) > 4:                       # four lines fit across the top; the rest join the fourth
+        lines = lines[:3] + ["  ·  ".join(lines[3:])]
+    under = [l for b in below for l in b["lines"]]
+    code = next((m.group(1) for l in topic["lines"] + lines for m in [re.match(r"^\((.+)\)$", l)] if m), "")
+    course = " ".join(l for l in topic["lines"] if not re.match(r"^\(.+\)$", l)) or " ".join(topic["lines"])
+    texts = [" ".join(b["lines"]) for b in below]
+    subtitle = texts[0] if texts else "  ·  ".join(lines)
+    lecturer, date = "", ""
+    if len(texts) > 1:
+        parts = [x for x in re.split(r"\s+·\s+", "  ·  ".join(texts[1:])) if x.strip()]
+        if len(parts) >= 2 and _DATE_WORDS.search(parts[-1]):
+            lecturer, date = "  ·  ".join(parts[:-1]), parts[-1]
+        else:
+            lecturer = "  ·  ".join(parts)
+    return dict(empty, lines=[l[:120] for l in lines], main=" ".join(topic["lines"])[:200], sub="\n".join(under)[:600],
+                tag=(" ".join(tag["lines"]) if tag else "")[:40], course=course[:80], code=code[:30], subtitle=subtitle[:120],
+                lecturer=lecturer[:80], date=date[:40])
+
+
 def parse_pptx_to_deck(path, max_pictures=30):
     """Reads an existing presentation into the deck model, so it can be
     reopened in the editor and rebuilt in any template: the title slide's
@@ -3817,7 +3932,7 @@ def parse_pptx_to_deck(path, max_pictures=30):
         title_shape = s.shapes.title
         title = re.sub(r"\s+", " ", title_shape.text_frame.text.replace("\v", " ")).strip() if title_shape is not None and title_shape.has_text_frame else ""
         kinds = {ph.placeholder_format.type for ph in s.placeholders}
-        extras = {}
+        extras = {"src": i}       # 3.5: which slide of the file it came from
         if s._element.get("show") == "0":
             extras["hidden"] = True
         if _transition_of(s):
@@ -3846,11 +3961,8 @@ def parse_pptx_to_deck(path, max_pictures=30):
         if is_title_slide:
             title_notes = s.notes_slide.notes_text_frame.text.strip() if s.has_notes_slide else ""
             raw_lines = [l.strip() for l in cover_text.replace("\v", "\n").split("\n") if l.strip()]
-            others = [re.sub(r"\s+", " ", sh.text_frame.text.replace("\v", " ")).strip() for sh in texts]
-            code = next((m.group(1) for l in raw_lines for m in [re.match(r"^\((.+)\)$", l)] if m), "")
-            course_lines = [l for l in raw_lines if not re.match(r"^\(.+\)$", l)]
-            title_slide = {"lines": raw_lines[:4], "main": others[0][:200] if others else "", "sub": others[1][:200] if len(others) > 1 else "",
-                           "course": " ".join(course_lines)[:80], "code": code[:30], "subtitle": others[0][:120] if others else ""}
+            # 3.5: every text on the cover, in its place — the biggest is the topic (nothing dropped)
+            title_slide = _cover_fields(prs, shapes, title_shape)
             if title_notes:
                 title_slide["notes"] = title_notes[:4000]
             if _transition_of(s):
@@ -4466,6 +4578,37 @@ def _o_layout_boxes(layout, prs, th):
     return t, b
 
 
+def _o_whole(slide, ids, prs):
+    """Does the slide hold more than its title and one text box (3.5)? A picture (not one that
+    fills the slide as its background, nor a small logo or icon), a table, a chart, a video or
+    another text box with words. Quick fix leaves such a slide whole: a copy of it would repeat
+    the picture, as the Convert screen's fix does."""
+    W, H = (prs.slide_width or 1), (prs.slide_height or 1)
+    for sh in _flat_shapes(slide.shapes):
+        if sh.shape_id in ids or _o_furniture(sh):
+            continue
+        if (getattr(sh, "has_table", False) and sh.has_table) or (getattr(sh, "has_chart", False) and sh.has_chart):
+            return True
+        if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip():
+            if _furniture_box(sh, H):
+                continue
+            return True
+        try:
+            st = int(sh.shape_type) if sh.shape_type is not None else -1
+        except Exception:
+            st = -1
+        if st in (7, 10, 16):            # an embedded or linked object, a video or sound
+            return True
+        if st == 13 or (st == 14 and getattr(sh, "is_placeholder", False) and sh.placeholder_format.type == PP_PLACEHOLDER.PICTURE):
+            w, h = (sh.width or 0), (sh.height or 0)
+            if w * h >= 0.85 * W * H or max(w, h) <= Inches(1.2):
+                continue                 # its background, or a small logo / icon: part of the look
+            return True
+        if sh._element.tag == qn("p:graphicFrame"):
+            return True                  # SmartArt and the like
+    return False
+
+
 def parse_pptx_original(path, work_dir, to_pdf=None):
     try:
         prs = Presentation(path)
@@ -4496,6 +4639,8 @@ def parse_pptx_original(path, work_dir, to_pdf=None):
             info["notes0"] = s.notes_slide.notes_text_frame.text.strip()[:4000]
         info["hidden0"] = s._element.get("show") == "0"
         info["tr0"] = _transition_of(s) or ""
+        if _o_whole(s, ids, prs):
+            info["whole"] = True      # 3.5: a picture, table, chart or another text box — never split
         clear[i] = ids
         out["slides"].append(info)
     lay = _o_content_layout(prs)
@@ -4640,6 +4785,7 @@ def _o_textbox(slide, box, text_or_points, title):
     if not box:
         return
     tb = slide.shapes.add_textbox(Inches(box["x"]), Inches(box["y"]), Inches(box["w"]), Inches(box["h"]))
+    tb.name = "Added title" if title else "Added text"      # 3.5: Quick fix's text style finds it again
     tf = tb.text_frame
     tf.word_wrap = True
     lv0 = (box.get("lv") or [{}])[0]
@@ -4667,6 +4813,128 @@ def json_dumps_sorted(v):
     return _json.dumps(v, sort_keys=True)
 
 
+# ---------------------------------------------------------------- 3.5: Quick fix, "Keep my design"
+_FIX_FONT = re.compile(r"^[A-Za-z0-9 .,'&()+-]{1,60}$")
+
+
+def _o_fix_opts(raw):
+    """Quick fix's text style for a deck that keeps its own design, checked: title / point sizes
+    (10-120 pt), fonts, colours (6-digit hex) and the headings' alignment. Anything else is left out."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k in ("t", "b"):
+        try:
+            v = float(raw.get(k))
+        except (TypeError, ValueError):
+            continue
+        if 10 <= v <= 120:
+            out[k] = round(v, 1)
+    for k in ("tf", "bf"):
+        v = str(raw.get(k) or "").strip()
+        if v and _FIX_FONT.match(v):
+            out[k] = v
+    for k in ("tc", "bc"):
+        v = str(raw.get(k) or "").strip().lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", v):
+            out[k] = v.upper()
+    if raw.get("ta") in ("left", "center", "right"):
+        out["ta"] = raw["ta"]
+    return out or None
+
+
+def _fix_sub_size(b):
+    """A sub-point's size beside its points' size: a little smaller, never below 16 pt (the editor's own rule)."""
+    return max(16.0, round(b * 0.85))
+
+
+def _o_rpr(rpr, size, font, colour):
+    if size:
+        rpr.set("sz", str(int(round(size * 100))))
+    if colour:
+        for tag in ("a:noFill", "a:solidFill", "a:gradFill", "a:blipFill", "a:pattFill", "a:grpFill"):
+            for el in rpr.findall(qn(tag)):
+                rpr.remove(el)
+        fill = etree.Element(qn("a:solidFill"))
+        etree.SubElement(fill, qn("a:srgbClr")).set("val", colour)
+        ln = rpr.find(qn("a:ln"))
+        rpr.insert(list(rpr).index(ln) + 1 if ln is not None else 0, fill)
+    if font:
+        for el in rpr.findall(qn("a:latin")):
+            rpr.remove(el)
+        latin = etree.Element(qn("a:latin"))
+        latin.set("typeface", font)
+        after = [el for el in rpr if el.tag in (qn("a:ea"), qn("a:cs"), qn("a:sym"), qn("a:hlinkClick"), qn("a:hlinkMouseOver"), qn("a:rtl"), qn("a:extLst"))]
+        if after:
+            after[0].addprevious(latin)
+        else:
+            rpr.append(latin)
+
+
+def _o_restyle(sh, size=None, sub_size=None, font=None, colour=None, align=None):
+    """One text shape in Quick fix's style: each paragraph's runs at the size for its level, in the
+    font and colour chosen, the paragraphs lined up as chosen — and, once sizes are set, no shrinking."""
+    tb = sh._element.find(".//" + qn("p:txBody"))
+    if tb is None or not (size or font or colour or align):
+        return
+    if size:
+        bp = tb.find(qn("a:bodyPr"))
+        if bp is not None:
+            for tag in ("a:normAutofit", "a:spAutoFit", "a:noAutofit"):
+                for el in bp.findall(qn(tag)):
+                    bp.remove(el)
+            na = etree.Element(qn("a:noAutofit"))
+            later = [el for el in bp if el.tag in (qn("a:scene3d"), qn("a:sp3d"), qn("a:flatTx"), qn("a:extLst"))]
+            if later:
+                later[0].addprevious(na)
+            else:
+                bp.append(na)
+    for p in tb.findall(qn("a:p")):
+        ppr = p.find(qn("a:pPr"))
+        level = int(ppr.get("lvl", "0")) if ppr is not None else 0
+        if align:
+            if ppr is None:
+                ppr = etree.Element(qn("a:pPr"))
+                p.insert(0, ppr)
+            ppr.set("algn", {"left": "l", "center": "ctr", "right": "r"}[align])
+        sz = (size if level == 0 else (sub_size or size)) if size else None
+        for r in p.findall(qn("a:r")) + p.findall(qn("a:fld")):
+            rpr = r.find(qn("a:rPr"))
+            if rpr is None:
+                rpr = etree.Element(qn("a:rPr"))
+                r.insert(0, rpr)
+            _o_rpr(rpr, sz, font, colour)
+        end = p.find(qn("a:endParaRPr"))
+        if end is not None:
+            _o_rpr(end, sz, font, colour)
+
+
+def _o_apply_fix(slide, o, fix, cover):
+    """Quick fix's "Keep my design" on one slide: its title and its main words (a cover: fonts and
+    colours only — its sizes and alignment were laid out with care)."""
+    title_sh = _o_find(slide, o["t"]["id"]) if o.get("t") else None
+    if title_sh is None:
+        title_sh = slide.shapes.title if not o.get("t") else None
+        if title_sh is None:
+            title_sh = next((sh for sh in slide.shapes if sh.name == "Added title"), None)
+    body_sh = _o_find(slide, o["b"]["id"]) if o.get("b") else None
+    if body_sh is None and not o.get("b"):
+        body_sh = next((p for p in slide.placeholders if p.placeholder_format.idx == 1 and p.has_text_frame), None)
+        if body_sh is None:
+            body_sh = next((sh for sh in slide.shapes if sh.name == "Added text"), None)
+    if title_sh is not None and getattr(title_sh, "has_text_frame", False):
+        if cover:
+            _o_restyle(title_sh, font=fix.get("tf"), colour=fix.get("tc"))
+        else:
+            _o_restyle(title_sh, size=fix.get("t"), font=fix.get("tf"), colour=fix.get("tc"), align=fix.get("ta"))
+    if body_sh is not None and getattr(body_sh, "has_text_frame", False):
+        if cover:
+            _o_restyle(body_sh, font=fix.get("bf"), colour=fix.get("bc"))
+        else:
+            b = fix.get("b")
+            _o_restyle(body_sh, size=b, sub_size=_fix_sub_size(b) if b else None, font=fix.get("bf"), colour=fix.get("bc"))
+
+
 def build_original_deck(deck, original_path, out_dir, filename="Presentation.pptx"):
     try:
         prs = Presentation(original_path)
@@ -4686,6 +4954,7 @@ def build_original_deck(deck, original_path, out_dir, filename="Presentation.ppt
                 break
     entries = [(True, deck.get("title_slide") or {})] + [(False, sd) for sd in (deck.get("slides") or [])[:MAX_SLIDES] if isinstance(sd, dict)]
     used, order = set(), []
+    fix = _o_fix_opts(deck.get("fix"))      # 3.5: Quick fix — "Keep my design" text style
     for cover, sd in entries:
         o = sd.get("orig") if isinstance(sd.get("orig"), dict) else {}
         i = o.get("i")
@@ -4759,6 +5028,8 @@ def build_original_deck(deck, original_path, out_dir, filename="Presentation.ppt
         tr = sd.get("transition") or ""
         if tr != (o.get("tr0") or "") and (tr in TRANSITIONS or tr in ("", "none")):
             _set_transition(slide, tr or "none")
+        if fix:
+            _o_apply_fix(slide, o, fix, cover)
         order.append(slide)
     # the deck's order; slides it doesn't use are dropped
     by_id = {sid.get("id"): sid for sid in lst}
