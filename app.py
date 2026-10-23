@@ -7518,6 +7518,7 @@ def _meet_tables(cur):
             peak INTEGER NOT NULL DEFAULT 0,
             seconds BIGINT NOT NULL DEFAULT 0
         )""")
+    cur.execute("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS captions BOOLEAN NOT NULL DEFAULT FALSE")   # 3.9: live captions
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_people (
             id SERIAL PRIMARY KEY,
@@ -7664,6 +7665,7 @@ def _meet_meta(cur, m):
     cur.execute("SELECT identity, role FROM meeting_people WHERE meeting_id = %s AND status = 'admitted' AND role <> 'attendee'", (m["id"],))
     roles = {r["identity"]: r["role"] for r in cur.fetchall()}
     return json.dumps({"title": m["title"], "locked": m["locked"], "lobby": m["lobby"], "speak": m["speak"], "chat": m["chat"],
+                       "captions": bool(m.get("captions")),
                        "e2ee": m["e2ee"], "endsAt": m["ends_at"].isoformat() if m.get("ends_at") else None, "roles": roles,
                        "v": int(time.time() * 1000)})
 
@@ -8045,7 +8047,7 @@ def meet_control(cur, code):
     actor = _meet_actor(cur, m, data)
     action, who = _text(data.get("action")), _text(data.get("identity"))
     if not _meet_running(m) and action not in ("end", "delete", "lock", "unlock", "lobby_on", "lobby_off", "chat_on", "chat_off",
-                                               "speak_all", "speak_chosen", "admit", "deny", "admit_all"):
+                                               "speak_all", "speak_chosen", "admit", "deny", "admit_all", "cc_on", "cc_off"):
         raise MeetError("This meeting isn’t running.", 409)
     target = None
     if who:
@@ -8060,7 +8062,7 @@ def meet_control(cur, code):
     if action in ("end", "delete", "cohost") and actor["role"] != "host":
         raise MeetError("Only the host can do that.", 403)
     flags = {"lock": ("locked", True), "unlock": ("locked", False), "lobby_on": ("lobby", True), "lobby_off": ("lobby", False),
-             "chat_on": ("chat", True), "chat_off": ("chat", False)}
+             "chat_on": ("chat", True), "chat_off": ("chat", False), "cc_on": ("captions", True), "cc_off": ("captions", False)}
     if action in flags:
         col, val = flags[action]
         cur.execute(f"UPDATE meetings SET {col} = %s WHERE id = %s RETURNING *", (val, m["id"]))
@@ -8185,16 +8187,23 @@ def meet_notes(cur, code):
         if isinstance(it, dict) and _text(it.get("text")).strip():
             lines.append(f"[{_text(it.get('time'))[:5]} {_meet_clean_name(it.get('name'))}] {_text(it.get('text'))[:600]}")
     slides = [f"Slide {i + 1}: {_text(s)[:200]}" for i, s in enumerate((data.get("slides") or [])[:200]) if _text(s).strip()]
-    if not lines and not slides:
-        raise MeetError("There’s nothing to make notes from yet — no chat or slides.", 400)
-    material = "\n".join(lines)[:30000] + ("\n\nSLIDES SHOWN:\n" + "\n".join(slides) if slides else "")
+    said = []
+    for it in (data.get("said") or [])[:1200]:      # 3.9: the live captions the host's device saw
+        if isinstance(it, dict) and _text(it.get("text")).strip():
+            said.append(f"[{_text(it.get('time'))[:5]} {_meet_clean_name(it.get('name'))}] {_text(it.get('text'))[:400]}")
+    if not lines and not slides and not said:
+        raise MeetError("There’s nothing to make notes from yet — no chat, captions or slides.", 400)
+    material = (("WHAT WAS SAID (live captions):\n" + "\n".join(said)[:40000] + "\n\n") if said else "") + \
+        ("CHAT:\n" + "\n".join(lines)[:30000] if lines else "") + ("\n\nSLIDES SHOWN:\n" + "\n".join(slides) if slides else "")
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         raise MeetError(str(e), 429)
-    system = ("You write clear meeting notes for an Academic-Home meeting called \"" + m["title"] + "\" from its chat and the titles of the "
-              "slides that were shown. Use only that material — never add facts it doesn't contain. Every point ends with where it "
-              "came from in square brackets: the person and time for chat — like [Ama 10:42] — or the slide, like [Slide 3]. Sections: "
+    system = ("You write clear meeting notes for an Academic-Home meeting called \"" + m["title"] + "\" from what was said (live "
+              "captions, when they were on — speech turned into text, so expect small mistakes and fix obvious ones only), its chat "
+              "and the titles of the slides that were shown. Use only that material — never add facts it doesn't contain. Every point "
+              "ends with where it came from in square brackets: the person and time for what was said or written — like [Ama 10:42] — "
+              "or the slide, like [Slide 3]. Sections: "
               "## Summary (3–5 points), ## Decisions, ## Questions asked (with the answers given, if any), ## Next steps (who does "
               "what, by when, if said). Leave a section out when there's nothing for it. Plain, short sentences.")
     try:

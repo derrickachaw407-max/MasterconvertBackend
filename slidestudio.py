@@ -2690,12 +2690,15 @@ def _content_slide(prs, deck, sd, number, logo, tpl):
             body_box, media_box = (L, T, W, H), None
         if media and media.get("type") == "image":
             body_box, media_box = _picture_boxes(tpl, pos)
+        diagram = body_box and diagram_style(sd, diagram_items(bullets))     # 3.9: the points as a diagram
         if body is not None:
-            if bullets and body_box:
+            if bullets and body_box and not diagram:
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
                 _write_bullets(body, bullets, body_box, numbered)
             else:
                 _remove(body)
+        if diagram:
+            add_diagram(s, sd, bullets, tpl, body_box)
         if media and media_box:
             _add_media(s, media, tuple(Inches(v) for v in media_box))
     if group == "tutor":
@@ -3008,6 +3011,9 @@ ANIMATIONS = {"appear": (1, 0), "fade": (10, 0), "wipe": (22, 8)}
 def _point_clicks(slide, sd):
     """[(shape id, paragraph), …] per click: each main point with its sub-points. Column headings
     and empty paragraphs stay in view from the start."""
+    dg = _diagram_clicks(slide)          # 3.9: a diagram comes in an item at a time
+    if dg:
+        return dg
     columns = (sd.get("kind") or "content") == "columns"
     bodies = sorted((ph for ph in slide.placeholders if ph.placeholder_format.idx in (1, 2) and ph.has_text_frame),
                     key=lambda ph: ph.placeholder_format.idx)
@@ -3045,8 +3051,9 @@ def _set_timing(slide, kind, clicks):
         return etree.SubElement(parent, qn("p:" + tag), **{k: str(v) for k, v in attrs.items()})
 
     def target(parent, spid, para):
-        t = el(el(el(parent, "tgtEl"), "spTgt", spid=spid), "txEl")
-        el(t, "pRg", st=para, end=para)
+        sp = el(el(parent, "tgtEl"), "spTgt", spid=spid)
+        if para is not None:             # a paragraph of a text box; None: the whole shape (3.9: a diagram's)
+            el(el(sp, "txEl"), "pRg", st=para, end=para)
 
     timing = etree.Element(qn("p:timing"))
     root = el(el(el(timing, "tnLst"), "par"), "cTn", id=1, dur="indefinite", restart="never", nodeType="tmRoot")
@@ -3078,8 +3085,10 @@ def _set_timing(slide, kind, clicks):
     for evt, tag in (("onPrev", "prevCondLst"), ("onNext", "nextCondLst")):
         el(el(el(seq, tag), "cond", evt=evt, delay=0), "tgtEl").append(etree.Element(qn("p:sldTgt")))
     builds = el(timing, "bldLst")
-    for spid in dict.fromkeys(spid for click in clicks for spid, _ in click):
+    for spid in dict.fromkeys(spid for click in clicks for spid, para in click if para is not None):
         el(builds, "bldP", spid=spid, grpId=0, build="p")
+    if not len(builds):
+        timing.remove(builds)
     anchor = sld.find(qn("p:transition"))
     if anchor is None:
         anchor = sld.find(qn("p:clrMapOvr"))
@@ -3094,8 +3103,10 @@ def _animation_of(slide):
     timing = slide._element.find(qn("p:timing"))
     if timing is None:
         return None
+    dg_ids = {str(sh.shape_id) for sh in slide.shapes if (sh.name or "").startswith("Academic-Home diagram ")}
     for ctn in timing.iter(qn("p:cTn")):
-        if ctn.get("presetClass") == "entr" and ctn.find(".//" + qn("p:txEl")) is not None:
+        tgt = ctn.find(".//" + qn("p:spTgt"))
+        if ctn.get("presetClass") == "entr" and (ctn.find(".//" + qn("p:txEl")) is not None or (tgt is not None and tgt.get("spid") in dg_ids)):
             return {"1": "appear", "10": "fade", "22": "wipe"}.get(ctn.get("presetID"), "fade")
     return None
 
@@ -3578,13 +3589,16 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
             body_box, media_box = (L, T, W, H), None
         if media and media.get("type") == "image":
             body_box, media_box = _picture_boxes(tpl, pos)
+        diagram = body_box and diagram_style(sd, diagram_items(bullets))     # 3.9: the points as a diagram
         if body is not None:
-            if bullets and body_box:
+            if bullets and body_box and not diagram:
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
                 _write_bullets(body, bullets, body_box, numbered)
                 _m_body_colours(body, tpl)
             else:
                 _remove(body)
+        if diagram:
+            add_diagram(s, sd, bullets, tpl, body_box)
         if media and media_box:
             if tpl.get("plain") and media.get("type") == "table":
                 media = dict(media, plain=True)
@@ -4014,10 +4028,16 @@ def parse_pptx_to_deck(path, max_pictures=30):
             sd.update(cols)
         else:
             bullets = []
+            dg = _read_diagram(shapes)          # 3.9: a diagram made here: its points, in order
             for sh in texts:
-                bullets.extend(_paragraph_bullets(sh.text_frame))
+                if not (sh.name or "").startswith("Academic-Home diagram "):
+                    bullets.extend(_paragraph_bullets(sh.text_frame))
+            if dg:
+                bullets = dg["bullets"] + bullets
             bullets, typed_numbers = _tidy_bullets(bullets[:40])
             sd["bullets"] = bullets
+            if dg and bullets:
+                sd["diagram"] = dg["style"]
             if typed_numbers:
                 sd["list_style"] = "numbers"
         media = None
@@ -5061,3 +5081,411 @@ _PLAIN = {"style": "modern", "name": "Plain White", "cover": "plain", "chrome": 
           "bg": "FFFFFF", "text": "000000", "muted": "404040"}
 TEMPLATES["student-plain"] = dict(_PLAIN, group="student")
 TEMPLATES["tutor-plain"] = dict(_PLAIN, group="tutor")
+
+
+# ======================= 3.9: diagrams =======================
+# A slide's points drawn as steps, a cycle, a timeline, side by side, or a pyramid. Main points are the diagram's
+# items; their sub-points sit with them (steps, timeline, side by side). Inches on the 13.333 × 7.5 slide, inside
+# the body's box (left, top, width, height). The app draws the very same shapes (diagram39_layout.js).
+DIAGRAM_STYLES = ("steps", "cycle", "timeline", "compare", "pyramid")
+DIAGRAM_MIN = {"steps": 2, "cycle": 3, "timeline": 2, "compare": 2, "pyramid": 3}
+DIAGRAM_MAX = {"steps": 8, "cycle": 6, "timeline": 8, "compare": 3, "pyramid": 6}
+DIAGRAM_SUBS = {"steps": True, "cycle": False, "timeline": True, "compare": True, "pyramid": False}
+
+
+def _r3(v):
+    return math.floor(v * 1000 + 0.5) / 1000      # as JavaScript's Math.round(v * 1000) / 1000
+
+
+def diagram_items(bullets):
+    """Clean points (as _clean_bullets gives them) as a diagram's items: main points, each with its sub-points."""
+    items = []
+    for b in bullets or []:
+        if not b.get("level") or not items:
+            items.append({"text": b["text"], "fmt": b.get("fmt"), "subs": []})
+        else:
+            items[-1]["subs"].append({"text": b["text"], "fmt": b.get("fmt")})
+    return items
+
+
+def diagram_style(sd, items):
+    """The diagram a slide is drawn as ('' = its points as a list) — the app's diagramOf()."""
+    style = sd.get("diagram")
+    if style not in DIAGRAM_STYLES or (sd.get("kind") or "content") != "content" or sd.get("media"):
+        return ""
+    n = len(items)
+    if n < DIAGRAM_MIN[style] or n > DIAGRAM_MAX[style]:
+        return ""
+    if not DIAGRAM_SUBS[style] and any(it["subs"] for it in items):
+        return ""
+    return style
+
+
+def diagram_layout(style, items, box):
+    n = min(len(items), DIAGRAM_MAX.get(style, 8))
+    L, T, W, H = box
+    out = []
+    any_subs = any(it.get("subs") for it in items[:n])
+
+    def push(o):
+        for k in ("x", "y", "w", "h", "rot"):
+            if k in o:
+                o[k] = _r3(o[k])
+        out.append(o)
+
+    def subs(i):
+        return (items[i].get("subs") or []) if i < len(items) else []
+
+    if not n:
+        return out
+    if style == "steps":
+        rows = 1 if n <= 5 else 2
+        k = math.ceil(n / rows)
+        ch = min(1.5, H * 0.32) if rows == 1 else min(1.1, H * 0.21)
+        p, g = min(0.35, ch * 0.3), 0.08
+        cw = (W + (k - 1) * (p - g)) / k
+        row_h = H / rows
+        for i in range(n):
+            r, c = i // k, i % k
+            y0, x = T + r * row_h, L + c * (cw - p + g)
+            y = y0 + 0.1 if any_subs else y0 + (row_h - ch) / 2
+            push({"kind": "pent" if c == 0 else "chev", "x": x, "y": y, "w": cw, "h": ch, "item": i, "fill": 0, "with": i})
+            if subs(i):
+                push({"kind": "text", "x": x + (0 if c == 0 else p * 0.6), "y": y + ch + 0.12, "w": cw - p * (0.6 if c == 0 else 1.2),
+                      "h": row_h - ch - 0.3, "item": i, "sub": True, "with": i})
+    elif style == "cycle":
+        few = n <= 4
+        bw = min(3.2, W * 0.3) if few else min(2.7, W * 0.3)
+        bh = min(1.3, H * 0.25) if few else min(1.05, H * 0.22)
+        cx, cy, rx, ry = L + W / 2, T + H / 2, W / 2 - bw / 2, H / 2 - bh / 2
+        for i in range(n):
+            a = (-90 + 360 * i / n) * math.pi / 180
+            push({"kind": "rrect", "x": cx + rx * math.cos(a) - bw / 2, "y": cy + ry * math.sin(a) - bh / 2, "w": bw, "h": bh, "item": i, "fill": 0, "with": i})
+        for i in range(n):
+            m = (-90 + 360 * (i + 0.5) / n) * math.pi / 180
+            aw, ah = 0.62, 0.42
+            tx, ty = -rx * math.sin(m), ry * math.cos(m)
+            push({"kind": "arrow", "x": cx + rx * 0.92 * math.cos(m) - aw / 2, "y": cy + ry * 0.92 * math.sin(m) - ah / 2, "w": aw, "h": ah,
+                  "rot": math.atan2(ty, tx) * 180 / math.pi, "fill": 1, "with": min(i + 1, n - 1)})
+    elif style == "timeline":
+        ly, d = T + H / 2, 0.3
+        lw, lh = min(W / n * 1.7, 3.0), H / 2 - 0.45
+        push({"kind": "bar", "x": L, "y": ly - 0.035, "w": W, "h": 0.07, "fill": 1})
+        for i in range(n):
+            x, up = L + W * (i + 0.5) / n, i % 2 == 0
+            lx = max(L, min(L + W - lw, x - lw / 2))
+            push({"kind": "dot", "x": x - d / 2, "y": ly - d / 2, "w": d, "h": d, "fill": 0, "with": i})
+            push({"kind": "tick", "x": x - 0.015, "y": ly - 0.38 if up else ly + d / 2, "w": 0.03, "h": 0.38 - d / 2, "fill": 1, "with": i})
+            push({"kind": "label", "x": lx, "y": ly - 0.4 - lh if up else ly + 0.4, "w": lw, "h": lh, "item": i, "up": up, "with": i})
+    elif style == "compare":
+        c, gap = n, 0.3
+        cw, hh = (W - (c - 1) * gap) / c, min(0.85, H * 0.18)
+        for i in range(c):
+            x = L + i * (cw + gap)
+            push({"kind": "head", "x": x, "y": T, "w": cw, "h": hh, "item": i, "fill": 0, "with": i})
+            push({"kind": "panel", "x": x, "y": T + hh + 0.12, "w": cw, "h": H - hh - 0.12, "item": i, "sub": True, "fill": 2, "with": i})
+    elif style == "pyramid":
+        g = 0.06
+        lh, wt, wb = (H - (n - 1) * g) / n, W * 0.26, min(W, H * 2.1)
+        cx = L + W / 2
+        for i in range(n):
+            y = T + i * (lh + g)
+            w0 = wt + (wb - wt) * ((y - T) / H)
+            w1 = wt + (wb - wt) * ((y + lh - T) / H)
+            push({"kind": "trap", "x": cx - w1 / 2, "y": y, "w": w1, "h": lh, "top": _r3(w0 / w1), "item": i, "fill": 3, "with": i})
+    return out
+
+
+# ---- colours (the app's diagramBase / _dgFill / _dgInk, the same arithmetic) ----
+def _dg_mix(hex_a, hex_b, t):
+    a = [int(hex_a.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    b = [int(hex_b.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    return "#" + "".join("%02X" % int(math.floor(a[k] + (b[k] - a[k]) * t + 0.5)) for k in range(3))
+
+
+def _dg_lum(hex_):
+    h = hex_.lstrip("#")
+    v = []
+    for i in (0, 2, 4):
+        x = int(h[i:i + 2], 16) / 255
+        v.append(x / 12.92 if x <= 0.03928 else math.pow((x + 0.055) / 1.055, 2.4))
+    return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+
+
+def _dg_contrast(a, b):
+    la, lb = _dg_lum(a), _dg_lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _dg_deepen(hex_, bg, ratio):
+    hex_ = hex_.upper()
+    if _dg_contrast(hex_, bg) >= ratio:
+        return hex_
+    target = "#000000" if _dg_lum(bg) > 0.18 else "#FFFFFF"
+    for k in range(1, 51):
+        c = _dg_mix(hex_, target, k * 0.02)
+        if _dg_contrast(c, bg) >= ratio:
+            return c
+    return target
+
+
+def diagram_base(tpl):
+    if tpl.get("plain"):
+        return "#000000"
+    if tpl.get("style") == "modern":
+        return "#" + tpl["emph"].upper()
+    accent = (tpl.get("theme") or {}).get("accent1") or ("4E67C8" if tpl["group"] == "student" else "9BA8B7")
+    if tpl["group"] == "tutor" and tpl.get("frame") and _dg_sat("#" + accent) < 0.25:
+        accent = tpl["frame"]          # a lecture design whose accent is a grey: its bright frame colour instead
+    return _dg_deepen("#" + accent, "#FFFFFF", 7)
+
+
+def _dg_sat(hex_):
+    """How colourful (HSL saturation, 0–1) — the app's _dgSat()."""
+    h = hex_.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    mx, mn = max(r, g, b), min(r, g, b)
+    li = (mx + mn) / 2
+    return 0 if mx == mn else (mx - mn) / (1 - abs(2 * li - 1))
+
+
+def diagram_text(tpl):
+    if tpl.get("style") == "modern":
+        return "#" + tpl["text"].upper()
+    return "#" + (TUTOR_TEXT if tpl["group"] == "tutor" else "000000")
+
+
+def _dg_fill(base, s):
+    f = s.get("fill")
+    if f == 1:
+        return _dg_mix(base, "#FFFFFF", 0.45)
+    if f == 2:
+        return _dg_mix(base, "#FFFFFF", 0.9)
+    if f == 3:
+        return _dg_mix(base, "#000000", min(0.4, s.get("item", 0) * 0.08))
+    return base
+
+
+def _dg_ink(fill):
+    return "#FFFFFF" if _dg_contrast(fill, "#FFFFFF") >= _dg_contrast(fill, "#111111") else "#111111"
+
+
+def diagram_font_size(text, w, h, mx, lines=0):
+    """The biggest size (from mx down to 11 pt) at which the words fit — the app's very rule."""
+    t = str(text or "")
+    n = len(t)
+    word = max([len(x) for x in re.split(r"\s+", t)] + [0])      # a word is never split: the longest has to fit a line
+    for pt in range(int(mx), 11, -1):
+        cpl = max(4, int(math.floor((w - 0.2) * 72 / (pt * 0.52))))
+        need = math.ceil(n / cpl) * pt * 1.2 / 72 + 0.12 + lines * pt * 1.2 / 72
+        if need <= h and word <= cpl:
+            return pt
+    return 11
+
+
+def _dg_text_box(s):
+    """(left, width) the words have inside a shape — the app's _dgTextBox()."""
+    if s["kind"] == "chev":
+        p = min(0.35, s["h"] * 0.3)
+        return s["x"] + p, s["w"] - p * 2
+    if s["kind"] == "pent":
+        p = min(0.35, s["h"] * 0.3)
+        return s["x"] + 0.06, s["w"] - p - 0.06
+    if s["kind"] == "trap":
+        tw = s["w"] * max(0.45, (s["top"] + 1) / 2)
+        return s["x"] + (s["w"] - tw) / 2, tw
+    return s["x"] + 0.08, s["w"] - 0.16
+
+
+_DG_MSO = {"pent": MSO_SHAPE.PENTAGON, "chev": MSO_SHAPE.CHEVRON, "trap": MSO_SHAPE.TRAPEZOID, "arrow": MSO_SHAPE.RIGHT_ARROW,
+           "rrect": MSO_SHAPE.ROUNDED_RECTANGLE, "head": MSO_SHAPE.ROUNDED_RECTANGLE, "panel": MSO_SHAPE.ROUNDED_RECTANGLE,
+           "dot": MSO_SHAPE.OVAL, "bar": MSO_SHAPE.RECTANGLE, "tick": MSO_SHAPE.RECTANGLE}
+
+
+def _dg_shape(slide, style, s, fill):
+    shp = slide.shapes.add_shape(_DG_MSO[s["kind"]], Inches(s["x"]), Inches(s["y"]), Inches(s["w"]), Inches(s["h"]))
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = RGBColor.from_string(fill[1:])
+    shp.line.fill.background()
+    shp.shadow.inherit = False
+    ss = min(s["w"], s["h"])
+    k = s["kind"]
+    if k in ("pent", "chev"):
+        shp.adjustments[0] = min(0.35, s["h"] * 0.3) / ss        # the point as deep as the app draws it
+    elif k == "trap":
+        shp.adjustments[0] = (s["w"] - s["top"] * s["w"]) / 2 / ss  # the top as narrow as the app draws it
+    elif k == "arrow":
+        shp.adjustments[0], shp.adjustments[1] = 0.5, 0.5
+    elif k in ("rrect", "head", "panel"):
+        shp.adjustments[0] = 0.16667
+    if s.get("rot"):
+        shp.rotation = s["rot"]
+    # the name says what it is, which item it goes with (for one-by-one) and which diagram (for opening it again)
+    shp.name = "Academic-Home diagram %s %s%s" % (style, k, (" #%d" % s["with"]) if "with" in s else "")
+    return shp
+
+
+def _dg_runs(p, text, fmt, pt, hex_, bold):
+    for words, flags in _fmt_segments(text, fmt):
+        r = p.add_run()
+        r.text = words
+        r.font.size = Pt(pt)
+        r.font.bold = True if (bold or "b" in flags) else False
+        if "i" in flags:
+            r.font.italic = True
+        if "u" in flags:
+            r.font.underline = True
+        r.font.color.rgb = RGBColor.from_string(hex_[1:])
+        if "s" in flags or "p" in flags or "d" in flags:
+            rpr = r._r.get_or_add_rPr()
+            if "s" in flags:
+                rpr.set("strike", "sngStrike")
+            if "p" in flags:
+                rpr.set("baseline", "30000")
+            elif "d" in flags:
+                rpr.set("baseline", "-25000")
+
+
+def _dg_frame(shp, anchor, margins=(0, 0, 0, 0)):
+    tf = shp.text_frame
+    tf.clear()
+    tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.vertical_anchor = {"middle": MSO_ANCHOR.MIDDLE, "top": MSO_ANCHOR.TOP, "bottom": MSO_ANCHOR.BOTTOM}[anchor]
+    tf.margin_left, tf.margin_top, tf.margin_right, tf.margin_bottom = (Inches(v) for v in margins)
+    return tf
+
+
+def _dg_bullet(p, pt):
+    pPr = p._p.get_or_add_pPr()
+    pPr.set("marL", str(int(Pt(pt) * 1.1)))
+    pPr.set("indent", str(-int(Pt(pt) * 1.1)))
+    bu = etree.SubElement(pPr, qn("a:buChar"))
+    bu.set("char", "•")
+
+
+def diagram_sizes(items, shapes):
+    """One size for each kind of words (the smallest any of them needs) — the app's diagramSizes()."""
+    main = label = sub = 99
+    for s in shapes:
+        it = items[s["item"]] if "item" in s else None
+        if not it:
+            continue
+        if s["kind"] in ("pent", "chev", "rrect", "head", "trap"):
+            left, tw = _dg_text_box(s)
+            main = min(main, diagram_font_size(it["text"], tw, s["h"], 30 if s["kind"] == "head" else 28))
+        elif s["kind"] == "label":
+            label = min(label, diagram_font_size(it["text"], s["w"], s["h"], 28, len(it["subs"])))
+        elif s["kind"] in ("text", "panel") and s.get("sub") and it["subs"]:
+            allw = " ".join(x["text"] for x in it["subs"])
+            sub = min(sub, diagram_font_size(allw, s["w"] - (0.3 if s["kind"] == "panel" else 0), s["h"], 26, len(it["subs"])))
+    return {"main": 18 if main == 99 else main, "label": 18 if label == 99 else label, "sub": 18 if sub == 99 else sub}
+
+
+def add_diagram(slide, sd, bullets, tpl, box):
+    """Draws the slide's points as its diagram in `box` (inches). Returns the number of shapes drawn."""
+    items = diagram_items(bullets)
+    style = diagram_style(sd, items)
+    if not style:
+        return 0
+    base, body = diagram_base(tpl), diagram_text(tpl)
+    shapes = diagram_layout(style, items, box)
+    size = diagram_sizes(items, shapes)
+    drawn = 0
+    for s in shapes:
+        it = items[s["item"]] if "item" in s else None
+        fill = _dg_fill(base, s) if "fill" in s else None
+        k = s["kind"]
+        tag = (" #%d" % s["with"]) if "with" in s else ""
+        if k in _DG_MSO:
+            shp = _dg_shape(slide, style, s, fill)
+            drawn += 1
+            if it and k in ("pent", "chev", "rrect", "head", "trap"):
+                left, tw = _dg_text_box(s)
+                pt = size["main"]
+                tf = _dg_frame(shp, "middle", (left - s["x"], 0, s["x"] + s["w"] - left - tw, 0))
+                p = tf.paragraphs[0]
+                p.alignment = PP_ALIGN.CENTER
+                p.line_spacing = 1.0
+                _dg_runs(p, it["text"], it.get("fmt"), pt, _dg_ink(fill), True)
+            elif it and k == "panel" and it["subs"]:
+                pt = size["sub"]
+                tf = _dg_frame(shp, "top", (0.15, 0.12, 0.15, 0.08))
+                for j, sb in enumerate(it["subs"]):
+                    p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                    p.alignment = PP_ALIGN.LEFT
+                    p.line_spacing = 1.05
+                    p.space_after = Pt(round(pt * 0.4))
+                    _dg_bullet(p, pt)
+                    _dg_runs(p, sb["text"], sb.get("fmt"), pt, _dg_ink(fill), False)
+        elif k == "label" and it:
+            pt = size["label"]
+            tb = slide.shapes.add_textbox(Inches(s["x"]), Inches(s["y"]), Inches(s["w"]), Inches(s["h"]))
+            tb.name = "Academic-Home diagram %s label%s" % (style, tag)
+            tf = _dg_frame(tb, "bottom" if s.get("up") else "top")
+            p = tf.paragraphs[0]
+            p.alignment = PP_ALIGN.CENTER
+            p.line_spacing = 1.0
+            _dg_runs(p, it["text"], it.get("fmt"), pt, base, True)
+            for sb in it["subs"]:
+                q = tf.add_paragraph()
+                q.alignment = PP_ALIGN.CENTER
+                q.line_spacing = 1.05
+                q.space_before = Pt(round(pt * 0.25))
+                _dg_runs(q, sb["text"], sb.get("fmt"), pt - 2, body, False)
+            drawn += 1
+        elif k == "text" and it and it["subs"]:
+            pt = size["sub"]
+            tb = slide.shapes.add_textbox(Inches(s["x"]), Inches(s["y"]), Inches(s["w"]), Inches(s["h"] - 0.2))
+            tb.name = "Academic-Home diagram %s points%s" % (style, tag)
+            tf = _dg_frame(tb, "top")
+            for j, sb in enumerate(it["subs"]):
+                p = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                p.alignment = PP_ALIGN.LEFT
+                p.line_spacing = 1.05
+                p.space_after = Pt(round(pt * 0.4))
+                _dg_bullet(p, pt)
+                _dg_runs(p, sb["text"], sb.get("fmt"), pt, body, False)
+            drawn += 1
+    return drawn
+
+
+_DG_NAME = re.compile(r"^Academic-Home diagram (steps|cycle|timeline|compare|pyramid) (\w+)(?: #(\d+))?$")
+
+
+def _read_diagram(shapes):
+    """A diagram this app drew (its shapes are named for it), read back: {"style", "bullets"} — each main point with
+    its sub-points, in order — or None. So a deck opened again comes back with its diagrams, not empty slides."""
+    found, style = {}, None
+    for sh in shapes:
+        m = _DG_NAME.match(getattr(sh, "name", "") or "")
+        if not m or m.group(3) is None or not getattr(sh, "has_text_frame", False):
+            continue
+        paras = _paragraph_bullets(sh.text_frame)
+        if not paras:
+            continue
+        style = style or m.group(1)
+        kind, it = m.group(2), found.setdefault(int(m.group(3)), {"main": None, "subs": []})
+        if kind in ("pent", "chev", "rrect", "head", "trap"):
+            it["main"] = dict(paras[0], level=0) if len(paras) == 1 else {"text": " ".join(p["text"] for p in paras), "level": 0}
+        elif kind == "label":
+            it["main"] = dict(paras[0], level=0)
+            it["subs"].extend(dict(p, level=1) for p in paras[1:])
+        elif kind in ("points", "panel"):
+            it["subs"].extend(dict(p, level=1) for p in paras)
+    bullets = []
+    for i in sorted(found):
+        if found[i]["main"] is not None:
+            bullets.append(found[i]["main"])
+            bullets.extend(found[i]["subs"])
+    return {"style": style, "bullets": bullets} if bullets else None
+
+
+def _diagram_clicks(slide):
+    """One click per item for a diagram's one-by-one: [[(shape id, None), …], …] (None: the whole shape)."""
+    by = {}
+    for sh in slide.shapes:
+        m = re.match(r"^Academic-Home diagram \w+ \w+ #(\d+)$", sh.name or "")
+        if m:
+            by.setdefault(int(m.group(1)), []).append((sh.shape_id, None))
+    return [by[k] for k in sorted(by)]
