@@ -5457,6 +5457,69 @@ def summarize_endpoint():
         return jsonify({"error": str(e)}), 502
 
 
+# 3.7: study notes from the same material as Smart Summarize — four kinds, each a plain Markdown page.
+NOTES_COMMON = (
+    "You turn a student's study material into study notes for a revision app. Use ONLY what is in the material: "
+    "never add facts, figures, names or sources it doesn't contain. Keep its exact terms, names, numbers and dates. "
+    "Write in clear, simple English a first-year student understands. Return Markdown only — no code fences, no "
+    "preamble, no closing remarks. Start with one line: '# ' and a short title for the notes (the topic, at most 8 words).\n\n")
+NOTES_KINDS = {
+    "sheet": ("Revision sheet",
+              "Make a ONE-PAGE REVISION SHEET: the material's key ideas under short '## ' headings (3 to 7 of them), each with "
+              "2 to 6 tight bullet points. Put the terms, definitions, numbers, dates, formulas and lists worth remembering in "
+              "**bold**. End with '## Remember' and the 3 to 5 points most likely to be examined."),
+    "terms": ("Key terms",
+              "Make a list of KEY TERMS: every important term, concept or name in the material, grouped under '## ' headings by "
+              "topic. Each is one bullet: the term in **bold**, a dash, then a one-sentence plain definition taken from the "
+              "material, and — only when the material gives one — a short example after 'e.g.'. Alphabetical within each topic."),
+    "questions": ("Exam questions",
+                  "Write 8 to 12 LIKELY EXAM QUESTIONS an examiner could set on this material, numbered, mixing short-answer "
+                  "questions and 2 or 3 longer essay-style ones (say how many marks each is worth, e.g. '(5 marks)'). Under each, "
+                  "'**A good answer:**' followed by bullet points of what the answer must include, all from the material."),
+    "map": ("Mind map",
+            "Make a MIND MAP as a nested bullet list: the first bullet is the central topic (in **bold**); under it 3 to 7 "
+            "main branches; under each branch 2 to 5 sub-branches, and at most one more level below. Every item is 2 to 7 "
+            "words — no sentences. Indent each level by two spaces."),
+}
+
+
+def _notes_title(md, fallback):
+    for line in md.splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            return s[2:].strip()[:80] or fallback
+        if s:
+            break
+    return fallback
+
+
+@app.route("/api/study-notes", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def study_notes_endpoint():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    kind = data.get("kind") if data.get("kind") in NOTES_KINDS else "sheet"
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+    if len(text) > 20000:
+        return jsonify({"error": "Text too long (20,000 character limit)"}), 400
+    reqs = str(data.get("requirements") or "").strip()[:1200]
+    name, how = NOTES_KINDS[kind]
+    system = NOTES_COMMON + how + (("\n\nTHE STUDENT'S REQUIREMENTS — follow them where they don't conflict with the rules above:\n<<<\n"
+                                    + reqs + "\n>>>") if reqs else "")
+    try:
+        md = call_claude(system_prompt=system, user_message="Material:\n\n" + text, max_tokens=3500, feature="notes")
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 502
+    md = str(md or "").strip()
+    if md.startswith("```"):
+        md = md.strip("`").split("\n", 1)[-1].strip()
+    if not md:
+        return jsonify({"error": "The notes came back empty. Try again."}), 502
+    return jsonify({"kind": kind, "name": name, "title": _notes_title(md, name), "notes": md[:30000]})
+
+
 @app.route("/api/summary-to-pptx", methods=["POST", "OPTIONS"])
 @auth_required
 def summary_to_pptx_endpoint():
