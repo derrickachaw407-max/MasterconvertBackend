@@ -10302,6 +10302,107 @@ def pdf_compress(pdf_path, out_dir, image_quality=60, filename="compressed.pdf")
     return _pdf_writer_to_file(writer, out_dir, filename)
 
 
+# 3.8: Make a PDF smaller — step by step until it fits (see server_shrink38.py)
+SHRINK_STEPS = [(2000, 75), (1700, 66), (1450, 58), (1250, 50), (1050, 43), (900, 36), (760, 30)]
+
+
+def _pdf_shrink_once(pdf_path, out_path, max_px, quality):
+    """One try: every big picture at most max_px on its long side, saved as JPEG at `quality`. Returns how many
+    pictures were redone."""
+    from PIL import Image as _PILImage
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    writer = pypdf.PdfWriter(clone_from=reader)
+    done, redone = set(), 0
+    for page in writer.pages:
+        try:
+            images = list(page.images)
+        except Exception:
+            continue
+        for img in images:
+            ref = getattr(img, "indirect_reference", None)
+            key = getattr(ref, "idnum", None)
+            if key is None or key in done:
+                continue
+            done.add(key)
+            try:
+                xobj = ref.get_object()
+                if "/SMask" in xobj or "/Mask" in xobj or xobj.get("/ImageMask"):
+                    continue                     # see-through parts would be lost
+                if len(img.data or b"") < 24 * 1024:
+                    continue                     # already small: not worth touching
+                pic = img.image
+                if pic is None or pic.mode in ("1",):
+                    continue                     # fax-style black-and-white scans are already tiny
+                if pic.mode not in ("RGB", "L"):
+                    pic = pic.convert("RGB")
+                w, h = pic.size
+                k = min(1.0, float(max_px) / max(w, h))
+                if k < 1.0:
+                    pic = pic.resize((max(1, int(w * k)), max(1, int(h * k))), _PILImage.LANCZOS)
+                img.replace(pic, quality=quality)
+                redone += 1
+            except Exception:
+                continue                         # a picture that can't be redone safely stays as it was
+    try:
+        writer.compress_identical_objects()
+    except Exception:
+        pass
+    for page in writer.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:
+            pass
+    with open(out_path, "wb") as f:
+        writer.write(f)
+    return redone
+
+
+def pdf_shrink(pdf_path, out_dir, target_bytes=None, filename="smaller.pdf", time_budget=55.0):
+    """Makes a PDF smaller, aiming at no more than target_bytes (None: as small as the steps go). Returns
+    (path, info) with info = {"before", "after", "fits", "pictures"}; the original comes back unchanged when nothing
+    makes it smaller (a PDF of text and drawings)."""
+    import time as _time
+    reader = _safe_load(pypdf.PdfReader, pdf_path)
+    _check_pdf_not_encrypted(reader, "made smaller")
+    before = os.path.getsize(pdf_path)
+    os.makedirs(out_dir, exist_ok=True)
+    start = _time.monotonic()
+    best_path, best_size, pictures = None, before, 0
+    steps = SHRINK_STEPS
+    i = 0
+    while i < len(steps):
+        max_px, q = steps[i]
+        trial = os.path.join(out_dir, "try-%d.pdf" % i)
+        try:
+            n = _pdf_shrink_once(pdf_path, trial, max_px, q)
+        except Exception:
+            break
+        pictures = max(pictures, n)
+        size = os.path.getsize(trial)
+        if size < best_size:
+            if best_path and os.path.exists(best_path):
+                os.remove(best_path)
+            best_path, best_size = trial, size
+        elif os.path.exists(trial):
+            os.remove(trial)
+        if n == 0:
+            break                                # no pictures to work on: more steps change nothing
+        if target_bytes and best_size <= target_bytes:
+            break
+        if _time.monotonic() - start > time_budget:
+            break
+        # far from the target: skip a step (each step is about a quarter smaller)
+        i += 2 if (target_bytes and best_size > target_bytes * 2.2 and i + 2 < len(steps)) else 1
+    out_path = os.path.join(out_dir, filename)
+    if best_path:
+        os.replace(best_path, out_path)
+    else:
+        shutil.copyfile(pdf_path, out_path)
+    after = os.path.getsize(out_path)
+    return out_path, {"before": before, "after": after, "fits": bool(target_bytes is None or after <= target_bytes),
+                      "pictures": pictures}
+
+
 def images_to_pdf(image_paths, out_dir, filename="images.pdf", display_names=None):
     """Combines one or more images into a PDF, one image per page,
     each page sized to that image's own aspect ratio (letter-width,

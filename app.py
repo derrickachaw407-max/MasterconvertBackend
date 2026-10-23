@@ -35,7 +35,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from converters import (
     convert, text_to_pptx, summary_slides_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
-    apply_pdf_operations, pdf_split, images_to_pdf, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
+    apply_pdf_operations, pdf_split, images_to_pdf, pdf_shrink, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
     warm_up_libreoffice,
 )
 from converters import _soffice_convert   # the server's own LibreOffice runner
@@ -2220,7 +2220,7 @@ def add_cors_headers(resp):
         resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note"
+    resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note, X-Size-Info"
     # 3.4: how a browser may treat this reply
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
@@ -4326,6 +4326,46 @@ def images_to_pdf_endpoint():
 
 def _is_pro(user):
     return (user or {}).get("plan") in PRO_PLANS
+
+
+# 3.8: Make a PDF smaller — under 1, 2 or 5 MB, or as small as it goes
+SHRINK_TARGETS = {"1": 1024 * 1024, "2": 2 * 1024 * 1024, "5": 5 * 1024 * 1024, "min": None}
+
+
+@app.route("/api/pdf/shrink", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def pdf_shrink_endpoint():
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"error": "Choose a PDF to make smaller."}), 400
+    target = request.form.get("target", "2")
+    if target not in SHRINK_TARGETS:
+        return jsonify({"error": "Choose how small to make it."}), 400
+    work_dir = tempfile.mkdtemp(prefix=f"mc_shrink_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
+        file.save(src_path)
+        with open(src_path, "rb") as fh:
+            if not fh.read(1024).lstrip().startswith(b"%PDF"):
+                return jsonify({"error": "That file isn't a PDF."}), 422
+        try:
+            out_path, info = pdf_shrink(src_path, os.path.join(work_dir, "out"), SHRINK_TARGETS[target])
+        except ConversionError as e:            # a locked or broken PDF (PdfEditError is one)
+            return jsonify({"error": str(e)}), 422
+        try:
+            _log_conversion_and_consume(request.current_user, "pdf", "pdf-small")
+        except Exception:
+            pass
+        base = safe_download_name(file.filename).rsplit(".", 1)[0]
+        resp = send_file(out_path, mimetype="application/pdf", as_attachment=True, download_name=f"{base} (smaller).pdf")
+        resp.headers["X-Size-Info"] = json.dumps(info)
+        return resp
+    except Exception as e:
+        logger.error(f"PDF shrink failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": "Making the PDF smaller failed. Please try again."}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.route("/api/pdf/apply", methods=["POST", "OPTIONS"])
