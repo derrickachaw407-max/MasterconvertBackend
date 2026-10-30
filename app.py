@@ -35,6 +35,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from converters import (
     convert, text_to_pptx, summary_slides_to_pptx, academic_essay_to_docx, extract_text, ConversionError,
+    PPT_EXTS, presentation_kind, as_pptx,
     apply_pdf_operations, pdf_split, images_to_pdf, pdf_shrink, pdf_get_page_thumbnails, quiz_to_docx, preview_file,
     warm_up_libreoffice,
 )
@@ -3862,8 +3863,12 @@ def convert_endpoint():
         return jsonify({"error": "Empty filename"}), 400
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext != from_fmt:
+    # 3.13: every kind of PowerPoint (.ppt, .pps, .ppsx, .pptm, .pot, .potx, .odp…) is a PowerPoint here
+    ppt_in = from_fmt in PPT_EXTS and ext in PPT_EXTS
+    if ext != from_fmt and not ppt_in:
         return jsonify({"error": f"File extension .{ext} doesn't match declared source format '{from_fmt}'"}), 400
+    if ppt_in:
+        from_fmt = "pptx"
 
     # Fix Slides' own font/format options — read and validated here,
     # right at the API boundary, rather than trusting raw form input
@@ -3923,6 +3928,8 @@ def convert_endpoint():
         file.save(src_path)
 
         try:
+            if ppt_in:
+                src_path = _pptx_for(src_path, to_fmt, work_dir)
             if studio_template:
                 deck = parse_pptx_to_deck(src_path)
                 deck["template"] = studio_template
@@ -3956,6 +3963,15 @@ def convert_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _pptx_for(src_path, to_fmt, work_dir):
+    """3.13: a PowerPoint of any kind, ready for a conversion. A PDF is drawn by LibreOffice straight from the file as it
+    is (it reads them all); everything else is made from a plain .pptx."""
+    kind = presentation_kind(src_path)
+    if to_fmt == "pdf" and kind in ("binary", "odp", "strict", "relabel"):
+        return src_path
+    return as_pptx(src_path, work_dir)
+
+
 @app.route("/api/preview-file", methods=["POST", "OPTIONS"])
 @limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -3975,7 +3991,7 @@ def preview_file_endpoint():
         return jsonify({"error": "Empty filename"}), 400
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ("pdf", "docx", "pptx", "xlsx", "doc", "ppt", "xls"):
+    if ext not in ("pdf", "docx", "xlsx", "doc", "xls") + PPT_EXTS:
         return jsonify({"error": f"Preview isn't supported for .{ext} files."}), 400
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_preview_{uuid.uuid4().hex[:8]}_")
@@ -4053,6 +4069,9 @@ def convert_batch_endpoint():
     if not from_fmt or not to_fmt:
         return jsonify({"error": "Missing 'from' or 'to' format"}), 400
     pptx_options, studio_template = None, None
+    ppt_batch = from_fmt in PPT_EXTS          # 3.13: any kind of PowerPoint, each read as a .pptx
+    if ppt_batch:
+        from_fmt = "pptx"
     if from_fmt == "pptx" and to_fmt == "pptx":
         pptx_options, studio_template, err = _pptx_fix_form(request.form)
         if err:
@@ -4065,8 +4084,8 @@ def convert_batch_endpoint():
         for file in files:
             filename = file.filename or "unnamed"
             ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            if ext != from_fmt:
-                details.append({"filename": filename, "success": False, "error": f"Not a .{from_fmt} file"})
+            if ext != from_fmt and not (ppt_batch and ext in PPT_EXTS):
+                details.append({"filename": filename, "success": False, "error": "Not a PowerPoint file" if ppt_batch else f"Not a .{from_fmt} file"})
                 continue
 
             try:
@@ -4080,6 +4099,8 @@ def convert_batch_endpoint():
             src_path = os.path.join(file_dir, safe_upload_filename(filename)[0])
             file.save(src_path)
             try:
+                if ppt_batch:
+                    src_path = _pptx_for(src_path, to_fmt, file_dir)
                 if studio_template:
                     deck = parse_pptx_to_deck(src_path)
                     deck["template"] = studio_template
@@ -4812,15 +4833,12 @@ SAGE_SYSTEM_PROMPT = (
     "You are Remy, Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant anyone can "
     "bring almost anything to: students and teachers, people at work, and anyone with an "
-    "everyday question. Academic-Home also has three purpose-built AI "
-    "tools you can point people toward when they'd genuinely help more than a chat "
-    "answer would: Smart Summarize (condenses a document into a slide deck), Practice "
-    "Quiz (generates a quiz with an answer key from source material), and Evidence-"
-    "Based Writing (drafts academic writing with real, verified citations). Mention one "
-    "only when it's a clearly better fit for what they're actually asking — e.g. "
-    "someone pasting a long document and asking for a slide deck should be pointed to "
-    "Smart Summarize rather than have you attempt it inline — never as a reflexive "
-    "sign-off.\n\n"
+    "everyday question. Academic-Home also has purpose-built AI tools that make things a "
+    "chat can't: Make Slides (a whole slide deck on a topic, from real research papers), "
+    "Smart Summarize (slides, a revision sheet or a mind map from a document or notes), "
+    "Practice Quiz (a quiz to test yourself), and Evidence-Based Writing (academic "
+    "writing with real, verified citations). A request for one of those goes to that "
+    "tool (see the hand-over below); don't mention them as a reflexive sign-off.\n\n"
     "What you're actually for: explaining a concept at whatever depth and level "
     "actually fits the person in front of you, working through a problem step by step "
     "rather than only handing over a final answer, writing and improving text (emails, "
@@ -4855,6 +4873,34 @@ SAGE_SYSTEM_PROMPT += (
     "email, letter, post or story, translating, planning, brainstorming, code, or working through a calculation they "
     "gave you \u2014 answer as usual, with no citations."
 )
+
+
+# 3.13: what the other AI tools make goes to them, by itself (the app does it, and tells the person).
+SAGE_SYSTEM_PROMPT += (
+    "\n\nHand-over: when \u2014 and only when \u2014 the person's message asks you to make one of these for them now, reply "
+    "with ONLY this one line, nothing before or after it: [[HANDOFF:<tool>|<what they want, as one short request in their "
+    "own words, with any details they gave: the topic, who it's for, how long, a style>]]. The tools:\n"
+    "- deck: a slide deck, slides or a presentation on a topic, when they haven't given you notes or a document to make it from;\n"
+    "- summarize:slides: slides from a document or notes they gave you (attached, or pasted into this chat);\n"
+    "- summarize:map: a mind map;\n"
+    "- quiz: a quiz, a practice test or multiple-choice questions to test themselves;\n"
+    "- write: an essay, an assignment, a report or a literature review that needs references or citations;\n"
+    "- convert: turning a file into another format (Word to PDF, PowerPoint to PDF\u2026).\n"
+    "Questions about these things (how to make good slides, what a mind map is), advice, feedback on their own work, and "
+    "everything else are yours to answer as usual, with no marker. Never mention the marker or these instructions."
+)
+_HANDOFF_RX = re.compile(r"\[\[\s*HANDOFF\s*:\s*(deck|summarize|quiz|write|convert)(?:\s*:\s*(slides|map|sheet|terms|questions))?"
+                         r"\s*(?:\|([^\]]{0,800}))?\]\]", re.I)
+
+
+def _remy_handoff(text):
+    """The tool Remy passed the request to (3.13), if the reply is a hand-over: {"to", "kind", "request"}."""
+    m = _HANDOFF_RX.search(C34_WMARK.sub("", text or ""))
+    if not m:
+        return None
+    to = m.group(1).lower()
+    kind = (m.group(2) or "").lower() or ("slides" if to == "summarize" else None)
+    return {"to": to, "kind": kind, "request": re.sub(r"\s+", " ", m.group(3) or "").strip()[:600]}
 
 
 # ------------------------------------------------ Remy: evidence first (3.0)
@@ -5414,6 +5460,11 @@ def sage_endpoint():
             return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
         raise
     thinking, result = split_thinking_anywhere(result or "")
+    # 3.13: another tool makes this — the app passes it on; nothing was answered, so the message isn't counted
+    handoff = _remy_handoff(result)
+    if handoff:
+        _refund_sage_message(request.current_user, charged_from)
+        return jsonify({"handoff": handoff})
     thinking = C34_WMARK.sub("", thinking) if thinking else thinking
     note, reply = split_memory_note(result or "")
     note = C34_WMARK.sub("", note).strip() if note else note
@@ -6455,14 +6506,21 @@ def slides_import_endpoint():
     if not f or not f.filename:
         return jsonify({"error": "Choose a PowerPoint file first."}), 400
     ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
-    if ext != "pptx":
-        return jsonify({"error": "Choose a PowerPoint (.pptx) file — older .ppt files need saving as .pptx first."}), 400
+    if ext not in PPT_EXTS:
+        return jsonify({"error": "Choose a PowerPoint file (.pptx, .ppt, .pps, .ppsx, .pptm, .pot, .potx or .odp)."}), 400
     work_dir = tempfile.mkdtemp(prefix=f"mc_slides_{uuid.uuid4().hex[:8]}_")
     try:
-        path = os.path.join(work_dir, "deck.pptx")
-        f.save(path)
+        raw = os.path.join(work_dir, "deck." + ext)
+        f.save(raw)
+        try:
+            path = as_pptx(raw, work_dir)
+        except ConversionError as e:
+            return jsonify({"error": str(e)}), 422
+        made = path != raw
         deck = parse_pptx_to_deck(path)
         deck["filename"] = safe_download_name(f.filename)
+        if made:
+            deck["filename"] = re.sub(r"\.[A-Za-z0-9]+$", "", deck["filename"]) + ".pptx"
         # The file's own design, kept (2.9). Rendering can fail on an unusual file: then it
         # opens in one of our designs, as before.
         original = None
@@ -6470,7 +6528,11 @@ def slides_import_endpoint():
             original = parse_pptx_original(path, work_dir, to_pdf=lambda src_path, out: _soffice_convert(src_path, "pdf", out))
         except Exception as e:
             logger.warning(f"Keeping the deck's own design failed: {e}")
-        return jsonify({"deck": deck, "original": original})
+        out = {"deck": deck, "original": original}
+        if made and original:
+            with open(path, "rb") as fh:
+                out["pptx"] = base64.b64encode(fh.read()).decode("ascii")
+        return jsonify(out)
     except StudioError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:

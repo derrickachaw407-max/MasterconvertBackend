@@ -1072,6 +1072,129 @@ def xlsx_to_pdf(src_path, out_dir, style=None):
     return _soffice_convert(src_path, "pdf", out_dir)
 
 
+# ======================================================= 3.13: every kind of PowerPoint
+# Read as a plain .pptx: .pptx itself; the same file under another label (.pptm with macros, .ppsx/.ppsm that open as a
+# slide show, .potx/.potm templates) relabelled, macros left out; PowerPoint 97-2003 (.ppt, .pps, .pot), OpenDocument
+# (.odp, .fodp) and Strict Open XML .pptx written as a .pptx by LibreOffice.
+PPT_EXTS = ("pptx", "ppt", "pptm", "pps", "ppsx", "ppsm", "pot", "potx", "potm", "odp", "fodp")
+_PML = "application/vnd.openxmlformats-officedocument.presentationml"
+_PML_MAIN = _PML + ".presentation.main+xml"
+_PML_OTHER_MAINS = (
+    "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+    _PML + ".slideshow.main+xml",
+    "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+    _PML + ".template.main+xml",
+    "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+)
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+PPT_LOCKED = ("This PowerPoint has a password. Open it in PowerPoint, remove the password (File \u2192 Info \u2192 "
+              "Protect Presentation), save it, then try again.")
+PPT_NOT = "This doesn't look like a PowerPoint file. It may be damaged, or another kind of file with a PowerPoint name."
+
+
+def _ole_has(path, names):
+    """Whether an Office 97-2003 wrapper file holds a stream with one of these names (its directory spells them in
+    UTF-16)."""
+    pats = [n.encode("utf-16-le") for n in names]
+    keep, tail = max(len(p) for p in pats), b""
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(4 * 1024 * 1024)
+            if not chunk:
+                return False
+            buf = tail + chunk
+            if any(p in buf for p in pats):
+                return True
+            tail = buf[-keep:]
+
+
+def presentation_kind(path):
+    """What a presentation file really is, read from its contents (never its name): "pptx" (ready as it is),
+    "relabel" (.pptm/.ppsx/.potx and the like), "strict" (Strict Open XML), "binary" (PowerPoint 97-2003), "odp"
+    (OpenDocument), "locked" (has a password) or None (not a presentation)."""
+    import zipfile
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return None
+    if head[:8] == _OLE_MAGIC:
+        # PowerPoint 97-2003, or any Office file with a password (they are all kept in this wrapper then)
+        if _ole_has(path, ("EncryptedPackage",)):
+            return "locked"
+        return "binary" if _ole_has(path, ("PowerPoint Document",)) else None
+    if head[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = set(z.namelist())
+                if "mimetype" in names:
+                    mt = z.read("mimetype")[:120]
+                    return "odp" if mt.startswith(b"application/vnd.oasis.opendocument.presentation") else None
+                if "[Content_Types].xml" not in names:
+                    return None
+                ct = z.read("[Content_Types].xml").decode("utf-8", "replace")
+                rels = z.read("_rels/.rels").decode("utf-8", "replace") if "_rels/.rels" in names else ""
+        except Exception:
+            return None
+        main = _PML_MAIN in ct or any(m in ct for m in _PML_OTHER_MAINS)
+        if not main:
+            return None
+        if "purl.oclc.org/ooxml" in rels:
+            return "strict"
+        return "pptx" if _PML_MAIN in ct else "relabel"
+    if b"<office:document" in head and b"application/vnd.oasis.opendocument.presentation" in head:
+        return "odp"          # a flat OpenDocument presentation (.fodp): one XML file
+    return None
+
+
+def _relabel_pptx(src_path, out_path):
+    """A .pptm/.ppsx/.potx (and the like) as a .pptx: the main part labelled as a presentation, macros left out."""
+    import zipfile
+    vba = re.compile(r"(^|/)(?:_rels/)?vba(?:Project|ProjectSignature|Data)[^/]*\.(?:bin|xml)(?:\.rels)?$", re.I)
+    with zipfile.ZipFile(src_path) as zin, zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            name = info.filename
+            if vba.search(name):
+                continue
+            data = zin.read(name)
+            if name == "[Content_Types].xml":
+                text = data.decode("utf-8")
+                for m in _PML_OTHER_MAINS:
+                    text = text.replace(m, _PML_MAIN)
+                text = re.sub(r'<Override\b[^>]*PartName="[^"]*vba[^"]*"[^>]*/>', "", text, flags=re.I)
+                text = re.sub(r'<Default\b[^>]*ContentType="application/vnd\.ms-office\.vbaProject"[^>]*/>', "", text, flags=re.I)
+                data = text.encode("utf-8")
+            elif name.endswith(".rels"):
+                text = data.decode("utf-8")
+                kept = re.sub(r'<Relationship\b[^>]*Type="[^"]*/(?:vbaProject|vbaProjectSignature|wordVbaData)"[^>]*/>', "", text)
+                if kept != text:
+                    data = kept.encode("utf-8")
+            zout.writestr(info, data)
+    return out_path
+
+
+def as_pptx(src_path, work_dir):
+    """Any kind of PowerPoint as a plain .pptx: the path of one (the same file when it already is one)."""
+    kind = presentation_kind(src_path)
+    if kind == "locked":
+        raise ConversionError(PPT_LOCKED)
+    if kind is None:
+        raise ConversionError(PPT_NOT)
+    if kind == "pptx" and src_path.lower().endswith(".pptx"):
+        return src_path
+    out_dir = tempfile.mkdtemp(prefix="pptx_", dir=work_dir)
+    if kind == "pptx":
+        out = os.path.join(out_dir, "presentation.pptx")
+        shutil.copyfile(src_path, out)
+        return out
+    if kind == "relabel":
+        return _relabel_pptx(src_path, os.path.join(out_dir, "presentation.pptx"))
+    out = _soffice_convert(src_path, "pptx", out_dir)      # PowerPoint 97-2003, OpenDocument, Strict Open XML
+    if presentation_kind(out) != "pptx":
+        raise ConversionError("This PowerPoint couldn't be read. Open it in PowerPoint, save it as a .pptx, then try again.")
+    return out
+
+
 def preview_file(src_path, out_dir, ext):
     """Produces a PDF the frontend can embed directly for a genuine,
     real preview of whatever was just generated — not a mocked-up
@@ -1086,7 +1209,14 @@ def preview_file(src_path, out_dir, ext):
     ext = ext.lower().lstrip(".")
     if ext == "pdf":
         return src_path
-    if ext in ("docx", "pptx", "xlsx", "doc", "ppt", "xls"):
+    if ext in PPT_EXTS:
+        kind = presentation_kind(src_path)
+        if kind == "locked":
+            raise ConversionError(PPT_LOCKED)
+        if kind is None:
+            raise ConversionError(PPT_NOT)
+        return _soffice_convert(src_path, "pdf", out_dir)
+    if ext in ("docx", "xlsx", "doc", "xls"):
         return _soffice_convert(src_path, "pdf", out_dir)
     raise ConversionError(f"Preview isn't supported for .{ext} files.")
 
@@ -9858,7 +9988,9 @@ def extract_text(src_path, ext):
             # to hand the AI an empty document; now the pages are read.
             text = _ocr_scanned_pdf_text(src_path) or text
         return text
-    if ext == "pptx":
+    if ext in PPT_EXTS:          # 3.13: every kind of PowerPoint, read as a .pptx
+        if ext != "pptx" or presentation_kind(src_path) != "pptx":
+            src_path = as_pptx(src_path, os.path.dirname(src_path))
         prs = _safe_load(Presentation, src_path)
         parts = []
         for slide in prs.slides:
