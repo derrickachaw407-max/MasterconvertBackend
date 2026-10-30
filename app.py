@@ -2221,6 +2221,9 @@ def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note, X-Size-Info"
+    # 3.11: the browser may remember a preflight's answer for two hours (it asked before almost every request)
+    if request.method == "OPTIONS":
+        resp.headers["Access-Control-Max-Age"] = "7200"
     # 3.4: how a browser may treat this reply
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "DENY")
