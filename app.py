@@ -4526,6 +4526,80 @@ def word_open_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+# ======================= 3.14: Remy in the Word editor =======================
+WORD_AI_ACTIONS = {
+    "write": "Write what the person asks for, ready to go into their document.",
+    "continue": "Carry on the document from where TEXT ends: one or two paragraphs that follow on naturally, in the same voice. Only the new words — don't repeat any of TEXT.",
+    "improve": "Rewrite TEXT so it reads better: clearer, smoother, the same meaning, about the same length.",
+    "shorter": "Rewrite TEXT shorter — about half the length — keeping every important point.",
+    "longer": "Rewrite TEXT longer — about half as long again — with more explanation or an example; add no facts you're unsure of.",
+    "simpler": "Rewrite TEXT in simpler words, short sentences, the same meaning, so a first-year student understands it at once.",
+    "formal": "Rewrite TEXT in a formal, academic tone, the same meaning.",
+    "friendly": "Rewrite TEXT in a warm, friendly tone, the same meaning.",
+    "fix": "Correct the spelling, grammar and punctuation of TEXT. Change nothing else: keep its words, tone, meaning and paragraph breaks.",
+    "summarize": "Summarize TEXT as 3 to 6 short bullet points.",
+    "outline": "Make an outline for a document about what the person asks for: a title, then headings, each with a few bullet points.",
+    "translate": "Translate TEXT into LANGUAGE. Keep its paragraph breaks, headings and lists.",
+    "explain": "Explain TEXT in plain words, in 3 to 6 sentences, for a student.",
+}
+WORD_AI_LANGS = ("English", "French", "Spanish", "Portuguese", "German", "Arabic", "Chinese", "Swahili", "Twi", "Ewe", "Ga", "Hausa", "Yoruba", "Igbo")
+
+
+@app.route("/api/word/ai", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def word_ai_endpoint():
+    """3.14 — Remy in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
+    far), ask (what to write, for write and outline), lang (for translate), title (the document's name). Returns
+    {"text": …} in plain text with light marks: "# " a title, "## " a heading, "- " a point, "1. " a numbered point."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "")
+    if action not in WORD_AI_ACTIONS:
+        return jsonify({"error": "Remy can't do that here."}), 400
+    text = str(data.get("text") or "").replace("\r", "").strip()[:14000]
+    ask = str(data.get("ask") or "").strip()[:1500]
+    lang = str(data.get("lang") or "")
+    title = str(data.get("title") or "").strip()[:120]
+    if action in ("write", "outline") and not ask:
+        return jsonify({"error": "Say what Remy should write."}), 400
+    if action not in ("write", "outline") and not text:
+        return jsonify({"error": "Choose some words first — or put the cursor in a paragraph."}), 400
+    if action == "translate" and lang not in WORD_AI_LANGS:
+        return jsonify({"error": "Choose a language."}), 400
+    try:
+        charged = _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 429
+    system = ("You are Remy, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
+              + WORD_AI_ACTIONS[action].replace("LANGUAGE", lang) +
+              " Reply with the words for the document only: no greeting, no note about what you did, no quotation marks around "
+              "it. Plain text with these marks only: '# ' starts a title, '## ' a heading, '### ' a smaller heading, '- ' a "
+              "bullet point, '1. ' a numbered point; a blank line between paragraphs. No bold or italic marks, no tables. "
+              "Use the same language as TEXT unless asked to translate. Never make up quotations, figures or references.")
+    material = ""
+    if title:
+        material += "DOCUMENT: " + title + "\n"
+    if ask:
+        material += "ASK: " + ask + "\n"
+    if text:
+        material += "TEXT:\n" + text + "\n"
+    try:
+        out = call_claude(system, material, max_tokens=2600 if action in ("write", "outline", "longer", "translate") else 1600,
+                          feature="word-" + action)
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged)
+        return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
+    out = (out or "").strip()
+    out = re.sub(r"^(?:here(?:'s| is)[^\n]*:\s*\n+)", "", out, flags=re.I)        # a preamble, if one slips in
+    out = out.replace("**", "").replace("__", "")
+    if not out:
+        _refund_sage_message(request.current_user, charged)
+        return jsonify({"error": "Remy had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
+    return jsonify({"text": out[:30000]})
+
+
 @app.route("/api/word/save", methods=["POST", "OPTIONS"])
 @limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -6637,6 +6711,135 @@ def _parse_assist_json(raw, action):
     return {"bullets": points}
 
 
+# ======================= 3.14: Remy for a whole deck (Slide Studio → All slides) =======================
+_ALL_ASSIST = {
+    "notes": ("For every slide, write speaker notes: what the presenter says while it is shown — 2 to 4 short paragraphs of "
+              "natural spoken English, about 80 to 150 words, covering each point. Reply for each slide with "
+              '{"i": <its number>, "notes": "..."}.', 6000),
+    "tighten": ("For every slide, rewrite its points so each is short and punchy — ideally under 12 words — keeping every "
+                "idea and its meaning; keep sub-points as sub-points (level 1); at most 7 points. Reply for each slide with "
+                '{"i": <its number>, "bullets": [{"text": "...", "level": 0}]}.', 4000),
+    "spelling": ("For every slide, correct the spelling, grammar and punctuation of its title and points. Change nothing "
+                 "else: keep the words, meaning, order and levels. Reply for each slide with "
+                 '{"i": <its number>, "title": "...", "bullets": [{"text": "...", "level": 0}]}.', 4000),
+    "translate": ("Translate every slide's title, points and speaker notes into LANGUAGE, keeping the order and levels. "
+                  'Reply for each slide with {"i": <its number>, "title": "...", "bullets": [{"text": "...", "level": 0}], '
+                  '"notes": "..."} (notes only where the slide has them).', 6000),
+}
+_ALL_LANGS = ("English", "French", "Spanish", "Portuguese", "German", "Arabic", "Chinese", "Swahili", "Twi", "Ewe", "Ga",
+              "Hausa", "Yoruba", "Igbo")
+
+
+def _all_points(raw, limit=12):
+    out = []
+    for b in (raw or [])[:40]:
+        if isinstance(b, str):
+            b = {"text": b, "level": 0}
+        if not isinstance(b, dict):
+            continue
+        text = str(b.get("text") or "").strip()[:600]
+        if not text:
+            continue
+        try:
+            level = max(0, min(int(b.get("level") or 0), 3))
+        except (TypeError, ValueError):
+            level = 0
+        out.append({"text": text, "level": level})
+    return out[:limit]
+
+
+@app.route("/api/slides/assist-all", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def slides_assist_all_endpoint():
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(silent=True) or {}
+    action = str(data.get("action") or "")
+    if action not in _ALL_ASSIST:
+        return jsonify({"error": "Unknown request for Remy."}), 400
+    lang = str(data.get("lang") or "")
+    if action == "translate" and lang not in _ALL_LANGS:
+        return jsonify({"error": "Choose a language."}), 400
+    slides = []
+    for s in (data.get("slides") or [])[:12]:
+        if not isinstance(s, dict):
+            continue
+        try:
+            i = int(s.get("i"))
+        except (TypeError, ValueError):
+            continue
+        title = str(s.get("title") or "").strip()[:200]
+        pts = _all_points(s.get("bullets"), 40)
+        notes = str(s.get("notes") or "").strip()[:2000]
+        if title or pts or (action == "translate" and notes):
+            slides.append((i, title, pts, notes))
+    if not slides:
+        return jsonify({"error": "There's nothing on the slides for Remy yet."}), 400
+    deck = str(data.get("deck_title") or "").strip()[:160]
+    lines = [f"Presentation: {deck}"] if deck else []
+    for i, title, pts, notes in slides:
+        lines.append(f"\nSLIDE {i}\nTitle: {title or '(none)'}")
+        if pts:
+            lines.append("Points:\n" + "\n".join(("  " * p["level"]) + "- " + p["text"] for p in pts))
+        if notes and action == "translate":
+            lines.append("Notes: " + notes)
+    instruction, max_tokens = _ALL_ASSIST[action]
+    instruction = instruction.replace("LANGUAGE", lang)
+    try:
+        charged = _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 429
+    system = ("You are Remy, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
+              'one JSON object only — no preamble, no code fences: {"slides": [ ... one object per slide given, with its number '
+              'as "i" ... ]}. ' + instruction + " Only rework what the slides already say or clearly imply: never invent "
+              "statistics, dates, citations or facts. Write in the slides' own language unless asked to translate.")
+    try:
+        raw = call_claude(system, "\n".join(lines) + "\n", max_tokens=max_tokens, feature="slides-all-" + action, timeout=170)
+        cleaned = (raw or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        try:
+            got = json.loads(cleaned)
+        except json.JSONDecodeError:
+            m = re.search(r"\{.*\}", cleaned, re.S)
+            got = json.loads(m.group(0)) if m else None
+        items = got.get("slides") if isinstance(got, dict) else None
+        if not isinstance(items, list):
+            raise ConversionError("Remy couldn't finish that — please try again.")
+    except (ConversionError, ValueError) as e:
+        _refund_sage_message(request.current_user, charged)
+        msg = str(e) if isinstance(e, ConversionError) else "Remy couldn't finish that — please try again."
+        return jsonify({"error": msg + AI_MSG_NOT_COUNTED}), 502
+    asked = {i for i, *_ in slides}
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            i = int(it.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if i not in asked:
+            continue
+        o = {"i": i}
+        if action in ("spelling", "translate") and isinstance(it.get("title"), str) and it["title"].strip():
+            o["title"] = it["title"].strip()[:200]
+        if action in ("tighten", "spelling", "translate"):
+            pts = _all_points(it.get("bullets"), 12)
+            if pts:
+                o["bullets"] = pts
+        if action in ("notes", "translate") and isinstance(it.get("notes"), str) and it["notes"].strip():
+            o["notes"] = it["notes"].strip()[:2000]
+        if len(o) > 1:
+            out.append(o)
+    if not out:
+        _refund_sage_message(request.current_user, charged)
+        return jsonify({"error": "Remy couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
+    return jsonify({"slides": out})
+
+
 @app.route("/api/slides/assist", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -7584,6 +7787,11 @@ def _meet_tables(cur):
             seconds BIGINT NOT NULL DEFAULT 0
         )""")
     cur.execute("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS captions BOOLEAN NOT NULL DEFAULT FALSE")   # 3.9: live captions
+    for col in ("starts_at TIMESTAMPTZ", "duration INTEGER", "agenda TEXT NOT NULL DEFAULT ''", "repeat TEXT NOT NULL DEFAULT ''",
+                "tz TEXT NOT NULL DEFAULT ''", "notes_sent_at TIMESTAMPTZ"):
+        cur.execute("ALTER TABLE meetings ADD COLUMN IF NOT EXISTS " + col)       # 3.14: a meeting's time, agenda
+    cur.execute("CREATE TABLE IF NOT EXISTS meeting_invites (user_id INTEGER NOT NULL, day DATE NOT NULL, n INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (user_id, day))")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS meeting_people (
             id SERIAL PRIMARY KEY,
@@ -7800,18 +8008,148 @@ def _meet_admit(cur, m, p):
                 "ticket_hash = NULL WHERE id = %s RETURNING *", (_meet_hash(seat), p["id"]))
     p = cur.fetchone()
     return {"status": "admitted", "seat": seat, "token": _meet_token(m, p), "url": LIVEKIT_URL, "identity": p["identity"],
-            "role": p["role"], "name": p["name"], "e2ee": m["e2ee"], "title": m["title"], "code": m["code"]}
+            "role": p["role"], "name": p["name"], "e2ee": m["e2ee"], "title": m["title"], "code": m["code"],
+            "agenda": m.get("agenda") or ""}      # 3.14: everyone let in sees the agenda
 
 
 def _meet_running(m):
     return bool(m.get("started_at") and not m.get("ended_at"))
 
 
-def _meet_public(m, host_name=None):
+def _meet_public(m, host_name=None, full=False):
     state = "live" if _meet_running(m) else ("ended" if m["ended_at"] else "waiting")
-    return {"code": m["code"], "title": m["title"], "host": host_name, "state": state, "passcode": bool(m["passcode_hash"]),
-            "lobby": m["lobby"], "e2ee": m["e2ee"], "locked": m["locked"], "maxPeople": m["max_people"],
-            "minutes": m["limit_minutes"], "endsAt": m["ends_at"].isoformat() if m["ends_at"] else None}
+    out = {"code": m["code"], "title": m["title"], "host": host_name, "state": state, "passcode": bool(m["passcode_hash"]),
+           "lobby": m["lobby"], "e2ee": m["e2ee"], "locked": m["locked"], "maxPeople": m["max_people"],
+           "minutes": m["limit_minutes"], "endsAt": m["ends_at"].isoformat() if m["ends_at"] else None}
+    # 3.14: when it's on, and what it's about
+    s = m.get("starts_at")
+    nxt = _meet_next(m)
+    out.update(startsAt=s.isoformat() if s else None, next=nxt.isoformat() if nxt else None, duration=m.get("duration"),
+               repeat=m.get("repeat") or "", tz=m.get("tz") or "", agenda=_meet_agenda_for(m, host=full))
+    return out
+
+
+# ======================= 3.14: scheduled meetings =======================
+MEET_INVITES_A_DAY = 60
+
+
+def _meet_next(m):
+    """The next time a scheduled meeting is on: its start, or — every week — the next week's (until 3 hours after)."""
+    s = m.get("starts_at") if isinstance(m, dict) else None
+    if not s:
+        return None
+    if (m.get("repeat") or "") == "weekly":
+        now = datetime.now(timezone.utc)
+        if s < now - timedelta(hours=3):
+            weeks = int((now - timedelta(hours=3) - s) / timedelta(weeks=1)) + 1
+            s = s + timedelta(weeks=weeks)
+    return s
+
+
+def _meet_when(data, m=None):
+    """The schedule fields from a request: (starts_at, duration, repeat, tz, agenda) — each None when not given."""
+    starts = None
+    raw = _text(data.get("starts_at"))
+    if raw:
+        try:
+            starts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise MeetError("That date and time couldn’t be read.", 400)
+        if starts.tzinfo is None:
+            raise MeetError("That date and time couldn’t be read.", 400)
+        now = datetime.now(timezone.utc)
+        if starts < now - timedelta(days=1) or starts > now + timedelta(days=400):
+            raise MeetError("Choose a time from today to a year ahead.", 400)
+    dur = None
+    if data.get("duration") is not None:
+        try:
+            dur = max(10, min(480, int(data.get("duration"))))
+        except (TypeError, ValueError):
+            dur = 60
+    rep = "weekly" if data.get("repeat") == "weekly" else ("" if "repeat" in data else None)
+    tz = re.sub(r"[^A-Za-z0-9_+\-/]", "", _text(data.get("tz")))[:64] if data.get("tz") is not None else None
+    agenda = _text(data.get("agenda")).replace("\r", "").strip()[:4000] if data.get("agenda") is not None else None
+    return starts, dur, rep, tz, agenda
+
+
+def _meet_save_when(cur, m, data):
+    starts, dur, rep, tz, agenda = _meet_when(data, m)
+    sets, args = [], []
+    for col, val in (("starts_at", starts), ("duration", dur), ("repeat", rep), ("tz", tz), ("agenda", agenda)):
+        if val is not None:
+            sets.append(col + " = %s")
+            args.append(val)
+    if data.get("unschedule"):
+        sets += ["starts_at = NULL", "repeat = ''"]
+    if not sets:
+        return m
+    cur.execute("UPDATE meetings SET " + ", ".join(sets) + " WHERE id = %s RETURNING *", args + [m["id"]])
+    return cur.fetchone()
+
+
+def _meet_tz(m):
+    """The host's time zone and its name — UTC when it isn't known here."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(m.get("tz") or "UTC"), (m.get("tz") or "UTC")
+    except Exception:
+        return timezone.utc, "UTC"
+
+
+def _meet_agenda_for(m, host=False):
+    """A meeting with a passcode keeps its agenda for the people who got in (and its host)."""
+    return (m.get("agenda") or "") if (host or not m.get("passcode_hash")) else ""
+
+
+def _meet_when_words(m):
+    """"Friday 30 October 2026, 3:00–4:00 pm (Africa/Accra)" — in the host's time zone."""
+    s = _meet_next(m)
+    if not s:
+        return ""
+    z, zname = _meet_tz(m)
+    a = s.astimezone(z)
+    b = a + timedelta(minutes=m.get("duration") or 60)
+    t = lambda d: d.strftime("%I:%M").lstrip("0") + ("am" if d.hour < 12 else "pm")
+    words = a.strftime("%A ") + str(a.day) + a.strftime(" %B %Y") + ", " + t(a) + "–" + t(b)
+    return words + " (" + zname.replace("_", " ") + ")" + (", every week" if m.get("repeat") == "weekly" else "")
+
+
+def _meet_gcal(m, link):
+    from urllib.parse import quote
+    s = _meet_next(m)
+    if not s:
+        return ""
+    e = s + timedelta(minutes=m.get("duration") or 60)
+    f = lambda d: d.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    details = "Join: " + link + ("\n\nAgenda:\n" + m["agenda"] if m.get("agenda") else "")
+    return ("https://calendar.google.com/calendar/render?action=TEMPLATE&text=" + quote(m["title"]) + "&dates=" + f(s) + "/" + f(e) +
+            "&details=" + quote(details) + ("&recur=RRULE:FREQ%3DWEEKLY" if m.get("repeat") == "weekly" else ""))
+
+
+def _meet_ics(m, link, agenda=""):
+    s = _meet_next(m) or datetime.now(timezone.utc)
+    e = s + timedelta(minutes=m.get("duration") or 60)
+    f = lambda d: d.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    esc = lambda t: str(t or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Academic-Home//Meetings//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "BEGIN:VEVENT",
+             "UID:" + m["code"] + "@academic-home", "DTSTAMP:" + f(datetime.now(timezone.utc)), "DTSTART:" + f(s), "DTEND:" + f(e),
+             "SUMMARY:" + esc(m["title"]), "URL:" + link, "LOCATION:" + esc(link),
+             "DESCRIPTION:" + esc("Join: " + link + ("\n\nAgenda:\n" + agenda if agenda else ""))]
+    if m.get("repeat") == "weekly":
+        lines.append("RRULE:FREQ=WEEKLY")
+    lines += ["BEGIN:VALARM", "TRIGGER:-PT10M", "ACTION:DISPLAY", "DESCRIPTION:" + esc(m["title"] + " starts in 10 minutes"), "END:VALARM",
+              "END:VEVENT", "END:VCALENDAR"]
+    out = []
+    for ln in lines:                       # lines of at most 75 octets, folded as the standard says
+        b = ln.encode("utf-8")
+        while len(b) > 75:
+            cut = 75
+            while cut > 0 and (b[cut] & 0xC0) == 0x80:
+                cut -= 1
+            out.append(b[:cut].decode("utf-8"))
+            b = b" " + b[cut:]
+        out.append(b.decode("utf-8"))
+    return "\r\n".join(out) + "\r\n"
 
 
 def _meet_reply(fn):
@@ -7870,6 +8208,150 @@ def _meet_person_key():
 
 
 # ------------------------------------------------------------ the endpoints
+@app.route("/api/meet/<code>/ics", methods=["GET", "OPTIONS"])
+@limiter.limit("120 per hour", key_func=_meet_code_key)
+@_meet_reply
+def meet_ics(cur, code):
+    m = _meet_get(cur, code)
+    link = f"{FRONTEND_URL}/?meet={m['code']}"
+    resp = app.response_class(_meet_ics(m, link, _meet_agenda_for(m)), mimetype="text/calendar")
+    resp.headers["Content-Disposition"] = "attachment; filename=\"" + safe_download_name((m["title"] or "Meeting")[:60] + ".ics") + "\""
+    return resp
+
+
+@app.route("/api/meet/<code>/invite", methods=["POST", "OPTIONS"])
+@limiter.limit("12 per hour", key_func=_account_or_ip_key)
+@auth_required
+@_meet_reply
+def meet_invite(cur, code):
+    user = request.current_user
+    m = _meet_get(cur, code)
+    if user["id"] != m["host_id"]:
+        raise MeetError("Only the host can send the invitation.", 403)
+    if m["e2ee"]:
+        raise MeetError("An end-to-end encrypted meeting’s link carries its key, so Academic-Home can’t email it — share the link yourself.", 400)
+    if user.get("email_verified", True) is False:
+        raise MeetError("Confirm your own email first — then you can email invitations.", 403)
+    if not _email_ready():
+        raise MeetError("Email isn’t set up on the server yet — share the link instead.", 503)
+    data = _json_body()
+    raw = data.get("emails") if isinstance(data.get("emails"), list) else re.split(r"[\s,;]+", _text(data.get("emails")))
+    emails = []
+    for e in raw[:40]:
+        e = _text(e).strip().lower()
+        if e and re.fullmatch(r"[^@\s<>\"']+@[^@\s<>\"']+\.[a-z]{2,}", e) and e not in emails:
+            emails.append(e)
+    if not emails:
+        raise MeetError("Type at least one email address.", 400)
+    if len(emails) > 20:
+        raise MeetError("Up to 20 people at a time.", 400)
+    cur.execute("INSERT INTO meeting_invites (user_id, day, n) VALUES (%s, CURRENT_DATE, %s) ON CONFLICT (user_id, day) "
+                "DO UPDATE SET n = meeting_invites.n + EXCLUDED.n RETURNING n", (user["id"], len(emails)))
+    if cur.fetchone()["n"] > MEET_INVITES_A_DAY:
+        raise MeetError(f"That’s more than {MEET_INVITES_A_DAY} invitations today — share the link instead, or try tomorrow.", 429)
+    link = f"{FRONTEND_URL}/?meet={m['code']}"
+    host = (user.get("name") or "Someone").strip()[:60]
+    when = _meet_when_words(m)
+    gcal = _meet_gcal(m, link)
+    base = (os.environ.get("RENDER_EXTERNAL_URL") or request.url_root).rstrip("/")     # this server's own address
+    if base.startswith("http://") and not re.match(r"http://(localhost|127\.)", base):
+        base = "https://" + base[7:]
+    ics = f"{base}/api/meet/{m['code']}/ics"
+    subject = ("Invitation: " + m["title"] + (" — " + when.split(" (")[0] if when else ""))[:180]
+    body = (f"{host} invited you to a meeting on Academic-Home.\n\n{m['title']}\n" + (f"When: {when}\n" if when else "") +
+            f"Join: {link}\nCode: {m['code']}\n" + (("Passcode: ask " + host + "\n") if m["passcode_hash"] else "") +
+            (f"\nAgenda:\n{m['agenda']}\n" if m.get("agenda") else "") +
+            ((f"\nAdd it to your calendar:\nGoogle Calendar: {gcal}\nOther calendars (a .ics file): {ics}\n") if when else "") +
+            "\nYou can join from a phone or a computer — no app needed.\n")
+    from html import escape as h
+    html = ("<div style=\"font-family:Arial,sans-serif;font-size:15px;line-height:1.5;color:#111\">" +
+            f"<p>{h(host)} invited you to a meeting on Academic-Home.</p><h2 style=\"margin:0 0 6px\">{h(m['title'])}</h2>" +
+            (f"<p style=\"margin:0 0 12px\"><b>When:</b> {h(when)}</p>" if when else "") +
+            f"<p><a href=\"{h(link)}\" style=\"display:inline-block;background:#1B4A9C;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none;font-weight:bold\">Join the meeting</a></p>" +
+            f"<p>Code: <b>{h(m['code'])}</b></p>" +
+            (f"<p><b>Agenda</b><br>{h(m['agenda']).replace(chr(10), '<br>')}</p>" if m.get("agenda") else "") +
+            (f"<p>Add it to your calendar: <a href=\"{h(gcal)}\">Google Calendar</a> · <a href=\"{h(ics)}\">Other calendars</a></p>" if when else "") +
+            "</div>")
+    sent = 0
+    for e in emails:
+        try:
+            send_email(e, subject, body, html)
+            sent += 1
+        except Exception as ex:
+            logger.warning(f"Meet: an invitation wasn't sent ({ex.__class__.__name__})")
+    if not sent:
+        raise MeetError("The invitations couldn’t be sent just now — please try again.", 502)
+    return jsonify({"sent": sent})
+
+
+@app.route("/api/meet/agenda", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def meet_agenda():
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_json(silent=True) or {}
+    title = str(data.get("title") or "").strip()[:120]
+    about = str(data.get("about") or "").strip()[:1500]
+    try:
+        minutes = max(10, min(480, int(data.get("minutes") or 60)))
+    except (TypeError, ValueError):
+        minutes = 60
+    if not title and not about:
+        return jsonify({"error": "Give the meeting a name first — Remy writes the agenda from it."}), 400
+    try:
+        charged = _log_sage_message_and_consume(request.current_user)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 429
+    system = ("You are Remy, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
+              f"agenda only: 4 to 7 lines, each \"- <minutes> min — <item>\", the minutes adding up to about {minutes}; start "
+              "with a short welcome and end with questions or next steps. Plain words, no heading, no other text. Never invent "
+              "names, dates or facts that weren't given.")
+    try:
+        out = call_claude(system, "Meeting: " + (title or "(no name)") + "\nLength: " + str(minutes) + " minutes" + ("\nAbout: " + about if about else ""),
+                          max_tokens=500, feature="meet-agenda")
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged)
+        return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    lines = [l if l.startswith("- ") else "- " + l.lstrip("-•* ") for l in lines if not l.lower().startswith(("here", "agenda:"))][:10]
+    if not lines:
+        _refund_sage_message(request.current_user, charged)
+        return jsonify({"error": "Remy couldn’t write the agenda — please try again." + AI_MSG_NOT_COUNTED}), 502
+    return jsonify({"agenda": "\n".join(lines)})
+
+
+@app.route("/api/meet/<code>/notes/send", methods=["POST", "OPTIONS"])
+@limiter.limit("10 per hour", key_func=_account_or_ip_key)
+@auth_required
+@_meet_reply
+def meet_notes_send(cur, code):
+    user = request.current_user
+    m = _meet_get(cur, code, lock=True)
+    if user["id"] != m["host_id"]:
+        raise MeetError("Only the host can send the notes.", 403)
+    notes = _text(_json_body().get("notes")).replace("\r", "").strip()[:12000]
+    if not notes:
+        raise MeetError("There are no notes to send yet.", 400)
+    if m.get("notes_sent_at") and datetime.now(timezone.utc) - m["notes_sent_at"] < timedelta(minutes=10):
+        raise MeetError("The notes were sent a moment ago — try again in a few minutes.", 429)
+    cur.execute("SELECT DISTINCT u.email FROM meeting_people p JOIN users u ON u.id = p.user_id WHERE p.meeting_id = %s "
+                "AND p.joined_at IS NOT NULL AND u.email IS NOT NULL LIMIT 150", (m["id"],))
+    to = [r["email"] for r in cur.fetchall()]
+    if user.get("email") and user["email"] not in to:
+        to.append(user["email"])
+    sent = 0
+    host = (user.get("name") or "The host").strip()[:60]
+    for e in to:
+        try:
+            send_email(e, ("Notes from " + m["title"])[:180], f"{host} shared the notes from “{m['title']}”, written by Remy.\n\n{notes}\n")
+            sent += 1
+        except Exception as ex:
+            logger.warning(f"Meet: notes weren't sent to one person ({ex.__class__.__name__})")
+    cur.execute("UPDATE meetings SET notes_sent_at = now() WHERE id = %s", (m["id"],))
+    return jsonify({"sent": sent})
+
+
 @app.route("/api/meet/config", methods=["GET", "OPTIONS"])
 def meet_config():
     if request.method == "OPTIONS":
@@ -7904,8 +8386,9 @@ def meet_create(cur):
                  generate_password_hash(passcode) if passcode else None, data.get("lobby", True) is not False,
                  bool(data.get("e2ee")), speak, MEET_MAX_PEOPLE, minutes))
     m = cur.fetchone()
-    logger.info(f"Meet: meeting {m['id']} made (lobby={m['lobby']} e2ee={m['e2ee']} speak={speak} minutes={minutes})")
-    return jsonify({"meeting": _meet_public(m, user.get("name")), "link": f"{FRONTEND_URL}/?meet={code}"})
+    m = _meet_save_when(cur, m, data)                 # 3.14: its time and agenda, when given
+    logger.info(f"Meet: meeting {m['id']} made (lobby={m['lobby']} e2ee={m['e2ee']} speak={speak} minutes={minutes} scheduled={bool(m.get('starts_at'))})")
+    return jsonify({"meeting": _meet_public(m, user.get("name"), full=True), "link": f"{FRONTEND_URL}/?meet={code}"})
 
 
 @app.route("/api/meet/mine", methods=["GET", "OPTIONS"])
@@ -7914,10 +8397,11 @@ def meet_create(cur):
 def meet_mine(cur):
     user = request.current_user
     cur.execute("SELECT m.*, (SELECT count(*) FROM meeting_people p WHERE p.meeting_id = m.id AND p.joined_at IS NOT NULL) AS came "
-                "FROM meetings m WHERE host_id = %s ORDER BY created_at DESC LIMIT 30", (user["id"],))
+                "FROM meetings m WHERE host_id = %s ORDER BY (starts_at IS NOT NULL AND (repeat = 'weekly' OR "
+                "starts_at > now() - interval '3 hours')) DESC, created_at DESC LIMIT 30", (user["id"],))   # 3.14: what's coming first
     out = []
     for m in cur.fetchall():
-        d = _meet_public(m, user.get("name"))
+        d = _meet_public(m, user.get("name"), full=True)
         d.update(created=m["created_at"].isoformat(), came=int(m["came"] or 0), peak=m["peak"])
         out.append(d)
     return jsonify({"meetings": out})
@@ -7937,6 +8421,8 @@ def meet_info(cur, code):
     user = _meet_user()
     d = _meet_public(m, host)
     d["youHost"] = bool(user and user["id"] == m["host_id"])
+    if d["youHost"]:
+        d["agenda"] = m.get("agenda") or ""
     return jsonify({"meeting": d})
 
 
@@ -8111,6 +8597,15 @@ def meet_control(cur, code):
     m = _meet_get(cur, code, lock=True)
     actor = _meet_actor(cur, m, data)
     action, who = _text(data.get("action")), _text(data.get("identity"))
+    if action == "schedule":                          # 3.14: its name, time and agenda
+        if actor["role"] != "host":
+            raise MeetError("Only the host can do that.", 403)
+        title = data.get("title")
+        if title is not None:
+            cur.execute("UPDATE meetings SET title = %s WHERE id = %s RETURNING *", (_meet_clean_name(title, fallback=m["title"])[:80], m["id"]))
+            m = cur.fetchone()
+        m = _meet_save_when(cur, m, data)
+        return jsonify({"meeting": _meet_public(m, full=True)})
     if not _meet_running(m) and action not in ("end", "delete", "lock", "unlock", "lobby_on", "lobby_off", "chat_on", "chat_off",
                                                "speak_all", "speak_chosen", "admit", "deny", "admit_all", "cc_on", "cc_off"):
         raise MeetError("This meeting isn’t running.", 409)
@@ -8176,7 +8671,7 @@ def meet_control(cur, code):
     else:
         raise MeetError("Unknown meeting control.", 400)
     cur.execute("SELECT * FROM meetings WHERE id = %s", (m["id"],))
-    return jsonify({"ok": True, "meeting": _meet_public(cur.fetchone())})
+    return jsonify({"ok": True, "meeting": _meet_public(cur.fetchone(), full=True)})
 
 
 def _meet_end(cur, m, why):
@@ -8372,7 +8867,8 @@ def _meet_reap_once():
                         _meet_end(cur, m, "no one was left in it")
                 _meet_webhook_check(cur, rooms)
             cur.execute("DELETE FROM meetings WHERE (ended_at IS NOT NULL OR started_at IS NULL) "
-                        "AND COALESCE(started_at, created_at) < now() - make_interval(days => %s)", (MEET_KEEP_DAYS,))
+                        "AND COALESCE(started_at, created_at) < now() - make_interval(days => %s) "
+                        "AND (starts_at IS NULL OR starts_at < now() - make_interval(days => %s))", (MEET_KEEP_DAYS, MEET_KEEP_DAYS))
         conn.commit()
     except MeetError:
         conn.rollback()

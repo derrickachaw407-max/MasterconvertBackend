@@ -8114,6 +8114,9 @@ class _WdCtx:
                     self.cells(el, bid, it["cells"], used)
                 out.append((el, bid))
                 continue
+            if "tbl" in it:                       # 3.14: a table made in the editor
+                out.append((self.new_table(it.get("tbl"), used), None))
+                continue
             p = _wd_new("w:p")
             model = self.paras.get(str(it.get("from"))) if it.get("from") is not None else None
             mp = model.find(_wd_qn("w:pPr")) if model is not None else None
@@ -8129,6 +8132,49 @@ class _WdCtx:
             self.fill(p, it.get("p") or {}, None)
             out.append((p, None))
         return out
+
+    def new_table(self, T, used):
+        """3.14: a table made in the editor — Word's Table Grid, its columns sharing the text's width."""
+        rows = T.get("rows") if isinstance(T, dict) else None
+        if not isinstance(rows, list) or not rows or len(rows) > 300 or not all(isinstance(r, list) for r in rows) \
+                or not all(isinstance(c, list) for r in rows for c in r):
+            raise WordEditError(_WD_BAD)
+        ncols = max(len(r) for r in rows)
+        if ncols < 1 or ncols > 40:
+            raise WordEditError(_WD_BAD)
+        tbl = _wd_new("w:tbl")
+        tpr = _wd_new("w:tblPr")
+        try:
+            self.ensure_style("TableGrid")
+            tpr.append(_wd_new("w:tblStyle", val="TableGrid"))
+        except WordEditError:
+            borders = _wd_new("w:tblBorders")
+            for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                borders.append(_wd_new("w:" + side, val="single", sz=4, space=0, color="auto"))
+            tpr.append(borders)
+        tpr.append(_wd_new("w:tblW", w=0, type="auto"))
+        tpr.append(_wd_new("w:tblLook", val="04A0", firstRow=1, lastRow=0, firstColumn=1, lastColumn=0, noHBand=0, noVBand=1))
+        tbl.append(tpr)
+        cw = max(200, int(self.text_width() * 20) // ncols)
+        grid = _wd_new("w:tblGrid")
+        for _ in range(ncols):
+            grid.append(_wd_new("w:gridCol", w=cw))
+        tbl.append(grid)
+        for r in rows:
+            tr = _wd_new("w:tr")
+            for items in (r + [[]] * (ncols - len(r)))[:ncols]:
+                tc = _wd_new("w:tc")
+                tcpr = _wd_new("w:tcPr")
+                tcpr.append(_wd_new("w:tcW", w=cw, type="dxa"))
+                tc.append(tcpr)
+                built = self.build(items if isinstance(items, list) else [], used, within="new.")
+                for el, _ in built:
+                    tc.append(el)
+                if not built or not _wd_is(built[-1][0], "p"):
+                    tc.append(_wd_new("w:p"))
+                tr.append(tc)
+            tbl.append(tr)
+        return tbl
 
     def cells(self, tbl, tid, cells, used):
         if not isinstance(cells, dict):
@@ -8177,6 +8223,29 @@ class _WdCtx:
                 _wd_place(ppr, _wd_new("w:jc", val={"justify": "both"}.get(al, al)), _WD_PPR_ORDER)
         if "list" in P:
             self.set_list(ppr, pstyle, P.get("list"))
+        # 3.14: line spacing, a page break before the paragraph, and (outside a list) its left indent
+        ls = _wd_num(P.get("ls"))
+        if ls and 0.5 <= ls <= 5:
+            sp = ppr.find(_wd_qn("w:spacing"))
+            if sp is None:
+                sp = _wd_new("w:spacing")
+                _wd_place(ppr, sp, _WD_PPR_ORDER)
+            sp.set(_wd_qn("w:line"), str(int(round(240 * ls))))
+            sp.set(_wd_qn("w:lineRule"), "auto")
+        if "pb" in P:
+            _wd_drop(ppr, "pageBreakBefore")
+            if P.get("pb"):
+                _wd_place(ppr, _wd_new("w:pageBreakBefore"), _WD_PPR_ORDER)
+        ind = _wd_num(P.get("ind"))
+        if ind is not None and 0 <= ind <= 720 and not P.get("list"):
+            el = ppr.find(_wd_qn("w:ind"))
+            if el is None:
+                el = _wd_new("w:ind")
+                _wd_place(ppr, el, _WD_PPR_ORDER)
+            for a in ("w:start", "w:left"):
+                if el.get(_wd_qn(a)) is not None:
+                    del el.attrib[_wd_qn(a)]
+            el.set(_wd_qn("w:left"), str(int(round(ind * 20))))
         keep = self.marks.get(pid, []) if pid else []
         for c in list(p):
             if c is not ppr:
@@ -8288,6 +8357,21 @@ class _WdCtx:
             _wd_drop(rpr, "vertAlign")
             if fmt.get("va") in ("sup", "sub"):
                 _wd_place(rpr, _wd_new("w:vertAlign", val="superscript" if fmt["va"] == "sup" else "subscript"), _WD_RPR_ORDER)
+        # 3.14: a font, a size and a highlight the editor set (absent or null: the run keeps its own)
+        fam = str(fmt.get("f") or "").strip()
+        if fam and re.fullmatch(r"[\w .\-]{1,60}", fam):
+            _wd_drop(rpr, "rFonts")
+            _wd_place(rpr, _wd_new("w:rFonts", ascii=fam, hAnsi=fam, cs=fam, eastAsia=fam), _WD_RPR_ORDER)
+        z = _wd_num(fmt.get("z"))
+        if z and 1 <= z <= 400:
+            _wd_drop(rpr, "sz")
+            _wd_drop(rpr, "szCs")
+            _wd_place(rpr, _wd_new("w:sz", val=int(round(z * 2))), _WD_RPR_ORDER)
+            _wd_place(rpr, _wd_new("w:szCs", val=int(round(z * 2))), _WD_RPR_ORDER)
+        if fmt.get("hl") is not None:
+            _wd_drop(rpr, "highlight")
+            if fmt.get("hl") in _WD_HIGHLIGHTS:
+                _wd_place(rpr, _wd_new("w:highlight", val=fmt["hl"]), _WD_RPR_ORDER)
         if len(rpr):
             r.append(rpr)
         for part in re.split("(\t|\n)", text):
@@ -8449,6 +8533,89 @@ def word_open(path):
             "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body)}
 
 
+_WD_HIGHLIGHTS = ("yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue", "darkCyan", "darkGreen", "darkMagenta",
+                  "darkRed", "darkYellow", "darkGray", "lightGray", "black")
+_WD_SIZES = {"a4": (595.3, 841.9), "letter": (612.0, 792.0), "legal": (612.0, 1008.0), "a5": (419.5, 595.3)}
+
+
+def _wd_page_setup(doc, page):
+    """3.14: the page the editor chose — its size, way round and margins — for every section."""
+    if not isinstance(page, dict):
+        return
+    size = _WD_SIZES.get(str(page.get("size") or "").lower())
+    orient = page.get("orient") if page.get("orient") in ("portrait", "landscape") else None
+    margins = page.get("margins")
+    if isinstance(margins, list) and len(margins) == 4 and all(_wd_num(m) is not None and 0 <= _wd_num(m) <= 288 for m in margins):
+        margins = [int(round(_wd_num(m) * 20)) for m in margins]
+    else:
+        margins = None
+    body = doc.element.body
+    sects = list(body.iter(_wd_qn("w:sectPr")))
+    if not sects:
+        sp = _wd_new("w:sectPr")
+        body.append(sp)
+        sects = [sp]
+    for sp in sects:
+        pg = sp.find(_wd_qn("w:pgSz"))
+        if pg is None:
+            pg = _wd_new("w:pgSz", w=12240, h=15840)
+            sp.insert(0, pg)
+        if size or orient:
+            w = _wd_num(pg.get(_wd_qn("w:w")), 12240) / 20.0
+            h = _wd_num(pg.get(_wd_qn("w:h")), 15840) / 20.0
+            if size:
+                w, h = size
+            land = (orient == "landscape") if orient else (w > h)
+            short, long_ = sorted((w, h))
+            w, h = (long_, short) if land else (short, long_)
+            pg.set(_wd_qn("w:w"), str(int(round(w * 20))))
+            pg.set(_wd_qn("w:h"), str(int(round(h * 20))))
+            if land:
+                pg.set(_wd_qn("w:orient"), "landscape")
+            elif pg.get(_wd_qn("w:orient")) is not None:
+                del pg.attrib[_wd_qn("w:orient")]
+        if margins:
+            mar = sp.find(_wd_qn("w:pgMar"))
+            if mar is None:
+                mar = _wd_new("w:pgMar", header=708, footer=708, gutter=0)
+                pg.addnext(mar)
+            for a, v in zip(("w:top", "w:right", "w:bottom", "w:left"), margins):
+                mar.set(_wd_qn(a), str(v))
+
+
+def _wd_page_numbers(doc, where):
+    """3.14: page numbers, as a PAGE field Word fills in, in the footer (or the header) of every section that has its
+    own — where there isn't one already."""
+    where = str(where or "")
+    if where not in ("bottom-center", "bottom-right", "bottom-left", "top-right", "top-center"):
+        return
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    for n, s in enumerate(doc.sections):
+        hf = s.header if where.startswith("top") else s.footer
+        if n and hf.is_linked_to_previous:
+            continue
+        if hf.is_linked_to_previous:
+            hf.is_linked_to_previous = False
+        if any("PAGE" in (t.text or "") for t in hf._element.iter(_wd_qn("w:instrText"))) or \
+                any("PAGE" in (f.get(_wd_qn("w:instr")) or "") for f in hf._element.iter(_wd_qn("w:fldSimple"))):
+            continue
+        p = hf.paragraphs[0] if hf.paragraphs and not hf.paragraphs[0].text.strip() and len(hf.paragraphs) == 1 else hf.add_paragraph()
+        p.alignment = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "left": WD_ALIGN_PARAGRAPH.LEFT}[where.split("-")[1]]
+        for kind, val in (("begin", None), ("instr", " PAGE "), ("separate", None), ("text", "1"), ("end", None)):
+            r = _wd_new("w:r")
+            if kind == "instr":
+                e = _wd_new("w:instrText")
+                e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                e.text = val
+            elif kind == "text":
+                e = _wd_new("w:t")
+                e.text = val
+            else:
+                e = _wd_new("w:fldChar", fldCharType=kind)
+            r.append(e)
+            p._p.append(r)
+
+
 def word_save(src_path, plan, out_dir, assets=None):
     """The Word editor's Save: the original .docx (or none, for a new document) plus the plan → the new .docx."""
     from docx import Document
@@ -8494,6 +8661,8 @@ def word_save(src_path, plan, out_dir, assets=None):
         body.append(_wd_new("w:p"))
     if sect is not None:
         body.append(sect)
+    _wd_page_setup(doc, plan.get("page"))           # 3.14: size, orientation and margins
+    _wd_page_numbers(doc, plan.get("numbers"))       # 3.14: page numbers
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "edited.docx")
     doc.save(out)
