@@ -42,6 +42,8 @@ from converters import (
 from converters import _soffice_convert   # the server's own LibreOffice runner
 from converters import pdf_apply_plan, pdf_plan_needs_pro, pdf_to_images   # 3.1: the PDF editor
 from converters import word_open, word_save   # 3.1: the Word editor
+from converters import CONVERTERS as _OLD_PAIRS   # 3.15: the pairs Convert always had (kept as they were)
+import convert315 as _any                          # 3.15: every other kind of file
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
 
 # Load LibreOffice into memory in the background as each worker starts, so
@@ -194,6 +196,7 @@ def safe_download_name(original_filename, fallback="download"):
 # domain can be added with EXTRA_ALLOWED_ORIGINS.
 _ALLOWED_ORIGIN_PATTERN = re.compile(r"^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.vercel\.app$")
 ALLOWED_ORIGINS = {
+    "https://acadhome.vercel.app",       # 3.15: the one address
     "https://getdocente.vercel.app",
     "https://docently.vercel.app",
     "https://masterconvert-tau.vercel.app",
@@ -201,9 +204,12 @@ ALLOWED_ORIGINS = {
 # Additional origins can be added without a code change via this env var
 # (comma-separated) — set on Render if a custom domain is added later.
 ALLOWED_ORIGINS |= {o.strip() for o in os.environ.get("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()}
-# The app's address, used in password-reset emails. getdocente.vercel.app
-# is the current name; the old addresses still open the same app.
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://getdocente.vercel.app").rstrip("/")
+# The app's address, used in emails (password resets, meeting invitations). 3.15: acadhome.vercel.app is the one
+# address; an old one still set on Render is read as the new one (the old addresses only move people there).
+FRONTEND_HOME = "https://acadhome.vercel.app"
+FRONTEND_URL = os.environ.get("FRONTEND_URL", FRONTEND_HOME).rstrip("/")
+if re.fullmatch(r"https?://(getdocente|docently|docently-1|docente-1-dusky|masterconvert-tau)\.vercel\.app", FRONTEND_URL):
+    FRONTEND_URL = FRONTEND_HOME
 
 
 def _origin_is_allowed(origin):
@@ -1310,6 +1316,9 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     if not ANTHROPIC_API_KEY:
         logger.error("AI is OFF for everyone: ANTHROPIC_API_KEY isn't set on Render.")
         raise ConversionError(AI_MSG_UNAVAILABLE)
+    style = _house_style()                       # 3.15: how the words must read
+    if style and style not in (system_prompt or ""):
+        system_prompt = (system_prompt or "") + style
     payload = {
         "model": model or ANTHROPIC_MODEL,
         "max_tokens": max_tokens,
@@ -1666,7 +1675,7 @@ import math as _math
 
 OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 _PAPER_TIMEOUT = 9
-_PAPER_UA = {"User-Agent": "Academic-Home/3.4 (study app; https://getdocente.vercel.app)"}
+_PAPER_UA = {"User-Agent": "Academic-Home/3.4 (study app; https://acadhome.vercel.app)"}
 _PAPER_STOP = set((
     "a an and are as at be been being but by can could do does for from had has have how i if in into is it its "
     "me my of on or our so than that the their them then there these they this those to was we were what when "
@@ -2274,6 +2283,125 @@ def handle_server_error(e):
     return jsonify({"error": "Something went wrong on our end. Please try again."}), 500
 
 
+# ======================= 3.15: moving to acadhome.vercel.app =======================
+MOVE_DIR = os.path.join(tempfile.gettempdir(), "ah-moves")
+MOVE_PART_MAX = 8 * 1024 * 1024 + 4096    # one locked part (the lock adds 28 bytes)
+MOVE_PER_PERSON = 112 * 1024 * 1024       # what one person (or one network, signed out) may have waiting at once
+MOVE_ALL_MAX = 640 * 1024 * 1024          # what everyone together may have waiting
+MOVE_DISK_SPARE = 1024 * 1024 * 1024      # the disk always keeps this much free (conversions need room too)
+MOVE_TTL = 3600                           # an hour
+
+
+def _move_id_ok(mid):
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{32}", mid or ""))
+
+
+def _move_owner():
+    """Who sent a part, without keeping who: a short hash of the account (or the network, signed out)."""
+    return hashlib.sha256(("move|" + _account_or_ip_key()).encode()).hexdigest()[:12]
+
+
+def _move_sweep():
+    """Parts older than an hour go. Returns what's still waiting: (bytes in all, {owner: bytes})."""
+    total, per = 0, {}
+    try:
+        names = os.listdir(MOVE_DIR)
+    except FileNotFoundError:
+        return 0, per
+    now = time.time()
+    for n in names:
+        p = os.path.join(MOVE_DIR, n)
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
+            continue
+        if now - st.st_mtime > MOVE_TTL or (n.endswith(".tmp") and now - st.st_mtime > 600):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+            continue
+        if n.endswith(".tmp"):
+            continue
+        total += st.st_size
+        owner = n.split(".", 1)[-1]
+        per[owner] = per.get(owner, 0) + st.st_size
+    return total, per
+
+
+def _move_path(mid):
+    try:
+        for n in os.listdir(MOVE_DIR):
+            if n.startswith(mid + ".") and not n.endswith(".tmp"):
+                return os.path.join(MOVE_DIR, n)
+    except FileNotFoundError:
+        pass
+    return None
+
+
+@app.route("/api/move", methods=["POST", "OPTIONS"])
+@limiter.limit("60 per hour", key_func=_account_or_ip_key)
+def move_put():
+    """One locked part of what a phone saved under an old address (only the phone has the key)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.get_data(cache=False)
+    if not data or len(data) < 29:
+        return jsonify({"error": "Nothing came through. Please try again."}), 400
+    if len(data) > MOVE_PART_MAX:
+        return jsonify({"error": "That part is too big."}), 413
+    os.makedirs(MOVE_DIR, exist_ok=True)
+    total, per = _move_sweep()
+    owner = _move_owner()
+    if per.get(owner, 0) + len(data) > MOVE_PER_PERSON:
+        return jsonify({"error": "That's more than can move at once. Please try again in an hour."}), 429
+    try:
+        spare = shutil.disk_usage(MOVE_DIR).free
+    except OSError:
+        spare = 0
+    if total + len(data) > MOVE_ALL_MAX or spare - len(data) < MOVE_DISK_SPARE:
+        logger.warning(f"Move: no room for a part of {len(data) // 1024} KB ({total // (1024 * 1024)} MB waiting)")
+        return jsonify({"error": "Lots of people are moving right now. Please try again in a few minutes."}), 503
+    mid = secrets.token_urlsafe(24)
+    tmp = os.path.join(MOVE_DIR, f"{mid}.{owner}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, os.path.join(MOVE_DIR, f"{mid}.{owner}"))
+    logger.info(f"Move: a part of {len(data) // 1024} KB is waiting")
+    return jsonify({"id": mid})
+
+
+@app.route("/api/move/<mid>", methods=["GET", "DELETE", "OPTIONS"])
+@limiter.limit("240 per hour")
+def move_get(mid):
+    if request.method == "OPTIONS":
+        return "", 204
+    if not _move_id_ok(mid):
+        return jsonify({"error": "This moving link isn't right."}), 404
+    path = _move_path(mid)
+    if request.method == "DELETE":
+        if path:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        return jsonify({"ok": True})
+    try:
+        fresh = path and time.time() - os.stat(path).st_mtime <= MOVE_TTL
+    except FileNotFoundError:
+        fresh = False
+    if not fresh:
+        return jsonify({"error": "This moving link has expired or was used already."}), 404
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return jsonify({"error": "This moving link has expired or was used already."}), 404
+    resp = app.response_class(data, mimetype="application/octet-stream")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "email": _email_ready(),
@@ -2284,6 +2412,102 @@ def health():
 def promo_status():
     """For the app's banner — no account needed."""
     return jsonify({"active": _promo_active(), "until": _promo_until().isoformat() if _promo_active() else None})
+
+
+# ---------- 3.15: study music: songs by mood ----------
+# The list is songs.json beside this file: edit it on GitHub to change the songs (the app picks the new list up within a
+# day; a broken file just means the app keeps the list it ships with). Each song: v (the YouTube video's id), t, a, m.
+_SONGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "songs.json")
+_SONG_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_SONG_LIST = re.compile(r"^[A-Za-z0-9_-]{10,64}$")
+_SONG_MOOD = re.compile(r"^[a-z]{2,20}$")
+_songs_cache = {"mtime": None, "data": None}
+_song_about = {}
+
+
+def _songs_load():
+    try:
+        mtime = os.stat(_SONGS_FILE).st_mtime
+    except OSError:
+        return None
+    if _songs_cache["mtime"] == mtime:
+        return _songs_cache["data"]
+    data = None
+    try:
+        with open(_SONGS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        moods = [{"id": m["id"], "name": str(m["name"])[:24], "lead": str(m["lead"])[:140]}
+                 for m in raw.get("moods", []) if isinstance(m, dict) and _SONG_MOOD.match(str(m.get("id", "")))
+                 and m.get("id") != "mine" and m.get("name") and m.get("lead")][:12]
+        ids = {m["id"] for m in moods}
+        songs, seen = [], set()
+        for s in raw.get("songs", []):
+            if not isinstance(s, dict) or not _SONG_ID.match(str(s.get("v", ""))) or s.get("m") not in ids or not s.get("t"):
+                continue
+            if s["v"] in seen:
+                continue
+            seen.add(s["v"])
+            one = {"v": s["v"], "t": str(s["t"])[:120], "a": str(s.get("a", ""))[:80], "m": s["m"]}
+            if s.get("live"):
+                one["live"] = True
+            songs.append(one)
+        if len(moods) >= 2 and len(songs) >= 6:
+            data = {"updated": str(raw.get("updated", ""))[:20], "moods": moods, "songs": songs[:400]}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        logging.getLogger(__name__).warning("songs.json could not be read; the app keeps its own list")
+    _songs_cache.update(mtime=mtime, data=data)
+    return data
+
+
+@app.route("/api/music/songs", methods=["GET", "OPTIONS"])
+def music_songs():
+    """The songs for Study music, by mood. No account needed."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = _songs_load()
+    if not data:
+        return jsonify({"error": "No list of songs here."}), 404
+    resp = jsonify(data)
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.route("/api/music/about", methods=["GET", "OPTIONS"])
+@limiter.limit("60 per hour")
+def music_about():
+    """A YouTube song's or playlist's name, for Your songs: YouTube's oEmbed is asked with only the link."""
+    if request.method == "OPTIONS":
+        return "", 204
+    v, lst = request.args.get("v", ""), request.args.get("list", "")
+    if v and _SONG_ID.match(v):
+        url, key = "https://www.youtube.com/watch?v=" + v, "v:" + v
+    elif lst and _SONG_LIST.match(lst):
+        url, key = "https://www.youtube.com/playlist?list=" + lst, "l:" + lst
+    else:
+        return jsonify({"ok": False, "reason": "bad_link"}), 400
+    hit = _song_about.get(key)
+    if hit and time.time() - hit[0] < 86400:
+        return jsonify(hit[1])
+    try:
+        r = requests.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"}, timeout=6)
+    except requests.RequestException:
+        return jsonify({"ok": False, "reason": "unreachable"}), 502
+    if r.status_code == 200:
+        try:
+            d = r.json()
+        except ValueError:
+            d = {}
+        out = {"ok": True, "title": str(d.get("title", ""))[:140], "author": str(d.get("author_name", ""))[:80]}
+    elif r.status_code in (401, 403):
+        out = {"ok": False, "reason": "not_embeddable"}     # its owner doesn't let it play in other apps (or it's private)
+    elif r.status_code in (400, 404):
+        out = {"ok": False, "reason": "not_found"}
+    else:
+        return jsonify({"ok": False, "reason": "unreachable"}), 502
+    if len(_song_about) > 2000:
+        _song_about.clear()
+    _song_about[key] = (time.time(), out)
+    return jsonify(out)
 
 
 # ---------- auth ----------
@@ -3136,7 +3360,7 @@ def plan_upgrade():
 
 
 # ------------------------------------------------------------ Paystack (web only)
-# On the web (getdocente.vercel.app) Pro is bought with Paystack — card or
+# On the web (acadhome.vercel.app) Pro is bought with Paystack — card or
 # mobile money, charged in Ghana cedis — as a one-time pass: 30 or 365 days of
 # Pro, or 30 Remy messages. The App Store and Google Play apps must use the
 # stores' own purchases (their rules), so requests from the store apps are
@@ -3863,8 +4087,15 @@ def convert_endpoint():
         return jsonify({"error": "Empty filename"}), 400
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    # 3.13: every kind of PowerPoint (.ppt, .pps, .ppsx, .pptm, .pot, .potx, .odp…) is a PowerPoint here
-    ppt_in = from_fmt in PPT_EXTS and ext in PPT_EXTS
+    # 3.15: a file's ending by any of its names (.jpeg is a JPG, .htm a web page, .tif a TIFF)
+    ext, from_fmt, to_fmt = _any.ALIASES.get(ext, ext), _any.ALIASES.get(from_fmt, from_fmt), _any.ALIASES.get(to_fmt, to_fmt)
+    # 3.13: every kind of PowerPoint (.ppt, .pps, .ppsx, .pptm, .pot, .potx, .odp…) is a PowerPoint here, whichever it's
+    # called (presenting in a meeting says .pps); a kind with its own way (.ppt or .odp into another kind) goes that way
+    own = ext == from_fmt and ((from_fmt, to_fmt) in _OLD_PAIRS or _any.can(from_fmt, to_fmt))
+    ppt_in = ext in PPT_EXTS and from_fmt in PPT_EXTS and (from_fmt == "pptx" or not own)
+    pair_from = "pptx" if ppt_in else from_fmt
+    if (pair_from, to_fmt) not in _OLD_PAIRS and not _any.can(pair_from, to_fmt):
+        return jsonify({"error": "Those two kinds of file can't be converted into each other here."}), 400
     if ext != from_fmt and not ppt_in:
         return jsonify({"error": f"File extension .{ext} doesn't match declared source format '{from_fmt}'"}), 400
     if ppt_in:
@@ -3930,29 +4161,32 @@ def convert_endpoint():
         try:
             if ppt_in:
                 src_path = _pptx_for(src_path, to_fmt, work_dir)
+            base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
             if studio_template:
                 deck = parse_pptx_to_deck(src_path)
                 deck["template"] = studio_template
                 result_path = build_template_deck(deck, work_dir, "fixed.pptx")
-            else:
+            elif (from_fmt, to_fmt) in _OLD_PAIRS:
                 result_path = convert(src_path, from_fmt, to_fmt, work_dir, style=style, pptx_options=pptx_options)
+            else:
+                result_path = _any.convert_any(src_path, from_fmt, to_fmt, os.path.join(work_dir, "out"), stem=base_name)
         except (ConversionError, StudioError) as e:
             return jsonify({"error": str(e)}), 422
         except FileNotFoundError as e:
             return jsonify({"error": f"Required conversion tool missing on server: {e}"}), 500
 
-        if to_fmt == "pptx":
+        if to_fmt == "pptx" and result_path.endswith(".pptx"):
             try:
                 _colour_not_bold(result_path)
             except Exception as e:   # a finished deck is never lost to this tidy-up
                 logger.warning(f"Colour-not-bold pass skipped: {e}")
 
-        base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
-        download_name = f"{base_name}.{to_fmt}"
+        zipped = result_path.lower().endswith(".zip") and to_fmt != "zip"
+        download_name = f"{base_name}.{'zip' if zipped else to_fmt}"
 
         return send_file(
             result_path,
-            mimetype=MIME_TYPES.get(to_fmt, "application/octet-stream"),
+            mimetype="application/zip" if zipped else (MIME_TYPES.get(to_fmt) or _any.MIME.get(to_fmt) or "application/octet-stream"),
             as_attachment=True,
             download_name=download_name,
         )
@@ -3970,6 +4204,12 @@ def _pptx_for(src_path, to_fmt, work_dir):
     if to_fmt == "pdf" and kind in ("binary", "odp", "strict", "relabel"):
         return src_path
     return as_pptx(src_path, work_dir)
+
+
+@app.route("/api/convert/formats", methods=["GET", "OPTIONS"])
+def convert_formats_endpoint():
+    """3.15: every format Convert takes, and what each turns into."""
+    return jsonify(_any.catalog())
 
 
 @app.route("/api/preview-file", methods=["POST", "OPTIONS"])
@@ -3991,7 +4231,7 @@ def preview_file_endpoint():
         return jsonify({"error": "Empty filename"}), 400
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if ext not in ("pdf", "docx", "xlsx", "doc", "xls") + PPT_EXTS:
+    if ext not in ("pdf", "docx", "xlsx", "doc", "xls", "odt", "rtf", "ods", "csv", "txt", "html") + PPT_EXTS:   # 3.15: more kinds
         return jsonify({"error": f"Preview isn't supported for .{ext} files."}), 400
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_preview_{uuid.uuid4().hex[:8]}_")
@@ -4069,9 +4309,12 @@ def convert_batch_endpoint():
     if not from_fmt or not to_fmt:
         return jsonify({"error": "Missing 'from' or 'to' format"}), 400
     pptx_options, studio_template = None, None
+    from_fmt, to_fmt = _any.ALIASES.get(from_fmt, from_fmt), _any.ALIASES.get(to_fmt, to_fmt)      # 3.15
     ppt_batch = from_fmt in PPT_EXTS          # 3.13: any kind of PowerPoint, each read as a .pptx
     if ppt_batch:
         from_fmt = "pptx"
+    if (from_fmt, to_fmt) not in _OLD_PAIRS and not _any.can(from_fmt, to_fmt):
+        return jsonify({"error": "Those two kinds of file can't be converted into each other here."}), 400
     if from_fmt == "pptx" and to_fmt == "pptx":
         pptx_options, studio_template, err = _pptx_fix_form(request.form)
         if err:
@@ -4084,6 +4327,7 @@ def convert_batch_endpoint():
         for file in files:
             filename = file.filename or "unnamed"
             ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            ext = _any.ALIASES.get(ext, ext)
             if ext != from_fmt and not (ppt_batch and ext in PPT_EXTS):
                 details.append({"filename": filename, "success": False, "error": "Not a PowerPoint file" if ppt_batch else f"Not a .{from_fmt} file"})
                 continue
@@ -4106,14 +4350,18 @@ def convert_batch_endpoint():
                     deck["template"] = studio_template
                     result_path = build_template_deck(deck, file_dir, "fixed.pptx")
                 else:
-                    result_path = convert(src_path, from_fmt, to_fmt, file_dir, style=style, pptx_options=pptx_options)
+                    if (from_fmt, to_fmt) in _OLD_PAIRS:
+                        result_path = convert(src_path, from_fmt, to_fmt, file_dir, style=style, pptx_options=pptx_options)
+                    else:
+                        result_path = _any.convert_any(src_path, from_fmt, to_fmt, os.path.join(file_dir, "out"),
+                                                       stem=safe_download_name(filename).rsplit(".", 1)[0])
                 if to_fmt == "pptx":
                     try:
                         _colour_not_bold(result_path)
                     except Exception as e:   # a finished deck is never lost to this tidy-up
                         logger.warning(f"Colour-not-bold pass skipped: {e}")
                 base_name = safe_download_name(filename).rsplit(".", 1)[0]
-                converted.append((result_path, f"{base_name}.{to_fmt}"))
+                converted.append((result_path, f"{base_name}.{'zip' if result_path.lower().endswith('.zip') else to_fmt}"))
                 details.append({"filename": filename, "success": True})
             except (ConversionError, StudioError) as e:
                 details.append({"filename": filename, "success": False, "error": str(e)})
@@ -4542,7 +4790,9 @@ WORD_AI_ACTIONS = {
     "translate": "Translate TEXT into LANGUAGE. Keep its paragraph breaks, headings and lists.",
     "explain": "Explain TEXT in plain words, in 3 to 6 sentences, for a student.",
 }
-WORD_AI_LANGS = ("English", "French", "Spanish", "Portuguese", "German", "Arabic", "Chinese", "Swahili", "Twi", "Ewe", "Ga", "Hausa", "Yoruba", "Igbo")
+# 3.15: the world's languages, most-spoken first, then regional ones (the app's Translate lists)
+WORD_AI_LANGS = (
+    "English", "Spanish", "French", "Arabic", "Chinese", "Hindi", "Portuguese", "Bengali", "Russian", "Japanese", "German", "Korean", "Italian", "Turkish", "Indonesian", "Vietnamese", "Urdu", "Persian", "Swahili", "Dutch", "Polish", "Ukrainian", "Thai", "Filipino", "Malay", "Greek", "Hebrew", "Romanian", "Czech", "Swedish", "Hungarian", "Tamil", "Telugu", "Marathi", "Punjabi", "Gujarati", "Amharic", "Somali", "Hausa", "Yoruba", "Igbo", "Zulu", "Xhosa", "Afrikaans", "Twi", "Ewe", "Ga")
 
 
 @app.route("/api/word/ai", methods=["POST", "OPTIONS"])
@@ -4812,7 +5062,7 @@ def _structure_summary(audience, obj, slides, presenters):
     outline = list(dict.fromkeys(re.sub(r"\*\*", "", s["header"]).strip() for s in slides))
     out = [{"kind": "cover", "header": title, "bullets": [], "icon": "", "chart": None, "is_cta": False}]
     if audience == "student":
-        out += plain("Presented by", presenters or ["Name \u2014 Index number"], "\U0001F465")
+        out += plain("Presented by", presenters or ["Your name and index number"], "\U0001F465")
         out += plain("Presentation Outline", outline, "\U0001F5C2\ufe0f")
         out += slides
         out += plain("References", refs or [f"Source material: {title}"], "\U0001F4DA")
@@ -5156,7 +5406,7 @@ def _c34_cut(text, a, b):
     le = text.find("\n", a)
     le = len(text) if le == -1 else le
     line = text[ls:le]
-    if not line.strip() or (_C34_ITEM.match(line) and not line[_C34_ITEM.match(line).end():].strip()):
+    if not line.strip() or re.match(r"^\s*(?:[-*+\u2022]|\d{1,3}[.)])\s*$", line):      # 3.15: a bare marker ("-") goes too
         text = text[:ls] + text[le + 1:]
     return text
 
@@ -5819,8 +6069,8 @@ def _quiz_case_rules(n_case, total, tutor=True):
         "\n\nCASE STUDIES — " + ("this quiz is for a tutor to set. " if tutor else "") + share +
         "A case study has \"case_study\": true and a "
         "\"case\" field: a realistic scenario of 4 to 7 sentences with concrete details (a named person, "
-        "age, setting, measurements or figures — whatever suits the subject; Ghanaian names and settings "
-        "are welcome). Its \"question\" must only be answerable by applying the subject's ideas to that "
+        "age, setting, measurements or figures — whatever suits the subject; names and places that fit the "
+        "material, or a varied mix from around the world). Its \"question\" must only be answerable by applying the subject's ideas to that "
         "scenario — assess, decide, calculate, explain or predict — never by recalling a definition. "
         "Case studies may be multiple_choice or short_answer; their explanations refer to the case's "
         "details." + (" Every other question has \"case_study\": false and no \"case\"." if n_case < total else "")
@@ -6020,7 +6270,7 @@ def quiz_generate_endpoint():
                 named = ""
             named = _standalone(re.sub(r"\s+", " ", named))[:90]
             if named:
-                title = named if "quiz" in named.lower() else f"{named} — Practice Quiz"
+                title = named if "quiz" in named.lower() else f"{named}: Practice Quiz"
         return jsonify({"questions": questions, "title": title, "difficulty": difficulty, "audience": audience, "question_style": style})
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
@@ -6058,6 +6308,204 @@ def quiz_export_docx_endpoint():
         return jsonify({"error": "Couldn't build the quiz document. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+
+
+# ======================= 3.15: finished writing =======================
+# How every AI tool's words must read. Added to the system prompt by call_claude, by the path being answered.
+STYLE_PROSE = (
+    "\n\nHOW IT READS (this always applies): write as a careful, skilled person writes, finished and ready to use, so "
+    "nothing needs fixing. Plain text only: no Markdown or other markup (no asterisks, no # signs, no underscores, no "
+    "backticks) and no emoji. (Code is the one exception: when code is asked for, put it in a fenced block, exactly as "
+    "it must be typed.) No dashes as punctuation: no em dash and no en dash anywhere, and no spaced hyphen used as "
+    "a dash; put an aside in brackets (like this) or between commas, and write a range with 'to' or a plain hyphen "
+    "(2010-2015). A heading, when the piece needs one, is a short line of its own. Make a list only when the content "
+    "really is one: numbered 1. 2. 3., or a • before each item when they have no order. Vary how long sentences are and "
+    "how they begin; choose plain, specific words; say each thing once. Leave out stock phrases and filler such as delve, "
+    "tapestry, testament, realm, landscape (meaning a field), pivotal, crucial role, vital role, multifaceted, intricate, "
+    "nuanced, underscore, foster, leverage, harness, robust, seamless, holistic, embark, navigate (meaning deal with), "
+    "unlock, elevate, in today's world, fast-paced, it is important to note, it is worth noting, a wide range of, in "
+    "conclusion, overall, ultimately, and sentences that open with Moreover, Furthermore or Additionally. Don't announce "
+    "what you are about to do, don't sum up what you did, and don't end with an offer. Never leave a placeholder ([Name], "
+    "[insert], XX): write the real thing or leave it out. Get every fact right, and leave out anything you are not sure of."
+)
+STYLE_WORDS = (
+    "\n\nIN THE WORDS YOU WRITE (this always applies): no dashes as punctuation (no em dash, no en dash, no spaced hyphen "
+    "used as a dash: brackets, a colon or commas instead, and 'to' or a plain hyphen for a range), no emoji, no bold or "
+    "italic marks (any list or heading marks the instructions above ask for are fine), no stock phrases (delve, pivotal, "
+    "crucial role, multifaceted, foster, leverage, robust, seamless, holistic, in today's world, it is important to note) "
+    "and no filler. Plain, specific, accurate words."
+)
+_STYLE_PATHS = (
+    (re.compile(r"^/api/(write|sage)$"), STYLE_PROSE),
+    (re.compile(r"^/api/meet/[^/]+/notes$"), STYLE_PROSE),
+    (re.compile(r"^/api/(word/ai|study-notes|quiz/generate|summarize|slides/(draft|assist|assist-all))$"), STYLE_WORDS),
+)
+
+
+def _house_style():
+    """The style for the request being answered (none outside a request, e.g. a check run in a thread)."""
+    try:
+        from flask import has_request_context
+        if not has_request_context():
+            return ""
+        for rx, style in _STYLE_PATHS:
+            if rx.match(request.path or ""):
+                return style
+    except Exception:
+        pass
+    return ""
+
+
+_FIN_EMOJI = re.compile("[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F900-\U0001F9FF\U00002B50\U00002B55\U0000FE0F\U0000200D\U000020E3]")
+_FIN_OPEN = re.compile(r"^(?:(?:sure|certainly|absolutely|of course|great question|good question|happy to help|okay|ok|alright)\b[^\n]{0,80}|"
+                       r"here(?:'s|’s| is| are)\b[^\n]{0,120}:)\s*$", re.I)
+_FIN_CLOSE = re.compile(r"^(?:i hope (?:this|that|it) helps|hope (?:this|that) helps|let me know (?:if|whether|how)|feel free to|"
+                        r"if you(?:'d|’d| would) like(?:,| me| to| more| any)|would you like me to|do you want me to|happy studying|good luck)\b", re.I)
+_FIN_HOLD = re.compile(r"\[(?:insert|your |name|date|author|citation needed|add |placeholder|tbd)[^\]\n]{0,60}\]", re.I)
+
+
+def _fin_single_dash(t):
+    """One dash left in a sentence: a colon after a short lead-in when an explanation or a list follows ("Three things
+    matter: cost, time"), else a comma ("It works, mostly")."""
+    out, last = [], 0
+    for m in re.finditer(r"[ \t]*[—–][ \t]*(?=\S)", t):
+        lead = t[last:m.start()]
+        start = max(lead.rfind(". "), lead.rfind("! "), lead.rfind("? "), lead.rfind("\n"), lead.rfind(": "), lead.rfind("("))
+        words = len(lead[start + 1:].split())
+        after = re.match(r"[^.!?\n]*", t[m.end():]).group(0)          # what follows, to the end of the sentence
+        out.append(lead)
+        out.append(": " if 0 < words <= 5 and ":" not in lead[start + 1:] and (len(after.split()) >= 3 or "," in after) else ", ")
+        last = m.end()
+    out.append(t[last:])
+    return "".join(out)
+
+
+def _fin_undash(t):
+    t = re.sub(r"(?<=\d)[ \t]*[–—][ \t]*(?=\d)", "-", t)                # 2010–2015, pp. 3–9
+    t = re.sub(r"(?<=\w)–(?=\w)", "-", t)                                     # cost–benefit
+    t = re.sub(r"(?m)^([ \t]*)[—–][ \t]*", r"\1", t)                    # a line that opens with one
+    pair = re.compile(r"[ \t]*[—–][ \t]*([^—–\n.!?]{1,160}?)[ \t]*[—–][ \t]*(?=\S)")
+    t = pair.sub(lambda m: " (" + m.group(1).strip() + ") ", t)                  # a pair: an aside, in brackets
+    t = re.sub(r"[ \t]*[—–][ \t]*(?=[.!?,;:)\n]|$)", "", t)             # one at the end of a sentence or line
+    t = _fin_single_dash(t)
+    # a spaced hyphen used as a dash, between words (never maths: "x - y" and "5 - 3" stay)
+    t = re.sub(r"(?<=[A-Za-z]{2})[ \t]+-[ \t]+(?=[A-Za-z]{2})", ", ", t)
+    t = re.sub(r",[ \t]*,", ",", t)
+    t = re.sub(r",[ \t]*([.;:!?])", r"\1", t)
+    t = re.sub(r"\([ \t]+", "(", t)
+    t = re.sub(r"[ \t]+\)", ")", t)
+    t = re.sub(r"\)[ \t]+([.,;:!?])", r")\1", t)
+    return t
+
+
+def _fin_marks(t):
+    t = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", t)
+    t = re.sub(r"__(?=\S)(.+?)(?<=\S)__", r"\1", t)
+    t = re.sub(r"(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?![\w*])", r"\1", t)
+    t = re.sub(r"(?<![\w_/])_(?=[^\s_])([^_\n]+?)(?<=[^\s_])_(?![\w_])", r"\1", t)
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    return t
+
+
+_FIN_CODE = re.compile(r"(?ms)^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$")
+_FIN_INLINE = re.compile(r"`[^`\n]+`")
+_FIN_URL = re.compile(r"\bhttps?://[^\s<>\])\"']+")
+
+
+def _finish_text(text, kind="chat"):
+    """What the AI wrote, as a careful writer hands it in. kind: "chat" or "essay" (plain text: Markdown marks off),
+    "word" or "notes" (their own heading and list marks stay: the app turns them into real headings and lists),
+    "words" (a short piece of text inside slides or a quiz). Code (a fenced block; in a chat, `inline` code too) and
+    links are kept exactly as they are."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    t = text.replace("\r\n", "\n")
+    keep = []
+
+    def stash(m):
+        keep.append(m.group(0))
+        return "\x00%d\x00" % (len(keep) - 1)
+    t = _FIN_CODE.sub(stash, t)
+    if kind == "chat":
+        t = _FIN_INLINE.sub(stash, t)
+    t = _FIN_URL.sub(stash, t)
+    if kind in ("chat", "essay"):
+        t = re.sub(r"(?m)^[ \t]*```[\w+-]*[ \t]*$", "", t)                      # code fences (their lines stay)
+        t = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t#]*$", r"\1", t)          # "## Heading" -> "Heading"
+        t = re.sub(r"(?m)^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "", t)           # a ruled line
+        t = re.sub(r"(?m)^([ \t]*)[-*+][ \t]+(?=\S)", r"\1• ", t)              # "- item" -> "• item"
+        t = re.sub(r"(?m)^([ \t]*)>[ \t]?", r"\1", t)                              # "> quote"
+    t = _fin_marks(t)
+    t = _fin_undash(t)
+    t = _FIN_EMOJI.sub("", t)
+    if kind != "words":
+        paras = [p for p in re.split(r"\n[ \t]*\n", t)]
+        if len(paras) > 1 and _FIN_OPEN.match(paras[0].strip()) and len(paras[0]) < 160:
+            paras = paras[1:]
+        elif paras and "\n" in paras[0]:
+            first, rest = paras[0].split("\n", 1)
+            if _FIN_OPEN.match(first.strip()) and rest.strip():
+                paras[0] = rest
+        while len(paras) > 1 and _FIN_CLOSE.match(paras[-1].strip()) and len(paras[-1]) < 400:
+            paras = paras[:-1]
+        t = "\n\n".join(paras)
+    t = _FIN_HOLD.sub("", t)
+    t = re.sub(r"(?<=\w)[ \t]+(?=[,;:.!?](?:\s|$))", "", t)            # "Dear , thank you" (a placeholder gone)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub("\x00(\\d+)\x00", lambda m: keep[int(m.group(1))], t)
+    return t.strip()
+
+
+# What each AI answer carries in words people read (references, sources and paper titles are quoted as published)
+_FIN_KEYS = {"reply", "text", "notes", "title", "subtitle", "heading", "question", "explanation", "case", "options",
+             "correct_answer", "answer", "bullets", "points", "quote", "caption", "body", "summary", "desc", "description",
+             "label", "items", "lines", "speaker_notes", "note"}
+_FIN_SKIP = {"references", "papers", "sources", "searched", "thinking", "handoff", "url", "urls", "img", "image", "images",
+             "query", "queries", "id", "style", "kind", "type", "layout", "template", "unsourced", "source_note"}
+_FIN_PATHS = (
+    (re.compile(r"^/api/sage$"), "chat"),
+    (re.compile(r"^/api/write$"), "essay"),
+    (re.compile(r"^/api/meet/[^/]+/notes$"), "chat"),
+    (re.compile(r"^/api/word/ai$"), "word"),
+    (re.compile(r"^/api/study-notes$"), "notes"),
+    (re.compile(r"^/api/(quiz/generate|summarize|slides/(draft|assist|assist-all))$"), "words"),
+)
+
+
+def _fin_walk(v, kind, live):
+    if isinstance(v, dict):
+        for k in list(v.keys()):
+            if k in _FIN_SKIP:
+                continue
+            v[k] = _fin_walk(v[k], kind, live or k in _FIN_KEYS)
+        return v
+    if isinstance(v, list):
+        return [_fin_walk(x, kind, live) for x in v]
+    if isinstance(v, str) and live:
+        return _finish_text(v, kind)
+    return v
+
+
+@app.after_request
+def _finish_ai_answers(resp):
+    """3.15: the AI's words, tidied on their way out (see _finish_text)."""
+    try:
+        if request.method != "POST" or resp.status_code != 200 or resp.mimetype != "application/json":
+            return resp
+        if resp.direct_passthrough or resp.headers.get("Content-Encoding"):
+            return resp
+        kind = next((k for rx, k in _FIN_PATHS if rx.match(request.path or "")), None)
+        if not kind:
+            return resp
+        data = json.loads(resp.get_data(as_text=True))
+        data = _fin_walk(data, kind, False)
+        resp.set_data(json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        logger.warning(f"Finishing an AI answer skipped: {e}")
+    return resp
 
 
 ROLE_DESCRIPTION = (
@@ -6726,8 +7174,7 @@ _ALL_ASSIST = {
                   'Reply for each slide with {"i": <its number>, "title": "...", "bullets": [{"text": "...", "level": 0}], '
                   '"notes": "..."} (notes only where the slide has them).', 6000),
 }
-_ALL_LANGS = ("English", "French", "Spanish", "Portuguese", "German", "Arabic", "Chinese", "Swahili", "Twi", "Ewe", "Ga",
-              "Hausa", "Yoruba", "Igbo")
+_ALL_LANGS = WORD_AI_LANGS
 
 
 def _all_points(raw, limit=12):
@@ -7325,7 +7772,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
         out += plain("Presentation Outline", outline, 6) + body + plain("Discussion", items("discussion", 4, 200))
         out.append({"kind": "end", "title": "Thank you", "big": "Thank you"})
     else:
-        out = plain("Presented by", items("presenters", 10, 120) or ["Name \u2014 Index number"], 6)
+        out = plain("Presented by", items("presenters", 10, 120) or ["Your name and index number"], 6)
         out += plain("Presentation Outline", outline, 6) + body + plain("References", lines(refs), 4)
     return {"template": ("tutor" if group == "tutor" else "student") + "-plain", "title_slide": title_slide, "slide_numbers": True,
             "slides": out}, refs

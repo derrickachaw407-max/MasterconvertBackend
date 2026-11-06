@@ -1860,6 +1860,10 @@ def _readable_templates():
 
 
 _readable_templates()
+# 3.15: the designs after the first 12 each with their own shapes; new designs and Morph designs (scenes315.py: their
+# words already read at AAA on whatever is behind them, so they're not deepened again)
+import scenes315 as _SC
+TEMPLATES.update(_SC.build())
 TUTOR_TEXT = "1A1A1A"      # classic lecture templates: points (the theme's own grey was 404040)
 TUTOR_TITLE = "262626"     # and titles
 
@@ -2353,6 +2357,10 @@ def _add_chart(slide, spec, left, top, width, height):
 def _picture_area(tpl):
     """The space under a slide's title and above its footer, and the left margin the
     points keep (inches). Same numbers as the app's preview."""
+    if tpl.get("chrome") == "scene":       # 3.15: under the design's title, beside its points' left edge (the app's numbers)
+        b = tpl["geo"]["body"]
+        top, bottom = b[1] - 0.15, min(6.85, b[1] + b[3] + 0.1)
+        return (0.0, top, 13.333, bottom - top), b[0]
     if tpl.get("style") == "modern":
         if tpl.get("chrome") == "card":
             return (0.6, 1.62, 12.13, 5.08), 0.35
@@ -2966,6 +2974,7 @@ def _notes(s, sd):
 # ------------------------------------------------ transitions, hidden slides, title notes
 # PowerPoint's own transitions (PresentationML), with the direction PowerPoint uses by default.
 TRANSITIONS = {
+    "morph": {},          # 3.15: PowerPoint's Morph (p159), with a Fade for apps that don't have it
     "fade": {},
     "push": {"dir": "u"},
     "wipe": {"dir": "r"},
@@ -2975,18 +2984,38 @@ TRANSITIONS = {
 }
 
 
+_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_P159 = "http://schemas.microsoft.com/office/powerpoint/2015/09/main"
+_P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+
+
+def _morph_transition():
+    """PowerPoint's Morph, as PowerPoint writes it: the Choice for PowerPoint 2019 and later, a Fade for the rest."""
+    return etree.fromstring(
+        '<mc:AlternateContent xmlns:mc="%s" xmlns:p="%s"><mc:Choice xmlns:p159="%s" Requires="p159">'
+        '<p:transition xmlns:p14="%s" spd="slow" p14:dur="1600"><p159:morph option="byObject"/></p:transition></mc:Choice>'
+        '<mc:Fallback><p:transition spd="slow"><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>'
+        % (_MC, "http://schemas.openxmlformats.org/presentationml/2006/main", _P159, _P14))
+
+
 def _set_transition(slide, kind):
     """<p:transition> sits after <p:clrMapOvr> (or <p:cSld>) and before <p:timing>."""
     sld = slide._element
     for old in sld.findall(qn("p:transition")):
         sld.remove(old)
+    for old in sld.findall("{%s}AlternateContent" % _MC):      # 3.15: a transition PowerPoint wrapped (Morph and the like)
+        if old.find(".//" + qn("p:transition")) is not None:
+            sld.remove(old)
     if kind not in TRANSITIONS:
         return
-    tr = etree.Element(qn("p:transition"))
-    tr.set("spd", "med")
-    effect = etree.SubElement(tr, qn("p:" + kind))
-    for k, v in TRANSITIONS[kind].items():
-        effect.set(k, v)
+    if kind == "morph":
+        tr = _morph_transition()
+    else:
+        tr = etree.Element(qn("p:transition"))
+        tr.set("spd", "med")
+        effect = etree.SubElement(tr, qn("p:" + kind))
+        for k, v in TRANSITIONS[kind].items():
+            effect.set(k, v)
     anchor = sld.find(qn("p:clrMapOvr"))
     if anchor is None:
         anchor = sld.find(qn("p:cSld"))
@@ -2995,6 +3024,13 @@ def _set_transition(slide, kind):
 
 def _transition_of(slide):
     tr = slide._element.find(qn("p:transition"))
+    if tr is None:
+        for ac in slide._element.findall("{%s}AlternateContent" % _MC):     # 3.15: Morph, or a newer transition's fallback
+            if ac.find(".//{%s}morph" % _P159) is not None:
+                return "morph"
+            tr = ac.find(".//" + qn("p:transition"))
+            if tr is not None:
+                break
     if tr is None:
         return None
     for child in tr:
@@ -3144,6 +3180,8 @@ def build_template_deck(deck, out_dir, filename="Presentation.pptx"):
     if len(slides) > MAX_SLIDES:
         raise StudioError(f"A deck can have up to {MAX_SLIDES} slides.")
     prs, key, tpl = _open_template(deck.get("template") or "student")
+    if tpl.get("morph") and not any(sd.get("transition") for sd in slides) and not (deck.get("title_slide") or {}).get("transition"):
+        slides = [dict(sd, transition="morph") for sd in slides]
     logo = _image_bytes(deck.get("logo"))
     if TEMPLATES.get(deck.get("template") or "", {}).get("group") != "student" or TEMPLATES.get(deck.get("template") or "", {}).get("style") == "modern":
         logo = None   # only classic student templates carry a logo
@@ -3200,7 +3238,7 @@ def _modern_base(tpl):
     prs.slide_width, prs.slide_height = SLIDE_W, SLIDE_H
     theme_part = prs.slide_masters[0].part.part_related_by(RT.THEME)
     xml = theme_part.blob.decode("utf-8")
-    xml = re.sub(r'(<a:majorFont>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + MODERN_TITLE_FONT + r"\g<2>", xml)
+    xml = re.sub(r'(<a:majorFont>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + tpl.get("tfont", MODERN_TITLE_FONT) + r"\g<2>", xml)
     xml = re.sub(r'(<a:minorFont>\s*<a:latin typeface=")[^"]*(")', r"\g<1>" + MODERN_BODY_FONT + r"\g<2>", xml)
     for slot, hex_ in (("dk2", tpl["ink"]), ("accent1", tpl["ink"]), ("accent2", tpl["emph"])):
         xml = re.sub(r'(<a:%s>\s*<a:srgbClr val=")[0-9A-Fa-f]{6}(")' % slot, r"\g<1>%s\g<2>" % hex_, xml)
@@ -3304,13 +3342,17 @@ def _m_number(slide, number, tpl, on_colour=False):
 def _m_footer(slide, tpl, deck, number, on_colour=False):
     foot = _tutor_footer(deck)
     if foot and not on_colour:
-        _m_text(slide, 0.9, 6.9, 9.5, 0.36, foot, 11, tpl["muted"]).name = "Academic-Home footer"
+        fx, fy, fw, fh = (tpl.get("geo") or {}).get("foot") or (0.9, 6.9, 9.5, 0.36)
+        _m_text(slide, fx, fy, fw, fh, foot, 11, tpl["muted"]).name = "Academic-Home footer"
     if deck.get("slide_numbers", True):
         _m_number(slide, number, tpl, on_colour)
 
 
-def _m_chrome(slide, tpl):
+def _m_chrome(slide, tpl, index=1):
     """The template's frame on an ordinary slide."""
+    if tpl.get("chrome") == "scene":       # 3.15: the design's own shapes (a Morph design's, as they are on this slide)
+        _sc_draw(slide, _SC.decor_for(tpl, "content", index), bool(tpl.get("states")))
+        return
     # The tinted background goes in first (furthest back) — except under a
     # card, where it's added after the card is sent back, so it lands behind
     # the card instead of covering it.
@@ -3331,7 +3373,9 @@ def _m_chrome(slide, tpl):
 
 
 def _m_geo(tpl):
-    if tpl["chrome"] == "card":
+    if tpl["chrome"] == "scene":
+        title, body = tuple(tpl["geo"]["title"]), tuple(tpl["geo"]["body"])
+    elif tpl["chrome"] == "card":
         title = (0.6, 0.55, 12.13, 0.95)
         body = (0.95, 1.85, 11.43, 4.6)
     elif tpl["chrome"] == "block":
@@ -3369,8 +3413,9 @@ def _m_title(slide, tpl, title, box, room_for_logo=False):
     r = p.add_run()
     r.text = title
     r.font.size = Pt(36 if len(title) <= 40 else 30 if len(title) <= 64 else 26)
-    r.font.bold, r.font.name = False, MODERN_TITLE_FONT
-    r.font.color.rgb = RGBColor.from_string(tpl["ink"])
+    r.font.bold, r.font.name = False, tpl.get("tfont") or MODERN_TITLE_FONT
+    r.font.color.rgb = RGBColor.from_string((tpl.get("geo") or {}).get("tc") or tpl["ink"])
+    t.name = "!!title"
 
 
 def _modern_title_slide(prs, deck, tpl):
@@ -3389,6 +3434,9 @@ def _modern_title_slide(prs, deck, tpl):
     picture, logo = _image_bytes(ts.get("picture")), None   # no logo: the picture is the star
     size = 50 if len(course) <= 26 else 42 if len(course) <= 44 else 34
     cover = tpl["cover"]
+    if cover == "scene":
+        _sc_cover(s, tpl, course, subtitle, small, picture, size)
+        return s
     if cover == "arc":
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
         if picture:
@@ -3478,6 +3526,8 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         _m_footer(s, tpl, deck, number)
         _notes(s, sd)
         return s
+    if kind in ("section", "end") and tpl.get("chrome") == "scene":
+        return _sc_section(prs, deck, sd, number, tpl)
     if kind in ("section", "end"):
         s = prs.slides.add_slide(_layout(prs, "Blank"))
         _m_shape(s, MSO_SHAPE.RECTANGLE, 0, 0, MW, 7.5, tpl["ink"])
@@ -3498,14 +3548,17 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         return s
     if kind == "quote":
         s = prs.slides.add_slide(_layout(prs, "Blank"))
-        _m_chrome(s, tpl)
+        _m_chrome(s, tpl, number - 1)
         quote = str(sd.get("quote") or "").strip().strip('"\u201c\u201d')[:400] or " "
+        qx, qy, qw, qh = (tpl.get("geo") or {}).get("quote") or (1.6, 1.4, 10.1, 4.3)
+        mark_dy = 0.95 if tpl.get("chrome") == "scene" else 0.7
         by = str(sd.get("by") or "").strip()[:120]
         if not tpl.get("plain"):
-            _m_text(s, 1.1, 0.7, 1.8, 1.8, "\u201c", 140, tpl["accent"], font="Georgia", anchor=MSO_ANCHOR.TOP)
+            _m_text(s, qx - 0.5, qy - mark_dy, 1.8, 1.8, "\u201c", 140, tpl["accent"], font="Georgia", anchor=MSO_ANCHOR.TOP)
         n = len(quote)
-        box = _m_text(s, 1.6, 1.4, 10.1, 4.3, quote, 38 if n <= 70 else 30 if n <= 140 else 24 if n <= 240 else 20,
-                      tpl["ink"], font=MODERN_TITLE_FONT, italic=True, align="center")
+        box = _m_text(s, qx, qy, qw, qh, quote, 38 if n <= 70 else 30 if n <= 140 else 24 if n <= 240 else 20,
+                      tpl["ink"], font=tpl.get("tfont") or MODERN_TITLE_FONT, italic=True, align="center")
+        box.name = "!!body"
         if by:
             p = box.text_frame.add_paragraph()
             p.alignment = PP_ALIGN.CENTER
@@ -3520,7 +3573,7 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
     geo = _m_geo(tpl)
     if kind == "picture":
         s = prs.slides.add_slide(_layout(prs, "Title Only"))
-        _m_chrome(s, tpl)
+        _m_chrome(s, tpl, number - 1)
         caption = str(sd.get("caption") or "").strip()[:300]
         _m_title(s, tpl, title, geo["title"])
         media = sd.get("media") if isinstance(sd.get("media"), dict) else {}
@@ -3529,7 +3582,7 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         top = T if title else 0.6
         bottom = T + H - (0.7 if caption else 0)
         if data:
-            _fit_picture(s, data, Inches(L), Inches(top), Inches(W), Inches(bottom - top))
+            _fit_picture(s, data, Inches(L), Inches(top), Inches(W), Inches(bottom - top)).name = "!!pic"
         if caption:
             _m_text(s, L, bottom + 0.05, W, 0.6, caption, 18, tpl["muted"], italic=True, align="center")
         _m_footer(s, tpl, deck, number)
@@ -3537,7 +3590,7 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         return s
 
     s = prs.slides.add_slide(_layout(prs, "Two Content" if kind == "columns" else "Title and Content"))
-    _m_chrome(s, tpl)
+    _m_chrome(s, tpl, number - 1)
     show_logo = bool(logo and deck.get("logo_on_all_slides"))
     _m_title(s, tpl, title, geo["title"], room_for_logo=show_logo)
     if show_logo:
@@ -3557,6 +3610,7 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
             ph.left, ph.top, ph.width, ph.height = (Inches(v) for v in box)
             _write_bullets(ph, bullets or [{"text": " ", "level": 0}], box, numbered)
             _m_body_colours(ph, tpl)
+            ph.name = "!!" + key
             if heading:
                 first = ph.text_frame.paragraphs[0]
                 hp = copy.deepcopy(first._p)
@@ -3595,6 +3649,7 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
                 body.left, body.top, body.width, body.height = (Inches(v) for v in body_box)
                 _write_bullets(body, bullets, body_box, numbered)
                 _m_body_colours(body, tpl)
+                body.name = "!!body"
             else:
                 _remove(body)
         if diagram:
@@ -3621,6 +3676,138 @@ def _m_body_colours(ph, tpl):
             clr = etree.Element(qn("a:buClr"))
             etree.SubElement(clr, qn("a:srgbClr")).set("val", tpl["emph"])
             pPr.insert(0, clr)
+
+
+# ------------------------------------------------ 3.15: designs with their own shapes (scenes315.py), and Morph names
+_SC_KIND = {"rect": MSO_SHAPE.RECTANGLE, "oval": MSO_SHAPE.OVAL, "tri": MSO_SHAPE.ISOSCELES_TRIANGLE, "rtri": MSO_SHAPE.RIGHT_TRIANGLE,
+            "para": MSO_SHAPE.PARALLELOGRAM, "hex": MSO_SHAPE.HEXAGON, "diam": MSO_SHAPE.DIAMOND, "ring": MSO_SHAPE.DONUT,
+            "star": MSO_SHAPE.STAR_5_POINT, "plus": MSO_SHAPE.CROSS}
+
+
+def _sc_alpha(fill_el, a):
+    for clr in fill_el.iter(qn("a:srgbClr")):
+        etree.SubElement(clr, qn("a:alpha")).set("val", str(int(round(a * 100000))))
+
+
+def _sc_shape(slide, s, name):
+    """One of a design's shapes, exactly as the app draws it; named "!!…" so Morph finds it on the next slide."""
+    k, w, h = s["k"], s["w"], s["h"]
+    ss = min(w, h)
+    rounded = k == "rect" and s.get("rr")
+    shp = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE if rounded else _SC_KIND[k], Inches(s["x"]), Inches(s["y"]), Inches(w), Inches(h))
+    if rounded:
+        shp.adjustments[0] = min(0.5, s["rr"] / ss)
+    elif k == "ring":
+        shp.adjustments[0] = min(0.5, (s.get("th") or ss * 0.25) / ss)
+    elif k == "hex":
+        shp.adjustments[0] = 0.25 * w / ss            # a regular hexagon's corners (the app's)
+    if s.get("g"):
+        shp.fill.gradient()
+        shp.fill.gradient_angle = s["g"][2]
+        stops = shp.fill.gradient_stops
+        stops[0].color.rgb, stops[1].color.rgb = RGBColor.from_string(s["g"][0]), RGBColor.from_string(s["g"][1])
+    else:
+        shp.fill.solid()
+        shp.fill.fore_color.rgb = RGBColor.from_string(s["f"])
+    if s.get("a") is not None and s["a"] < 1:
+        _sc_alpha(shp.fill._xPr.find(qn("a:gradFill") if s.get("g") else qn("a:solidFill")), s["a"])
+    if s.get("l"):
+        shp.line.color.rgb = RGBColor.from_string(s["l"][0])
+        shp.line.width = Pt(s["l"][1])
+    else:
+        shp.line.fill.background()
+    shp.shadow.inherit = False
+    if s.get("r"):
+        shp.rotation = s["r"] % 360
+    if s.get("tx"):
+        tf = shp.text_frame
+        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        tf.word_wrap = False
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+        r = p.add_run()
+        r.text = s["tx"]
+        r.font.size, r.font.bold, r.font.name = Pt(s.get("ts") or 18), bool(s.get("tb")), MODERN_BODY_FONT
+        r.font.color.rgb = RGBColor.from_string(s.get("tc") or "FFFFFF")
+    shp.name = "!!" + name
+    return shp
+
+
+def _sc_draw(slide, shapes, named):
+    """A slide's shapes, behind everything else, in order (a Morph design's by their names, others by their place)."""
+    made = [_sc_shape(slide, s, s["n"] if named and s.get("n") else "d%d" % i) for i, s in enumerate(shapes)]
+    tree = slide.shapes._spTree
+    for j, shp in enumerate(made):
+        tree.remove(shp._element)
+        tree.insert(2 + j, shp._element)
+
+
+def _sc_fit(text, w, h, start, least=24):
+    """The largest size (from `start`, in steps of 2pt) at which the words fill no more of the box than it has (the app's rule)."""
+    n = len(str(text or "")) or 1
+    pt = start
+    while pt > least:
+        per = max(4, int(w * 72 // (pt * 0.5)))
+        if math.ceil(n / per * 1.15) * pt * 1.05 <= h * 72:
+            return pt
+        pt -= 2
+    return least
+
+
+def _sc_pic_shape(pic, cg, pb):
+    """A cover picture in its design's shape: rounded, a circle, an arch, a leaf, a hexagon."""
+    geom = pic._element.spPr.find(qn("a:prstGeom"))
+    k, ss = cg.get("pk") or "round", min(pb[2], pb[3])
+    prst, adj = {"circle": ("ellipse", None), "arch": ("round2SameRect", 50000), "leaf": ("round2DiagRect", 50000),
+                 "hex": ("hexagon", int(25000 * pb[2] / ss))}.get(k, ("roundRect" if cg.get("pr") else "rect", int(min(50000, 100000 * (cg.get("pr") or 0) / ss))))
+    geom.set("prst", prst)
+    for old in geom.findall(qn("a:avLst")):
+        geom.remove(old)
+    av = etree.SubElement(geom, qn("a:avLst"))
+    if adj is not None and prst != "rect":
+        etree.SubElement(av, qn("a:gd")).attrib.update({"name": "adj" if prst in ("roundRect", "hexagon") else "adj1", "fmla": "val %d" % adj})
+
+
+def _sc_cover(s, tpl, course, subtitle, small, picture, size):
+    _sc_draw(s, _SC.decor_for(tpl, "content", 0), bool(tpl.get("states")))
+    (tb, sb, mb), al, pb = _SC.cover_boxes(tpl, bool(picture))
+    cg = tpl["cg"]
+    if pb:
+        pic = _fill_picture(s, picture, *(Inches(v) for v in pb))
+        _sc_pic_shape(pic, cg, pb)
+        pic.name = "!!pic"
+    font = tpl.get("tfont") or MODERN_TITLE_FONT
+    _m_text(s, tb[0], tb[1], tb[2], tb[3], course, _sc_fit(course, tb[2], tb[3], cg.get("tp") or size, 28), cg["tc"], font=font, align=al,
+            anchor=MSO_ANCHOR.BOTTOM, spacing=0.9).name = "!!title"
+    if subtitle:
+        _m_text(s, sb[0], sb[1], sb[2], sb[3], subtitle, _sc_fit(subtitle, sb[2], sb[3], 24, 18), cg["sc"], align=al).name = "!!sub"
+    if small:
+        _m_text(s, mb[0], mb[1], mb[2], mb[3], small, 15, cg["mc"], align=al).name = "!!small"
+
+
+def _sc_section(prs, deck, sd, number, tpl):
+    kind = sd.get("kind")
+    s = prs.slides.add_slide(_layout(prs, "Blank"))
+    _sc_draw(s, _SC.decor_for(tpl, kind, number - 1), bool(tpl.get("states")))
+    sg, font = tpl["sg"], tpl.get("tfont") or MODERN_TITLE_FONT
+    t, b, al = sg["t"], sg["s"], sg.get("al", "left")
+    title = str(sd.get("title") or "").strip()[:140]
+    if kind == "section":
+        sub = str(sd.get("sub") or "").strip()[:200]
+        _m_text(s, t[0], t[1], t[2], t[3], title or " ", _sc_fit(title, t[2], t[3], 44 if len(title) <= 36 else 34, 26), sg["tc"], font=font,
+                align=al, anchor=MSO_ANCHOR.BOTTOM).name = "!!title"
+        if sub:
+            _m_text(s, b[0], b[1], b[2], b[3], sub, _sc_fit(sub, b[2], b[3], 24, 18), sg["sc"], align=al, anchor=MSO_ANCHOR.TOP).name = "!!sub"
+    else:
+        big = str(sd.get("big") or "Thank you").strip()[:60]
+        _m_text(s, t[0], t[1], t[2], t[3], big, _sc_fit(big, t[2], t[3], 64 if len(big) <= 14 else 46, 30), sg["tc"], font=font,
+                align=al, anchor=MSO_ANCHOR.BOTTOM).name = "!!title"
+        if title:
+            _m_text(s, b[0], b[1], b[2], b[3], title, _sc_fit(title, b[2], b[3], 26, 18), sg["sc"], align=al, anchor=MSO_ANCHOR.TOP).name = "!!sub"
+    _m_footer(s, tpl, deck, number, on_colour=True)
+    _notes(s, sd)
+    return s
 
 # ---------------------------------------------------------------- reading
 def _flat_shapes(shapes):

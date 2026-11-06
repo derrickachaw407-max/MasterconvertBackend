@@ -17,3 +17,6 @@ Pillow
 google-auth
 PyJWT
 cryptography
+pillow-heif
+markdown
+markdownify

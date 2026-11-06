@@ -7363,7 +7363,7 @@ _WD_MATH = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 _WD_MAX_BLOCKS = 8000
 _WD_MAX_PICS = 80
 _WD_PIC_BUDGET = 9 * 1024 * 1024
-_WD_OFFER = ["Title", "Subtitle", "Heading1", "Heading2", "Heading3"]
+_WD_OFFER = ["Title", "Subtitle", "Heading1", "Heading2", "Heading3", "Caption", "TOCHeading"]   # 3.15: captions, a contents title
 _WD_BAD = "The changes don't match this file — please open it again."
 _WD_RPR_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow",
                  "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
@@ -7887,6 +7887,7 @@ class _WdCtx:
         if pstyle not in self.styles.el:
             pstyle = self.styles.default_p
         why = "field" if self.field_open > 0 else None
+        toc = getattr(self, "toc_kind", None) if self.field_open > 0 else None    # 3.15: inside a table of contents
         if ppr is not None:
             prpr = ppr.find(_wd_qn("w:rPr"))
             if ppr.find(_wd_qn("w:pPrChange")) is not None or (prpr is not None and any(
@@ -7916,13 +7917,23 @@ class _WdCtx:
                         if depth == 0:
                             break
                     j += 1
+                fi = _wd_group_instr(items, i)     # 3.15: what the field is
                 if depth > 0:                      # it goes on into the next paragraphs (a table of contents)
                     why = why or "field"
+                    if not toc and re.match(r"\s*TOC\b", fi, re.I):
+                        toc = self.toc_kind = _wd_toc_kind(fi)
                     break
                 group = items[i:j + 1]
+                if re.match(r"\s*TOC\b", fi, re.I):      # 3.15: a table of contents all in one paragraph (one entry)
+                    why = why or "field"
+                    toc = toc or _wd_toc_kind(fi)
                 self.atoms[o] = ("items", group)
                 if self.view:
-                    pieces.append(dict({"a": o, "k": "field", "label": _wd_field_label(group)}))
+                    v = {"a": o, "k": "field", "label": _wd_field_label(group)}
+                    m_seq = re.match(r"\s*SEQ\s+\"?([^\s\"\\]+)", fi, re.I)
+                    if m_seq:                      # 3.15: a caption's number (SEQ Table): the editor numbers it live
+                        v["seq"] = m_seq.group(1)[:40]
+                    pieces.append(v)
                 k += 1
                 i = j + 1
                 continue
@@ -7975,6 +7986,8 @@ class _WdCtx:
         self.marks[pid] = marks
         if why:
             self.locked.add(pid)
+        if self.field_open <= 0:
+            self.toc_kind = None
         if not self.view:
             return None
         self.used_styles.add(pstyle)
@@ -7982,6 +7995,13 @@ class _WdCtx:
         if why:
             blk["locked"] = why
             blk["text"] = _wd_text(p)[:3000]
+            tx = _wd_ptext(p)
+            if "\t" in tx:
+                blk["tx"] = tx[:3000]           # 3.15: its tabs, for a table of contents' dotted line to the page
+        if toc:
+            blk["toc"] = toc[0]
+            if toc[1]:
+                blk["lab"] = toc[1]
         if ppr is not None:
             d = self.styles.plook([ppr])
             if ppr.find(_wd_qn("w:jc")) is not None:
@@ -7993,6 +8013,15 @@ class _WdCtx:
                 blk["sp"] = [full["before"], full["after"], full["line"]]
             if ppr.find(_wd_qn("w:sectPr")) is not None:
                 blk["sect"] = True
+                # 3.15: the kind of section break: the next section starts on a new page unless it's "continuous"
+                blk["st"] = _wd_val(ppr.find(_wd_qn("w:sectPr")).find(_wd_qn("w:type"))) or "nextPage"
+        tsp = getattr(self, "tsp_stack", None) and self.tsp_stack[-1]
+        if tsp and "sp" not in blk and not any(s.find(_wd_qn("w:pPr") + "/" + _wd_qn("w:spacing")) is not None for s in self.styles.chain(pstyle)):
+            blk["sp"] = [tsp["before"], tsp["after"], tsp["line"] or 1.0]     # 3.15: in a table, its style's spacing
+        lay = self.styles.players(pstyle, ppr)
+        for key, tag in (("kn", "keepNext"), ("kl", "keepLines"), ("pbb", "pageBreakBefore")):   # 3.15
+            if _wd_first_on(lay, tag):
+                blk[key] = True
         pl = self.styles.plook(self.styles.players(pstyle, ppr))
         if pl["num"] and pl["num"] != "0":
             lv = self.numbering().level(pl["num"], pl["ilvl"])
@@ -8004,6 +8033,17 @@ class _WdCtx:
     def table(self, tbl, tid):
         self.blocks[tid] = tbl
         why = None
+        tsp = None                                 # 3.15: the table style's paragraph spacing
+        tpr = tbl.find(_wd_qn("w:tblPr"))
+        tsid = _wd_val(tpr.find(_wd_qn("w:tblStyle")) if tpr is not None else None)
+        for st in self.styles.chain(tsid):
+            sp_ = st.find(_wd_qn("w:pPr") + "/" + _wd_qn("w:spacing"))
+            if sp_ is not None:
+                tsp = self.styles.plook([st.find(_wd_qn("w:pPr"))])
+                break
+        if not hasattr(self, "tsp_stack"):
+            self.tsp_stack = []
+        self.tsp_stack.append(tsp)
         if any(_wd_tag(c)[1] in ("sdt", "customXml") for c in tbl) or tbl.find(_wd_qn("w:tblPr") + "/" + _wd_qn("w:tblPrChange")) is not None:
             why = "controls"
         rows = []
@@ -8027,6 +8067,7 @@ class _WdCtx:
                 cells.append(cell)
                 col += span
             rows.append(cells)
+        self.tsp_stack.pop()
         if why:
             self.locked.add(tid)
         if not self.view:
@@ -8060,7 +8101,7 @@ class _WdCtx:
             elif t in ("sdt", "customXml", "altChunk"):
                 self.blocks[bid] = el
                 self.locked.add(bid)
-                b = {"id": bid, "t": "locked", "text": _wd_text(el)[:3000], "why": "control"} if self.view else None
+                b = self.locked_view(el, bid) if self.view else None
             else:
                 continue
             if b is not None:
@@ -8068,6 +8109,39 @@ class _WdCtx:
             if len(self.blocks) > _WD_MAX_BLOCKS:
                 raise WordEditError("This document is too long to edit here — more than %d paragraphs." % _WD_MAX_BLOCKS)
         return out
+
+    def locked_view(self, el, bid):
+        """3.15: a block kept as it is, as it reads: line by line (each paragraph's style and words, tabs kept), and
+        whether it's a table of contents or a list of tables or figures (Word's gallery, or the TOC field inside)."""
+        b = {"id": bid, "t": "locked", "text": _wd_text(el)[:3000], "why": "control"}
+        lines = []
+        for p in el.iter(_wd_qn("w:p")):
+            if len(lines) >= 400:
+                break
+            ppr = p.find(_wd_qn("w:pPr"))
+            sid = _wd_val(ppr.find(_wd_qn("w:pStyle")) if ppr is not None else None)
+            if sid not in self.styles.el:
+                sid = self.styles.default_p
+            if sid:
+                self.used_styles.add(sid)
+            line = {"s": sid, "x": _wd_ptext(p)[:600]}
+            jc = _wd_val(ppr.find(_wd_qn("w:jc")) if ppr is not None else None)
+            if jc:
+                line["al"] = _WD_ALIGN.get(jc, "left")
+            lines.append(line)
+        if lines:
+            b["lines"] = lines
+        gal = el.find(".//" + _wd_qn("w:docPartGallery"))
+        gv = (_wd_val(gal) or "") if gal is not None else ""
+        instr = next((x.text for x in el.iter(_wd_qn("w:instrText")) if re.match(r"\s*TOC\b", x.text or "", re.I)), None)
+        if "Table of Contents" in gv or instr:
+            kind, lab = _wd_toc_kind(instr or "")
+            b["toc"] = kind
+            if lab:
+                b["lab"] = lab
+        elif "Bibliograph" in gv:
+            b["bib"] = True
+        return b
 
     # ---------------------------------------------------------------- writing
     def ensure_style(self, sid):
@@ -8117,6 +8191,10 @@ class _WdCtx:
             if "tbl" in it:                       # 3.14: a table made in the editor
                 out.append((self.new_table(it.get("tbl"), used), None))
                 continue
+            if "toc" in it and not within:        # 3.15: a table of contents, a list of tables or figures
+                for el in self.new_toc(it):
+                    out.append((el, None))
+                continue
             p = _wd_new("w:p")
             model = self.paras.get(str(it.get("from"))) if it.get("from") is not None else None
             mp = model.find(_wd_qn("w:pPr")) if model is not None else None
@@ -8132,6 +8210,125 @@ class _WdCtx:
             self.fill(p, it.get("p") or {}, None)
             out.append((p, None))
         return out
+
+    def toc_styles(self, sids):
+        """3.15: Word's own styles for a table of contents (toc 1, toc 2, ...) and a list of figures, made when the file
+        doesn't have them (Word knows them by their names)."""
+        base = self.styles.default_p or "Normal"
+        for sid in sids:
+            if sid in self.styles.el:
+                continue
+            try:
+                self.ensure_style(sid)
+                continue
+            except WordEditError:
+                pass
+            if sid.startswith("TOC") and sid[3:].isdigit():
+                name, left, after = "toc " + sid[3:], 220 * (int(sid[3:]) - 1), 100
+            else:
+                name, left, after = "table of figures", 0, 0
+            st = _wd_new("w:style", type="paragraph", styleId=sid)
+            st.append(_wd_new("w:name", val=name))
+            st.append(_wd_new("w:basedOn", val=base))
+            st.append(_wd_new("w:next", val=base))
+            st.append(_wd_new("w:uiPriority", val=39))
+            st.append(_wd_new("w:unhideWhenUsed"))
+            ppr = _wd_new("w:pPr")
+            ppr.append(_wd_new("w:spacing", after=after))
+            if left:
+                ppr.append(_wd_new("w:ind", left=left))
+            st.append(ppr)
+            self.styles.root.append(st)
+            self.styles.el[sid] = st
+
+    def new_toc(self, it):
+        """3.15: a table of contents (in Word's content control, its title inside), or a list of tables or of figures
+        (a TOC field with \\c straight in the text, as Word puts it in): each entry its words, a dotted tab and its
+        page number. Word fills the numbers in again when the file opens (updateFields)."""
+        kind = it.get("toc") if it.get("toc") in ("toc", "tables", "figures") else "toc"
+        lab = re.sub(r"[^\w -]", "", str(it.get("lab") or ("Table" if kind == "tables" else "Figure")))[:40].strip() or "Figure"
+        entries = it.get("entries") if isinstance(it.get("entries"), list) else []
+        rows = []
+        for e in entries[:600]:
+            if not isinstance(e, list) or len(e) < 2:
+                raise WordEditError(_WD_BAD)
+            lvl = max(1, min(9, int(_wd_num(e[0], 1) or 1)))
+            text = _wd_clean(e[1])[:400].strip()
+            page = re.sub(r"[^0-9ivxlcdmIVXLCDM-]", "", str(e[2] if len(e) > 2 else ""))[:8]
+            if text:
+                rows.append((lvl, text, page))
+        tw = int(self.text_width() * 20)
+        if kind == "toc":
+            levels = max([r[0] for r in rows] + [3])
+            instr = ' TOC \\o "1-%d" \\h \\z \\u ' % min(9, levels)
+            styles = ["TOC%d" % r[0] for r in rows] or ["TOC1"]
+            empty = "No table of contents entries found."
+        else:
+            instr = ' TOC \\h \\z \\c "%s" ' % lab
+            styles = ["TableofFigures"]
+            empty = "No table of figures entries found."
+        self.toc_styles(sorted(set(styles)))
+        self.fields_dirty = True
+
+        def run(text=None, fld=None, instr_text=None, tab=False):
+            r = _wd_new("w:r")
+            if fld:
+                r.append(_wd_new("w:fldChar", fldCharType=fld))
+            elif instr_text is not None:
+                e = _wd_new("w:instrText")
+                e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                e.text = instr_text
+                r.append(e)
+            elif tab:
+                r.append(_wd_new("w:tab"))
+            else:
+                e = _wd_new("w:t")
+                e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                e.text = text
+                r.append(e)
+            return r
+
+        paras = []
+        for n, (lvl, text, page) in enumerate(rows or [(1, empty, "")]):
+            p = _wd_new("w:p")
+            ppr = _wd_new("w:pPr")
+            ppr.append(_wd_new("w:pStyle", val=("TOC%d" % lvl) if kind == "toc" else "TableofFigures"))
+            tabs = _wd_new("w:tabs")
+            tabs.append(_wd_new("w:tab", val="right", leader="dot", pos=tw))
+            ppr.append(tabs)
+            p.append(ppr)
+            if n == 0:
+                for r in (run(fld="begin"), run(instr_text=instr), run(fld="separate")):
+                    p.append(r)
+            p.append(run(text))
+            if page:
+                p.append(run(tab=True))
+                p.append(run(page))
+            paras.append(p)
+        paras[-1].append(run(fld="end"))
+        if kind != "toc":
+            return paras
+        title = _wd_clean(it.get("title") or "Contents")[:120].strip()
+        sdt = _wd_new("w:sdt")
+        spr = _wd_new("w:sdtPr")
+        dpo = _wd_new("w:docPartObj")
+        dpo.append(_wd_new("w:docPartGallery", val="Table of Contents"))
+        dpo.append(_wd_new("w:docPartUnique"))
+        spr.append(dpo)
+        sdt.append(spr)
+        sc = _wd_new("w:sdtContent")
+        if title:
+            self.ensure_style("TOCHeading")
+            tp = _wd_new("w:p")
+            tpp = _wd_new("w:pPr")
+            tpp.append(_wd_new("w:pStyle", val="TOCHeading"))
+            tp.append(tpp)
+            tp.append(run(title))
+            sc.append(tp)
+        for p in paras:
+            sc.append(p)
+        sdt.append(sc)
+        return [sdt]
 
     def new_table(self, T, used):
         """3.14: a table made in the editor — Word's Table Grid, its columns sharing the text's width."""
@@ -8246,6 +8443,19 @@ class _WdCtx:
                 if el.get(_wd_qn(a)) is not None:
                     del el.attrib[_wd_qn(a)]
             el.set(_wd_qn("w:left"), str(int(round(ind * 20))))
+        first = _wd_num(P.get("first"))
+        if first is not None and -720 <= first <= 720 and not P.get("list"):    # 3.15: first-line (or hanging) indent
+            el = ppr.find(_wd_qn("w:ind"))
+            if el is None:
+                el = _wd_new("w:ind")
+                _wd_place(ppr, el, _WD_PPR_ORDER)
+            for a in ("w:firstLine", "w:hanging", "w:firstLineChars", "w:hangingChars"):
+                if el.get(_wd_qn(a)) is not None:
+                    del el.attrib[_wd_qn(a)]
+            if first > 0:
+                el.set(_wd_qn("w:firstLine"), str(int(round(first * 20))))
+            elif first < 0:
+                el.set(_wd_qn("w:hanging"), str(int(round(-first * 20))))
         keep = self.marks.get(pid, []) if pid else []
         for c in list(p):
             if c is not ppr:
@@ -8295,6 +8505,25 @@ class _WdCtx:
                 continue
             if "pic" in rs:
                 out.append(self.picture(rs))
+                link = None
+                continue
+            if "seq" in rs:                        # 3.15: a caption's number (SEQ Table), Word numbers it again on opening
+                lab = re.sub(r"[^\w-]", "", str(rs.get("seq") or ""))[:40] or "Figure"
+                num = re.sub(r"[^0-9]", "", str(rs.get("x") or ""))[:6] or "1"
+                for kind, val in (("begin", None), ("instr", " SEQ %s \\* ARABIC " % lab), ("separate", None), ("text", num), ("end", None)):
+                    r = _wd_new("w:r")
+                    if kind == "instr":
+                        e = _wd_new("w:instrText")
+                        e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                        e.text = val
+                    elif kind == "text":
+                        e = _wd_new("w:t")
+                        e.text = val
+                    else:
+                        e = _wd_new("w:fldChar", fldCharType=kind)
+                    r.append(e)
+                    out.append(r)
+                self.fields_dirty = True
                 link = None
                 continue
             text = _wd_clean(rs.get("x"))
@@ -8430,6 +8659,61 @@ class _WdCtx:
         return r
 
 
+def _wd_ptext(el):
+    """3.15: the words of a paragraph with its tabs kept (an entry in a table of contents: the title, a tab, the page) —
+    a field's result counts, its instruction doesn't; deleted words don't."""
+    out = []
+    for r in el.iter(_wd_qn("w:r")):
+        for x in r:
+            uri, t = _wd_tag(x)
+            if uri != _WD_W:
+                continue
+            if t == "t":
+                out.append(x.text or "")
+            elif t in ("tab", "ptab"):
+                out.append("\t")
+            elif t in ("br", "cr") and x.get(_wd_qn("w:type")) in (None, "textWrapping"):
+                out.append(" ")
+    return "".join(out).strip()
+
+
+def _wd_toc_kind(instr):
+    """3.15: what a TOC field lists — the headings ("toc"), or the captions of one label (\\c "Table": "tables";
+    any other label: "figures") — and that label."""
+    m = re.search(r'\\[ca]\s+(?:"([^"]*)"|(\S+))', str(instr or ""))
+    if not m:
+        return ("toc", "")
+    lab = (m.group(1) if m.group(1) is not None else m.group(2) or "").strip()[:40]
+    return ("tables" if lab.lower().startswith("tab") else "figures", lab)
+
+
+def _wd_group_instr(items, i):
+    """3.15: a field's instruction (its words before the result), from the item where it begins."""
+    depth, out = 0, []
+    for kind, val, rpr, href, x in items[i:]:
+        if kind == "fld":
+            if val == "begin":
+                depth += 1
+            elif val == "end":
+                depth -= 1
+                if depth <= 0:
+                    break
+            elif val == "separate" and depth == 1:
+                break
+        elif kind == "instr" and depth == 1:
+            out.append(val)
+    return "".join(out)
+
+
+def _wd_first_on(layers, tag):
+    """3.15: a paragraph setting that is on or off (keep with next, ...): the nearest layer that says."""
+    for L in layers:
+        e = L.find(_wd_qn("w:" + tag)) if L is not None else None
+        if e is not None:
+            return bool(_wd_toggle(e))
+    return False
+
+
 def _wd_field_word(instr):
     word = (str(instr or "").strip().split() or ["Field"])[0].upper()
     return {"PAGE": "Page number", "NUMPAGES": "Number of pages", "DATE": "Date", "TIME": "Time", "TOC": "Table of contents",
@@ -8485,6 +8769,138 @@ def _wd_page(body):
     if mar is not None:
         for k, a in (("ml", "w:left"), ("mr", "w:right"), ("mt", "w:top"), ("mb", "w:bottom")):
             out[k] = abs(_wd_num(mar.get(_wd_qn(a)), 1440)) / 20.0
+        for k, a in (("hd", "w:header"), ("fd", "w:footer")):     # 3.15: the header's and footer's distance from the edge
+            out[k] = abs(_wd_num(mar.get(_wd_qn(a)), 720)) / 20.0
+    return out
+
+
+def _wd_hf_part(el, ctx):
+    """3.15: a header or footer as the pages show it: each paragraph's style, alignment and pieces (words with their
+    tabs; {"f": "PAGE"} or {"f": "NUMPAGES"}), and whether it holds only those (then it can be changed here)."""
+    lines, state = [], {"simple": True}
+
+    def token(instr):
+        w = (str(instr or "").strip().split() or [""])[0].upper()
+        return {"PAGE": {"f": "PAGE"}, "NUMPAGES": {"f": "NUMPAGES"}, "SECTIONPAGES": {"f": "NUMPAGES"}}.get(w)
+
+    def para(p):
+        parts, depth, instr, shown, done = [], 0, [], False, False
+
+        def put(x):
+            if isinstance(x, str) and parts and isinstance(parts[-1], str):
+                parts[-1] += x
+            elif x != "":
+                parts.append(x)
+
+        def walk(node):
+            nonlocal depth, instr, shown, done
+            for c in node:
+                uri, t = _wd_tag(c)
+                if uri != _WD_W:
+                    state["simple"] = False
+                    continue
+                if t in ("pPr", "bookmarkStart", "bookmarkEnd", "proofErr", "permStart", "permEnd"):
+                    continue
+                if t == "r":
+                    for x in c:
+                        xu, xt = _wd_tag(x)
+                        if xu != _WD_W or xt == "rPr":
+                            continue
+                        if xt == "fldChar":
+                            ft = x.get(_wd_qn("w:fldCharType"))
+                            if ft == "begin":
+                                depth += 1
+                                if depth == 1:
+                                    instr, shown, done = [], False, False
+                            elif ft == "separate" and depth == 1:
+                                shown = True
+                                tk = token("".join(instr))
+                                if tk:
+                                    put(tk)
+                                    done = True
+                                else:
+                                    state["simple"] = False
+                            elif ft == "end":
+                                if depth == 1 and not shown:
+                                    tk = token("".join(instr))
+                                    if tk:
+                                        put(tk)
+                                    else:
+                                        state["simple"] = False
+                                depth = max(0, depth - 1)
+                        elif xt == "instrText":
+                            if depth == 1:
+                                instr.append(x.text or "")
+                        elif xt == "t":
+                            if depth == 0 or (depth == 1 and shown and not done):
+                                put(x.text or "")
+                        elif xt in ("tab", "ptab"):
+                            if depth == 0:
+                                put("\t")
+                        elif xt in ("br", "cr"):
+                            put(" ")
+                        elif xt in ("lastRenderedPageBreak", "noBreakHyphen", "softHyphen"):
+                            continue
+                        else:
+                            state["simple"] = False   # a picture, a shape, a symbol...
+                elif t == "fldSimple":
+                    tk = token(c.get(_wd_qn("w:instr")))
+                    if tk:
+                        put(tk)
+                    else:
+                        state["simple"] = False
+                        walk(c)
+                elif t in ("hyperlink", "smartTag"):
+                    walk(c)
+                elif t == "sdt":
+                    state["simple"] = False
+                    sc = c.find(_wd_qn("w:sdtContent"))
+                    if sc is not None:
+                        walk(sc)
+                else:
+                    state["simple"] = False
+
+        walk(p)
+        ppr = p.find(_wd_qn("w:pPr"))
+        sid = _wd_val(ppr.find(_wd_qn("w:pStyle")) if ppr is not None else None)
+        if sid not in ctx.styles.el:
+            sid = ctx.styles.default_p
+        if sid:
+            ctx.used_styles.add(sid)
+        al = ctx.styles.plook(ctx.styles.players(sid, ppr))["align"]
+        return {"s": sid, "al": al, "x": parts}
+
+    for c in el:
+        uri, t = _wd_tag(c)
+        if uri != _WD_W:
+            continue
+        if t == "p":
+            lines.append(para(c))
+        elif t in ("tbl", "sdt"):
+            state["simple"] = False
+            for p in c.iter(_wd_qn("w:p")):
+                lines.append(para(p))
+        if len(lines) >= 12:
+            state["simple"] = False
+            break
+    words = [l for l in lines if any((isinstance(x, str) and x.strip()) or isinstance(x, dict) for x in l["x"])]
+    if len(words) > 1:
+        state["simple"] = False                # more than one line: kept as it is
+    return {"lines": words, "edit": state["simple"]}
+
+
+def _wd_hf_view(doc, ctx):
+    """3.15: every section's header and footer (and the first page's, when it has its own)."""
+    out, prev = [], {}
+    for s in list(doc.sections)[:40]:
+        cur = {"tp": bool(s.different_first_page_header_footer)}
+        for key, hf in (("h", s.header), ("f", s.footer), ("h1", s.first_page_header), ("f1", s.first_page_footer)):
+            if hf.is_linked_to_previous:               # Word's "Link to Previous": the section before's
+                cur[key] = dict(prev[key], lk=True) if prev.get(key) else None
+            else:
+                cur[key] = _wd_hf_part(hf._element, ctx)
+        out.append(cur)
+        prev = cur
     return out
 
 
@@ -8502,6 +8918,14 @@ def _wd_style_view(ctx, sid, missing=False):
     v = {"name": st.name(sid), "b": rl["b"], "i": rl["i"], "u": rl["u"], "sz": rl["sz"], "f": rl["f"], "c": rl["c"],
          "caps": rl["caps"], "align": pl["align"], "before": pl["before"], "after": pl["after"], "line": pl["line"],
          "left": pl["left"], "first": pl["first"], "next": nxt if nxt in st.el else None, "list": lst}
+    for L in st.players(sid):                 # 3.15: the outline level (Heading 1: 0) — what a table of contents lists
+        ol = L.find(_wd_qn("w:outlineLvl")) if L is not None else None
+        if ol is not None:
+            lvl = _wd_num(ol.get(_wd_qn("w:val")), 9)
+            lvl = 9 if lvl is None else int(lvl)
+            if lvl < 9:
+                v["ol"] = lvl
+            break
     if missing:
         v["missing"] = True
     return v
@@ -8516,6 +8940,10 @@ def word_open(path):
         doc = Document()
     ctx = _WdCtx(doc, view=True)
     blocks = ctx.container(doc.element.body, "b")
+    try:
+        hf = _wd_hf_view(doc, ctx)             # 3.15: headers and footers
+    except Exception:
+        hf = []
     styles = {}
     offer = [ctx.styles.default_p] + [s for s in _WD_OFFER if s != ctx.styles.default_p]
     for sid in [s for s in offer if s] + sorted(s for s in ctx.used_styles if s):
@@ -8530,7 +8958,7 @@ def word_open(path):
     for nid in sorted(ctx.used_lists):
         lists[nid] = {str(l): list(num.level(nid, l) or ("decimal", "%" + str(l + 1) + ".", 1)) for l in range(9)}
     return {"sig": _wd_sig(path, doc) if path else "", "blocks": blocks, "styles": styles, "default": ctx.styles.default_p,
-            "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body)}
+            "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body), "hf": hf}
 
 
 _WD_HIGHLIGHTS = ("yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue", "darkCyan", "darkGreen", "darkMagenta",
@@ -8583,7 +9011,7 @@ def _wd_page_setup(doc, page):
                 mar.set(_wd_qn(a), str(v))
 
 
-def _wd_page_numbers(doc, where):
+def _wd_page_numbers(doc, where, fmt=None):
     """3.14: page numbers, as a PAGE field Word fills in, in the footer (or the header) of every section that has its
     own — where there isn't one already."""
     where = str(where or "")
@@ -8601,8 +9029,20 @@ def _wd_page_numbers(doc, where):
             continue
         p = hf.paragraphs[0] if hf.paragraphs and not hf.paragraphs[0].text.strip() and len(hf.paragraphs) == 1 else hf.add_paragraph()
         p.alignment = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "left": WD_ALIGN_PARAGRAPH.LEFT}[where.split("-")[1]]
-        for kind, val in (("begin", None), ("instr", " PAGE "), ("separate", None), ("text", "1"), ("end", None)):
+        pieces = [("begin", None), ("instr", " PAGE "), ("separate", None), ("text", "1"), ("end", None)]
+        if fmt in ("page", "pageof"):               # 3.15: "Page 3", "Page 3 of 9"
+            pieces = [("words", "Page ")] + pieces
+        if fmt == "pageof":
+            pieces += [("words", " of "), ("begin", None), ("instr", " NUMPAGES "), ("separate", None), ("text", "1"), ("end", None)]
+        for kind, val in pieces:
             r = _wd_new("w:r")
+            if kind == "words":
+                e = _wd_new("w:t")
+                e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                e.text = val
+                r.append(e)
+                p._p.append(r)
+                continue
             if kind == "instr":
                 e = _wd_new("w:instrText")
                 e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
@@ -8614,6 +9054,118 @@ def _wd_page_numbers(doc, where):
                 e = _wd_new("w:fldChar", fldCharType=kind)
             r.append(e)
             p._p.append(r)
+
+
+_WD_SETTINGS_AFTER = ("hdrShapeDefaults", "footnotePr", "endnotePr", "compat", "docVars", "rsids", "mathPr", "attachedSchema",
+                      "themeFontLang", "clrSchemeMapping", "doNotIncludeSubdocsInStats", "doNotAutoCompressPictures",
+                      "forceUpgrade", "captions", "readModeInkLockDown", "smartTagType", "schemaLibrary", "shapeDefaults",
+                      "doNotEmbedSmartTags", "decimalSymbol", "listSeparator")
+
+
+def _wd_update_fields(doc):
+    """3.15: Word fills in the fields again when the file opens (a new table of contents' page numbers, new captions'
+    numbers) — settings' updateFields, in its place among the settings."""
+    st = doc.settings.element
+    if st.find(_wd_qn("w:updateFields")) is not None:
+        return
+    uf = _wd_new("w:updateFields", val="true")
+    for c in st:
+        if _wd_tag(c)[1] in _WD_SETTINGS_AFTER:
+            c.addprevious(uf)
+            return
+    st.append(uf)
+
+
+def _wd_hf_write(doc, ctx, edits):
+    """3.15: a section's header and footer as the editor set them: one line each — left, middle and right ({page} and
+    {pages} are Word's PAGE and NUMPAGES fields), at the tab stops Word's Header and Footer styles use — and "different
+    first page"."""
+    if not isinstance(edits, list):
+        return
+    secs = list(doc.sections)
+    tw = int(ctx.text_width() * 20)
+
+    def runs(text, p):
+        for piece in re.split(r"(\{page\}|\{pages\})", text):
+            if not piece:
+                continue
+            if piece in ("{page}", "{pages}"):
+                for kind, val in (("begin", None), ("instr", " PAGE " if piece == "{page}" else " NUMPAGES "), ("separate", None),
+                                  ("text", "1"), ("end", None)):
+                    r = _wd_new("w:r")
+                    if kind == "instr":
+                        e = _wd_new("w:instrText")
+                        e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                        e.text = val
+                    elif kind == "text":
+                        e = _wd_new("w:t")
+                        e.text = val
+                    else:
+                        e = _wd_new("w:fldChar", fldCharType=kind)
+                    r.append(e)
+                    p.append(r)
+                continue
+            for k, part in enumerate(piece.split("\t")):
+                if k:
+                    r = _wd_new("w:r")
+                    r.append(_wd_new("w:tab"))
+                    p.append(r)
+                if part:
+                    r = _wd_new("w:r")
+                    e = _wd_new("w:t")
+                    e.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                    e.text = part
+                    r.append(e)
+                    p.append(r)
+
+    def write(hf, slots, style):
+        if not isinstance(slots, dict):
+            return
+        l, c, r = [_wd_clean(slots.get(k) or "")[:300].replace("\t", " ").strip() for k in ("l", "c", "r")]
+        el = hf._element
+        for x in list(el):
+            if _wd_tag(x)[1] in ("p", "tbl", "sdt"):
+                el.remove(x)
+        p = _wd_new("w:p")
+        ppr = _wd_new("w:pPr")
+        try:
+            ctx.ensure_style(style)
+            ppr.append(_wd_new("w:pStyle", val=style))
+        except WordEditError:
+            pass
+        filled = [s for s in (l, c, r) if s]
+        if len(filled) > 1:
+            tabs = _wd_new("w:tabs")
+            tabs.append(_wd_new("w:tab", val="center", pos=tw // 2))
+            tabs.append(_wd_new("w:tab", val="right", pos=tw))
+            ppr.append(tabs)
+            text = l + "\t" + c + "\t" + r if c or not r else l + "\t\t" + r
+        else:
+            text = filled[0] if filled else ""
+            if c:
+                ppr.append(_wd_new("w:jc", val="center"))
+            elif r:
+                ppr.append(_wd_new("w:jc", val="right"))
+        if len(ppr):
+            p.append(ppr)
+        runs(text.rstrip("\t"), p)
+        el.append(p)
+
+    for e in edits[:40]:
+        if not isinstance(e, dict):
+            continue
+        i = int(_wd_num(e.get("i"), 0) or 0)
+        if i < 0 or i >= len(secs):
+            continue
+        s = secs[i]
+        if "tp" in e:
+            s.different_first_page_header_footer = bool(e.get("tp"))
+        for key, style in (("h", "Header"), ("f", "Footer")):
+            if key in e:
+                hf = s.header if key == "h" else s.footer
+                if hf.is_linked_to_previous:
+                    hf.is_linked_to_previous = False
+                write(hf, e.get(key), style)
 
 
 def word_save(src_path, plan, out_dir, assets=None):
@@ -8662,7 +9214,10 @@ def word_save(src_path, plan, out_dir, assets=None):
     if sect is not None:
         body.append(sect)
     _wd_page_setup(doc, plan.get("page"))           # 3.14: size, orientation and margins
-    _wd_page_numbers(doc, plan.get("numbers"))       # 3.14: page numbers
+    _wd_hf_write(doc, ctx, plan.get("hf"))           # 3.15: headers and footers
+    _wd_page_numbers(doc, plan.get("numbers"), plan.get("numfmt"))       # 3.14: page numbers (3.15: how they read)
+    if getattr(ctx, "fields_dirty", False) or plan.get("fields"):     # 3.15: Word fills in new tables of contents, captions
+        _wd_update_fields(doc)
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "edited.docx")
     doc.save(out)
@@ -9281,6 +9836,17 @@ _MD_IMAGE = re.compile(r"^\s*!\[([^\]]*)\]\((data:image/(?:png|jpe?g);base64,[A-
 _MD_HEADING_LINE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _MD_BOLD_HEADING = re.compile(r"^\*\*([^*].{0,110}?)\*\*:?\s*$")
 _MD_BULLET_LINE = re.compile(r"^\s*[-*•]\s+(.+)$")
+_PLAIN_HEAD_END = set(".,;:!?)\"'”’")
+
+
+def _plain_heading(line):
+    # 3.15: a heading written as plain words: short, no closing punctuation, not a list item, no citation
+    t = line.strip()
+    if not t or len(t) > 90 or len(t.split()) > 12 or t[-1] in _PLAIN_HEAD_END or "(" in t:
+        return False
+    if re.match(r"^[-*•]\s", t) or t.startswith("|"):
+        return False
+    return t[0].isupper() or t[0].isdigit()
 _MD_NUMBER_LINE = re.compile(r"^\s*\d{1,3}[.)]\s+(.+)$")
 
 
@@ -9555,6 +10121,20 @@ def _md_blocks(text, skip_heading=None):
         if m and len(m.group(1).split()) <= 12:
             flush()
             blocks.append(("h", 1, m.group(1).strip()))
+            i += 1
+            continue
+        # 3.15: a heading written as a short line of its own (blank lines around it, no full stop, a few words)
+        prev_blank = i == 0 or not lines[i - 1].strip()
+        next_blank = i + 1 >= len(lines) or not lines[i + 1].strip()
+        if prev_blank and next_blank and not buf and _plain_heading(line) and any(l.strip() for l in lines[i + 1:]):
+            flush()
+            m2 = re.match(r"^(\d+(?:\.\d+)*)\.?\s+(.+)$", line)
+            level = min(3, m2.group(1).count(".") + 1) if m2 else 1
+            h = line
+            if skip and h.lower() == skip:
+                skip = ""
+            else:
+                blocks.append(("h", level, h))
             i += 1
             continue
         m = _MD_BULLET_LINE.match(raw)

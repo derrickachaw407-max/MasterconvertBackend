@@ -1,0 +1,68 @@
+{
+  "updated": "2026-11-05",
+  "note": "Study music: popular songs by mood, played in YouTube's own player. To change the songs, edit this file: v is the YouTube video's id (the part after watch?v=), t the song, a who made it, m its mood (focus, reading, calm, encourage, break or wind). The app picks up the new list within a day.",
+  "moods": [
+    {"id": "focus", "name": "Focus", "lead": "Steady music with few or no words, for deep work."},
+    {"id": "reading", "name": "Reading", "lead": "Soft piano and strings, with no words to pull you off the page."},
+    {"id": "calm", "name": "Calm", "lead": "Gentle songs for when you need to slow down."},
+    {"id": "encourage", "name": "Encouragement", "lead": "Songs that tell you to keep going."},
+    {"id": "break", "name": "Break time", "lead": "Upbeat songs for a short break. Back to work when it ends."},
+    {"id": "wind", "name": "Wind down", "lead": "Slow songs for the end of a long day."}
+  ],
+  "songs": [
+    {"v": "7GlsxNI4LVI", "t": "Cornfield Chase", "a": "Hans Zimmer", "m": "focus"},
+    {"v": "c56t7upa8Bk", "t": "Time", "a": "Hans Zimmer", "m": "focus"},
+    {"v": "O9wjmEhMKFw", "t": "Experience", "a": "Ludovico Einaudi", "m": "focus"},
+    {"v": "OtLcqr3RQJY", "t": "snowfall", "a": "Øneheart, reidenshi", "m": "focus"},
+    {"v": "X4VbdwhkE10", "t": "lofi hip hop radio", "a": "Lofi Girl (live, all day)", "m": "focus", "live": true},
+    {"v": "InyT9Gyoz_o", "t": "On the Nature of Daylight", "a": "Max Richter", "m": "focus"},
+    {"v": "H9gFLkNdHvA", "t": "Arrival of the Birds", "a": "The Cinematic Orchestra", "m": "focus"},
+    {"v": "uxTdTaNIUxo", "t": "Avril 14th", "a": "Aphex Twin", "m": "focus"},
+
+    {"v": "znfYwABeSZ0", "t": "Comptine d'un autre été", "a": "Yann Tiersen", "m": "reading"},
+    {"v": "CQ8zglIXZi8", "t": "Nuvole Bianche", "a": "Ludovico Einaudi", "m": "reading"},
+    {"v": "9Z_9VUrLUE4", "t": "River Flows in You", "a": "Yiruma", "m": "reading"},
+    {"v": "jRYNaLvtMd4", "t": "Clair de lune", "a": "Debussy, played by Lang Lang", "m": "reading"},
+    {"v": "dYEX6-w86YY", "t": "Merry-Go-Round of Life", "a": "Joe Hisaishi", "m": "reading"},
+    {"v": "Wk7RrtEGDyo", "t": "Mia & Sebastian's Theme", "a": "Justin Hurwitz", "m": "reading"},
+    {"v": "ZT0aOrjIcVE", "t": "Solas", "a": "Jamie Duffy", "m": "reading"},
+    {"v": "KeU_K86ZGqg", "t": "Gymnopédie No. 1", "a": "Satie, played by Lang Lang", "m": "reading"},
+
+    {"v": "V9PVRfjEBTI", "t": "BIRDS OF A FEATHER", "a": "Billie Eilish", "m": "calm"},
+    {"v": "NgsWGfUlwJI", "t": "Glimpse of Us", "a": "Joji", "m": "calm"},
+    {"v": "GxldQ9eX2wo", "t": "Until I Found You", "a": "Stephen Sanchez", "m": "calm"},
+    {"v": "RBtlPT23PTM", "t": "Space Song", "a": "Beach House", "m": "calm"},
+    {"v": "lSD_L-xic9o", "t": "From The Start", "a": "Laufey", "m": "calm"},
+    {"v": "8inJtTG_DuU", "t": "Bloom", "a": "The Paper Kites", "m": "calm"},
+    {"v": "PEM0Vs8jf1w", "t": "golden hour", "a": "JVKE", "m": "calm"},
+    {"v": "vx4kLgnFexo", "t": "My Love Mine All Mine", "a": "Mitski", "m": "calm"},
+
+    {"v": "YaEG2aWJnZ8", "t": "Unstoppable", "a": "Sia", "m": "encourage"},
+    {"v": "mk48xRzuNvA", "t": "Hall of Fame", "a": "The Script, will.i.am", "m": "encourage"},
+    {"v": "xo1VInw-SKc", "t": "Fight Song", "a": "Rachel Platten", "m": "encourage"},
+    {"v": "lwgr_IMeEgA", "t": "Rise Up", "a": "Andra Day", "m": "encourage"},
+    {"v": "b7k0a5hYnSI", "t": "Unwritten", "a": "Natasha Bedingfield", "m": "encourage"},
+    {"v": "yebNIHKAC4A", "t": "Golden", "a": "HUNTR/X, from KPop Demon Hunters", "m": "encourage"},
+    {"v": "UtF6Jej8yb4", "t": "The Nights", "a": "Avicii", "m": "encourage"},
+    {"v": "7wtfhZwyrcc", "t": "Believer", "a": "Imagine Dragons", "m": "encourage"},
+    {"v": "crtQSTYWtqE", "t": "Rush", "a": "Ayra Starr", "m": "encourage"},
+
+    {"v": "eVli-tstM5E", "t": "Espresso", "a": "Sabrina Carpenter", "m": "break"},
+    {"v": "ekr2nIex040", "t": "APT.", "a": "ROSÉ, Bruno Mars", "m": "break"},
+    {"v": "WcIcVapfqXw", "t": "Calm Down", "a": "Rema, Selena Gomez", "m": "break"},
+    {"v": "mRD0-GxqHVo", "t": "Heat Waves", "a": "Glass Animals", "m": "break"},
+    {"v": "ApXoWvfEYVU", "t": "Sunflower", "a": "Post Malone, Swae Lee", "m": "break"},
+    {"v": "KK4dC7rASYs", "t": "Tshwala Bam", "a": "TitoM, Yuppe", "m": "break"},
+    {"v": "H5v3kku4y6Q", "t": "As It Was", "a": "Harry Styles", "m": "break"},
+    {"v": "XoiOOiuH8iI", "t": "Water", "a": "Tyla", "m": "break"},
+
+    {"v": "UfcAVejslrU", "t": "Weightless", "a": "Marconi Union", "m": "wind"},
+    {"v": "kPa7bsKwL-c", "t": "Die With A Smile", "a": "Lady Gaga, Bruno Mars", "m": "wind"},
+    {"v": "V1Pl8CzNzCw", "t": "lovely", "a": "Billie Eilish, Khalid", "m": "wind"},
+    {"v": "k4V3Mo61fJM", "t": "Fix You", "a": "Coldplay", "m": "wind"},
+    {"v": "Oextk-If8HQ", "t": "Somewhere Only We Know", "a": "Keane", "m": "wind"},
+    {"v": "Ip6cw8gfHHI", "t": "Here With Me", "a": "d4vd", "m": "wind"},
+    {"v": "y7tHZ3WeJAw", "t": "Dandelions", "a": "Ruth B.", "m": "wind"},
+    {"v": "yKNxeF4KMsY", "t": "Yellow", "a": "Coldplay", "m": "wind"}
+  ]
+}

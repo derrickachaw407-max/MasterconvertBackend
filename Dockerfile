@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice \
     poppler-utils \
     tesseract-ocr \
+    ffmpeg \
     fonts-crosextra-carlito \
     fonts-crosextra-caladea \
     fonts-liberation \
@@ -18,7 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Every Python file in the repository, so adding a module can never break
 # the build by being missing from this list.
-COPY *.py ./
+# 3.15: and the JSON files (songs.json: the songs for Study music, edit it to change them)
+COPY *.py *.json ./
 
 EXPOSE 8000
 # gthread + threads instead of just adding more sync workers: this box is
