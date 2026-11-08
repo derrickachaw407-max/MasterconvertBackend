@@ -310,9 +310,17 @@ STORE_PRODUCT_TO_PLAN = {
     "com.docently.app.yearly": "yearly",
 }
 PASS_DAYS = 30   # kept for any account on the earlier 30-day pass
-# 3.2: Pro is 1 month or 6 months ('halfyear'). 'yearly' is no longer sold, but one bought earlier still counts.
-PRO_PLANS = ("monthly", "halfyear", "yearly")
-_PRO_SQL = "('monthly', 'halfyear', 'yearly')"
+# 4.0: Scholar is bought as a pass — Day, Week, Month, Semester or Year. The earlier Pro plans still count while they last.
+SCHOLAR_PASSES = ("day", "week", "month", "semester", "year")
+PRO_PLANS = SCHOLAR_PASSES + ("monthly", "halfyear", "yearly")
+_PRO_SQL = "('day', 'week', 'month', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
+PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "semester": "Scholar Semester", "year": "Scholar Year",
+              "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
+# Points: the unit of AI work. A Remy answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
+POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
+TRIAL_POINTS = 10          # Free: once per phone, never renewed
+SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
+BONUS_MONTH_POINTS = 400   # a referral bonus month works like Scholar Month
 # What Pro adds beyond Free (none of Free's own allowances change).
 REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Remy reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
@@ -401,6 +409,19 @@ def init_db():
             # allowance, never expiring — and every store transaction that
             # granted them, so the same purchase is never credited twice.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
+            # 4.0: a pass's points (end with the pass), the day's spending, the free trial (once per phone)
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pass_points INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS day_points_used INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS day_points_at DATE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_points_used INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trial_devices (
+                    device_id TEXT PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS memory_enabled BOOLEAN NOT NULL DEFAULT TRUE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_source TEXT")   # 'store', 'paystack' or 'bonus'
             # Accounts that already exist count as confirmed (DEFAULT TRUE); new
@@ -1113,11 +1134,42 @@ def effective_plan(row):
     return "free" if _pass_expired(row) else row["plan"]
 
 
+def _points_state(row):
+    """What the account has: (points in all, pass points, bought points, trial points left, points still allowed
+    today (never more than it has), the day's cap or None). Computed, never written."""
+    plan = effective_plan(row)
+    bought = int(row.get("remy_credits") or 0) if hasattr(row, "get") else 0
+    if plan != "free":
+        if (row.get("plan_source") in ("store", "promo")) and not (row.get("pass_points") or 0):
+            used, limit, _ = _sage_status(row)
+            left = max(0, limit - used)
+            return left + bought, left, bought, 0, None, None
+        pp = max(0, int(row.get("pass_points") or 0))
+        today = datetime.now(timezone.utc).date()
+        used_today = int(row.get("day_points_used") or 0) if row.get("day_points_at") == today else 0
+        today_left = max(0, SCHOLAR_DAY_CAP - used_today)
+        return pp + bought, pp, bought, 0, min(today_left, pp + bought), SCHOLAR_DAY_CAP
+    trial_left = 0 if row.get("trial_blocked") else max(0, TRIAL_POINTS - int(row.get("trial_points_used") or 0))
+    return trial_left + bought, 0, bought, trial_left, None, None
+
+
 def user_row_to_dict(row):
     row = _with_promo(row)
     exp = row.get("plan_expires_at") if hasattr(row, "get") else None
     msgs_used, msgs_limit, msgs_reset = _sage_status(row)
+    points, pass_pts, bought_pts, trial_left, today_left, day_cap = _points_state(row)
     return {
+        # 4.0: points — the unit of AI work — and the plan's name as the app shows it
+        "points": points,
+        "pass_points": pass_pts,
+        "bought_points": bought_pts,
+        "trial_points_left": trial_left,
+        "trial_blocked": bool(row.get("trial_blocked")) if hasattr(row, "get") else False,
+        "points_today_left": today_left,
+        "points_day_cap": day_cap,
+        "plan_name": PLAN_NAMES.get(effective_plan(row), "Scholar"),
+        "scholar": effective_plan(row) in PRO_PLANS,
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "points": v[2], "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
@@ -1178,7 +1230,7 @@ def auth_required(fn):
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0 WHERE id = %s AND plan_expires_at <= now()", (user_id,))
                 conn.commit()
             except Exception as e:
                 logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
@@ -1212,8 +1264,8 @@ def auth_required(fn):
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET plan = 'monthly', plan_expires_at = now() + interval '30 days', plan_source = 'bonus', "
-                                "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *", (user_id,))
+                    cur.execute("UPDATE users SET plan = 'month', plan_expires_at = now() + interval '30 days', plan_source = 'bonus', pass_points = pass_points + %s, "
+                                "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *", (BONUS_MONTH_POINTS, user_id))
                     started = cur.fetchone()
                 conn.commit()
                 if started:
@@ -2978,10 +3030,40 @@ def change_email():
     return jsonify({"user": user_row_to_dict(new_row), "sent": sent, "error": err, "retry_after": wait})
 
 
+_DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
+
+
+def _device_seen(row, device_id):
+    """The free trial is once per phone: the first account on a phone keeps it; another account on the same phone
+    gets none. Returns the row (updated when the trial was just closed)."""
+    if not device_id or not _DEVICE_RE.match(device_id) or not DATABASE_URL:
+        return row
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM trial_devices WHERE device_id = %s", (device_id,))
+                seen = cur.fetchone()
+                if not seen:
+                    cur.execute("INSERT INTO trial_devices (device_id, user_id) VALUES (%s, %s) ON CONFLICT (device_id) DO NOTHING", (device_id, row["id"]))
+                elif seen["user_id"] != row["id"] and not row.get("trial_blocked") and effective_plan(row) == "free" and not (row.get("trial_points_used") or 0):
+                    cur.execute("UPDATE users SET trial_blocked = TRUE WHERE id = %s RETURNING *", (row["id"],))
+                    updated = cur.fetchone()
+                    if updated:
+                        row = _with_promo(updated)
+                        logger.info(f"Trial closed for user {row['id']}: the phone already had its trial")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Couldn't record the device for user {row.get('id')}: {e}")
+    return row
+
+
 @app.route("/api/auth/me", methods=["GET", "OPTIONS"])
 @auth_required
 def me():
-    row = request.current_user
+    row = _device_seen(request.current_user, request.headers.get("X-Device", ""))
     if _needs_verification(row) and not _active_code(row["id"]):
         sent, _, _ = _send_verification_code(row)
         return jsonify({"user": user_row_to_dict(row), "verify": _verify_info(row, sent)})
@@ -3370,13 +3452,20 @@ PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "").strip()
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY", "").strip()
 PAYSTACK_API = "https://api.paystack.co"
 PAYSTACK_PLANS = {
-    # plan: (price in pesewas, days of Pro, Remy messages added)
-    "monthly": (10000, 30, 0),
-    "halfyear": (40000, 182, 0),   # 3.2: 6 months — a whole semester, for about the price of 4 months
-    "payperuse": (3000, 0, 30),    # the Remy Pack
-    "yearly": (30000, 365, 0),     # no longer sold (see PAYSTACK_ON_SALE); kept so an older payment still applies
+    # plan: (price in pesewas, days of Scholar, points). A pass's points end with the pass; "points" never end.
+    "day": (500, 1, 30),
+    "week": (1500, 7, 120),
+    "month": (4000, 30, 400),
+    "semester": (12000, 120, 1300),
+    "year": (30000, 365, 3000),
+    "points": (2000, 0, 100),
+    # earlier plans: no longer sold, kept so an older payment still applies
+    "monthly": (10000, 30, 400),
+    "halfyear": (40000, 182, 1600),
+    "payperuse": (3000, 0, 30),
+    "yearly": (30000, 365, 3000),
 }
-PAYSTACK_ON_SALE = ("halfyear", "monthly", "payperuse")
+PAYSTACK_ON_SALE = ("day", "week", "month", "semester", "year", "points")
 
 
 def _paystack_on():
@@ -3424,12 +3513,21 @@ def _paystack_apply(reference, paid_amount, currency):
             if days:
                 # Bought during the free-Pro promotion: the paid days start when it ends.
                 start = _promo_until() if _promo_active() else datetime.now(timezone.utc)
+                # A shorter pass bought on top of a longer one that is still running keeps the longer one's name;
+                # the days and points are added either way.
+                cur.execute("SELECT plan, plan_expires_at FROM users WHERE id = %s FOR UPDATE", (pay["user_id"],))
+                cur_row = cur.fetchone() or {}
+                new_plan = pay["plan"]
+                cur_plan, cur_exp = cur_row.get("plan"), cur_row.get("plan_expires_at")
+                if cur_plan in PAYSTACK_PLANS and cur_exp and cur_exp > datetime.now(timezone.utc) and PAYSTACK_PLANS[cur_plan][1] > days:
+                    new_plan = cur_plan
                 cur.execute(
-                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), plan_source = 'paystack' WHERE id = %s",
-                    (pay["plan"], start, days, pay["user_id"]))
-                if pay["plan"] in PRO_PLANS and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
+                    "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), "
+                    "plan_source = 'paystack', pass_points = pass_points + %s WHERE id = %s",
+                    (new_plan, start, days, credits, pay["user_id"]))
+                if pay["plan"] in ("month", "semester", "year", "monthly", "halfyear", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
                     cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
-            if credits:
+            elif credits:
                 cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
             cur.execute("UPDATE paystack_payments SET status = 'success', applied_at = now() WHERE reference = %s", (reference,))
         conn.commit()
@@ -3447,7 +3545,8 @@ def paystack_config():
         "enabled": _paystack_on(), "public_key": PAYSTACK_PUBLIC_KEY if _paystack_on() else None, "currency": "GHS",
         # live or test keys — never the key itself — so the setup can be checked at a glance
         "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test") if _paystack_on() else None,
-        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2]} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2], "points": v[2], "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
+        "trial_points": TRIAL_POINTS, "day_cap": SCHOLAR_DAY_CAP,
     })
 
 
@@ -3458,13 +3557,13 @@ def paystack_initialize():
     if not _paystack_on():
         return jsonify({"error": "Payments aren't set up yet — please try again later."}), 503
     if _from_store_app():
-        return jsonify({"error": "In the Academic-Home app, Pro is bought through the App Store or Google Play."}), 403
+        return jsonify({"error": "In the Academic-Home app from a store, Scholar is bought through the App Store or Google Play."}), 403
     plan = str((request.get_json(silent=True) or {}).get("plan") or "")
     if plan not in PAYSTACK_ON_SALE:
-        return jsonify({"error": "Choose 6 months or 1 month of Pro, or a Remy Pack."}), 400
+        return jsonify({"error": "Choose a Scholar pass (Day, Week, Month, Semester or Year), or Points."}), 400
     user = request.current_user
     if plan in PRO_PLANS and user.get("plan") in PRO_PLANS and _owns_store_plan(user["id"]):
-        return jsonify({"error": "You already have Pro through the App Store or Google Play — manage it there."}), 409
+        return jsonify({"error": "You already have Scholar through the App Store or Google Play; manage it there."}), 409
     friend_code = _clean_code((request.get_json(silent=True) or {}).get("referral_code"))
     amount = PAYSTACK_PLANS[plan][0]
     reference = f"dct_{user['id']}_{secrets.token_hex(6)}"
@@ -3975,26 +4074,26 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
-def _refund_sage_message(user_row, source="allowance"):
-    """Returns one Remy message to the user's monthly allowance, for a
-    request that was counted but never got a reply. Never goes below zero
-    (the allowance may have reset in between). Best-effort: a failure here
-    is logged, never shown to the user on top of the original error."""
+def _refund_sage_message(user_row, source="allowance", points=1):
+    """Gives back what a request spent when it never got a reply: pass points, bought points, trial points or a
+    message of the old monthly allowance. Best-effort."""
+    points = max(1, int(points or 1))
     conn = None
     try:
         conn = get_db()
+        conn.autocommit = False
         with conn.cursor() as cur:
             if source == "credit":
-                # It came from a Pay-per-Use purchase: back to the purchase.
-                cur.execute("UPDATE users SET remy_credits = remy_credits + 1 WHERE id = %s", (user_row["id"],))
+                cur.execute("UPDATE users SET remy_credits = remy_credits + %s WHERE id = %s", (points, user_row["id"]))
+            elif source == "pass":
+                cur.execute("UPDATE users SET pass_points = pass_points + %s, day_points_used = GREATEST(day_points_used - %s, 0) WHERE id = %s", (points, points, user_row["id"]))
+            elif source == "trial":
+                cur.execute("UPDATE users SET trial_points_used = GREATEST(trial_points_used - %s, 0) WHERE id = %s", (points, user_row["id"]))
             else:
-                cur.execute(
-                    "UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s",
-                    (user_row["id"],),
-                )
+                cur.execute("UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s", (user_row["id"],))
         conn.commit()
     except Exception as e:
-        logger.error("Couldn't refund a Remy message for user %s: %s", user_row.get("id"), e)
+        logger.error("Couldn't refund points for user %s: %s", user_row.get("id"), e)
         if conn:
             conn.rollback()
     finally:
@@ -4019,21 +4118,69 @@ def _sage_status(row):
     return used, limit, reset_at
 
 
-def _log_sage_message_and_consume(user_row):
-    """Enforce Sage's own monthly message cap and record the message —
-    same row-locking pattern as _log_conversion_and_consume above, for
-    the same reason (a concurrent pair of requests must not both slip
-    past the cap), but with its own counter and its own limit that
-    applies on every plan, not just free: SAGE_PAID_MESSAGES_LIMIT
-    exists specifically because "paid" doesn't mean "an unbounded bill
-    is fine," it means a much higher ceiling aimed at runaway or
-    automated use rather than genuine tutoring conversations."""
+class PointsError(ConversionError):
+    """The account has no points for this piece of AI work; the app offers Scholar or points."""
+    extra = {"points_needed": True}
+
+
+def _points_reply(e):
+    return jsonify(dict({"error": str(e)}, **getattr(e, "extra", {}))), 429
+
+
+def _no_points_error(row, points):
+    plan = effective_plan(row)
+    pack = PAYSTACK_PLANS["points"]
+    buy = f"Add {pack[2]} points for GH₵{pack[0] // 100:.0f}"
+    if plan == "free":
+        if row.get("trial_blocked"):
+            return PointsError("Remy's free trial has already been used on this phone. "
+                                   f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
+        return PointsError(f"You've used your free trial ({TRIAL_POINTS} points). "
+                               f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
+    return PointsError(f"Your pass has no points left. {buy}, or a new pass adds more.")
+
+
+def _log_sage_message_and_consume(user_row, points=1):
+    """Spend points for one piece of AI work, under a row lock so two requests at once can't both slip past.
+    A pass's points first, then points bought on their own, then the free trial. Any pass spends at most
+    SCHOLAR_DAY_CAP a day. Store and promo accounts keep the earlier monthly allowance. Returns where the points
+    came from: 'pass', 'credit', 'trial' or 'allowance'."""
+    points = max(1, int(points or 1))
     conn = get_db()
     conn.autocommit = False
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
             row = _with_promo(cur.fetchone())
+            plan = effective_plan(row)
+            old_way = plan != "free" and row.get("plan_source") in ("store", "promo") and not (row.get("pass_points") or 0)
+            if not old_way:
+                bought = int(row.get("remy_credits") or 0)
+                if plan != "free":
+                    today = datetime.now(timezone.utc).date()
+                    used_today = int(row.get("day_points_used") or 0) if row.get("day_points_at") == today else 0
+                    if used_today + points > SCHOLAR_DAY_CAP:
+                        conn.rollback()
+                        raise PointsError(f"That's today's limit ({SCHOLAR_DAY_CAP} points). It starts again tomorrow. "
+                                              "Everything that runs on your phone keeps working.")
+                    pp = int(row.get("pass_points") or 0)
+                    if pp + bought < points:
+                        conn.rollback()
+                        raise _no_points_error(row, points)
+                    from_pass = min(pp, points)
+                    cur.execute("UPDATE users SET pass_points = pass_points - %s, remy_credits = remy_credits - %s, day_points_used = %s, day_points_at = %s WHERE id = %s",
+                                (from_pass, points - from_pass, used_today + points, today, row["id"]))
+                    conn.commit()
+                    return "pass" if from_pass else "credit"
+                trial_left = 0 if row.get("trial_blocked") else max(0, TRIAL_POINTS - int(row.get("trial_points_used") or 0))
+                if trial_left + bought < points:
+                    conn.rollback()
+                    raise _no_points_error(row, points)
+                from_trial = min(trial_left, points)
+                cur.execute("UPDATE users SET trial_points_used = trial_points_used + %s, remy_credits = remy_credits - %s WHERE id = %s",
+                            (from_trial, points - from_trial, row["id"]))
+                conn.commit()
+                return "trial" if from_trial else "credit"
             used, limit, reset_at = _sage_status(row)
             source = "allowance"
             if used >= limit:
@@ -4046,11 +4193,11 @@ def _log_sage_message_and_consume(user_row):
                     if row["plan"] == "free":
                         raise ConversionError(
                             f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
-                            f"Get Pro for {SAGE_PAID_MESSAGES_LIMIT} a month, or a Remy Pack for {PAYPERUSE_MESSAGES} more."
+                            f"A Scholar pass adds points for Remy and every other AI feature."
                         )
                     raise ConversionError(
                         f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
-                        f"account. It resets next month — or a Remy Pack adds {PAYPERUSE_MESSAGES} more now."
+                        f"account. It resets next month, or a Scholar pass adds points now."
                     )
             if source == "allowance":
                 cur.execute(
@@ -4600,6 +4747,15 @@ def _is_pro(user):
     return (user or {}).get("plan") in PRO_PLANS
 
 
+def _scholar_gate(user, feature):
+    """A JSON answer (402) when a Scholar-only feature is asked for on Free; None when the account may go on."""
+    if _is_pro(user):
+        return None
+    day = PAYSTACK_PLANS["day"][0] // 100
+    return jsonify({"error": f"{feature} is part of Scholar. A Day pass is GH₵{day:.0f}; everything on your phone stays free.",
+                    "scholar_needed": True, "feature": feature}), 402
+
+
 # 3.8: Make a PDF smaller — under 1, 2 or 5 MB, or as small as it goes
 SHRINK_TARGETS = {"1": 1024 * 1024, "2": 2 * 1024 * 1024, "5": 5 * 1024 * 1024, "min": None}
 
@@ -4661,7 +4817,7 @@ def pdf_apply_endpoint():
     if not isinstance(plan, dict):
         return jsonify({"error": "The changes couldn't be read — please try again."}), 400
     if pdf_plan_needs_pro(plan) and not _is_pro(request.current_user):
-        return jsonify({"error": "Redacting and protecting PDFs are part of Academic-Home Pro.", "pro": True}), 403
+        return jsonify({"error": "Redacting and protecting PDFs are part of Scholar.", "pro": True, "scholar_needed": True, "feature": "PDF protection"}), 402
     try:
         _log_conversion_and_consume(request.current_user, "pdf", "pdf-edit")
     except ConversionError as e:
@@ -4821,7 +4977,7 @@ def word_ai_endpoint():
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
-        return jsonify({"error": str(e)}), 429
+        return _points_reply(e)
     system = ("You are Remy, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
               + WORD_AI_ACTIONS[action].replace("LANGUAGE", lang) +
               " Reply with the words for the document only: no greeting, no note about what you did, no quotation marks around "
@@ -5737,7 +5893,7 @@ def sage_endpoint():
     try:
         charged_from = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
-        return jsonify({"error": str(e)}), 429
+        return _points_reply(e)
 
     # Remy's memory (when the person allows it): what Remy noted before, and
     # permission to note one new durable thing — taken out of the reply below.
@@ -5859,6 +6015,11 @@ def summarize_endpoint():
     reqs_block = ("\n\nTHE PRESENTER'S REQUIREMENTS \u2014 follow them exactly (number of slides, sections to include, focus, "
                   "level of language), while keeping the JSON format described above:\n<<<\n" + reqs + "\n>>>") if reqs else ""
     presenters = [str(x).strip()[:80] for x in (data.get("presenters") or []) if str(x).strip()][:10] if audience == "student" else []
+    # 4.0: a summary costs a point — taken before the call, given back if the call fails
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_REMY)
+    except ConversionError as e:
+        return _points_reply(e)
     try:
         result = call_claude(
             system_prompt=(_summary_structure_prompt(audience) if audience else SUMMARIZE_SYSTEM_PROMPT) + reqs_block,
@@ -5872,6 +6033,7 @@ def summarize_endpoint():
         title, deck = _structure_summary(audience, obj, slides, presenters)
         return jsonify({"slides": deck, "title": title, "audience": audience})
     except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
         return jsonify({"error": str(e)}), 502
 
 
@@ -6255,6 +6417,11 @@ def quiz_generate_endpoint():
     # A little more room: explanations now teach, and a case study's scenario runs long.
     max_tokens = min(64000, max(4000, num_questions * 360 + n_case * 260 + 600))
 
+    # 4.0: a quiz costs a point — taken before the call, given back if the call fails
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_REMY)
+    except ConversionError as e:
+        return _points_reply(e)
     try:
         result = call_claude(
             system_prompt=QUIZ_SYSTEM_PROMPT + QUIZ_STANDALONE_RULES + (_quiz_case_rules(n_case, num_questions, audience == "tutor") if n_case else "") + reqs_block,
@@ -6273,6 +6440,7 @@ def quiz_generate_endpoint():
                 title = named if "quiz" in named.lower() else f"{named}: Practice Quiz"
         return jsonify({"questions": questions, "title": title, "difficulty": difficulty, "audience": audience, "question_style": style})
     except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
         return jsonify({"error": str(e)}), 502
 
 
@@ -6652,6 +6820,14 @@ def write_endpoint():
             if role in ("user", "assistant") and content:
                 history.append({"role": role, "content": content})
 
+    # 4.0: Evidence-Based Writing is Scholar's, and a draft costs POINTS_WRITE — taken before any call, given back on failure
+    gate = _scholar_gate(request.current_user, "Evidence-Based Writing")
+    if gate:
+        return gate
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_WRITE)
+    except ConversionError as e:
+        return _points_reply(e)
     outline = parse_outline(topic)
 
     # Citation style and how recent the sources must be (both optional).
@@ -6776,6 +6952,7 @@ def write_endpoint():
                 "truncated": cont_result["stop_reason"] == "max_tokens",
             })
         except ConversionError as e:
+            _refund_sage_message(request.current_user, charged_from, POINTS_WRITE)
             return jsonify({"error": str(e)}), 502
 
     try:
@@ -6975,7 +7152,163 @@ def write_endpoint():
             "truncated": truncated,
         })
     except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from, POINTS_WRITE)
         return jsonify({"error": str(e)}), 502
+
+
+# ---------- 4.0 Guided citing: statements with real references, one tap at a time ----------
+GUIDE_STATEMENTS = 10          # suggestions in one batch
+GUIDE_PAPERS = 12              # real papers searched for one batch
+
+
+def _guide_json(raw):
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (raw or "").strip())
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        a, b = cleaned.find("{"), cleaned.rfind("}")
+        if a >= 0 and b > a:
+            try:
+                return json.loads(cleaned[a:b + 1])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def _guide_clip(v, n):
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+
+
+@app.route("/api/guide/outline", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def guide_outline():
+    """Subtopics a researcher could build a piece of writing from, for one main topic."""
+    data = request.get_json(silent=True) or {}
+    topic = _guide_clip(data.get("topic"), 300)
+    kind = _guide_clip(data.get("kind"), 40) or "essay"
+    if not topic:
+        return jsonify({"error": "Type the topic first."}), 400
+    gate = _scholar_gate(request.current_user, "Guided citing")
+    if gate:
+        return gate
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_REMY)
+    except ConversionError as e:
+        return _points_reply(e)
+    system = ("You help a researcher plan a piece of academic writing. Reply with one JSON object only, no code fences: "
+              '{"subtopics": [{"title": "...", "why": "..."}]}. Give 5 to 8 subtopics in the order the writing should run '
+              "(background and definitions first, then the body, then gaps or implications). Each title is a heading of 2 to "
+              "8 words in sentence case; each why is one sentence (at most 18 words) on what that part should establish. "
+              "Write in the topic's language. Never invent studies, numbers or names.")
+    try:
+        raw = call_claude(system, f"Topic: {topic}\nKind of writing: {kind}", max_tokens=900, feature="guide")
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
+        return jsonify({"error": str(e)}), 502
+    obj = _guide_json(raw)
+    subs = []
+    for x in (obj or {}).get("subtopics") or []:
+        if isinstance(x, dict) and _guide_clip(x.get("title"), 90):
+            subs.append({"title": _guide_clip(x.get("title"), 90), "why": _guide_clip(x.get("why"), 200)})
+    if not subs:
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
+        return jsonify({"error": "Remy couldn't outline that — try a few more words about the topic."}), 502
+    return jsonify({"topic": topic, "subtopics": subs[:8]})
+
+
+@app.route("/api/guide/statements", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def guide_statements():
+    """About ten statements for one topic or subtopic, each grounded in one real, downloadable paper, with
+    the in-text citation and the reference entry in the chosen style, and a paraphrase ready to insert."""
+    data = request.get_json(silent=True) or {}
+    topic = _guide_clip(data.get("topic"), 300)
+    sub = _guide_clip(data.get("subtopic"), 200)
+    style = str(data.get("style") or "apa").lower()
+    if style not in CITE_STYLES:
+        style = "apa"
+    since = data.get("recent_years")
+    try:
+        since = datetime.now(timezone.utc).year - int(since) if since else None
+    except (TypeError, ValueError):
+        since = None
+    exclude = set(str(x) for x in (data.get("exclude") or [])[:60] if x)
+    if not (topic or sub):
+        return jsonify({"error": "Type the topic first."}), 400
+    gate = _scholar_gate(request.current_user, "Guided citing")
+    if gate:
+        return gate
+    query = f"{topic} {sub}".strip() if sub and topic and sub.lower() not in topic.lower() else (sub or topic)
+    papers, diag = search_papers(query, max_results=GUIDE_PAPERS, since=since)
+    if len(papers) < 3 and sub:                     # the subtopic alone was too narrow: widen to the topic
+        more, _ = search_papers(topic or sub, max_results=GUIDE_PAPERS, since=since)
+        seen = {p.get("doi") or p["title"] for p in papers}
+        papers += [p for p in more if (p.get("doi") or p["title"]) not in seen]
+    papers = [p for p in papers if (p.get("doi") or p.get("url") or "") not in exclude][:GUIDE_PAPERS]
+    if not papers:
+        return jsonify({"error": "No open papers with a PDF were found for that. Try other words, or a wider topic.",
+                        "no_papers": True}), 404
+    sources = enrich_sources(papers, style)
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_RESEARCH)
+    except ConversionError as e:
+        return _points_reply(e)
+    heading = sub or topic
+    system = ("You help a researcher write, one evidence-based statement at a time. You are given real papers, each with a "
+              "number, its citation key and its abstract. Reply with one JSON object only, no code fences: "
+              '{"statements": [{"paper": <number>, "text": "...", "paraphrase": "...", "kind": "..."}]}. '
+              f"Write {GUIDE_STATEMENTS} statements a careful academic writer could put under the heading given, in the order "
+              "that builds the argument: context and definitions first, then findings and evidence, then limits, gaps or "
+              "implications. Each statement says ONE thing the abstract of its paper actually supports; never go beyond the "
+              "abstract, never invent numbers, and quote a figure only when the abstract gives it. 18 to 40 words each, plain "
+              "academic English (or the topic's language), no citation inside the text (the app adds it). paraphrase says the "
+              "same thing in clearly different words and sentence shape, the version that will go into the document. kind is one "
+              "of: context, definition, finding, method, evidence, limitation, gap, implication. Use at least 6 different papers; "
+              "each paper at most twice. Use only the numbers given.")
+    lines = []
+    for i, src in enumerate(sources, 1):
+        lines.append(f"[{i}] {src['citation_key']} {src['title']} ({src.get('venue') or 'paper'}, {src.get('year') or 'n.d.'})"
+                     + (f"\n    Abstract: {src['abstract'][:900]}" if src.get("abstract") else ""))
+    user = f"Heading: {heading}" + (f"\nMain topic: {topic}" if topic and sub else "") + "\n\nPapers:\n" + "\n".join(lines)
+    try:
+        raw = call_claude(system, user, max_tokens=3200, timeout=120, feature="guide")
+    except ConversionError as e:
+        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH)
+        return jsonify({"error": str(e)}), 502
+    obj = _guide_json(raw)
+    out = []
+    kinds = {"context", "definition", "finding", "method", "evidence", "limitation", "gap", "implication"}
+    for x in (obj or {}).get("statements") or []:
+        if not isinstance(x, dict):
+            continue
+        try:
+            n = int(x.get("paper"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= n <= len(sources):
+            continue
+        text, para = _guide_clip(x.get("text"), 600), _guide_clip(x.get("paraphrase"), 600)
+        if len(text.split()) < 6:
+            continue
+        if len(para.split()) < 6 or para.lower() == text.lower():
+            para = text
+        src = sources[n - 1]
+        out.append({"id": f"{len(out) + 1}", "paper": n, "text": text, "paraphrase": para,
+                    "kind": x.get("kind") if x.get("kind") in kinds else "finding",
+                    "cite": src["citation_key"],
+                    "ref": {"text": src["ref_text"], "url": src["url"], "pdf": src.get("pdf") or None, "doi": src.get("doi") or None,
+                            "key": src["citation_key"], "title": src["title"], "year": src.get("year"), "authors": src.get("authors") or []}})
+        if len(out) >= GUIDE_STATEMENTS:
+            break
+    if len(out) < 3:
+        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH)
+        return jsonify({"error": "Remy couldn't build statements from those papers — try again, or say the topic in other words."}), 502
+    return jsonify({"topic": topic, "subtopic": sub, "style": style, "style_name": CITE_STYLES[style]["name"],
+                    "references_title": CITE_STYLES[style]["heading"], "statements": out,
+                    "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or ""})
+
 
 
 @app.route("/api/write/export-docx", methods=["POST", "OPTIONS"])
@@ -7236,7 +7569,7 @@ def slides_assist_all_endpoint():
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
-        return jsonify({"error": str(e)}), 429
+        return _points_reply(e)
     system = ("You are Remy, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
               'one JSON object only — no preamble, no code fences: {"slides": [ ... one object per slide given, with its number '
               'as "i" ... ]}. ' + instruction + " Only rework what the slides already say or clearly imply: never invent "
@@ -7778,7 +8111,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
             "slides": out}, refs
 
 
-@app.route("/api/slides/draft", methods=["POST", "OPTIONS"])
+@app.route("/api/slides/draft", methods=["POST", "OPTIONS"])   # a whole deck: POINTS_DECK
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def slides_draft_endpoint():
@@ -7814,9 +8147,9 @@ def slides_draft_endpoint():
     # request already over its limit), and given back below if no usable
     # deck arrives — a message only counts when the answer does.
     try:
-        charged_from = _log_sage_message_and_consume(request.current_user)
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_DECK)
     except ConversionError as e:
-        return jsonify({"error": str(e)}), 429
+        return _points_reply(e)
     try:
         raw = call_claude(system, f"Request: {topic}", max_tokens=12000 if pro else 9000, timeout=150 if pro else None, feature="deck")
         deck, refs = _parse_full_deck(raw, group, sources, deck_max=content_max + 2)
@@ -8749,7 +9082,7 @@ def meet_agenda():
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
-        return jsonify({"error": str(e)}), 429
+        return _points_reply(e)
     system = ("You are Remy, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
               f"agenda only: 4 to 7 lines, each \"- <minutes> min — <item>\", the minutes adding up to about {minutes}; start "
               "with a short welcome and end with questions or next steps. Plain words, no heading, no other text. Never invent "
