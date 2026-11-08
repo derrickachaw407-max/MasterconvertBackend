@@ -320,7 +320,7 @@ PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Mo
 POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
 TRIAL_POINTS = 10          # Free: once per phone, never renewed
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
-BONUS_MONTH_POINTS = 400   # a referral bonus month works like Scholar Month
+BONUS_MONTH_POINTS = 450   # a referral bonus month works like Scholar Month
 # What Pro adds beyond Free (none of Free's own allowances change).
 REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Remy reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
@@ -3453,12 +3453,13 @@ PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY", "").strip()
 PAYSTACK_API = "https://api.paystack.co"
 PAYSTACK_PLANS = {
     # plan: (price in pesewas, days of Scholar, points). A pass's points end with the pass; "points" never end.
-    "day": (500, 1, 30),
-    "week": (1500, 7, 120),
-    "month": (4000, 30, 400),
-    "semester": (12000, 120, 1300),
-    "year": (30000, 365, 3000),
-    "points": (2000, 0, 100),
+    # 4.1: GH₵20 a day; the longer the pass, the less a day costs (a week is 3 days' price, a month 8, a semester 24, a year 60)
+    "day": (2000, 1, 40),
+    "week": (6000, 7, 150),
+    "month": (16000, 30, 450),
+    "semester": (48000, 120, 1400),
+    "year": (120000, 365, 3500),
+    "points": (4000, 0, 100),
     # earlier plans: no longer sold, kept so an older payment still applies
     "monthly": (10000, 30, 400),
     "halfyear": (40000, 182, 1600),
@@ -4941,6 +4942,13 @@ WORD_AI_ACTIONS = {
     "formal": "Rewrite TEXT in a formal, academic tone, the same meaning.",
     "friendly": "Rewrite TEXT in a warm, friendly tone, the same meaning.",
     "fix": "Correct the spelling, grammar and punctuation of TEXT. Change nothing else: keep its words, tone, meaning and paragraph breaks.",
+    "paraphrase": "Rewrite TEXT in your own words: different words and sentence shapes, exactly the same meaning and facts, about the same length. Nothing may be copied from TEXT except names, numbers and technical terms.",
+    "academic": "Rewrite TEXT in careful academic English: precise terms, no contractions, hedged claims where the evidence is not certain, the same meaning.",
+    "confident": "Rewrite TEXT so it sounds sure of itself: direct sentences, active voice, no hedging or filler, the same meaning.",
+    "plain": "Rewrite TEXT in plain English for a general reader: everyday words, one idea per sentence, no jargon (explain a term in brackets if it must stay), the same meaning.",
+    "bullets": "Turn TEXT into short bullet points, one point per line starting with '- ', keeping every fact.",
+    "prose": "Turn TEXT (notes or bullet points) into flowing paragraphs, keeping every fact, with sentences that connect.",
+    "proofread": "PROOFREAD",
     "summarize": "Summarize TEXT as 3 to 6 short bullet points.",
     "outline": "Make an outline for a document about what the person asks for: a title, then headings, each with a few bullet points.",
     "translate": "Translate TEXT into LANGUAGE. Keep its paragraph breaks, headings and lists.",
@@ -4949,6 +4957,40 @@ WORD_AI_ACTIONS = {
 # 3.15: the world's languages, most-spoken first, then regional ones (the app's Translate lists)
 WORD_AI_LANGS = (
     "English", "Spanish", "French", "Arabic", "Chinese", "Hindi", "Portuguese", "Bengali", "Russian", "Japanese", "German", "Korean", "Italian", "Turkish", "Indonesian", "Vietnamese", "Urdu", "Persian", "Swahili", "Dutch", "Polish", "Ukrainian", "Thai", "Filipino", "Malay", "Greek", "Hebrew", "Romanian", "Czech", "Swedish", "Hungarian", "Tamil", "Telugu", "Marathi", "Punjabi", "Gujarati", "Amharic", "Somali", "Hausa", "Yoruba", "Igbo", "Zulu", "Xhosa", "Afrikaans", "Twi", "Ewe", "Ga")
+
+
+def _word_proofread(user, text, charged):
+    """A list of fixes for TEXT: each one the exact words to change, the words to put instead, and why, in plain
+    English. The app applies them one by one or all at once, so the person stays in charge of every change.
+    The point was already taken by the endpoint; it is given back if Remy fails."""
+    system = ("You are Remy, the proofreader inside Academic-Home's Word editor. Read TEXT and list what should be fixed: "
+              "spelling, grammar, punctuation, wrong words, agreement, tense, capital letters, repeated words, and sentences that "
+              "are unclear or too long. Reply with one JSON object only, no code fences: "
+              '{"issues": [{"from": "<the exact words in TEXT to change, 1 to 12 words, copied exactly>", "to": "<the words to put '
+              'instead>", "why": "<one short plain reason, at most 12 words>", "kind": "spelling|grammar|punctuation|clarity|style"}], '
+              '"summary": "<one friendly sentence on how the writing reads overall>"}. '
+              "Rules: from must appear in TEXT exactly once if possible (add a word of context to make it unique); never change "
+              "names, quotations or facts; keep the writer's voice; at most 25 issues, the most important first; if TEXT is clean, "
+              "issues is an empty list and summary says so. Write why in the language of TEXT.")
+    try:
+        raw = call_claude(system, "TEXT:\n" + text[:12000], max_tokens=2400, feature="word-proofread")
+    except ConversionError as e:
+        _refund_sage_message(user, charged)
+        return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
+    obj = _guide_json(raw)
+    if not isinstance(obj, dict) or not isinstance(obj.get("issues"), list):
+        _refund_sage_message(user, charged)
+        return jsonify({"error": "Remy couldn't read the text this time — please try again." + AI_MSG_NOT_COUNTED}), 502
+    issues = []
+    for x in obj["issues"][:25]:
+        if not isinstance(x, dict):
+            continue
+        frm, to = str(x.get("from") or "").strip(), str(x.get("to") or "").strip()
+        if not frm or frm == to or frm not in text:
+            continue
+        issues.append({"from": frm[:300], "to": to[:300], "why": str(x.get("why") or "").strip()[:160],
+                       "kind": x.get("kind") if x.get("kind") in ("spelling", "grammar", "punctuation", "clarity", "style") else "grammar"})
+    return jsonify({"issues": issues, "summary": str(obj.get("summary") or "").strip()[:240]})
 
 
 @app.route("/api/word/ai", methods=["POST", "OPTIONS"])
@@ -4978,6 +5020,8 @@ def word_ai_endpoint():
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return _points_reply(e)
+    if action == "proofread":
+        return _word_proofread(request.current_user, text, charged)
     system = ("You are Remy, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
               + WORD_AI_ACTIONS[action].replace("LANGUAGE", lang) +
               " Reply with the words for the document only: no greeting, no note about what you did, no quotation marks around "
@@ -7309,6 +7353,107 @@ def guide_statements():
                     "references_title": CITE_STYLES[style]["heading"], "statements": out,
                     "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or ""})
 
+
+
+# ---------- 4.1 Remy plans before it works ----------
+REMY_PLAN_TOOLS = """
+chat: answer a question, explain something, talk, or write a short text (an email, a message, a study plan). No params.
+quiz: a practice quiz from a topic, pasted notes or an attached file. params: topic (what it is on, or "the attached file"),
+  count (5, 8, 12, 15, 25 or 50; default 8), style (mixed, mcq, short, tf or case; default mixed), level (mixed, easy,
+  medium, hard; default mixed), audience (student or tutor; default student).
+deck: a whole slide deck drafted from a topic, from real research papers; no file needed. params: topic, group (student or tutor).
+summarize: notes or an attached file turned into slides, a one-page revision sheet, a mind map, likely exam questions or
+  key terms. Needs text or an attached file. params: kind (slides, sheet, map, questions or terms), audience (student or tutor).
+write: an essay, report or section written with real sources cited. params: topic, style (apa, harvard, mla or chicago;
+  default apa), length_words (300 to 3000; default 800).
+cite: Guided citing in the Word editor: real papers, one statement at a time, each with its citation and reference, while
+  the person writes. params: topic.
+convert: convert a file to another format. params: from_kind (docs, slides, pics, sheets, sound or video), to (the format
+  wanted, like pdf, docx, pptx, jpg, mp3, or empty).
+meeting: start an online meeting or class, with an agenda Remy can write. params: title, minutes (30 to 300).
+focus: start the focus timer with calm sounds. params: minutes (25, 45 or 60).
+pdf: edit, sign, fill in, protect or shrink a PDF. No params.
+word: open or start a Word document to edit by hand. No params.
+scan: scan paper pages with the camera into a clean PDF. No params.
+studio: open Slide Studio to make or edit slides by hand. No params.
+"""
+REMY_PLAN_POINTS = {"quiz": POINTS_REMY, "deck": POINTS_DECK, "summarize": POINTS_REMY, "write": POINTS_WRITE, "cite": POINTS_RESEARCH, "chat": POINTS_REMY}
+REMY_PLAN_SCHOLAR = {"write": "Writing with sources", "cite": "Guided citing"}
+REMY_PLAN_SYSTEM = (
+    "You are Remy's planner inside Academic-Home, a study app. You read what a person asks for and decide how Remy should "
+    "respond, in one JSON object and nothing else. You never do the task yourself.\n\nWhat the app can do:" + REMY_PLAN_TOOLS +
+    "\nAnswer with exactly one of these shapes:\n"
+    '1. {"do":"chat"} when the person asks a question, wants something explained, is talking, or wants a short text written '
+    "(an email, a message, a plan). Most messages are this.\n"
+    '2. {"do":"ask","say":"<one short question>","options":["<choice>","<choice>"],"free":true} when the task is clear but one '
+    "thing Remy must know is missing (for a quiz, deck, essay or citing: the topic; for summarize: whether there are notes or a "
+    "file). Ask ONE question at a time, in plain words; give 2 to 4 short tappable choices when choices make sense, else an "
+    "empty list. free is true when typing an answer makes sense.\n"
+    '3. {"do":"plan","tool":"<tool>","title":"<one line: what Remy will make>","detail":["<a choice made, in plain words>", ...],'
+    '"params":{...},"next":["<something useful to do afterwards>", ...]} when enough is known. Fill every param, using the '
+    "defaults when the person did not say; put the choices that matter in detail (2 to 4 lines, so the person can change them). "
+    "next has 2 or 3 short things. For tools with no params use an empty object.\n"
+    '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing Remy can do>", ...]} when the person is vague '
+    'about what they want ("help me study", "I have an exam on Friday", "what can you do"). Give 3 or 4 concrete, specific '
+    "options written as things the person could say.\n\n"
+    "Rules: keep every word short and plain, the way you would speak to a first-year student; never invent facts, names or "
+    "numbers; use the person's own words for the topic; write in the person's language; a file the person attached is "
+    "referred to as 'your file'. When the message continues an earlier exchange (given as history), use what was already said "
+    "and do not ask it again."
+)
+
+
+@app.route("/api/remy/plan", methods=["POST", "OPTIONS"])
+@limiter.limit("90 per hour;400 per day", key_func=_account_or_ip_key)
+@auth_required
+def remy_plan():
+    data = request.get_json(silent=True) or {}
+    text = re.sub(r"\s+", " ", str(data.get("text") or "")).strip()[:1500]
+    if not text:
+        return jsonify({"error": "Say what you want Remy to do."}), 400
+    turns = []
+    for t in (data.get("history") or [])[-8:]:
+        if isinstance(t, dict) and t.get("role") in ("user", "assistant") and str(t.get("content") or "").strip():
+            turns.append({"role": t["role"], "content": str(t["content"]).strip()[:1200]})
+    has_file = bool(data.get("has_file"))
+    file_name = str(data.get("file_name") or "")[:120]
+    recent = [str(x)[:80] for x in (data.get("recent") or [])[:5] if str(x).strip()]
+    context = ("The person attached a file" + (f" called {file_name}" if file_name else "") + ".\n" if has_file else "No file is attached.\n")
+    if recent:
+        context += "Things they made or opened lately: " + "; ".join(recent) + ".\n"
+    # the exchange so far, then the new message, flattened so the planner sees it in one go
+    convo = "".join(("Person: " if t["role"] == "user" else "Remy asked: ") + t["content"] + "\n" for t in turns)
+    user_msg = context + (("Earlier in this exchange:\n" + convo) if convo else "") + "Person now says: " + text
+    try:
+        raw = call_claude(REMY_PLAN_SYSTEM, user_msg, max_tokens=500, timeout=40, feature="plan")
+    except ConversionError as e:
+        return jsonify({"do": "chat", "note": str(e)[:200]})
+    obj = _guide_json(raw) if isinstance(raw, str) else None
+    if not isinstance(obj, dict) or obj.get("do") not in ("chat", "ask", "plan", "suggest"):
+        return jsonify({"do": "chat"})
+    out = {"do": obj["do"]}
+    clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+    if obj["do"] in ("ask", "suggest"):
+        out["say"] = clip(obj.get("say"), 300) or ("What should it be about?" if obj["do"] == "ask" else "Here are a few things I can do.")
+        out["options"] = [clip(o, 90) for o in (obj.get("options") or []) if clip(o, 90)][:4]
+        out["free"] = bool(obj.get("free", True))
+    if obj["do"] == "plan":
+        tool = clip(obj.get("tool"), 20)
+        if tool not in REMY_PLAN_POINTS and tool not in ("convert", "meeting", "focus", "pdf", "word", "scan", "studio"):
+            return jsonify({"do": "chat"})
+        params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
+        out.update({"tool": tool, "title": clip(obj.get("title"), 140) or "Remy will do this", "detail": [clip(d, 160) for d in (obj.get("detail") or []) if clip(d, 160)][:4],
+                    "params": {str(k)[:30]: (clip(v, 400) if isinstance(v, str) else v) for k, v in params.items() if k},
+                    "next": [clip(n, 90) for n in (obj.get("next") or []) if clip(n, 90)][:3],
+                    "points": REMY_PLAN_POINTS.get(tool, 0)})
+        if tool in REMY_PLAN_SCHOLAR and not _is_pro(request.current_user):
+            out["scholar"] = REMY_PLAN_SCHOLAR[tool]
+    try:
+        pts = _points_state(request.current_user)
+        out["have"] = pts[0]
+    except Exception:
+        pass
+    return jsonify(out)
 
 
 @app.route("/api/write/export-docx", methods=["POST", "OPTIONS"])
