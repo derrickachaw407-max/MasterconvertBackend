@@ -80,7 +80,7 @@ Compress(app)
 # processes, each keeping its own count, so a limit here can let through
 # up to twice its number. That's fine for what these limits are for —
 # stopping scripts making hundreds or thousands of requests — not precise
-# quotas (Remy's monthly allowance is exact; it's counted in the database).
+# quotas (Scholar AI's monthly allowance is exact; it's counted in the database).
 def _client_ip():
     """The visitor's own address. Render's edge sets True-Client-IP to it (replacing any value a visitor sends);
     elsewhere (a computer, the tests) the connection's own address."""
@@ -293,7 +293,7 @@ GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")
 # not something settable from here.
 STORE_PRODUCT_TO_PLAN = {
     # The ids to register in App Store Connect and Play Console:
-    #   Pay-per-Use — one full use of Pro: PAYPERUSE_MESSAGES Remy messages
+    #   Pay-per-Use — one full use of Pro: PAYPERUSE_MESSAGES Scholar AI messages
     #   that never expire (Apple: Consumable; Google Play: one-time product,
     #   consumed after it's granted). Each store transaction is credited
     #   once only (store_purchases).
@@ -316,16 +316,16 @@ PRO_PLANS = SCHOLAR_PASSES + ("monthly", "halfyear", "yearly")
 _PRO_SQL = "('day', 'week', 'month', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
 PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "semester": "Scholar Semester", "year": "Scholar Year",
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
-# Points: the unit of AI work. A Remy answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
+# Points: the unit of AI work. A Scholar AI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
 POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
 TRIAL_POINTS = 10          # Free: once per phone, never renewed
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
 BONUS_MONTH_POINTS = 450   # a referral bonus month works like Scholar Month
 # What Pro adds beyond Free (none of Free's own allowances change).
-REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Remy reads (~8 / ~25 pages)
+REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Scholar AI reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
-DECK_CONTENT_FREE, DECK_CONTENT_PRO = 14, 22         # content slides in a deck Remy drafts
-PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: Remy messages that never expire
+DECK_CONTENT_FREE, DECK_CONTENT_PRO = 14, 22         # content slides in a deck Scholar AI drafts
+PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: Scholar AI messages that never expire
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
@@ -405,7 +405,7 @@ def init_db():
             # When a Pay-per-Use pass ends. NULL for Free and for store
             # subscriptions (the stores handle their renewals).
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ")
-            # Pay-per-Use: Remy messages bought once, used after the monthly
+            # Pay-per-Use: Scholar AI messages bought once, used after the monthly
             # allowance, never expiring — and every store transaction that
             # granted them, so the same purchase is never credited twice.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
@@ -543,7 +543,7 @@ MEMORY_LIMIT = 50
 
 
 def _memory_on(user_row):
-    """Whether this person lets Remy remember (Profile -> Remy's memory)."""
+    """Whether this person lets Scholar AI remember (Profile -> Scholar AI's memory)."""
     try:
         return user_row.get("memory_enabled", True) is not False
     except Exception:
@@ -1180,7 +1180,7 @@ def user_row_to_dict(row):
         # Where Pro came from — the app describes it truthfully: a store plan
         # renews, a Paystack pass or a bonus month runs to its date.
         "plan_source": (row.get("plan_source") if hasattr(row, "get") else None) if (row.get("plan") if hasattr(row, "get") else None) != "free" else None,
-        # The Remy message meter: this window's allowance, used so far, and
+        # The Scholar AI message meter: this window's allowance, used so far, and
         # when it renews (30 days after it began).
         "remy_messages_used": msgs_used,
         "remy_messages_limit": msgs_limit,
@@ -1287,7 +1287,7 @@ _UNCONFIRMED_OK = {"me", "verify_email", "resend_code", "change_email", "delete_
 
 
 # 3.2: what each AI call used, logged as counts with an estimated cost (USD per million tokens; web search per
-# search) so the real cost of a Remy answer can be checked — never anyone's words or account.
+# search) so the real cost of a Scholar AI answer can be checked — never anyone's words or account.
 _AI_RATES = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (2.0, 10.0)}
 _AI_SEARCH_COST = 0.01
 
@@ -1307,11 +1307,11 @@ def _log_ai_use(model, usage, feature):
 
 # 3.3.1: what people see when the AI can't answer. Never the AI service's own words — they can name this account's
 # credit balance or keys. The real reason goes to the server log for the owner (see _ai_failure).
-AI_MSG_UNAVAILABLE = "Remy isn\u2019t available right now. Please try again a little later."
-AI_MSG_BUSY = "Remy is busy right now. Please try again in a minute."
-AI_MSG_SLOW = "Remy took too long to answer. Please try again."
-AI_MSG_TOO_BIG = "That\u2019s more than Remy can read at once. Please try a shorter message or file."
-AI_MSG_FAILED = "Remy couldn\u2019t answer just now. Please try again."
+AI_MSG_UNAVAILABLE = "Scholar AI isn\u2019t available right now. Please try again a little later."
+AI_MSG_BUSY = "Scholar AI is busy right now. Please try again in a minute."
+AI_MSG_SLOW = "Scholar AI took too long to answer. Please try again."
+AI_MSG_TOO_BIG = "That\u2019s more than Scholar AI can read at once. Please try a shorter message or file."
+AI_MSG_FAILED = "Scholar AI couldn\u2019t answer just now. Please try again."
 AI_MSG_NOT_COUNTED = " This didn\u2019t use any of your messages."
 
 
@@ -2314,7 +2314,7 @@ def handle_too_large(e):
 def handle_rate_limited(e):
     # Flask-Limiter's default reply is an HTML page; the app reads replies
     # as JSON, so without this a limited user saw a parsing error ("Unexpected
-    # token '<'") instead of an explanation. Remy's monthly allowance returns
+    # token '<'") instead of an explanation. Scholar AI's monthly allowance returns
     # its own 429 message directly and never reaches this handler.
     return jsonify({"error": "You've made a lot of requests in a short time. Please wait a few minutes, then try again."}), 429
 
@@ -3404,7 +3404,7 @@ def plan_upgrade():
                                 (holder["user_id"], holder["product"]))
                     logger.info(f"Store purchase {transaction_key} moved from user {holder['user_id']} to {request.current_user['id']}")
             if plan == "payperuse":
-                # One full use of Pro: Remy messages that never expire, on top
+                # One full use of Pro: Scholar AI messages that never expire, on top
                 # of the monthly allowance; the plan itself doesn't change.
                 # A transaction already credited (a retried or replayed
                 # request) adds nothing the second time.
@@ -3444,7 +3444,7 @@ def plan_upgrade():
 # ------------------------------------------------------------ Paystack (web only)
 # On the web (acadhome.vercel.app) Pro is bought with Paystack — card or
 # mobile money, charged in Ghana cedis — as a one-time pass: 30 or 365 days of
-# Pro, or 30 Remy messages. The App Store and Google Play apps must use the
+# Pro, or 30 Scholar AI messages. The App Store and Google Play apps must use the
 # stores' own purchases (their rules), so requests from the store apps are
 # refused here and the app hides Paystack there too. The secret key is read
 # only from the server's environment — never from code or the app.
@@ -3810,8 +3810,8 @@ if _paystack_on() and "fake" not in os.environ.get("DATABASE_URL", "fake"):
     _threading.Thread(target=_paystack_reconcile_loop, daemon=True, name="paystack-check").start()
 
 
-# ------------------------------------------------------------ Remy's memory
-# What Remy remembers about a person is theirs to see and control: list it,
+# ------------------------------------------------------------ Scholar AI's memory
+# What Scholar AI remembers about a person is theirs to see and control: list it,
 # add a note, edit or delete one, clear everything, or switch memory off
 # (then nothing is read or saved). Every change is limited to the person's
 # own notes.
@@ -3832,11 +3832,11 @@ def memory_endpoint():
             if request.method == "POST":
                 note = re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("note") or "")).strip()[:300]
                 if not note:
-                    return jsonify({"error": "Write something for Remy to remember."}), 400
+                    return jsonify({"error": "Write something for Scholar AI to remember."}), 400
                 cur.execute("SELECT note FROM user_memory WHERE user_id = %s", (user["id"],))
                 existing = [r["note"].strip().lower() for r in cur.fetchall()]
                 if len(existing) >= MEMORY_LIMIT:
-                    return jsonify({"error": f"Remy can remember up to {MEMORY_LIMIT} notes — delete one first."}), 400
+                    return jsonify({"error": f"Scholar AI can remember up to {MEMORY_LIMIT} notes — delete one first."}), 400
                 if note.lower() not in existing:
                     cur.execute("INSERT INTO user_memory (user_id, note) VALUES (%s, %s)", (user["id"], note))
             elif request.method == "DELETE":
@@ -4134,7 +4134,7 @@ def _no_points_error(row, points):
     buy = f"Add {pack[2]} points for GH₵{pack[0] // 100:.0f}"
     if plan == "free":
         if row.get("trial_blocked"):
-            return PointsError("Remy's free trial has already been used on this phone. "
+            return PointsError("Scholar AI's free trial has already been used on this phone. "
                                    f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
         return PointsError(f"You've used your free trial ({TRIAL_POINTS} points). "
                                f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
@@ -4193,11 +4193,11 @@ def _log_sage_message_and_consume(user_row, points=1):
                     conn.rollback()
                     if row["plan"] == "free":
                         raise ConversionError(
-                            f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Remy this month. "
-                            f"A Scholar pass adds points for Remy and every other AI feature."
+                            f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Scholar AI this month. "
+                            f"A Scholar pass adds points for Scholar AI and every other AI feature."
                         )
                     raise ConversionError(
-                        f"You've reached Remy's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
+                        f"You've reached Scholar AI's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
                         f"account. It resets next month, or a Scholar pass adds points now."
                     )
             if source == "allowance":
@@ -4931,7 +4931,7 @@ def word_open_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# ======================= 3.14: Remy in the Word editor =======================
+# ======================= 3.14: Scholar AI in the Word editor =======================
 WORD_AI_ACTIONS = {
     "write": "Write what the person asks for, ready to go into their document.",
     "continue": "Carry on the document from where TEXT ends: one or two paragraphs that follow on naturally, in the same voice. Only the new words — don't repeat any of TEXT.",
@@ -4962,8 +4962,8 @@ WORD_AI_LANGS = (
 def _word_proofread(user, text, charged):
     """A list of fixes for TEXT: each one the exact words to change, the words to put instead, and why, in plain
     English. The app applies them one by one or all at once, so the person stays in charge of every change.
-    The point was already taken by the endpoint; it is given back if Remy fails."""
-    system = ("You are Remy, the proofreader inside Academic-Home's Word editor. Read TEXT and list what should be fixed: "
+    The point was already taken by the endpoint; it is given back if Scholar AI fails."""
+    system = ("You are Scholar AI, the proofreader inside Academic-Home's Word editor. Read TEXT and list what should be fixed: "
               "spelling, grammar, punctuation, wrong words, agreement, tense, capital letters, repeated words, and sentences that "
               "are unclear or too long. Reply with one JSON object only, no code fences: "
               '{"issues": [{"from": "<the exact words in TEXT to change, 1 to 12 words, copied exactly>", "to": "<the words to put '
@@ -4980,7 +4980,7 @@ def _word_proofread(user, text, charged):
     obj = _guide_json(raw)
     if not isinstance(obj, dict) or not isinstance(obj.get("issues"), list):
         _refund_sage_message(user, charged)
-        return jsonify({"error": "Remy couldn't read the text this time — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "Scholar AI couldn't read the text this time — please try again." + AI_MSG_NOT_COUNTED}), 502
     issues = []
     for x in obj["issues"][:25]:
         if not isinstance(x, dict):
@@ -4997,7 +4997,7 @@ def _word_proofread(user, text, charged):
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def word_ai_endpoint():
-    """3.14 — Remy in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
+    """3.14 — Scholar AI in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
     far), ask (what to write, for write and outline), lang (for translate), title (the document's name). Returns
     {"text": …} in plain text with light marks: "# " a title, "## " a heading, "- " a point, "1. " a numbered point."""
     if request.method == "OPTIONS":
@@ -5005,13 +5005,13 @@ def word_ai_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in WORD_AI_ACTIONS:
-        return jsonify({"error": "Remy can't do that here."}), 400
+        return jsonify({"error": "Scholar AI can't do that here."}), 400
     text = str(data.get("text") or "").replace("\r", "").strip()[:14000]
     ask = str(data.get("ask") or "").strip()[:1500]
     lang = str(data.get("lang") or "")
     title = str(data.get("title") or "").strip()[:120]
     if action in ("write", "outline") and not ask:
-        return jsonify({"error": "Say what Remy should write."}), 400
+        return jsonify({"error": "Say what Scholar AI should write."}), 400
     if action not in ("write", "outline") and not text:
         return jsonify({"error": "Choose some words first — or put the cursor in a paragraph."}), 400
     if action == "translate" and lang not in WORD_AI_LANGS:
@@ -5022,7 +5022,7 @@ def word_ai_endpoint():
         return _points_reply(e)
     if action == "proofread":
         return _word_proofread(request.current_user, text, charged)
-    system = ("You are Remy, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
+    system = ("You are Scholar AI, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
               + WORD_AI_ACTIONS[action].replace("LANGUAGE", lang) +
               " Reply with the words for the document only: no greeting, no note about what you did, no quotation marks around "
               "it. Plain text with these marks only: '# ' starts a title, '## ' a heading, '### ' a smaller heading, '- ' a "
@@ -5046,7 +5046,7 @@ def word_ai_endpoint():
     out = out.replace("**", "").replace("__", "")
     if not out:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Remy had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "Scholar AI had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"text": out[:30000]})
 
 
@@ -5354,7 +5354,7 @@ def _parse_summary_json(raw_text):
 
 
 SAGE_SYSTEM_PROMPT = (
-    "You are Remy, Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
+    "You are Scholar AI, Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant anyone can "
     "bring almost anything to: students and teachers, people at work, and anyone with an "
     "everyday question. Academic-Home also has purpose-built AI tools that make things a "
@@ -5418,7 +5418,7 @@ _HANDOFF_RX = re.compile(r"\[\[\s*HANDOFF\s*:\s*(deck|summarize|quiz|write|conve
 
 
 def _remy_handoff(text):
-    """The tool Remy passed the request to (3.13), if the reply is a hand-over: {"to", "kind", "request"}."""
+    """The tool Scholar AI passed the request to (3.13), if the reply is a hand-over: {"to", "kind", "request"}."""
     m = _HANDOFF_RX.search(C34_WMARK.sub("", text or ""))
     if not m:
         return None
@@ -5427,7 +5427,7 @@ def _remy_handoff(text):
     return {"to": to, "kind": kind, "request": re.sub(r"\s+", " ", m.group(3) or "").strip()[:600]}
 
 
-# ------------------------------------------------ Remy: evidence first (3.0)
+# ------------------------------------------------ Scholar AI: evidence first (3.0)
 _REMY_NO_PAPERS = re.compile(
     r"\b(?:e-?mails?|letters?|cover letter|cv|resume|grammar|spelling|proofread|rewrite|rephrase|paraphrase|translat\w*|"
     r"timetable|schedule|plan my|my (?:week|day|weekend)|to-?do|brainstorm|ideas? for|names? for|poem|story|joke|song|lyrics|"
@@ -5475,7 +5475,7 @@ _REMY_CITE = re.compile(r"(?<![\w\]\[])\[(\d{1,2}(?:\s*[,–\-]\s*\d{1,2})*)\]")
 
 
 def _number_cited_papers(text, papers):
-    """Remy's [n] citations renumbered 1, 2, 3… in the order they first appear; a number that
+    """Scholar AI's [n] citations renumbered 1, 2, 3… in the order they first appear; a number that
     matches no paper is taken out. Returns (text, the cited papers in that order)."""
     if not papers or not text:
         return text, []
@@ -5713,7 +5713,7 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
     return text, unsourced
 
 
-# ---- Remy
+# ---- Scholar AI
 def _c34_marked_text(content):
     """The answer's text with a private mark after each passage the web search grounded (its page's index), and the
     pages: title, address, and the lines the answer drew on."""
@@ -5812,7 +5812,7 @@ def _c34_number(text, papers, pages):
 
 
 def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment):
-    """Remy's answer with a source on every sentence that states something (see the top of this patch).
+    """Scholar AI's answer with a source on every sentence that states something (see the top of this patch).
     Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced)."""
     text = _C34_AFTER.sub(lambda m: (" " if m.group(2).strip().startswith("[") else "") + m.group(2).strip() + m.group(1), text)
     is_cited = _c34_remy_cited(papers)
@@ -5939,7 +5939,7 @@ def sage_endpoint():
     except ConversionError as e:
         return _points_reply(e)
 
-    # Remy's memory (when the person allows it): what Remy noted before, and
+    # Scholar AI's memory (when the person allows it): what Scholar AI noted before, and
     # permission to note one new durable thing — taken out of the reply below.
     memory_on = _memory_on(request.current_user)
     system_prompt = SAGE_SYSTEM_PROMPT
@@ -5958,7 +5958,7 @@ def sage_endpoint():
         try:
             papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
         except Exception as e:
-            logger.warning(f"Remy's paper search failed: {e}")
+            logger.warning(f"Scholar AI's paper search failed: {e}")
             papers = []
     if papers:
         system_prompt += "\n\n" + _remy_papers_block(papers)
@@ -6814,7 +6814,7 @@ MEMORY_INSTRUCTION = (
     "next time — omit it entirely otherwise, and never repeat something you already noted "
     "before. Never note sensitive personal details (health, money, religion, relationships, "
     "passwords or anything they'd keep private). They can see, edit and delete these notes "
-    "in Profile -> Remy's memory."
+    "in Profile -> Scholar AI's memory."
 )
 
 
@@ -7257,7 +7257,7 @@ def guide_outline():
             subs.append({"title": _guide_clip(x.get("title"), 90), "why": _guide_clip(x.get("why"), 200)})
     if not subs:
         _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
-        return jsonify({"error": "Remy couldn't outline that — try a few more words about the topic."}), 502
+        return jsonify({"error": "Scholar AI couldn't outline that — try a few more words about the topic."}), 502
     return jsonify({"topic": topic, "subtopics": subs[:8]})
 
 
@@ -7348,14 +7348,14 @@ def guide_statements():
             break
     if len(out) < 3:
         _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH)
-        return jsonify({"error": "Remy couldn't build statements from those papers — try again, or say the topic in other words."}), 502
+        return jsonify({"error": "Scholar AI couldn't build statements from those papers — try again, or say the topic in other words."}), 502
     return jsonify({"topic": topic, "subtopic": sub, "style": style, "style_name": CITE_STYLES[style]["name"],
                     "references_title": CITE_STYLES[style]["heading"], "statements": out,
                     "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or ""})
 
 
 
-# ---------- 4.1 Remy plans before it works ----------
+# ---------- 4.1 Scholar AI plans before it works ----------
 REMY_PLAN_TOOLS = """
 chat: answer a question, explain something, talk, or write a short text (an email, a message, a study plan). No params.
 quiz: a practice quiz from a topic, pasted notes or an attached file. params: topic (what it is on, or "the attached file"),
@@ -7370,7 +7370,7 @@ cite: Guided citing in the Word editor: real papers, one statement at a time, ea
   the person writes. params: topic.
 convert: convert a file to another format. params: from_kind (docs, slides, pics, sheets, sound or video), to (the format
   wanted, like pdf, docx, pptx, jpg, mp3, or empty).
-meeting: start an online meeting or class, with an agenda Remy can write. params: title, minutes (30 to 300).
+meeting: start an online meeting or class, with an agenda Scholar AI can write. params: title, minutes (30 to 300).
 focus: start the focus timer with calm sounds. params: minutes (25, 45 or 60).
 pdf: edit, sign, fill in, protect or shrink a PDF. No params.
 word: open or start a Word document to edit by hand. No params.
@@ -7380,20 +7380,20 @@ studio: open Slide Studio to make or edit slides by hand. No params.
 REMY_PLAN_POINTS = {"quiz": POINTS_REMY, "deck": POINTS_DECK, "summarize": POINTS_REMY, "write": POINTS_WRITE, "cite": POINTS_RESEARCH, "chat": POINTS_REMY}
 REMY_PLAN_SCHOLAR = {"write": "Writing with sources", "cite": "Guided citing"}
 REMY_PLAN_SYSTEM = (
-    "You are Remy's planner inside Academic-Home, a study app. You read what a person asks for and decide how Remy should "
+    "You are Scholar AI's planner inside Academic-Home, a study app. You read what a person asks for and decide how Scholar AI should "
     "respond, in one JSON object and nothing else. You never do the task yourself.\n\nWhat the app can do:" + REMY_PLAN_TOOLS +
     "\nAnswer with exactly one of these shapes:\n"
     '1. {"do":"chat"} when the person asks a question, wants something explained, is talking, or wants a short text written '
     "(an email, a message, a plan). Most messages are this.\n"
     '2. {"do":"ask","say":"<one short question>","options":["<choice>","<choice>"],"free":true} when the task is clear but one '
-    "thing Remy must know is missing (for a quiz, deck, essay or citing: the topic; for summarize: whether there are notes or a "
+    "thing Scholar AI must know is missing (for a quiz, deck, essay or citing: the topic; for summarize: whether there are notes or a "
     "file). Ask ONE question at a time, in plain words; give 2 to 4 short tappable choices when choices make sense, else an "
     "empty list. free is true when typing an answer makes sense.\n"
-    '3. {"do":"plan","tool":"<tool>","title":"<one line: what Remy will make>","detail":["<a choice made, in plain words>", ...],'
+    '3. {"do":"plan","tool":"<tool>","title":"<one line: what Scholar AI will make>","detail":["<a choice made, in plain words>", ...],'
     '"params":{...},"next":["<something useful to do afterwards>", ...]} when enough is known. Fill every param, using the '
     "defaults when the person did not say; put the choices that matter in detail (2 to 4 lines, so the person can change them). "
     "next has 2 or 3 short things. For tools with no params use an empty object.\n"
-    '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing Remy can do>", ...]} when the person is vague '
+    '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing Scholar AI can do>", ...]} when the person is vague '
     'about what they want ("help me study", "I have an exam on Friday", "what can you do"). Give 3 or 4 concrete, specific '
     "options written as things the person could say.\n\n"
     "Rules: keep every word short and plain, the way you would speak to a first-year student; never invent facts, names or "
@@ -7410,7 +7410,7 @@ def remy_plan():
     data = request.get_json(silent=True) or {}
     text = re.sub(r"\s+", " ", str(data.get("text") or "")).strip()[:1500]
     if not text:
-        return jsonify({"error": "Say what you want Remy to do."}), 400
+        return jsonify({"error": "Say what you want Scholar AI to do."}), 400
     turns = []
     for t in (data.get("history") or [])[-8:]:
         if isinstance(t, dict) and t.get("role") in ("user", "assistant") and str(t.get("content") or "").strip():
@@ -7422,7 +7422,7 @@ def remy_plan():
     if recent:
         context += "Things they made or opened lately: " + "; ".join(recent) + ".\n"
     # the exchange so far, then the new message, flattened so the planner sees it in one go
-    convo = "".join(("Person: " if t["role"] == "user" else "Remy asked: ") + t["content"] + "\n" for t in turns)
+    convo = "".join(("Person: " if t["role"] == "user" else "Scholar AI asked: ") + t["content"] + "\n" for t in turns)
     user_msg = context + (("Earlier in this exchange:\n" + convo) if convo else "") + "Person now says: " + text
     try:
         raw = call_claude(REMY_PLAN_SYSTEM, user_msg, max_tokens=500, timeout=40, feature="plan")
@@ -7442,7 +7442,7 @@ def remy_plan():
         if tool not in REMY_PLAN_POINTS and tool not in ("convert", "meeting", "focus", "pdf", "word", "scan", "studio"):
             return jsonify({"do": "chat"})
         params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
-        out.update({"tool": tool, "title": clip(obj.get("title"), 140) or "Remy will do this", "detail": [clip(d, 160) for d in (obj.get("detail") or []) if clip(d, 160)][:4],
+        out.update({"tool": tool, "title": clip(obj.get("title"), 140) or "Scholar AI will do this", "detail": [clip(d, 160) for d in (obj.get("detail") or []) if clip(d, 160)][:4],
                     "params": {str(k)[:30]: (clip(v, 400) if isinstance(v, str) else v) for k, v in params.items() if k},
                     "next": [clip(n, 90) for n in (obj.get("next") or []) if clip(n, 90)][:3],
                     "points": REMY_PLAN_POINTS.get(tool, 0)})
@@ -7577,10 +7577,10 @@ def slides_build_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# Remy inside Slide Studio: one tap to tighten a slide's points, put them in
+# Scholar AI inside Slide Studio: one tap to tighten a slide's points, put them in
 # simpler words, draft points from its title, or write its speaker notes.
 # Like Smart Summarize it's a slide tool, free on every plan, so it doesn't
-# use the Remy message allowance — only the per-account AI rate limit.
+# use the Scholar AI message allowance — only the per-account AI rate limit.
 _ASSIST_ACTIONS = {
     "tighten": ("Rewrite the slide's points so each is short and punchy — ideally under 12 words — keeping every idea "
                 "and its meaning. Keep sub-points as sub-points (level 1). Use at most 7 points.", 700),
@@ -7592,7 +7592,7 @@ _ASSIST_ACTIONS = {
               "of natural spoken English, about 80 to 150 words, covering each point.", 900),
 }
 _ASSIST_SYSTEM = (
-    "You are Remy, the study assistant in Academic-Home, improving one slide of a student's or lecturer's presentation. "
+    "You are Scholar AI, the study assistant in Academic-Home, improving one slide of a student's or lecturer's presentation. "
     "Reply with one JSON object only — no preamble and no code fences. For points reply "
     '{"bullets": [{"text": "...", "level": 0}]} (level 0 for main points, 1 for sub-points); for speaker notes reply '
     '{"notes": "..."}. Only rework what the slide already says or clearly implies: never invent statistics, dates, '
@@ -7608,13 +7608,13 @@ def _parse_assist_json(raw, action):
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        raise ConversionError("Remy couldn't improve this slide — please try again.")
+        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
     if not isinstance(data, dict):
-        raise ConversionError("Remy couldn't improve this slide — please try again.")
+        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
     if action == "notes":
         notes = data.get("notes")
         if not isinstance(notes, str) or not notes.strip():
-            raise ConversionError("Remy couldn't write notes for this slide — please try again.")
+            raise ConversionError("Scholar AI couldn't write notes for this slide — please try again.")
         return {"notes": notes.strip()[:2000]}
     points = []
     for b in data.get("bullets") or []:
@@ -7633,11 +7633,11 @@ def _parse_assist_json(raw, action):
         if len(points) >= 10:
             break
     if not points:
-        raise ConversionError("Remy couldn't improve this slide — please try again.")
+        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
     return {"bullets": points}
 
 
-# ======================= 3.14: Remy for a whole deck (Slide Studio → All slides) =======================
+# ======================= 3.14: Scholar AI for a whole deck (Slide Studio → All slides) =======================
 _ALL_ASSIST = {
     "notes": ("For every slide, write speaker notes: what the presenter says while it is shown — 2 to 4 short paragraphs of "
               "natural spoken English, about 80 to 150 words, covering each point. Reply for each slide with "
@@ -7682,7 +7682,7 @@ def slides_assist_all_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in _ALL_ASSIST:
-        return jsonify({"error": "Unknown request for Remy."}), 400
+        return jsonify({"error": "Unknown request for Scholar AI."}), 400
     lang = str(data.get("lang") or "")
     if action == "translate" and lang not in _ALL_LANGS:
         return jsonify({"error": "Choose a language."}), 400
@@ -7700,7 +7700,7 @@ def slides_assist_all_endpoint():
         if title or pts or (action == "translate" and notes):
             slides.append((i, title, pts, notes))
     if not slides:
-        return jsonify({"error": "There's nothing on the slides for Remy yet."}), 400
+        return jsonify({"error": "There's nothing on the slides for Scholar AI yet."}), 400
     deck = str(data.get("deck_title") or "").strip()[:160]
     lines = [f"Presentation: {deck}"] if deck else []
     for i, title, pts, notes in slides:
@@ -7715,7 +7715,7 @@ def slides_assist_all_endpoint():
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return _points_reply(e)
-    system = ("You are Remy, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
+    system = ("You are Scholar AI, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
               'one JSON object only — no preamble, no code fences: {"slides": [ ... one object per slide given, with its number '
               'as "i" ... ]}. ' + instruction + " Only rework what the slides already say or clearly imply: never invent "
               "statistics, dates, citations or facts. Write in the slides' own language unless asked to translate.")
@@ -7732,10 +7732,10 @@ def slides_assist_all_endpoint():
             got = json.loads(m.group(0)) if m else None
         items = got.get("slides") if isinstance(got, dict) else None
         if not isinstance(items, list):
-            raise ConversionError("Remy couldn't finish that — please try again.")
+            raise ConversionError("Scholar AI couldn't finish that — please try again.")
     except (ConversionError, ValueError) as e:
         _refund_sage_message(request.current_user, charged)
-        msg = str(e) if isinstance(e, ConversionError) else "Remy couldn't finish that — please try again."
+        msg = str(e) if isinstance(e, ConversionError) else "Scholar AI couldn't finish that — please try again."
         return jsonify({"error": msg + AI_MSG_NOT_COUNTED}), 502
     asked = {i for i, *_ in slides}
     out = []
@@ -7761,7 +7761,7 @@ def slides_assist_all_endpoint():
             out.append(o)
     if not out:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Remy couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "Scholar AI couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"slides": out})
 
 
@@ -7772,7 +7772,7 @@ def slides_assist_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in _ASSIST_ACTIONS:
-        return jsonify({"error": "Unknown request for Remy."}), 400
+        return jsonify({"error": "Unknown request for Scholar AI."}), 400
     slide = data.get("slide") if isinstance(data.get("slide"), dict) else {}
     title = str(slide.get("title") or "").strip()[:200]
     points = []
@@ -7802,19 +7802,19 @@ def slides_assist_endpoint():
         return jsonify({"error": str(e)}), 502
     except Exception as e:
         logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
-        return jsonify({"error": "Remy couldn't reach the AI just now — please try again."}), 502
+        return jsonify({"error": "Scholar AI couldn't reach the AI just now — please try again."}), 502
 
 
 # --------------------------------------------------------- drafting a whole deck
 # Starting a new deck in Slide Studio no longer has to mean a blank slide:
-# given a topic, Remy drafts a full outline (title slide plus content slides)
-# that opens straight into the editor to fix up. It uses one Remy message per
-# draft (the same allowance and Pay-per-Use messages as Remy chat), since a
+# given a topic, Scholar AI drafts a full outline (title slide plus content slides)
+# that opens straight into the editor to fix up. It uses one Scholar AI message per
+# draft (the same allowance and Pay-per-Use messages as Scholar AI chat), since a
 # whole deck is a substantial AI request; editing the deck afterwards, and
-# Remy's per-slide help, stay free.
+# Scholar AI's per-slide help, stay free.
 _DRAFT_MAX_SLIDES = 10
 _DRAFT_SYSTEM = (
-    "You are Remy, the study assistant in Academic-Home, drafting a full slide-deck outline from a short topic someone "
+    "You are Scholar AI, the study assistant in Academic-Home, drafting a full slide-deck outline from a short topic someone "
     "gives you, for a {group} to open and edit. Reply with one JSON object only — no preamble, no code fences: "
     '{{"title_slide": {{...}}, "slides": [...]}}.\n'
     "{title_fields}"
@@ -7866,7 +7866,7 @@ def _parse_draft_deck_json(raw, group):
     except json.JSONDecodeError:
         data = None
     if not isinstance(data, dict):
-        raise ConversionError("Remy couldn't draft this topic — please try again, or add a bit more detail.")
+        raise ConversionError("Scholar AI couldn't draft this topic — please try again, or add a bit more detail.")
 
     ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
     clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
@@ -7906,7 +7906,7 @@ def _parse_draft_deck_json(raw, group):
     else:
         body, end = slides, {"kind": "end", "title": "Any questions" if group == "tutor" else "End", "big": "Thank you"}
     if not body:
-        raise ConversionError("Remy couldn't draft this topic — please try again, or add a bit more detail.")
+        raise ConversionError("Scholar AI couldn't draft this topic — please try again, or add a bit more detail.")
     return {
         "template": ("tutor" if group == "tutor" else "student") + "-classic",
         "title_slide": title_slide, "slide_numbers": True, "slides": body[: _DRAFT_MAX_SLIDES - 1] + [end],
@@ -8072,7 +8072,7 @@ _DECK_ORDER_FIELDS = {
               'and at most 14 words.\ndiscussion: 2 or 3 short questions for a class discussion at the end.\n'),
 }
 _DECK_SYSTEM = (
-    "You are Remy, the assistant in Academic-Home, writing a COMPLETE slide deck from a short request, for a {group} to present. "
+    "You are Scholar AI, the assistant in Academic-Home, writing a COMPLETE slide deck from a short request, for a {group} to present. "
     "Reply with ONE JSON object only — no preamble, no code fences: {{\"title_slide\": {{...}}, \"slides\": [...]}}.\n"
     "{title_fields}"
     "slides: {min_slides} to {max_slides} items in teaching order: an introduction or overview first, then the content, then key "
@@ -8179,7 +8179,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
             except json.JSONDecodeError:
                 data = None
     if not isinstance(data, dict):
-        raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
+        raise ConversionError("Scholar AI couldn't write this deck — please try again, or add a bit more detail.")
     ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
     clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
     if group == "tutor":
@@ -8232,7 +8232,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
             slides.append(s)
     body = slides[:deck_max]
     if not any(s["kind"] != "section" for s in body):
-        raise ConversionError("Remy couldn't write this deck — please try again, or add a bit more detail.")
+        raise ConversionError("Scholar AI couldn't write this deck — please try again, or add a bit more detail.")
     refs = build_references_list(sources, cited) if sources else []
     lines = lambda rs: [re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else "") for r in rs]
 
@@ -8264,7 +8264,7 @@ def slides_draft_endpoint():
     group = "tutor" if data.get("group") == "tutor" else "student"
     topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
     if not topic:
-        return jsonify({"error": "Tell Remy what the deck is about first."}), 400
+        return jsonify({"error": "Tell Scholar AI what the deck is about first."}), 400
     pro = _is_pro(request.current_user)
     content_max = DECK_CONTENT_PRO if pro else DECK_CONTENT_FREE   # room for 2 section dividers on top
     # Evidence first: real papers for the topic, and the request's own wishes (drawings, charts).
@@ -8286,8 +8286,8 @@ def slides_draft_endpoint():
         system += _DECK_DRAWINGS
     if sources and _CHART_WORDS.search(topic):
         system += _DECK_CHARTS
-    # A whole drafted deck is real AI work, so it draws on the same Remy
-    # messages as chatting with Remy: the month's allowance first, then any
+    # A whole drafted deck is real AI work, so it draws on the same Scholar AI
+    # messages as chatting with Scholar AI: the month's allowance first, then any
     # Pay-per-Use messages. Checked before the AI call (never spend on a
     # request already over its limit), and given back below if no usable
     # deck arrives — a message only counts when the answer does.
@@ -8583,7 +8583,7 @@ def _colour_not_bold(pptx_path):
 # ------------------------------------------------------------ deleting an account
 # Required by the App Store and Google Play for any app where people create
 # an account: deleting it from inside the app. Everything stored with the
-# account goes with it — conversion history and Remy's memory notes (removed
+# account goes with it — conversion history and Scholar AI's memory notes (removed
 # by the database with the account), and the store purchase records; promo
 # codes someone created stay usable but no longer point at them. The
 # password is asked again, so a borrowed phone that's already signed in
@@ -9223,12 +9223,12 @@ def meet_agenda():
     except (TypeError, ValueError):
         minutes = 60
     if not title and not about:
-        return jsonify({"error": "Give the meeting a name first — Remy writes the agenda from it."}), 400
+        return jsonify({"error": "Give the meeting a name first — Scholar AI writes the agenda from it."}), 400
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return _points_reply(e)
-    system = ("You are Remy, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
+    system = ("You are Scholar AI, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
               f"agenda only: 4 to 7 lines, each \"- <minutes> min — <item>\", the minutes adding up to about {minutes}; start "
               "with a short welcome and end with questions or next steps. Plain words, no heading, no other text. Never invent "
               "names, dates or facts that weren't given.")
@@ -9242,7 +9242,7 @@ def meet_agenda():
     lines = [l if l.startswith("- ") else "- " + l.lstrip("-•* ") for l in lines if not l.lower().startswith(("here", "agenda:"))][:10]
     if not lines:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Remy couldn’t write the agenda — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "Scholar AI couldn’t write the agenda — please try again." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"agenda": "\n".join(lines)})
 
 
@@ -9269,7 +9269,7 @@ def meet_notes_send(cur, code):
     host = (user.get("name") or "The host").strip()[:60]
     for e in to:
         try:
-            send_email(e, ("Notes from " + m["title"])[:180], f"{host} shared the notes from “{m['title']}”, written by Remy.\n\n{notes}\n")
+            send_email(e, ("Notes from " + m["title"])[:180], f"{host} shared the notes from “{m['title']}”, written by Scholar AI.\n\n{notes}\n")
             sent += 1
         except Exception as ex:
             logger.warning(f"Meet: notes weren't sent to one person ({ex.__class__.__name__})")
@@ -9662,11 +9662,11 @@ def meet_attendance(cur, code):
 @auth_required
 @_meet_reply
 def meet_notes(cur, code):
-    """Remy's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
+    """Scholar AI's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
     data = _json_body()
     m = _meet_get(cur, code)
     if request.current_user["id"] != m["host_id"]:
-        raise MeetError("Only the host can ask Remy for the notes.", 403)
+        raise MeetError("Only the host can ask Scholar AI for the notes.", 403)
     lines = []
     for it in (data.get("chat") or [])[:400]:
         if isinstance(it, dict) and _text(it.get("text")).strip():
