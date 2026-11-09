@@ -10218,9 +10218,7 @@ def _build_word(payload, pages):
     _apa_styles(doc)
     numbered = bool(payload.get("numbered"))
     references = [r for r in (payload.get("references") or []) if isinstance(r, dict) and (r.get("text") or r.get("url"))]
-    if not numbered:
-        # APA's reference list is alphabetical; the keys stay with their entries
-        references = sorted(references, key=lambda r: re.sub(r"[*_]", "", str(r.get("text") or "")).lower())
+    # the list comes in the order its style asks (worked out on the server: n.d. first, one author before several, …)
     links = _CiteLinks(references, numbered) if references else None
     title = re.sub(r"\s+", " ", str(payload.get("title") or "Academic Response")).strip()[:200]
 
@@ -10421,6 +10419,9 @@ def _build_word(payload, pages):
             url = str(ref.get("url") or "").strip()
             if url.startswith("http"):
                 _write_url(p, url)
+            after = str(ref.get("after") or "").strip()[:80]
+            if after:
+                p._p.append(_xrun(" " + after))
             _xbookmark(p._p, f"ref_{i + 1}", next_id())
 
     return doc, [(bm, text) for bm, text, _ in heads], [(bm, "Table", n, cap) for bm, n, cap in tables] + [(bm, "Figure", n, cap) for bm, n, cap in figures]

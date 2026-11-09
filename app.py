@@ -12,6 +12,7 @@ import string
 import tempfile
 import shutil
 import time
+import unicodedata
 import uuid
 import zipfile
 from collections import Counter
@@ -318,7 +319,12 @@ PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Mo
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
 # Points: the unit of AI work. A Scholar AI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
 POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
-TRIAL_POINTS = 10          # Free: once per phone, never renewed
+# 4.5 (the owner, 9 Nov 2026): Free gets 5 points every calendar month (UTC), once per phone, and at most 2 of its uses
+# a month may be research writing — an automatic draft (/api/write) or a batch of statements for manual research
+# writing (/api/guide/statements). Research writing still costs its usual 2 points each.
+FREE_MONTH_POINTS = 5
+FREE_MONTH_RESEARCH = 2
+TRIAL_POINTS = FREE_MONTH_POINTS   # the old name; older apps read "trial_points" from /api/paystack/config
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
 BONUS_MONTH_POINTS = 450   # a referral bonus month works like Scholar Month
 # What Pro adds beyond Free (none of Free's own allowances change).
@@ -414,6 +420,10 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS day_points_used INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS day_points_at DATE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_points_used INTEGER NOT NULL DEFAULT 0")
+            # 4.5: trial_points_used counts Free's points in the month named by free_month (its first day, UTC);
+            # free_research_used counts that month's research writings
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS free_month DATE")
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS free_research_used INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_blocked BOOLEAN NOT NULL DEFAULT FALSE")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trial_devices (
@@ -519,7 +529,7 @@ def add_user_memory(user_id, note):
     work — additive only, existing notes are never edited or removed."""
     note = (note or "").strip()[:400]
     if not (DATABASE_URL and user_id and note):
-        return
+        return False
     try:
         conn = get_db()
         try:
@@ -528,15 +538,16 @@ def add_user_memory(user_id, note):
                 cur.execute("SELECT note FROM user_memory WHERE user_id = %s", (user_id,))
                 existing = [r["note"].strip().lower() for r in cur.fetchall()]
                 if note.lower() in existing or len(existing) >= MEMORY_LIMIT:
-                    return
+                    return False
                 cur.execute(
                     "INSERT INTO user_memory (user_id, note) VALUES (%s, %s)",
                     (user_id, note),
                 )
+                return True             # 4.5: the app says "Scholar AI will remember…" only for a note really saved
         finally:
             conn.close()
     except Exception:
-        pass  # memory is a nice-to-have — never let it break the actual response
+        return False  # memory is a nice-to-have — never let it break the actual response
 
 
 MEMORY_LIMIT = 50
@@ -664,8 +675,20 @@ def verify_token(token):
         return None
 
 
-def make_reset_token(user_id, email=None):
-    return _serializer.dumps({"reset_user_id": user_id, "email": (email or "").lower()}, salt="password-reset")
+def make_reset_token(user_id, email=None, token_version=None):
+    # 4.5: the account's token version goes in, so a link works once: the reset itself moves the version on
+    data = {"reset_user_id": user_id, "email": (email or "").lower()}
+    if token_version is not None:
+        data["tv"] = int(token_version)
+    return _serializer.dumps(data, salt="password-reset")
+
+
+def _reset_token_version(token):
+    try:
+        v = (_serializer.loads(token, max_age=RESET_TOKEN_MAX_AGE, salt="password-reset") or {}).get("tv")
+        return int(v) if v is not None else None
+    except (BadSignature, SignatureExpired, TypeError, ValueError):
+        return None
 
 
 def verify_reset_token(token):
@@ -1019,7 +1042,7 @@ def _send_verification_code(row, force=False, to=None):
     try:
         send_email(to or row["email"], f"{code} is your Academic-Home code", text, html)
     except Exception as e:
-        logger.warning(f"Couldn't send a confirmation code to user {uid}: {e}")
+        logger.warning(f"Couldn't send a confirmation code to user {uid}: {e.__class__.__name__}")
         _email_send_result(False, e, to or row["email"])
         # Let them try again straight away, and don't count the failed send against the hourly allowance.
         conn = get_db()
@@ -1149,8 +1172,32 @@ def _points_state(row):
         used_today = int(row.get("day_points_used") or 0) if row.get("day_points_at") == today else 0
         today_left = max(0, SCHOLAR_DAY_CAP - used_today)
         return pp + bought, pp, bought, 0, min(today_left, pp + bought), SCHOLAR_DAY_CAP
-    trial_left = 0 if row.get("trial_blocked") else max(0, TRIAL_POINTS - int(row.get("trial_points_used") or 0))
+    trial_left = _free_state(row)[0]
     return trial_left + bought, 0, bought, trial_left, None, None
+
+
+def _month_start(now=None):
+    d = (now or datetime.now(timezone.utc)).date()
+    return d.replace(day=1)
+
+
+def _next_month_start(now=None):
+    m = _month_start(now)
+    return (m.replace(year=m.year + 1, month=1) if m.month == 12 else m.replace(month=m.month + 1))
+
+
+def _free_state(row):
+    """Free's month, computed, never written: (points left, research writings left, the day they come back).
+    A new month starts at zero even before the database row is reset by the next use. A phone whose free points
+    belong to another account (trial_blocked) has no free points, but may still use bought points for research
+    writing within the month's research limit."""
+    get = row.get if hasattr(row, "get") else (lambda k, d=None: d)
+    month = _month_start()
+    same = get("free_month") == month
+    used = int(get("trial_points_used") or 0) if same else 0
+    research_used = int(get("free_research_used") or 0) if same else 0
+    points_left = 0 if get("trial_blocked") else max(0, FREE_MONTH_POINTS - used)
+    return points_left, max(0, FREE_MONTH_RESEARCH - research_used), _next_month_start()
 
 
 def user_row_to_dict(row):
@@ -1165,6 +1212,11 @@ def user_row_to_dict(row):
         "bought_points": bought_pts,
         "trial_points_left": trial_left,
         "trial_blocked": bool(row.get("trial_blocked")) if hasattr(row, "get") else False,
+        # 4.5: Free's month — 5 points, at most 2 research writings, back on the first day of next month
+        "free_points_month": FREE_MONTH_POINTS,
+        "free_research_left": _free_state(row)[1],
+        "free_research_month": FREE_MONTH_RESEARCH,
+        "free_resets_on": _free_state(row)[2].isoformat(),
         "points_today_left": today_left,
         "points_day_cap": day_cap,
         "plan_name": PLAN_NAMES.get(effective_plan(row), "Scholar"),
@@ -1496,12 +1548,12 @@ def search_web_sources(topic, max_results=4):
             timeout=60,
         )
     except requests.exceptions.RequestException as e:
-        logger.warning("search_web_sources: request failed for %r: %s", topic[:80], e)
+        logger.warning("search_web_sources: request failed (a %d-character topic): %s", len(topic or ""), e.__class__.__name__)
         return [], f"web search request failed: {e}"
     if resp.status_code != 200:
         logger.warning(
-            "search_web_sources: non-200 (%s) for %r — body: %s",
-            resp.status_code, topic[:80], resp.text[:500],
+            "search_web_sources: non-200 (%s) for a %d-character topic — body: %s",
+            resp.status_code, len(topic or ""), resp.text[:300],
         )
         return [], f"web search returned HTTP {resp.status_code}: {resp.text[:200]}"
     data = resp.json()
@@ -1520,7 +1572,7 @@ def search_web_sources(topic, max_results=4):
             if url and title and url not in seen:
                 seen.add(url)
                 sources.append({"title": title, "url": url, "authors": None, "year": None, "venue": None, "abstract": None})
-    logger.info("search_web_sources: %r -> %d source(s)", topic[:80], len(sources))
+    logger.info("search_web_sources: a %d-character topic -> %d source(s)", len(topic or ""), len(sources))
     diag = None if sources else "web search ran but found no usable results for this topic"
     return sources[:max_results], diag
 
@@ -1595,10 +1647,10 @@ def search_semantic_scholar(query, max_results=4):
                 timeout=12,
             )
         except requests.exceptions.RequestException as e:
-            logger.warning("search_semantic_scholar: request failed for %r: %s", query[:80], e)
+            logger.warning("search_semantic_scholar: request failed (a %d-character query): %s", len(query or ""), e.__class__.__name__)
             return [], f"Semantic Scholar request failed: {e}"
         if resp.status_code == 429 and attempt == 0:
-            logger.warning("search_semantic_scholar: 429 on first attempt for %r, retrying after backoff", query[:80])
+            logger.warning("search_semantic_scholar: 429 on first attempt, retrying after backoff")
             time.sleep(2.5)
             continue
         break
@@ -1612,7 +1664,7 @@ def search_semantic_scholar(query, max_results=4):
     try:
         data = resp.json()
     except ValueError:
-        logger.warning("search_semantic_scholar: non-JSON response for %r", query[:80])
+        logger.warning("search_semantic_scholar: non-JSON response")
         return [], "Semantic Scholar returned a non-JSON response"
     sources = []
     for paper in data.get("data", []):
@@ -1632,7 +1684,7 @@ def search_semantic_scholar(query, max_results=4):
         })
     sources.sort(key=lambda s: s["year"] or 0, reverse=True)
     raw_count = len(data.get("data", []))
-    logger.info("search_semantic_scholar: %r -> %d source(s) (raw hits: %d)", query[:80], len(sources), raw_count)
+    logger.info("search_semantic_scholar: a %d-character query -> %d source(s) (raw hits: %d)", len(query or ""), len(sources), raw_count)
     diag = None if sources else (
         f"Semantic Scholar ran but returned {raw_count} raw hits, none usable" if raw_count
         else "Semantic Scholar found zero matching papers for this topic"
@@ -1664,9 +1716,9 @@ def search_for_sources(topic, max_results=8):
                 sources.append(s)
     if not sources:
         combined_diag = "; ".join(d for d in (ss_diag, web_diag) if d) or "no sources found (unknown reason)"
-        logger.warning("search_for_sources: ZERO total sources found for %r — %s", topic[:120], combined_diag)
+        logger.warning("search_for_sources: ZERO total sources found (a %d-character topic) — %s", len(topic or ""), combined_diag)
         return [], combined_diag
-    logger.info("search_for_sources: %r -> %d total source(s)", topic[:80], len(sources))
+    logger.info("search_for_sources: a %d-character topic -> %d total source(s)", len(topic or ""), len(sources))
     return sources[:max_results], None
 
 
@@ -1769,25 +1821,40 @@ def _norm_doi(d):
     return d.lower() if d.startswith("10.") else None
 
 
+# A retraction notice, a withdrawn paper or an expression of concern is never offered as evidence
+_RETRACTED_TITLE = re.compile(r"^\W*(?:(?:retraction\s+notice|notice\s+of\s+(?:retraction|withdrawal)|withdrawal\s+notice|"
+                              r"expression\s+of\s+concern)\b|(?:retracted|retraction|withdrawn)(?:\s+article)?\s*[:.\]\-–—])", re.I)
+# Preprint servers, by name or DOI: a preprint isn't peer reviewed, and its reference says so
+_PREPRINT_VENUE = re.compile(r"\b(?:arxiv|biorxiv|medrxiv|chemrxiv|psyarxiv|socarxiv|edarxiv|eartharxiv|techrxiv|ssrn|research\s*square|"
+                             r"preprints?(?:\.org)?|osf\s+preprints|authorea)\b", re.I)
+_PREPRINT_DOI = re.compile(r"^10\.(?:48550/|1101/\d{4}\.\d{2}\.\d{2}\.|2139/ssrn|21203/rs\.|20944/preprints|26434/chemrxiv|"
+                           r"31234/osf\.io|31235/osf\.io|35542/osf\.io|31219/osf\.io|22541/au\.|36227/techrxiv|31223/)", re.I)
+
+
+def _is_preprint(venue, doi):
+    return bool((venue and _PREPRINT_VENUE.search(str(venue))) or (doi and _PREPRINT_DOI.match(str(doi))))
+
+
 def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, cites=0, biblio=None):
     title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(title or ""))).strip().rstrip(".")
-    if not title or not pdf or not str(pdf).startswith("http"):
+    if not title or not pdf or not str(pdf).startswith("http") or _RETRACTED_TITLE.match(title):
         return None
     try:
         year = int(year) if year else None
     except (TypeError, ValueError):
         year = None
-    authors = [re.sub(r"\s+", " ", str(a)).strip() for a in (authors or []) if str(a or "").strip()][:20]
+    authors = [re.sub(r"\s+", " ", str(a)).strip() for a in (authors or []) if str(a or "").strip()][:100]
     abstract = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(abstract or ""))).strip() or None
     doi = _norm_doi(doi)
     return {"title": title[:400], "authors": authors or None, "year": year, "venue": (str(venue).strip()[:200] or None) if venue else None,
             "doi": doi, "pdf": str(pdf)[:600], "landing": (str(landing)[:600] if landing else None),
             "url": f"https://doi.org/{doi}" if doi else str(pdf)[:600],
-            "abstract": abstract[:2000] if abstract else None, "found_in": found_in, "cites": int(cites or 0), "biblio": biblio or {}}
+            "abstract": abstract[:2000] if abstract else None, "found_in": found_in, "cites": int(cites or 0), "biblio": biblio or {},
+            "preprint": _is_preprint(venue, doi)}
 
 
 def _openalex_papers(query, n, since=None):
-    flt = "is_oa:true" + (f",publication_year:>{since - 1}" if since else "")
+    flt = "is_oa:true,is_retracted:false" + (f",publication_year:>{since - 1}" if since else "")
     params = {"search": query[:300], "filter": flt, "per-page": max(n * 3, 15),
               "select": "id,doi,display_name,publication_year,authorships,primary_location,best_oa_location,locations,"
                         "abstract_inverted_index,biblio,cited_by_count,type"}
@@ -1815,6 +1882,7 @@ def _openalex_papers(query, n, since=None):
                    "OpenAlex", w.get("cited_by_count"),
                    {k: b.get(k) for k in ("volume", "issue", "first_page", "last_page") if b.get(k)})
         if p:
+            p["preprint"] = p["preprint"] or str(w.get("type") or "").lower() == "preprint"
             out.append(p)
     return out, None if out else "OpenAlex found no open papers with a PDF"
 
@@ -1855,7 +1923,7 @@ def _s2_papers(query, n, since=None):
 
 
 def _epmc_papers(query, n, since=None):
-    q = f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y" + (f" AND PUB_YEAR:[{since} TO 3000]" if since else "")
+    q = f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y AND NOT PUB_TYPE:\"retracted publication\"" + (f" AND PUB_YEAR:[{since} TO 3000]" if since else "")
     params = {"query": q, "format": "json", "resultType": "core", "pageSize": max(n * 2, 12)}
     resp = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
     if resp.status_code != 200:
@@ -1883,12 +1951,48 @@ def _epmc_papers(query, n, since=None):
         p = _paper(x.get("title"), names, x.get("pubYear"), journal, x.get("doi"), pdf, landing, x.get("abstractText"),
                    "Europe PMC", x.get("citedByCount"), biblio)
         if p:
+            p["preprint"] = p["preprint"] or str(x.get("source") or "").upper() == "PPR"
             out.append(p)
     return out, None if out else "Europe PMC found no open papers with a PDF"
 
 
 def _title_key(t):
     return re.sub(r"[^a-z0-9]+", "", str(t or "").lower())[:120]
+
+
+def _first_surname(p):
+    a = (p.get("authors") or [None])[0]
+    if not a:
+        return ""
+    a = str(a).strip()
+    return re.sub(r"[^a-z]", "", (a.split(",")[0] if "," in a else a.split()[-1]).lower())
+
+
+_GENERIC_TITLES = {"introduction", "editorial", "preface", "foreword", "bookreview", "bookreviews", "commentary", "reply",
+                   "response", "erratum", "corrigendum", "correction", "letter", "lettertotheeditor", "abstracts", "conclusion",
+                   "conclusions", "discussion", "index", "contents", "frontmatter", "backmatter", "acknowledgements",
+                   "acknowledgments", "notes", "review", "overview", "summary", "abstract"}
+
+
+def _same_work(a, b):
+    """Two index records are the same paper: the same DOI, or the same title with years at most one apart and the
+    same first author's surname (two different papers that share a title stay apart). When one record lacks its
+    authors or its year, the same long, specific title and whatever else both give is enough."""
+    if a.get("doi") and b.get("doi") and a["doi"] == b["doi"]:
+        return True
+    ta = _title_key(a.get("title"))
+    if not ta or ta != _title_key(b.get("title")):
+        return False
+    try:
+        ya, yb = int(a.get("year") or 0), int(b.get("year") or 0)
+    except (TypeError, ValueError):
+        ya = yb = 0
+    if ya and yb and abs(ya - yb) > 1:
+        return False
+    sa, sb = _first_surname(a), _first_surname(b)
+    if sa and sb:
+        return sa == sb
+    return len(ta) >= 25 and ta not in _GENERIC_TITLES
 
 
 def _rank_papers(papers, query):
@@ -1939,32 +2043,30 @@ def search_papers(query, max_results=8, since=None, check_links=True):
             try:
                 papers, diag = jobs[name].result(timeout=_PAPER_TIMEOUT * 2 + 3)
             except Exception as e:
-                papers, diag = [], f"{name} failed: {e}"
+                papers, diag = [], f"{name} failed: {e.__class__.__name__}"
             for i, p in enumerate(papers):
                 p["_rank"] = i          # its place in that index's own relevance order
             got[name] = papers
             if diag:
                 why.append(diag)
     found = [p for name, _ in order for p in got.get(name, [])]
-    seen_doi, seen_title, merged = set(), set(), []
+    merged = []
     for p in found:
-        tk = _title_key(p["title"])
-        if (p["doi"] and p["doi"] in seen_doi) or tk in seen_title:
-            # the same paper from another index: keep whatever this copy adds
-            twin = next((m for m in merged if (p["doi"] and m["doi"] == p["doi"]) or _title_key(m["title"]) == tk), None)
-            if twin is not None:
-                for k in ("abstract", "venue", "doi", "authors", "year"):
-                    if not twin.get(k) and p.get(k):
-                        twin[k] = p[k]
-                if not twin.get("biblio") and p.get("biblio"):
-                    twin["biblio"] = p["biblio"]
-                if twin["doi"]:
-                    twin["url"] = f"https://doi.org/{twin['doi']}"
+        twin = next((m for m in merged if _same_work(m, p)), None)
+        if twin is None:
+            merged.append(p)
             continue
-        if p["doi"]:
-            seen_doi.add(p["doi"])
-        seen_title.add(tk)
-        merged.append(p)
+        # the same paper from another index: keep whatever this copy adds. Another version of it (a different DOI —
+        # a preprint and its journal article) lends only its abstract, so a reference never mixes two versions.
+        same_record = bool(twin.get("doi") and twin.get("doi") == p.get("doi")) or not (twin.get("doi") and p.get("doi"))
+        for k in (("abstract", "venue", "doi", "authors", "year") if same_record else ("abstract",)):
+            if not twin.get(k) and p.get(k):
+                twin[k] = p[k]
+        if same_record and not twin.get("biblio") and p.get("biblio"):
+            twin["biblio"] = p["biblio"]
+        twin["preprint"] = bool(twin.get("preprint") or (same_record and p.get("preprint")))
+        if twin.get("doi"):
+            twin["url"] = f"https://doi.org/{twin['doi']}"
     ranked = _rank_papers(merged, query)[: max_results * 2]
     if check_links and ranked:
         alive = {}
@@ -1982,7 +2084,7 @@ def search_papers(query, max_results=8, since=None, check_links=True):
     papers = ranked[:max_results]
     for p in papers:
         p.pop("_rank", None)
-    logger.info("search_papers: %r -> %d paper(s) (%s)", query[:80], len(papers), "; ".join(why) or "ok")
+    logger.info("search_papers: a %d-character query -> %d paper(s) (%s)", len(query or ""), len(papers), "; ".join(why) or "ok")
     return papers, (None if papers else ("; ".join(why) or "no open papers with a PDF were found"))
 
 
@@ -2020,19 +2122,215 @@ def _no_sources_note(diag, subject):
             "service names or error messages. Write as much as the task genuinely needs.")
 
 
-def _format_author_apa(full_name):
-    """'John Smith' -> 'Smith, J.' for a References-list author entry."""
-    parts = full_name.strip().split()
-    if not parts:
-        return full_name
-    surname = parts[-1]
-    initials = " ".join(p[0].upper() + "." for p in parts[:-1] if p)
-    return f"{surname}, {initials}" if initials else surname
+# ------------------------------------------------ 4.5: references and in-text citations, as the style guides say
+# Every part comes from the record a paper index gave (authors, year, title, journal, volume, issue, pages, DOI);
+# nothing is invented. Checked against: APA 7 (8.17–8.19, 9.8–9.11, 9.44–9.49), Cite Them Right Harvard, MLA 9 and
+# Chicago author-date (17th).
+_NAME_PARTICLES = {"van", "von", "de", "del", "della", "der", "den", "di", "da", "du", "la", "le", "dos", "das", "do", "ter",
+                   "ten", "bin", "ibn", "al", "el", "zu", "vom", "af"}
+_NAME_SUFFIX = re.compile(r"^(?:jr|sr|ii|iii|iv)\.?$", re.I)
+_ORG_WORDS = re.compile(r"\b(?:Organi[sz]ations?|Collaborat(?:ors?|ions?|ives?)|Groups?|Consorti(?:um|a)|Committees?|Institutes?|Institutions?|"
+                        r"Associations?|Councils?|Societ(?:y|ies)|Networks?|Agenc(?:y|ies)|Ministr(?:y|ies)|Departments?|Universit(?:y|ies)|"
+                        r"Foundations?|Cent(?:re|er)s?|Commissions?|Teams?|Initiatives?|Program(?:me)?s?|Boards?|Offices?|Authorit(?:y|ies)|"
+                        r"Alliances?|Federations?|Confederations?|Unions?|Bureaus?|Corporations?|Compan(?:y|ies)|Inc|Ltd|LLC|Units?|Services?|"
+                        r"Panels?|Trusts?|Projects?|Investigators|Working Party|Task Force|Taskforce|Writing Committee|Bank|Fund|Forum|"
+                        r"Academ(?:y|ies)|Coalition|Partnership|Secretariat|Assembly|Parliament|Government|Cabinet|Tribunal|Hospitals?|"
+                        r"Clinics?|College|Library|Museum|Laborator(?:y|ies)|Observatory|Administration|Corps|League|Cooperative|"
+                        r"Co-operative|Nations|Statistics|Survey|Collective)\b")
+_SMALL_TITLE = {"a", "an", "the", "and", "but", "or", "nor", "for", "so", "yet", "as", "at", "by", "in", "of", "off", "on", "per", "to",
+                "up", "via", "vs", "with", "from", "into", "onto", "over", "upon", "than", "versus"}
+
+
+def _name_parts(full):
+    """One author as {"org": True, "name"} or {"surname", "given": [...], "suffix"}; particles stay with the surname
+    ("van den Berg"), Jr./Sr./II stay apart, and a group author ("World Health Organization") stays whole."""
+    full = re.sub(r"\s+", " ", str(full or "")).strip().strip(",")
+    if not full:
+        return None
+    if (re.search(r"\d", full) or (_ORG_WORDS.search(full) and not _person_like(full))
+            or (full.isupper() and len(full) > 3 and " " not in full)
+            or (" " in full and "," not in full and re.search(r"\s(?:the|of|for|on|and|&)\s", full))):   # "Save the Children"
+        return {"org": True, "name": full}
+    if "," in full:                                   # "Mensah, Kofi A."
+        sur, _, giv = full.partition(",")
+        given = giv.split()
+        suffix = ""
+        if given and _NAME_SUFFIX.match(given[-1]):
+            suffix = given.pop()
+        return {"org": False, "surname": sur.strip(), "given": given, "suffix": suffix}
+    toks = full.split(" ")
+    suffix = ""
+    if len(toks) > 1 and _NAME_SUFFIX.match(toks[-1]):
+        suffix = toks.pop()
+    if len(toks) == 1:
+        return {"org": False, "surname": toks[0], "given": [], "suffix": suffix}
+    i = j = len(toks) - 1                              # the surname, with any particles just before it
+    while j - 1 >= 1 and toks[j - 1].lower().strip(".") in _NAME_PARTICLES:
+        j -= 1
+    run = toks[j:i]
+    if run and (len(run) >= 2 or any(t[:1].islower() for t in run) or _is_particle(run[-1], toks[i])):
+        i = j
+    return {"org": False, "surname": " ".join(toks[i:]), "given": toks[:i], "suffix": suffix}
+
+
+# Surnames from East and South-East Asia that a capitalised "Van", "Da", "Le"… in front of is a given or middle name
+# ("Hung Van Tran", "Wei Da Chen"), not a particle ("Martin Van Buren", "Maria Da Silva").
+_ASIAN_SURNAMES = set("""nguyen tran le pham hoang huynh phan vu vo dang bui do ho ngo duong ly truong dinh mai trinh lam ha
+luong cao doan ta quach thai wang li zhang liu chen yang huang zhao wu zhou xu sun ma zhu hu guo he lin gao luo zheng liang
+xie song tang han feng deng peng zeng xiao tian dong pan yuan cai jiang yu du ye cheng wei su lu ding ren shen yao cui zhong
+tan fan jin shi liao jia xia fu fang bai zou meng xiong qin qiu hou yin xue yan duan lei long tao mao hao gu gong shao wan
+qian lai hong kong chang chan cheung chow lau leung ng wong lee kim park choi jung kang cho yoon jang lim oh seo shin kwon
+hwang ahn yoo jeon ko moon son bae baek heo nam shim noh kwak sung cha joo woo koo min ryu na""".split())
+
+
+def _is_particle(tok, after):
+    """"van", "de", "da"… before a surname are part of it; capitalised, they are only when the surname isn't one of the
+    East or South-East Asian ones where "Van" or "Da" is a given name."""
+    low = tok.lower().strip(".")
+    if low not in _NAME_PARTICLES:
+        return False
+    if tok[:1].islower():
+        return True
+    return re.sub(r"[^a-z]", "", str(after or "").lower()) not in _ASIAN_SURNAMES
+
+
+# the first word of a two-word organisation ("World Bank", "Reserve Bank"); "Robert Service" and "Jean Bureau" are people
+_ORG_FIRST = re.compile(r"^(?:World|National|International|Global|Central|Federal|Royal|United|European|African|American|Asian|"
+                        r"Commonwealth|State|Regional|Local|City|County|Public|Private|Reserve|Development|Education|Health|"
+                        r"Statistical|Statistics|Research|Medical|Science|Scientific|Civil|Community|Ghana|Nigeria|Kenya|Africa)$")
+
+
+def _person_like(full):
+    """A two-word name whose org word is only its last ("Robert Service", "Mikkel Bank") names a person."""
+    toks = full.split()
+    if "," in full or len(toks) != 2 or _ORG_WORDS.search(toks[0]) or not _ORG_WORDS.fullmatch(toks[1]):
+        return False
+    return not (_ORG_FIRST.match(toks[0]) or _PLACES_RX.search(toks[0].lower()))
+
+
+def _initials(given):
+    """["Jean-Pierre", "K."] -> "J.-P. K." (lower-case particles in a given name are left out)."""
+    out = []
+    for g in given:
+        g = g.strip()
+        if not g or g[0].islower():
+            continue
+        if re.fullmatch(r"(?:[A-ZÀ-ɏ]\.?){2,3}", g) and g.replace(".", "").isupper():   # "JR" or "J.R." already initials
+            out += [c + "." for c in g.replace(".", "")]
+            continue
+        out.append("-".join(p[0].upper() + "." for p in g.split("-") if p))
+    return " ".join(out)
+
+
+def _au_surname(a):
+    return a["name"] if a.get("org") else a["surname"]
+
+
+def _au_inverted_apa(a):
+    if a.get("org"):
+        return a["name"]
+    ini = _initials(a["given"])
+    return a["surname"] + (", " + ini if ini else "") + (", " + a["suffix"].rstrip(".") + "." if a.get("suffix") else "")
+
+
+def _au_full(a):
+    if a.get("org"):
+        return a["name"]
+    return " ".join(a["given"] + [a["surname"]]) + (", " + a["suffix"] if a.get("suffix") else "")
+
+
+def _au_inverted_full(a):
+    if a.get("org"):
+        return a["name"]
+    return a["surname"] + (", " + " ".join(a["given"]) if a["given"] else "") + (", " + a["suffix"] if a.get("suffix") else "")
+
+
+def _end_dot(s):
+    """s with one full stop at its end ("Does it work?" keeps its question mark)."""
+    s = str(s or "").rstrip()
+    return s if not s or s[-1] in ".?!" else s + "."
+
+
+def _title_case(t):
+    """MLA and Chicago titles: principal words capitalised; words with capitals or digits inside are left as they are."""
+    words = t.split(" ")
+    out = []
+    for i, w in enumerate(words):
+        core = w.strip("“”\"'‘’()[]")
+        first = i == 0 or (out and out[-1].endswith((":", "?", "!", "—")))
+        last = i == len(words) - 1
+        if not core or any(c.isdigit() for c in core) or any(c.isupper() for c in core[1:]) or core.startswith(("http", "www")):
+            out.append(w)
+        elif core.lower() in _SMALL_TITLE and not first and not last:
+            out.append(w.replace(core, core.lower(), 1))
+        else:
+            out.append(w.replace(core, "-".join(p[:1].upper() + p[1:] for p in core.split("-")), 1))
+    return " ".join(out)
+
+
+def _tidy_title(t):
+    """A title as published, minus the "Effects Of Peer Tutoring On" quirk of some indexes: a small word inside a title
+    that capitalises every word is lower-cased (safe: no proper name is changed)."""
+    t = re.sub(r"\s+", " ", str(t or "")).strip().rstrip(".")
+    words = t.split(" ")
+    caps = [w for w in words if len(w) > 3 and w[:1].isalpha()]
+    if caps and sum(1 for w in caps if w[:1].isupper()) >= 0.8 * len(caps):
+        for i in range(1, len(words) - 1):
+            if words[i] in {w.capitalize() for w in _SMALL_TITLE} and not words[i - 1].endswith((":", "?", "!")):
+                words[i] = words[i].lower()
+    return " ".join(words)
+
+
+def _short_title(t, n=4):
+    w = re.sub(r"[.:;,?!]+$", "", " ".join(str(t or "").split()[:n]))
+    return w
+
+
+def _sort_title(t):
+    return re.sub(r"^(?:a|an|the)\s+", "", str(t or "").lower()).strip()
+
+
+def _group_norm(s):
+    """A name for comparing: accents off, lower case, letters and digits only ("van den Berg" -> "vandenberg")."""
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+def _names_group(names, title):
+    """What two works must share before their in-text citations can affect each other (initials, more names, a/b):
+    the first author's surname (a group's name), or for a work with no author, its short title."""
+    if names:   # cut where a citation's own text would be cut ("Department of Health and Social Care" -> "departmentofhealth")
+        return _group_norm(re.split(r"\s*(?:,|&|\band\b|\bet al\.?)\s*", _au_surname(names[0]))[0])
+    t = _group_norm(_short_title(_tidy_title(title)))
+    return "t:" + t if t else ""
+
+
+def _paper_group(p):
+    return _names_group([a for a in (_name_parts(x) for x in (p.get("authors") or [])) if a], p.get("title") or "")
+
+
+_KEY_YEAR = re.compile(r",?\s+(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?|no date)(?:\s*,\s*(?:pp?|paras?|chap|ch|sec)\.?\s*[\w–\-]+)?\s*$")
+
+
+def _key_group(key):
+    """The same, worked out from an in-text citation alone: "(J. Lee, 2020)" -> "lee", "(Mensah et al., 2021)" ->
+    "mensah", "(“Short Title,” 2021)" -> "t:shorttitle"."""
+    s = str(key or "").strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1]
+    s = s.strip()
+    if s[:1] == "*":                                  # Harvard sets a no-author title in italics
+        return "t:" + _group_norm(s[1:].split("*")[0])
+    if s[:1] in "“\"":
+        return "t:" + _group_norm(re.split(r"[”\"]", s[1:])[0])
+    s = _KEY_YEAR.sub("", s)
+    s = re.sub(r"^(?:[A-ZÀ-ɏ]\.\s*(?:-?[A-ZÀ-ɏ]\.\s*)*)", "", s).strip()
+    first = re.split(r"\s*(?:,|&|\band\b|\bet al\.?)\s*", s)[0]
+    return _group_norm(first)
 
 
 def _domain_org_name(url):
-    """Falls back to a readable site name (e.g. 'Healthline') when a web
-    source has no identifiable author — standard APA practice for websites."""
+    """A readable site name (e.g. 'Healthline') for a web page with no author."""
     try:
         host = urlparse(url).netloc.lower()
         if host.startswith("www."):
@@ -2043,158 +2341,226 @@ def _domain_org_name(url):
         return "Source"
 
 
-def enrich_sources_for_apa(sources):
-    """Computes a real APA in-text citation key and a full References-list
-    entry for each source, from actual metadata only — nothing here is
-    invented. Sources with no known individual author fall back to the
-    organization/site name (standard APA practice); sources with no known
-    year use 'n.d.'. Duplicate (author, year) pairs get a/b/c suffixes, as
-    APA requires, applied consistently to both the in-text key and the
-    reference entry."""
-    enriched = []
-    for s in sources:
-        authors = s.get("authors")
-        if authors:
-            surnames = [a.split()[-1] for a in authors if a.split()]
-            if len(surnames) == 1:
-                author_intext = surnames[0]
-            elif len(surnames) == 2:
-                author_intext = f"{surnames[0]} & {surnames[1]}"
-            else:
-                author_intext = f"{surnames[0]} et al."
-            author_refs_list = [_format_author_apa(a) for a in authors[:20]]
-            if len(author_refs_list) == 1:
-                author_refs = author_refs_list[0]
-            else:
-                author_refs = ", ".join(author_refs_list[:-1]) + ", & " + author_refs_list[-1]
-        else:
-            org = _domain_org_name(s["url"])
-            author_intext = org
-            author_refs = org
-
-        year = s.get("year")
-        year_display = str(year) if year else "n.d."
-        enriched.append({**s, "author_intext": author_intext, "author_refs": author_refs,
-                          "year_display": year_display, "base_key": f"{author_intext}|{year_display}"})
-
-    key_counts = Counter(e["base_key"] for e in enriched)
-    running = {}
-    for e in enriched:
-        if key_counts[e["base_key"]] > 1:
-            idx = running.get(e["base_key"], 0)
-            running[e["base_key"]] = idx + 1
-            e["year_display"] += "abcdefghij"[idx] if idx < 10 else str(idx)
-        e["citation_key"] = f"({e['author_intext']}, {e['year_display']})"
-
-    for e in enriched:
-        title = e["title"].rstrip(".")
-        vol, iss, pages = _biblio_parts(e)
-        tail = ""
-        if e.get("venue"):      # APA 7: *Journal*, *volume*(issue), pages.
-            tail = f" *{e['venue']}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "") + (f", {pages}" if pages else "") + "."
-        e["ref_text"] = f"{e['author_refs']} ({e['year_display']}). {title}." + tail
-
-    return enriched
+def _format_author_apa(full_name):
+    a = _name_parts(full_name)
+    return _au_inverted_apa(a) if a else str(full_name or "")
 
 
 def _biblio_parts(e):
-    """(volume, issue, pages) as the index gave them; pages as "100\u2013110"."""
+    """(volume, issue, pages) as the index gave them; pages as "100–110"."""
     b = e.get("biblio") or {}
     vol, iss = str(b.get("volume") or "").strip(), str(b.get("issue") or "").strip()
     first, last = str(b.get("first_page") or "").strip(), str(b.get("last_page") or "").strip()
-    pages = f"{first}\u2013{last}" if first and last and first != last else first
+    pages = f"{first}–{last}" if first and last and first != last else first
     return vol[:20], iss[:20], pages[:30]
 
 
-# Citation styles for Evidence-Based Writing. Every style is built from the
-# same real metadata (authors, year, title, venue, link) as APA — nothing is
-# invented — and keeps the same a/b suffixes when one author has two works
-# in the same year, so the in-text keys and the references always agree.
 CITE_STYLES = {
     "apa": {"name": "APA 7", "heading": "References", "example": "(Smith, 2023)"},
-    "harvard": {"name": "Harvard", "heading": "Reference list", "example": "(Smith 2023)"},
+    "harvard": {"name": "Harvard", "heading": "Reference list", "example": "(Smith, 2023)"},
     "mla": {"name": "MLA 9", "heading": "Works Cited", "example": "(Smith)"},
     "chicago": {"name": "Chicago (author-date)", "heading": "References", "example": "(Smith 2023)"},
 }
 
 
+def _intext_names(names, style, n_full=None):
+    """The authors as an in-text citation names them. n_full: how many to name before "et al." (APA's way of telling
+    apart two works whose "et al." forms would be the same)."""
+    sur = [_au_surname(a) for a in names]
+    amp = " & " if style == "apa" else " and "
+    if n_full and n_full < len(sur):
+        return ", ".join(sur[:n_full]) + ", et al."
+    if n_full and n_full >= len(sur) and len(sur) > 2:
+        return ", ".join(sur[:-1]) + ("," if style in ("apa", "chicago", "mla") else "") + amp + sur[-1]
+    if len(sur) == 1:
+        return sur[0]
+    if len(sur) == 2:
+        return sur[0] + amp + sur[1]
+    if len(sur) == 3 and style in ("harvard", "chicago"):
+        return f"{sur[0]}, {sur[1]}" + ("," if style == "chicago" else "") + f" and {sur[2]}"
+    return sur[0] + " et al."
+
+
+def _no_date(style):
+    return "no date" if style == "harvard" else "n.d."
+
+
 def enrich_sources(sources, style="apa"):
-    enriched = enrich_sources_for_apa(sources)
-    if style not in CITE_STYLES or style == "apa":
-        return enriched
-    for e in enriched:
-        names = [a.split() for a in (e.get("authors") or []) if a.split()]
-        surn = [n[-1] for n in names]
-        org = e["author_intext"]
-        yd = e["year_display"]
-        title = e["title"].rstrip(".")
-        venue = e.get("venue")
-        if not surn:
-            au = org
-        elif len(surn) == 1:
-            au = surn[0]
-        elif len(surn) == 2:
-            au = f"{surn[0]} and {surn[1]}"
-        elif style == "chicago" and len(surn) == 3:
-            au = f"{surn[0]}, {surn[1]}, and {surn[2]}"
-        elif style == "harvard" and len(surn) == 3:
-            au = f"{surn[0]}, {surn[1]} and {surn[2]}"
-        else:
-            au = f"{surn[0]} et al."
-        e["citation_key"] = f"({au})" if style == "mla" else f"({au} {yd})"
-        inverted = (f"{names[0][-1]}, {' '.join(names[0][:-1])}".strip().rstrip(",")) if names else org
-        if style == "harvard":
-            if names:
-                parts = [(f"{n[-1]}, " + " ".join(p[0] + "." for p in n[:-1])).strip().rstrip(",") for n in names]
+    """Each source with its in-text citation (citation_key) and its reference entry (ref_text) in the chosen style,
+    told apart from the others as the style asks (more names, or a/b after the year)."""
+    style = style if style in CITE_STYLES else "apa"
+    out = []
+    for s in sources or []:
+        e = dict(s)
+        e["_names"] = [a for a in (_name_parts(x) for x in (s.get("authors") or [])) if a]
+        e["_title"] = _tidy_title(s.get("title") or "")
+        e["_year"] = str(s.get("year")) if s.get("year") else ""
+        out.append(e)
+    # the in-text names, before telling works apart
+    for e in out:
+        e["_intext"] = _intext_names(e["_names"], style) if e["_names"] else None
+    # APA 8.19 / MLA: two first authors with the same surname: their initials go in front
+    firsts = {}
+    for e in out:
+        if e["_names"] and not e["_names"][0].get("org"):
+            firsts.setdefault(e["_names"][0]["surname"].lower(), set()).add(_initials(e["_names"][0]["given"]))
+    for e in out:
+        if e["_names"] and not e["_names"][0].get("org") and len(firsts.get(e["_names"][0]["surname"].lower(), ())) > 1:
+            ini = _initials(e["_names"][0]["given"])
+            if ini and style in ("apa", "mla", "chicago", "harvard"):
+                e["_intext"] = (ini.split(" ")[0] if style == "mla" else ini) + " " + e["_intext"]
+    # APA 8.18: works whose "et al." forms collide name as many authors as it takes to tell them apart
+    if style == "apa":
+        groups = {}
+        for e in out:
+            if e["_names"] and len(e["_names"]) >= 3:
+                groups.setdefault((e["_intext"], e["_year"]), []).append(e)
+        for g in groups.values():
+            lists = {tuple(_au_surname(a).lower() for a in e["_names"]) for e in g}
+            if len(g) < 2 or len(lists) < 2:
+                continue
+            for e in g:
+                sur = [_au_surname(a).lower() for a in e["_names"]]
+                n = 1
+                while n < len(sur) and sum(1 for o in g if [_au_surname(a).lower() for a in o["_names"]][:n] == sur[:n]) > 1:
+                    n += 1
+                e["_intext"] = _intext_names(e["_names"], style, n_full=n)
+    # the same authors in the same year: a, b, c after the year, in title order (APA 8.19, Harvard, Chicago)
+    letters = {}
+    for e in out:
+        who = tuple(_au_surname(a).lower() + "|" + _initials(a.get("given") or []) for a in e["_names"]) if e["_names"] else ("t:" + _sort_title(e["_title"]),)
+        e["_who"] = who
+        letters.setdefault((who, e["_year"]), []).append(e)
+    for g in letters.values():
+        if len(g) > 1:
+            g.sort(key=lambda e: _sort_title(e["_title"]))
+            for i, e in enumerate(g):
+                e["_letter"] = "abcdefghijklmnopqrstuvwxyz"[i] if i < 26 else str(i)
+    for e in out:
+        L = e.get("_letter", "")
+        yd = (e["_year"] + L) if e["_year"] else (_no_date(style) + ("-" + L if L and style != "harvard" else (L if L else "")))
+        e["year_display"] = yd
+        title, venue = e["_title"], (e.get("venue") or "").strip()
+        vol, iss, pages = _biblio_parts(e)
+        pre = " [Preprint]" if e.get("preprint") else ""
+        doi_url = f"https://doi.org/{e['doi']}" if e.get("doi") else ""
+        if style == "apa":
+            if e["_names"]:
+                refs = [_au_inverted_apa(a) for a in e["_names"]]
+                if len(refs) >= 21:
+                    auth = ", ".join(refs[:19]) + ", . . . " + refs[-1]
+                elif len(refs) == 1:
+                    auth = refs[0]
+                else:
+                    auth = ", ".join(refs[:-1]) + ", & " + refs[-1]
+                key = f"({e['_intext']}, {yd})"
+                head = f"{_end_dot(auth)} ({yd}). "
+                body = (f"*{title}*{pre}" + ("" if (not pre and title.endswith(("?", "!"))) else ".")) if (not venue or e.get("preprint")) else _end_dot(title)
+            else:                                       # no author: the title takes the author's place (APA 9.12)
+                key = f"(“{_title_case(_short_title(title))},” {yd})"
+                head = ""
+                body = _end_dot(title) + f" ({yd})."
+            tail = ""
+            if venue and not e.get("preprint"):
+                tail = f" *{venue}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "") + (f", {pages}" if pages else "") + "."
+            elif venue:
+                tail = f" {venue}."
+            e["ref_text"] = (head + body + tail).strip()
+        elif style == "harvard":
+            nm = e["_names"]
+            avail = " Available at:" if (doi_url or e.get("url")) else ""
+            if e.get("url") and not doi_url:          # Cite Them Right: a link with no DOI is followed by when it was read
+                e["ref_after"] = f"(Accessed: {_today_words()})."
+            if venue and not e.get("preprint"):
+                src = f"*{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "") + (f", pp. {pages}" if pages else "") + "."
+            else:
+                src = ""
+            if nm:
+                parts = [_au_inverted_apa(a) for a in nm]
                 auth = parts[0] + " et al." if len(parts) > 3 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+                key = f"({e['_intext']}, {yd})"
+                if src:
+                    body = f"‘{title}’, {src}"
+                else:
+                    body = f"*{title}*" + (f" [Preprint]. {venue}." if e.get("preprint") and venue else ("" if title.endswith(("?", "!")) else "."))
+                e["ref_text"] = f"{auth} ({yd}) {body}{avail}"
             else:
-                auth = org
-            vol, iss, pages = _biblio_parts(e)
-            e["ref_text"] = f"{auth} ({yd}) " + (f"\u2018{title}\u2019, *{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "")
-                                                  + (f", pp. {pages}" if pages else "") + "." if venue else f"*{title}*.")
+                key = f"(*{_short_title(title)}*, {yd})"
+                e["ref_text"] = (f"‘{title}’ ({yd}) {src}" if src else f"*{title}* ({yd})" + (f" [Preprint]. {venue}." if e.get("preprint") and venue else ".")) + avail
         elif style == "chicago":
-            full = [" ".join(n) for n in names]
-            if not names:
-                auth = org
+            nm = e["_names"]
+            full = [_au_full(a) for a in nm]
+            if not nm:
+                auth = ""
             elif len(full) == 1:
-                auth = inverted
+                auth = _au_inverted_full(nm[0])
             elif len(full) > 10:
-                auth = inverted + ", " + ", ".join(full[1:7]) + ", et al."
+                auth = _au_inverted_full(nm[0]) + ", " + ", ".join(full[1:7]) + ", et al."
             elif len(full) == 2:
-                auth = f"{inverted}, and {full[1]}"
+                auth = f"{_au_inverted_full(nm[0])}, and {full[1]}"
             else:
-                auth = inverted + ", " + ", ".join(full[1:-1]) + ", and " + full[-1]
-            vol, iss, pages = _biblio_parts(e)
-            e["ref_text"] = f"{auth}. {yd}. \u201c{title}.\u201d" + (f" *{venue}*" + (f" {vol}" if vol else "") + (f" ({iss})" if vol and iss else "")
-                                                                  + (f": {pages}" if pages else "") + "." if venue else "")
+                auth = _au_inverted_full(nm[0]) + ", " + ", ".join(full[1:-1]) + ", and " + full[-1]
+            ttl = _title_case(title)
+            key = f"({e['_intext']} {yd})" if nm else f"(“{_short_title(ttl)}” {yd})"
+            src = (f" *{venue}*" + (f" {vol}" if vol else "") + (f" ({iss})" if vol and iss else "") + (f": {pages}" if pages else "") + ".") if venue and not e.get("preprint") else (f" {venue}." if venue else "")
+            lead = (_end_dot(auth) + " " + _end_dot(yd) + " ") if nm else ""
+            ttl_part = f"“{_end_dot(ttl)}”" + (" Preprint." if e.get("preprint") else "")
+            e["ref_text"] = (lead + ttl_part + (" " + _end_dot(yd) if not nm else "") + src).strip()
         else:   # MLA 9
-            year = str(e.get("year") or "n.d.")
-            if names:
-                auth = inverted if len(names) == 1 else f"{inverted}, and {' '.join(names[1])}" if len(names) == 2 else f"{inverted}, et al"
-                vol, iss, pages = _biblio_parts(e)
-                e["ref_text"] = (f"{auth}. \u201c{title}.\u201d " + (f"*{venue}*, " if venue else "") + (f"vol. {vol}, " if vol else "")
-                                 + (f"no. {iss}, " if iss else "") + f"{year}" + (f", pp. {pages}" if pages else "") + ".")
+            nm = e["_names"]
+            ttl = _title_case(title)
+            if nm:
+                auth = _au_inverted_full(nm[0]) if len(nm) == 1 else (f"{_au_inverted_full(nm[0])}, and {_au_full(nm[1])}" if len(nm) == 2 else f"{_au_inverted_full(nm[0])}, et al.")
+                key = f"({e['_intext']})"
+                lead = _end_dot(auth) + " "
             else:
-                e["ref_text"] = f"\u201c{title}.\u201d *{venue or org}*, {year}."
+                key = f"(“{_short_title(ttl)}”)"
+                lead = ""
+            bits = []
+            if venue:
+                bits.append(f"*{_title_case(venue)}*" if not e.get("preprint") else venue)
+            if vol:
+                bits.append(f"vol. {vol}")
+            if iss:
+                bits.append(f"no. {iss}")
+            if e["_year"]:
+                bits.append(e["_year"])
+            if pages:
+                bits.append(f"pp. {pages}")
+            e["ref_text"] = (lead + f"“{_end_dot(ttl)}” " + (", ".join(bits) + "." if bits else "")).strip()
+        e["citation_key"] = key
+        e["author_intext"] = e["_intext"] or _short_title(title)
+        e["_sort"] = (tuple((_au_surname(a).lower(), _initials(a.get("given") or []).lower()) for a in e["_names"]) if e["_names"] else ((_sort_title(title), ""),),
+                      -1 if not e["_year"] else int(e["_year"]) if e["_year"].isdigit() else 9999, _sort_title(title))
     if style == "mla":     # two works by one author: MLA tells them apart by a short title
-        counts = Counter(e["citation_key"] for e in enriched)
-        for e in enriched:
-            if counts[e["citation_key"]] > 1:
-                short = " ".join(e["title"].split()[:3]).rstrip(".,:;")
-                e["citation_key"] = e["citation_key"][:-1] + f", \u201c{short}\u201d)"
-    return enriched
+        counts = Counter(e["citation_key"] for e in out)
+        for e in out:
+            if counts[e["citation_key"]] > 1 and e["_names"]:
+                e["citation_key"] = e["citation_key"][:-1] + f", “{_short_title(_title_case(e['_title']), 3)}”)"
+    for e in out:
+        e["group"] = _names_group(e["_names"], e["_title"])
+        for k in ("_names", "_title", "_year", "_intext", "_letter", "_who"):
+            e.pop(k, None)
+    return out
+
+
+def enrich_sources_for_apa(sources):
+    return enrich_sources(sources, "apa")
+
+
+def _today_words():
+    d = datetime.now(timezone.utc)
+    return f"{d.day} {d.strftime('%B')} {d.year}"
 
 
 def build_sources_block(sources):
-    """Source list for the writing prompt, keyed by the exact citation (in the chosen style)
-    the model must copy verbatim. Sources with an abstract (from Semantic
-    Scholar) include a short excerpt, so the model can cite what the paper
-    actually found instead of guessing from the title alone."""
+    """Source list for the writing prompt, keyed by the exact citation (in the chosen style) the model must copy
+    verbatim, with a short excerpt of each abstract."""
     lines = []
     for s in sources:
         line = f"{s['citation_key']} {s['title']}"
         if s.get("venue") or s.get("year"):
-            line += f" \u2014 {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
+            line += f" — {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
         if s.get("abstract"):
             line += f"\n    Abstract: {s['abstract'][:700]}"
         lines.append(line)
@@ -2202,75 +2568,262 @@ def build_sources_block(sources):
 
 
 def build_references_list(sources, cited=None):
-    """The reference list: only the sources the text cites (all of them when cited is None),
-    alphabetical as APA requires. Each entry: its text, its link (DOI, or the PDF), the PDF
-    itself, the DOI, and its in-text key — so a download can link every citation to it."""
+    """The reference list: only the sources the text cites (all of them when cited is None), in the order the style
+    asks (by authors' surnames, then year with n.d. first, then title). Each entry: its text, its link (DOI, or the
+    PDF), the PDF itself, the DOI, and its in-text key."""
     picked = [s for i, s in enumerate(sources) if cited is None or i in cited]
-    ordered = sorted(picked, key=lambda s: (s["author_intext"].lower(), s.get("year_display") or ""))
+    ordered = sorted(picked, key=lambda s: s.get("_sort") or (((str(s.get("author_intext") or "").lower(), ""),), 0, ""))
     return [{"text": s["ref_text"], "url": s["url"], "pdf": s.get("pdf") or None, "doi": s.get("doi") or None,
-             "key": s.get("citation_key") or ""} for s in ordered]
+             "key": s.get("citation_key") or "", "group": s.get("group") or _key_group(s.get("citation_key")),
+             "sort": _sort_json(s.get("_sort")), "after": s.get("ref_after") or ""} for s in ordered]
+
+
+def _sort_json(k):
+    """A reference's place in the list, as plain data the app can send back (to continue a piece of writing)."""
+    try:
+        names, year, title = k
+        return [[[str(a)[:120], str(b)[:40]] for a, b in names][:30], int(year), str(title)[:300]]
+    except Exception:
+        return None
+
+
+def _sort_back(v, text=""):
+    """The place sent back by the app, as a sort key again; for an older list without one, worked out from the text."""
+    try:
+        names, year, title = v
+        return (tuple((str(a)[:120], str(b)[:40]) for a, b in names[:30]), int(year), str(title)[:300])
+    except Exception:
+        pass
+    t = re.sub(r"[*_]", "", str(text or "")).strip()
+    m = re.search(r"(?:\(|\.\s+)(?:(1[5-9]\d{2}|20\d{2})[a-z]?|n\.\s?d\.|no date)", t)
+    year = int(m.group(1)) if m and m.group(1) else (-1 if m else 9999)
+    lead = t[:m.start() + (1 if m and t[m.start()] == "." else 0)] if m else t
+    names = []
+    for part in re.split(r",?\s*&\s*|,?\s+and\s+|(?<=\.),\s+(?=[A-ZÀ-ɏ])", lead.strip()):
+        sur, _, ini = part.partition(",")
+        if sur.strip():
+            names.append((sur.strip().lower(), re.sub(r"\s+", " ", ini.strip()).lower()))
+    return (tuple(names) or ((t.lower(), ""),), year, t.lower())
 
 
 # An in-text citation's shape: a capitalised name, then the year (or n.d.), maybe a page.
-_CITE_SHAPE = re.compile(r"^[A-Z\u00C0-\u024F][^;()]{0,120}?,?\s+(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.)"
-                         r"(?:\s*,\s*(?:p|pp|para|chap|ch)\.?\s*[\w\u2013\-]+)?$")
+_CITE_SHAPE = re.compile(r"^[A-ZÀ-ɏ“\"*][^;()]{0,120}?,?\s+(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?|no date)"
+                         r"(?:\s*,\s*(?:p|pp|para|chap|ch|sec)\.?\s*[\w–\-]+)?$")
+# MLA's: a name, maybe "and Name" or "et al.", maybe a page
+_MLA_SHAPE = re.compile(r"^[A-ZÀ-ɏ][\w'’\-]+(?:,?\s+(?:and|&)\s+[A-ZÀ-ɏ][\w'’\-]+|\s+et al\.)?(?:,?\s+\d+(?:[–\-]\d+)?)?$")
+_CITE_LEAD = re.compile(r"^(?:see also|see|e\.g\.,?|cf\.|for example,?|as cited in)\s+", re.I)
+_CITE_LOCATOR = re.compile(r"(?:,\s*|\s+)(?:(?:pp?|paras?|chap|ch|sec)\.\s*)?\d+(?:\s*[–\-]\s*\d+)?\s*$", re.I)
+_NARRATIVE = re.compile(r"([A-ZÀ-ɏ][\w'’\-]+(?:\s+(?:and|&)\s+[A-ZÀ-ɏ][\w'’\-]+|,?\s+et al\.)?)(?:['’]s)?\s*"
+                        r"\(((?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?)(?:,\s*(?:pp?|paras?)\.\s*[\d–\-]+)?\)")
+# a page or paragraph given with "p."/"para.": a key the app made never has one, a person's own may
+_CITE_PAGE = re.compile(r",?\s*(?:pp?|paras?|chap|ch|sec)\.\s*[\w–\-]+(?:\s*[–\-]\s*\w+)?\s*$", re.I)
+# the word before "(2008)" names a law, an event, a survey or a report, or a month, not an author: such a phrase is left
+# to the sentence check (which keeps it only when a source supports it)
+_NARR_NOT_AUTHOR = re.compile(r"^(?:Acts?|Laws?|Bills?|Polic(?:y|ies)|Constitution|Amendments?|Agreements?|Accords?|Treat(?:y|ies)|"
+                              r"Conventions?|Declarations?|Charters?|Protocols?|Census|Reforms?|Pandemic|Epidemic|Outbreak|"
+                              r"Elections?|War|Crisis|Summit|Conference|Games|Olympics|Budget|Plan|Strategy|Framework|Agenda|"
+                              r"Programmes?|Programs?|Initiatives?|Projects?|Campaigns?|Goals|Surveys?|Data|Dataset|Database|"
+                              r"Index|Reports?|Stud(?:y|ies)|Cohort|Atlas|Yearbook|Statistics|Assessments?|"
+                              r"January|February|April|July|August|September|October|November|December)$")
+_PLACE_SURNAMES = {"england", "ireland", "wales", "france", "london", "berlin", "madrid", "colombo", "lagos", "kano", "cairo", "mali",
+                   "brazil", "canada", "geneva", "amman", "vancouver", "dublin", "athens", "rome", "lisbon", "amsterdam", "zurich",
+                   "manila", "durban", "rabat", "tripoli", "juba", "blantyre", "india", "china", "kenya", "turkey", "chile", "cuba"}
+# Countries, regions and large cities (names that are also common surnames, like Jordan or Washington, left out): a
+# place before "(2012)" ("Literacy rose in Rwanda (2012)") or in brackets ("(Accra)") is not an author
+_PLACES_RX = re.compile(r"(?:^|[^a-z'])(?:" + "|".join(sorted({re.escape(x.strip()) for x in """
+afghanistan|albania|algeria|andorra|angola|antigua and barbuda|argentina|armenia|australia|austria|azerbaijan|bahamas|bahrain|
+bangladesh|barbados|belarus|belgium|belize|benin|bhutan|bolivia|bosnia and herzegovina|botswana|brazil|brunei|bulgaria|
+burkina faso|burundi|cabo verde|cape verde|cambodia|cameroon|canada|central african republic|chile|china|colombia|comoros|congo|
+costa rica|cote d'ivoire|côte d'ivoire|ivory coast|croatia|cuba|cyprus|czechia|czech republic|denmark|djibouti|dominica|
+dominican republic|drc|ecuador|egypt|el salvador|equatorial guinea|eritrea|estonia|eswatini|swaziland|ethiopia|fiji|finland|
+france|gabon|gambia|the gambia|germany|ghana|greece|grenada|guatemala|guinea|guinea-bissau|guyana|haiti|honduras|hungary|iceland|
+india|indonesia|iran|iraq|ireland|italy|jamaica|japan|kazakhstan|kenya|kiribati|kosovo|kuwait|kyrgyzstan|laos|latvia|lebanon|
+lesotho|liberia|libya|liechtenstein|lithuania|luxembourg|madagascar|malawi|malaysia|maldives|mali|malta|mauritania|mauritius|
+mexico|micronesia|moldova|monaco|mongolia|montenegro|morocco|mozambique|myanmar|burma|namibia|nauru|nepal|netherlands|
+new zealand|nicaragua|niger|nigeria|north korea|north macedonia|norway|oman|pakistan|palau|palestine|panama|papua new guinea|
+paraguay|peru|philippines|poland|portugal|qatar|romania|russia|rwanda|saint lucia|samoa|san marino|saudi arabia|senegal|serbia|
+seychelles|sierra leone|singapore|slovakia|slovenia|solomon islands|somalia|somaliland|south africa|south korea|korea|
+south sudan|spain|sri lanka|sudan|suriname|sweden|switzerland|syria|taiwan|tajikistan|tanzania|thailand|timor-leste|togo|tonga|
+trinidad and tobago|tunisia|turkey|türkiye|turkmenistan|tuvalu|uganda|ukraine|united arab emirates|uae|united kingdom|uk|
+britain|great britain|england|scotland|wales|northern ireland|united states|usa|us|the us|the uk|uruguay|uzbekistan|vanuatu|
+venezuela|vietnam|viet nam|yemen|zambia|zimbabwe|hong kong|macau|puerto rico|greenland|
+africa|asia|europe|oceania|antarctica|north america|south america|latin america|central america|caribbean|the caribbean|
+middle east|sub-saharan africa|west africa|east africa|north africa|southern africa|central africa|south asia|east asia|
+southeast asia|south-east asia|central asia|western europe|eastern europe|scandinavia|sahel|the sahel|
+accra|kumasi|tamale|cape coast|takoradi|lagos|abuja|kano|ibadan|nairobi|mombasa|kisumu|kampala|kigali|dar es salaam|dodoma|
+addis ababa|cairo|johannesburg|cape town|pretoria|durban|lusaka|harare|bulawayo|maputo|luanda|kinshasa|dakar|abidjan|bamako|
+ouagadougou|niamey|lomé|lome|cotonou|freetown|monrovia|conakry|banjul|nouakchott|rabat|casablanca|algiers|tunis|tripoli|
+khartoum|juba|mogadishu|asmara|antananarivo|lilongwe|blantyre|gaborone|windhoek|maseru|mbabane|yaoundé|yaounde|douala|libreville|
+brazzaville|bangui|n'djamena|london|berlin|madrid|rome|lisbon|dublin|amsterdam|brussels|vienna|zurich|geneva|stockholm|oslo|
+copenhagen|helsinki|warsaw|prague|budapest|athens|moscow|kyiv|kiev|istanbul|ankara|tehran|baghdad|riyadh|dubai|doha|beirut|
+jerusalem|amman|delhi|new delhi|mumbai|kolkata|chennai|bangalore|bengaluru|karachi|lahore|islamabad|dhaka|kathmandu|colombo|
+beijing|shanghai|tokyo|seoul|manila|jakarta|bangkok|hanoi|ho chi minh city|kuala lumpur|melbourne|auckland|toronto|montreal|
+vancouver|ottawa|new york|los angeles|mexico city|bogotá|bogota|buenos aires|são paulo|sao paulo|rio de janeiro|brasília|
+brasilia|caracas|havana""".replace("\n", "").split("|") if x.strip()}, key=len, reverse=True)) + r")$")
 
 
 def _cite_norm(s):
-    s = str(s or "").replace("&", " and ").replace("\u2019", "'").replace("\u2018", "'").lower()
+    s = str(s or "").replace("&", " and ").replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').replace("*", "").lower()
     s = re.sub(r"\s+", " ", s)
     return s.strip(" ,.;")
 
 
-def keep_known_citations(text, sources, style="apa"):
-    """Keeps the in-text citations that match a real source and takes out any other, so every
-    citation left in the text leads to a real paper. Returns (text, cited): the indices of the
-    sources the text cites (in parentheses, or as "Mensah and Boateng (2022)")."""
+def _narr_key(s):
+    """A narrative citation as compared with the person's own: "Adams' (2019)" and "d'Adams (2019)" are Adams (2019)."""
+    return re.sub(r"\s+", " ", re.sub(r"'s?\s*(?=\()", " ", _cite_norm(s))).strip()
+
+
+def _narr_tail(s):
+    """A narrative citation's words before the year, compared: "Mensah's", "Adams'" are Mensah, Adams."""
+    return {s, re.sub(r"'s$", "", s), re.sub(r"'$", "", s)}
+
+
+def keep_known_citations(text, sources, style="apa", locators=False, allow=None):
+    """Keeps the in-text citations that exactly match a real source and takes out any other, so every citation left
+    leads to the right paper. A page given after a real key ("p. 45") is taken off unless locators is set (the person's
+    own text): the app has a paper's abstract, never its pages, so a page it wrote would be made up. A sentence that
+    names a study in the narrative way ("Johnson (2019) found…") that is not one of the sources goes too; a known one
+    is recognised by its full name ("The World Health Organization (2023)", "van den Berg (2022)", "J. Lee (2020)").
+    allow: narrative citations (as _cite_norm gives them) to keep as they are, e.g. those in the person's own text.
+    Returns (text, cited): the indices of the sources the text cites."""
     if not text:
         return text, set()
-    inners = {}
+    inners, narr = {}, {}
     for i, s in enumerate(sources or []):
         key = str(s.get("citation_key") or "")
         if key.startswith("(") and key.endswith(")"):
-            inners[_cite_norm(key[1:-1])] = i
+            inner = key[1:-1]
+            plain = _CITE_PAGE.sub("", inner)
+            inners.setdefault(_cite_norm(inner), i)
+            inners.setdefault(_cite_norm(plain), i)
+            m = re.match(r"^(.*?)(?:,\s*|\s+)((?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?|no date)$", plain)
+            if m:
+                narr.setdefault((_cite_norm(m.group(1)), _cite_norm(m.group(2))), i)
+        if style == "mla" and s.get("author_intext") and s.get("year"):
+            narr.setdefault((_cite_norm(s["author_intext"]), _cite_norm(str(s["year"]))), i)
     cited = set()
+    words = set(re.findall(r"[a-zà-ɏ'’\-]+", " ".join(f"{s.get('title') or ''} {s.get('abstract') or ''} {s.get('venue') or ''}"
+                                                        for s in sources or []).lower()))
+    stems = {w[:5] for w in words if len(w) >= 4}
 
     def known(part):
-        n = _cite_norm(part)
-        if n in inners:
-            return inners[n]
-        for k, i in inners.items():
-            if n.startswith(k + ",") or n.startswith(k + " p") or re.search(r"(?:^|\W)" + re.escape(k) + r"(?:$|[\s,])", n):
-                return i
-        return None
+        part = part.strip()
+        lead = _CITE_LEAD.match(part)
+        p = _CITE_LEAD.sub("", part)
+        if _cite_norm(p) in inners:
+            return inners[_cite_norm(p)], part
+        q = _CITE_LOCATOR.sub("", p).rstrip(" ,")
+        if _cite_norm(q) in inners:
+            return inners[_cite_norm(q)], (part if locators else (lead.group(0) if lead else "") + q)
+        return None, part
+
+    def shaped(part):
+        p = _CITE_LEAD.sub("", part.strip())
+        if re.match(r"^(?:Figure|Fig|Table|Chapter|Section|Appendix|Equation|Eq|Step|Part|Item|Question|Page|Note|Box|Panel|Model|Study|"
+                    r"Phase|Grade|Class|Level|Unit|Week|Day|Room|Article|Rule|Act|Year|Form|Stage|Wave|Session|Lesson|Module|Round|"
+                    r"Cohort|Experiment|Trial|Hypothesis|Objective|Aim|Goal|Standard|Primary|Basic|Volume|Vol|Issue|No|Number|"
+                    r"Version|Type|Tier|Sample|Group|Arm|Site|School|Region|District|Zone|Month|Quarter|Semester|Term|Period|Theme|"
+                    r"Cycle|Participant|Respondent|Interviewee|Patient|Case|Condition|Scenario|Task|Visit|Dose|Factor|Component|"
+                    r"Dimension|Domain|Category|Code|Station|Batch|Teacher|Student|Pupil|Child|Subject|Lab|Ward|Block|Plot)\b", p):
+            return False                # "(Figure 2)", "(Table 1)", "(Year 12)": not citations
+        if style == "mla":
+            return bool(_MLA_SHAPE.match(p)) and bool(re.search(r"\d|\band\b|&|et al", p))
+        # an MLA-shaped "(Johnson 12)" in another style is a citation too; an acronym, or a word the sources use
+        # ("(Theme 3)", "(Participant 12)"), isn't
+        if _CITE_SHAPE.match(p):
+            return True
+        if not (_MLA_SHAPE.match(p) and re.search(r"\d", p)) or p.split()[0].isupper():
+            return False
+        head = re.sub(r",?\s+\d.*$", "", p)
+        return not any(w.lower()[:5] in stems for w in re.findall(r"[A-Za-zÀ-ɏ]+", head) if len(w) >= 4)
+
+    def bare_name(part, m):
+        # MLA cites by a surname alone, "(Johnson)": at the end of a sentence, a name that no source has anywhere is one
+        if style != "mla" or not words:
+            return False
+        p = _CITE_LEAD.sub("", part.strip())
+        if not re.fullmatch(r"[A-ZÀ-ɏ][a-zà-ɏ'’\-]+(?:\s+[A-ZÀ-ɏ][a-zà-ɏ'’\-]+)?", p):
+            return False
+        if not re.match(r"\s*(?:[.!?;,:]|$)", m.string[m.end():m.end() + 3]):
+            return False
+        if _PLACES_RX.search(_cite_norm(p)) and _cite_norm(p) not in _PLACE_SURNAMES:
+            return False
+        return not any(w.lower() in words for w in p.split())
 
     def fix(m):
         parts = [p.strip() for p in m.group(1).split(";")]
-        kept, dropped = [], False
+        kept, dropped, changed = [], False, False
         for p in parts:
-            i = known(p)
+            i, clean = known(p)
             if i is not None:
                 cited.add(i)
-                kept.append(p)
-            elif style != "mla" and _CITE_SHAPE.match(p):
+                changed = changed or clean != p
+                kept.append(clean)
+            elif shaped(p) or bare_name(p, m):
                 dropped = True          # looks like a citation, but no such source: out
             else:
                 kept.append(p)
-        if not dropped:
+        if not dropped and not changed:
             return m.group(0)
         return "(" + "; ".join(kept) + ")" if kept else ""
 
     out = re.sub(r"\(([^()]{2,400})\)", fix, text)
+
+    allow = {_narr_key(x) for x in (allow or set())}
+
+    def ends(text, name):
+        return text == name or (text.endswith(name) and not text[-len(name) - 1].isalnum())
+
+    def narr_known(m):
+        # the source's whole name ends right before "(year)", covers every name the citation gives ("Park and Lee
+        # (2020)" is not Lee (2020)), and is not the end of a longer list ("Park, Mensah and Boateng (2022)")
+        yr = _cite_norm(m.group(2))
+        own = _narr_tail(_cite_norm(m.group(1)))
+        before = _cite_norm(m.string[max(0, m.start(1) - 300):m.end(1)])
+        for b in _narr_tail(before):
+            for (nm, yy), i in narr.items():
+                if yy != yr or not nm or not ends(b, nm) or not any(ends(nm, g) for g in own):
+                    continue
+                if re.search(r"(?<!\))(?:,|\s+and)$", b[:len(b) - len(nm)].rstrip()):
+                    continue
+                return i
+        return None
+
+    # narrative citations: "Mensah and Boateng (2022) found…" — a known one counts (a page the app gave it is taken
+    # off); an unknown one takes its sentence out
+    def narr_fix(m):
+        if locators or "," not in m.group(0)[m.group(0).rfind("("):] or narr_known(m) is None:
+            return m.group(0)
+        return m.group(0)[:m.group(0).rfind("(")] + "(" + m.group(2) + ")"
+
+    out = _NARRATIVE.sub(narr_fix, out)
+    bad = []
+    for m in _NARRATIVE.finditer(out):
+        if _narr_key(m.group(0)) in allow:
+            continue
+        i = narr_known(m)
+        if i is not None:
+            cited.add(i)
+            continue
+        pre = out[max(0, m.start(1) - 120):m.start(1)]
+        after_prep = bool(re.search(r"\b(?i:in|across|throughout|during|from|of|at|within|outside|to|into|for|on|since|until|by)\s+"
+                                    r"(?:the\s+)?(?:[A-ZÀ-ɏ][\w'’\-]*\s+){0,3}$", pre))
+        after_the = bool(re.search(r"\b[Tt]he\s+(?:[A-ZÀ-ɏ][\w'’\-]*\s+){0,6}$", pre))
+        last = m.group(1).split()[-1].strip(".,")
+        if " and " not in m.group(1) and " & " not in m.group(1) and (
+                re.search(r"\d", m.group(1))
+                or (_NARR_NOT_AUTHOR.match(last) and (after_the or after_prep))
+                or (after_prep and _PLACES_RX.search(_cite_norm(out[max(0, m.start(1) - 60):m.end(1)])))):
+            continue
+        bad.append(m.start())
+    if bad:
+        spans = _c34_sentences(out)
+        for a, b in sorted({sp for sp in spans for x in bad if sp[0] <= x < sp[1]}, key=lambda sp: -sp[0]):
+            out = _c34_cut(out, a, b)
+        out = _c34_tidy(out) if "\n" in out else out.strip()
     out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"[ \t]+(?=\n|$)", "", out)
-    # narrative citations: "Mensah and Boateng (2022)", "Asante et al. (2019)"
-    low = _cite_norm(out)
-    for k, i in inners.items():
-        name, _, year = k.rpartition(",") if "," in k else k.rpartition(" ")
-        name, year = name.strip(), year.strip()
-        if name and year and re.search(re.escape(name) + r"\s*\(" + re.escape(year) + r"\)", low):
-            cited.add(i)
     return out, cited
 
 
@@ -2693,7 +3246,7 @@ def forgot_password():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM users WHERE email = %s", (email,))
+            cur.execute("SELECT id, name, token_version FROM users WHERE email = %s", (email,))
             row = cur.fetchone()
     finally:
         conn.close()
@@ -2701,7 +3254,7 @@ def forgot_password():
     # Always the same response whether or not the email has an account —
     # never confirm or deny that in the response itself.
     if row:
-        token = make_reset_token(row["id"], email)
+        token = make_reset_token(row["id"], email, row.get("token_version") or 0)
         reset_link = f"{FRONTEND_URL}/?reset_token={token}"
         try:
             send_email(
@@ -2716,7 +3269,7 @@ def forgot_password():
             )
         except Exception as e:
             # Never a 500, and never a hint about whether the address has an account.
-            logger.warning(f"Couldn't send a password reset email: {e}")
+            logger.warning(f"Couldn't send a password reset email: {e.__class__.__name__}")
             _email_send_result(False, e, email)
 
     return jsonify({"message": "If that email has an account, a reset link has been sent."})
@@ -2741,10 +3294,16 @@ def reset_password():
     if not user_id:
         return jsonify({"error": "This reset link is invalid or has expired — request a new one"}), 400
     link_email = _reset_token_email(token)
+    link_tv = _reset_token_version(token)
 
     conn = get_db()
     try:
         with conn.cursor() as cur:
+            if link_tv is not None:
+                cur.execute("SELECT token_version FROM users WHERE id = %s", (user_id,))
+                cur_row = cur.fetchone()
+                if cur_row and (cur_row.get("token_version") or 0) != link_tv:
+                    return jsonify({"error": "This reset link has already been used — request a new one"}), 400
             # Receiving the link proves the address it was sent to: if that's still the account's
             # address, it counts as confirmed (and a Google link made before it was confirmed is
             # dropped). Every other signed-in device is signed out.
@@ -2753,9 +3312,11 @@ def reset_password():
                        google_sub = CASE WHEN email_verified OR lower(email) <> %s THEN google_sub ELSE NULL END,
                        email_verified = email_verified OR lower(email) = %s,
                        email_proven = email_proven OR lower(email) = %s
-                   WHERE id = %s""",
-                (generate_password_hash(new_password), link_email or "", link_email or "", link_email or "", user_id),
+                   WHERE id = %s AND (%s IS NULL OR token_version = %s)""",
+                (generate_password_hash(new_password), link_email or "", link_email or "", link_email or "", user_id, link_tv, link_tv),
             )
+            if cur.rowcount == 0 and link_tv is not None:
+                return jsonify({"error": "This reset link has already been used — request a new one"}), 400
             if cur.rowcount == 0:
                 # The token's signature was valid, but the account it
                 # points to no longer exists (deleted after the reset
@@ -3548,6 +4109,7 @@ def paystack_config():
         "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test") if _paystack_on() else None,
         "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2], "points": v[2], "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
         "trial_points": TRIAL_POINTS, "day_cap": SCHOLAR_DAY_CAP,
+        "free_points": FREE_MONTH_POINTS, "free_research": FREE_MONTH_RESEARCH,
     })
 
 
@@ -4075,9 +4637,9 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
-def _refund_sage_message(user_row, source="allowance", points=1):
-    """Gives back what a request spent when it never got a reply: pass points, bought points, trial points or a
-    message of the old monthly allowance. Best-effort."""
+def _refund_sage_message(user_row, source="allowance", points=1, research=False):
+    """Gives back what a request spent when it never got a reply: pass points, bought points, Free's points (and,
+    for research writing, that month's research writing) or a message of the old monthly allowance. Best-effort."""
     points = max(1, int(points or 1))
     conn = None
     try:
@@ -4092,6 +4654,9 @@ def _refund_sage_message(user_row, source="allowance", points=1):
                 cur.execute("UPDATE users SET trial_points_used = GREATEST(trial_points_used - %s, 0) WHERE id = %s", (points, user_row["id"]))
             else:
                 cur.execute("UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s", (user_row["id"],))
+            # a research writing on Free that never arrived doesn't count against the month's research writings
+            if research and source in ("trial", "credit") and effective_plan(user_row) == "free":
+                cur.execute("UPDATE users SET free_research_used = GREATEST(free_research_used - 1, 0) WHERE id = %s", (user_row["id"],))
         conn.commit()
     except Exception as e:
         logger.error("Couldn't refund points for user %s: %s", user_row.get("id"), e)
@@ -4133,19 +4698,26 @@ def _no_points_error(row, points):
     pack = PAYSTACK_PLANS["points"]
     buy = f"Add {pack[2]} points for GH₵{pack[0] // 100:.0f}"
     if plan == "free":
+        back = _free_back_words()
         if row.get("trial_blocked"):
-            return PointsError("Scholar AI's free trial has already been used on this phone. "
+            return PointsError("This phone’s free points belong to another account. "
                                    f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
-        return PointsError(f"You've used your free trial ({TRIAL_POINTS} points). "
+        return PointsError(f"You’ve used this month’s {FREE_MONTH_POINTS} free points. They come back on {back}. "
                                f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
     return PointsError(f"Your pass has no points left. {buy}, or a new pass adds more.")
 
 
-def _log_sage_message_and_consume(user_row, points=1):
+def _free_back_words():
+    d = _next_month_start()
+    return f"{d.day} {d.strftime('%B')}"
+
+
+def _log_sage_message_and_consume(user_row, points=1, research=False):
     """Spend points for one piece of AI work, under a row lock so two requests at once can't both slip past.
-    A pass's points first, then points bought on their own, then the free trial. Any pass spends at most
-    SCHOLAR_DAY_CAP a day. Store and promo accounts keep the earlier monthly allowance. Returns where the points
-    came from: 'pass', 'credit', 'trial' or 'allowance'."""
+    A pass's points first, then points bought on their own. On Free: the month's free points first, then bought
+    points, and research writing at most FREE_MONTH_RESEARCH times a month. Any pass spends at most SCHOLAR_DAY_CAP
+    a day. Store and promo accounts keep the earlier monthly allowance. Returns where the points came from: 'pass',
+    'credit', 'trial' (Free's month) or 'allowance'."""
     points = max(1, int(points or 1))
     conn = get_db()
     conn.autocommit = False
@@ -4173,13 +4745,23 @@ def _log_sage_message_and_consume(user_row, points=1):
                                 (from_pass, points - from_pass, used_today + points, today, row["id"]))
                     conn.commit()
                     return "pass" if from_pass else "credit"
-                trial_left = 0 if row.get("trial_blocked") else max(0, TRIAL_POINTS - int(row.get("trial_points_used") or 0))
+                trial_left, research_left, _ = _free_state(row)
+                month = _month_start()
+                same = row.get("free_month") == month
+                if research and research_left <= 0:
+                    conn.rollback()
+                    raise PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
+                                      f"{_free_back_words()}. With a Scholar pass there are more; a Day pass is "
+                                      f"GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}.")
                 if trial_left + bought < points:
                     conn.rollback()
                     raise _no_points_error(row, points)
                 from_trial = min(trial_left, points)
-                cur.execute("UPDATE users SET trial_points_used = trial_points_used + %s, remy_credits = remy_credits - %s WHERE id = %s",
-                            (from_trial, points - from_trial, row["id"]))
+                used = (int(row.get("trial_points_used") or 0) if same else 0) + from_trial
+                research_used = (int(row.get("free_research_used") or 0) if same else 0) + (1 if research else 0)
+                cur.execute("UPDATE users SET trial_points_used = %s, free_research_used = %s, free_month = %s, "
+                            "remy_credits = remy_credits - %s WHERE id = %s",
+                            (used, research_used, month, points - from_trial, row["id"]))
                 conn.commit()
                 return "trial" if from_trial else "credit"
             used, limit, reset_at = _sage_status(row)
@@ -4748,11 +5330,18 @@ def _is_pro(user):
     return (user or {}).get("plan") in PRO_PLANS
 
 
-def _scholar_gate(user, feature):
-    """A JSON answer (402) when a Scholar-only feature is asked for on Free; None when the account may go on."""
+def _scholar_gate(user, feature, research=False):
+    """A JSON answer (402) when a Scholar feature is asked for on Free; None when the account may go on. Research
+    writing (research=True) is open on Free while the month's research writings last."""
     if _is_pro(user):
         return None
     day = PAYSTACK_PLANS["day"][0] // 100
+    if research:
+        if _free_state(user)[1] > 0:
+            return None
+        return jsonify({"error": f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
+                                 f"{_free_back_words()}. {feature} is part of Scholar: a Day pass is GH₵{day:.0f}.",
+                        "scholar_needed": True, "feature": feature}), 402
     return jsonify({"error": f"{feature} is part of Scholar. A Day pass is GH₵{day:.0f}; everything on your phone stays free.",
                     "scholar_needed": True, "feature": feature}), 402
 
@@ -5044,10 +5633,31 @@ def word_ai_endpoint():
     out = (out or "").strip()
     out = re.sub(r"^(?:here(?:'s| is)[^\n]*:\s*\n+)", "", out, flags=re.I)        # a preamble, if one slips in
     out = out.replace("**", "").replace("__", "")
+    out = _c45_word_citations(out, text)
     if not out:
         _refund_sage_message(request.current_user, charged)
         return jsonify({"error": "Scholar AI had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"text": out[:30000]})
+
+
+def _c45_word_citations(out, text):
+    """4.5: Scholar AI in the Word editor never adds a citation of its own: only those already in the person's text stay,
+    as they wrote them (a page they gave stays), and so do their narrative ones ("Mensah and Boateng (2022) found…")."""
+    present = []
+    for m in re.finditer(r"\(([^()]{2,400})\)", text or ""):
+        for p in m.group(1).split(";"):
+            p = _CITE_LEAD.sub("", p.strip())
+            if _CITE_SHAPE.match(p) or _MLA_SHAPE.match(p):
+                present.append({"citation_key": "(" + p + ")"})
+    own = set()
+    for m in _NARRATIVE.finditer(text or ""):
+        own.add(_cite_norm(m.group(0)))
+        # the same citation, put in brackets by the AI ("(Mensah and Boateng, 2022)"): its name, up to six words back
+        words = re.sub(r"['’]s$", "", (text or "")[max(0, m.start(1) - 120):m.end(1)].strip()).split()
+        for k in range(1, min(6, len(words)) + 1):
+            present.append({"citation_key": "(" + " ".join(words[-k:]) + ", " + m.group(2) + ")"})
+    return keep_known_citations(keep_known_citations(out, present, "apa", locators=True, allow=own)[0],
+                                present, "mla", locators=True, allow=own)[0]
 
 
 @app.route("/api/word/save", methods=["POST", "OPTIONS"])
@@ -5360,8 +5970,10 @@ SAGE_SYSTEM_PROMPT = (
     "everyday question. Academic-Home also has purpose-built AI tools that make things a "
     "chat can't: Make Slides (a whole slide deck on a topic, from real research papers), "
     "Smart Summarize (slides, a revision sheet or a mind map from a document or notes), "
-    "Practice Quiz (a quiz to test yourself), and Evidence-Based Writing (academic "
-    "writing with real, verified citations). A request for one of those goes to that "
+    "Practice Quiz (a quiz to test yourself), Automatic research writing (Scholar AI drafts "
+    "academic writing from real papers, with citations and references) and Manual research writing "
+    "(the person writes in the Word editor while statements from real papers, each with its "
+    "citation and reference, wait beside the page). A request for one of those goes to that "
     "tool (see the hand-over below); don't mention them as a reflexive sign-off.\n\n"
     "What you're actually for: explaining a concept at whatever depth and level "
     "actually fits the person in front of you, working through a problem step by step "
@@ -5431,17 +6043,31 @@ def _remy_handoff(text):
 _REMY_NO_PAPERS = re.compile(
     r"\b(?:e-?mails?|letters?|cover letter|cv|resume|grammar|spelling|proofread|rewrite|rephrase|paraphrase|translat\w*|"
     r"timetable|schedule|plan my|my (?:week|day|weekend)|to-?do|brainstorm|ideas? for|names? for|poem|story|joke|song|lyrics|"
-    r"caption|tweet|post for|code|program(?:me)? in|python|javascript|html|css|sql|excel formula|recipe|cook|weather|news|today|"
-    r"tonight|tomorrow|latest|right now|this (?:week|month|year)|score|who won|exchange rate|price of)\b", re.I)
+    r"caption|tweet|post for|code|program(?:me)? in|python|javascript|html|css|sql|excel formula|recipe|cook)\b", re.I)
+# about now: papers aren't the evidence (unless research is asked for: "the latest research on…")
+_REMY_NOW = re.compile(r"\b(?:weather|news|headlines?|tonight|tomorrow|yesterday|score|who won|exchange rate|price of)\b", re.I)
+# a question about the news, a result or a price: its answer needs a web source, or says it has none
+_REMY_LIVE = re.compile(r"\b(?:weather|news|headlines?|who won|(?:final )?scores?\b(?= of| in| for|\?)|exchange rates?|"
+                        r"(?:stock |share )?prices? of|what happened|election results?|(?:latest|current) (?:news|updates?|"
+                        r"prices?|rates?|scores?|figures?|numbers?|situation|results?)|today'?s (?:news|weather|match|game|"
+                        r"prices?|rates?|results?))\b", re.I)
+_REMY_RESEARCHY = re.compile(r"\b(?:research|studies|study|evidence|papers?|literature|journals?|meta-?analys\w*|trials?|"
+                             r"findings|scholarly|peer[- ]reviewed)\b", re.I)
 
 
 def _remy_wants_papers(message):
-    """A question about a topic, where real papers are the right evidence."""
+    """A question about a topic, where real papers are the right evidence ("the latest research on…" is one)."""
     m = str(message or "")
-    if len(m) > 2000 or _REMY_NO_PAPERS.search(m):
+    if len(m) > 2000 or _REMY_NO_PAPERS.search(m) or ((_REMY_NOW.search(m) or _REMY_LIVE.search(m)) and not _REMY_RESEARCHY.search(m)):
         return False
     q = _search_topic(m)
     return _worth_searching(q) and len(_paper_terms(q)) >= 1
+
+
+def _remy_live_q(message):
+    """A question about the news, a score, a price…: its answer needs a web source, or says it has none."""
+    m = str(message or "")
+    return len(m) <= 2000 and bool(_REMY_LIVE.search(m)) and not _REMY_NO_PAPERS.search(m) and not _REMY_RESEARCHY.search(m)
 
 
 def _paper_reference(p):
@@ -5471,7 +6097,7 @@ def _remy_papers_block(papers):
             "— the app shows them under your answer.\n\nPAPERS:\n" + "\n".join(lines))
 
 
-_REMY_CITE = re.compile(r"(?<![\w\]\[])\[(\d{1,2}(?:\s*[,–\-]\s*\d{1,2})*)\]")
+_REMY_CITE = re.compile(r"(?<![\w\[])\[(\d{1,2}(?:\s*[,–\-]\s*\d{1,2})*)\]")
 
 
 def _number_cited_papers(text, papers):
@@ -5631,13 +6257,17 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
         return None
     system = (
         "You check an answer so that every sentence that states something is backed by evidence. Below: the EVIDENCE "
-        "(each item with an id), then the person's REQUEST, then numbered SENTENCES from the answer that have no source "
-        "yet. For each sentence: if one or more evidence items directly support what it says, give their ids (at most "
+        "(each item with an id), then the person's REQUEST, then numbered SENTENCES from the answer (their citations "
+        "taken off: judge each one by what it says, not by where it came from). For each sentence: if one or more "
+        "evidence items directly support what it says — every figure in it included — give their ids (at most "
         "3); if none does, mark it drop. Never pair a sentence with evidence that doesn't support it. If the request "
         "doesn't call for evidence at all (small talk, the person's own email, letter or story, editing their text, "
         "translating, planning, brainstorming, code, a calculation), answer {\"skip\": true}. Reply with JSON only, "
-        "like {\"skip\": false, \"sentences\": [{\"n\": 1, \"cite\": [\"P2\"]}, {\"n\": 2, \"drop\": true}]}.\n\n"
-        "EVIDENCE:\n" + "\n".join(evidence_lines))
+        "like {\"skip\": false, \"sentences\": [{\"n\": 1, \"cite\": [\"P2\"]}, {\"n\": 2, \"drop\": true}]}."
+        + (" These sentences are the points of a slide deck: a point that states no fact (it only names a topic or a "
+           "heading, or is an activity, an instruction or a question for the audience) is answered {\"n\": 3, \"keep\": true}."
+           if kind == "deck" else "")
+        + "\n\nEVIDENCE:\n" + "\n".join(evidence_lines))
     user = ("REQUEST:\n" + str(request_text or "")[:1500] + "\n\nSENTENCES:\n"
             + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
             + "\n\nTHE WHOLE ANSWER, for context:\n" + str(context or "")[:6000])
@@ -5651,7 +6281,7 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
     except Exception as e:
         logger.warning(f"Citations ({kind}): the sentence check didn't run ({str(e)[:100]})")
         return None
-    out = {"skip": obj.get("skip") is True, "cite": {}, "drop": set()}
+    out = {"skip": obj.get("skip") is True, "cite": {}, "drop": set(), "keep": set()}
     for it in obj.get("sentences") or []:
         if not isinstance(it, dict):
             continue
@@ -5664,43 +6294,249 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
         ids = [str(x).strip().upper() for x in (it.get("cite") or []) if str(x).strip()][:3]
         if ids and not it.get("drop"):
             out["cite"][i] = ids
+        elif it.get("keep") is True and kind == "deck":
+            out["keep"].add(i)
         else:
             out["drop"].add(i)
     return out
 
 
-def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, deadline, allow_skip):
-    """Every sentence that states something gets a source or goes. Returns (text, unsourced): unsourced counts the
-    sentences left without one \u2014 only when taking them out would remove most of the answer."""
-    need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
-    todo = [s for s in need if not is_cited(text[s[0]:s[1]])]
+_C45_NUM = re.compile(r"(?<![\w.\-/])(\d+(?:[.,]\d+)*)\s?(%|percent|per cent)?(?![\w\-/])")
+_C45_MARKS = re.compile(r"\[\d[^\]]*\]|⟦[^⟧]*⟧")
+
+
+_C45_FACT = re.compile(r"(?<![\w.\-/])(\d+(?:[.,]\d+)*)(?:\s?(%|percent\b|per cent\b|percentage points?\b)|(?![\w\-/]))", re.I)
+_C45_STOP = {"of", "the", "a", "an", "in", "on", "at", "to", "and", "or", "for", "by", "with", "from", "per", "than", "more",
+             "less", "fewer", "over", "under", "about", "around", "nearly", "almost", "out", "times", "were", "was", "are", "is",
+             "had", "have", "has", "who", "which", "that", "this", "these", "those", "as", "into", "across", "among", "between",
+             "each", "all", "other", "new", "such", "being", "been", "be", "it", "its", "their", "his", "her", "s"}
+# "Grade 6", "Table 2", "Year 10", "SDG 4": a number that names something, not a figure
+_C45_LABEL = re.compile(r"\b(?:grade|year|phase|figure|fig|table|level|class|chapter|section|step|stage|wave|study|experiment|"
+                        r"session|week|day|form|primary|standard|basic|item|question|part|unit|module|lesson|page|cohort|round|"
+                        r"group|arm|trial|model|version|type|no|number|pp?|para|sdg|goal|article|clause|vol|volume|issue|"
+                        r"covid|hypothesis|scale|aim|objective|tier|key stage)\.?\s*$", re.I)
+_C45_WORDNUM = dict({w: str(i) for i, w in enumerate("zero one two three four five six seven eight nine ten eleven twelve "
+                                                     "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split())},
+                    thirty="30", forty="40", fifty="50", sixty="60", seventy="70", eighty="80", ninety="90", hundred="100")
+# people counted under any of these names are the same count ("120 students" and "120 pupils")
+_C45_PEOPLE = {"stud", "pupi", "lear", "chil", "part", "resp", "subj", "adol", "yout", "kids", "indi", "peop", "pers", "adul",
+               "pati", "wome", "woma", "girl", "boys", "teen", "inte", "case", "volu"}
+
+
+_C45_UNITS = {"kg": "kg", "kgs": "kg", "kilogram": "kg", "kilograms": "kg", "kilo": "kg", "kilos": "kg", "g": "g", "gram": "g",
+              "grams": "g", "mg": "mg", "km": "km", "kilometre": "km", "kilometres": "km", "kilometer": "km", "kilometers": "km",
+              "m": "m", "metre": "m", "metres": "m", "meter": "m", "meters": "m", "cm": "cm", "mm": "mm", "min": "min",
+              "mins": "min", "minute": "min", "minutes": "min", "h": "hour", "hr": "hour", "hrs": "hour", "hour": "hour",
+              "hours": "hour", "s": "sec", "sec": "sec", "secs": "sec", "second": "sec", "seconds": "sec", "d": "day",
+              "day": "day", "days": "day", "wk": "week", "wks": "week", "week": "week", "weeks": "week", "mo": "month",
+              "mos": "month", "month": "month", "months": "month", "y": "year", "yr": "year", "yrs": "year", "year": "year",
+              "years": "year", "l": "litre", "litre": "litre", "litres": "litre", "liter": "litre", "liters": "litre",
+              "ml": "ml", "kcal": "kcal", "calorie": "kcal", "calories": "kcal", "point": "pp", "points": "pp", "pp": "pp"}
+
+
+def _c45_unit(word):
+    low = word.lower().strip("-")
+    if low in _C45_UNITS:
+        return _C45_UNITS[low]
+    w = low[:4]
+    return "people" if w in _C45_PEOPLE else w
+
+
+def _c45_numbers(sentence):
+    """The figures a sentence states, each with what it counts: ("40", "%"), ("12", "scho"), ("0.45", "") — percentages,
+    decimals, and whole numbers (any size when a word says what they count, or 10 and more on their own). Years, labels
+    ("Grade 6", "Table 2"), and the sentence's own citations and markers are left out."""
+    plain = re.sub(r"\([^()]*\b(?:1[5-9]|20)\d{2}[a-z]?\b[^()]*\)", " ", _C45_MARKS.sub(" ", sentence))
+    out = []
+    for m in _C45_FACT.finditer(plain):
+        n, pct = m.group(1), m.group(2)
+        v = n.replace(",", "") if re.fullmatch(r"\d{1,3}(?:,\d{3})+", n) else n.replace(",", ".")
+        try:
+            f = float(v)
+        except ValueError:
+            continue
+        if _C45_LABEL.search(plain[max(0, m.start() - 24):m.start()]):
+            continue
+        unit = ("pp" if pct and "point" in pct.lower() else "%") if pct or _C45_RANGE_PCT.match(plain[m.end():m.end() + 40]) else ""
+        if not unit and "." not in v:
+            if len(v) == 4 and 1500 <= f <= 2099 and "," not in n:
+                continue                                # a year ("2,000 teachers" is a count)
+            run = re.match(r"\s*([A-Za-z][A-Za-z\-]*)(?:\s+([A-Za-z][A-Za-z\-]*))?(?:\s+([A-Za-z][A-Za-z\-]*))?", plain[m.end():])
+            ws = []
+            for w in (run.groups() if run else ()):
+                if not w or w.lower() in _C45_STOP:
+                    break
+                ws.append(_c45_unit(w))
+            unit = "|".join(ws)
+            if f < 10 and not unit:
+                continue
+        out.append((v, unit))
+    return out
+
+
+def _c45_ev_norm(evidence):
+    t = re.sub(r"(?<=\d),(?=\d{3}\b)", "", str(evidence or ""))
+    return re.sub(r"\b(" + "|".join(_C45_WORDNUM) + r")\b", lambda m: _C45_WORDNUM[m.group(1).lower()], t, flags=re.I)
+
+
+def _c45_copied(a, b, run=6):
+    """a shares a run of `run` or more words with b (too close to be a paraphrase of it)."""
+    wa, wb = re.findall(r"[a-z0-9]+", str(a or "").lower()), re.findall(r"[a-z0-9]+", str(b or "").lower())
+    grams = {tuple(wb[i:i + run]) for i in range(len(wb) - run + 1)}
+    return any(tuple(wa[i:i + run]) in grams for i in range(len(wa) - run + 1))
+
+
+_C45_VERBS = {"took", "take", "takes", "made", "make", "gave", "give", "got", "get", "went", "go", "came", "come", "saw", "see",
+              "said", "say", "found", "find", "show", "shows", "shown", "rose", "fell", "met", "read", "wrote", "also", "only",
+              "respectively", "overall", "both", "did", "do", "does", "will", "would", "could", "can", "may", "might", "must",
+              "should", "became", "become", "felt", "left", "kept", "won", "lost", "ran", "began", "grew", "sat", "spent"}
+_C45_EVN = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?|\.\d+)(?!\d)")
+_C45_PCT = re.compile(r"\s?(?:%|percent\b|per cent\b|percentage points?\b)", re.I)
+_C45_RANGE_PCT = re.compile(r"\s*(?:[–\-]|to\b|and\b)\s*\d+(?:\.\d+)?\s?(?:%|percent\b|per cent\b|percentage points?\b)", re.I)
+
+
+def _c45_numbers_in(numbers, evidence):
+    """Every figure is in the evidence, as the same value (12 and 12.0, 0.8 and 0.80, .05 and 0.05 are the same), counting
+    the same thing: "40%" needs a percentage there (10–20% makes both ends one), and "12 schools" can't be 12% or 12
+    pupils — though a number the evidence gives without saying what it counts ("aged 6–12") is enough. Number words in
+    the evidence count ("three schools" is 3 schools); 1,200 and 1200 are the same."""
+    t = _c45_ev_norm(evidence)
+    occ = []
+    for m in _C45_EVN.finditer(t):
+        try:
+            val = float(m.group(1))
+        except ValueError:
+            continue
+        after = t[m.end():m.end() + 60]
+        pct = bool(_C45_PCT.match(after) or _C45_RANGE_PCT.match(after))
+        pp = bool(re.match(r"\s?-?\s?(?:percentage\s+)?points?\b|\s?pp\b", after, re.I))
+        nxt = re.match(r"\s*-?([A-Za-z][A-Za-z\-]*)", after)
+        occ.append((val, pct, pp, after, t[max(0, m.start() - 40):m.start()], nxt.group(1).lower() if nxt else ""))
+    for v, unit in numbers:
+        try:
+            fv = float(v)
+        except ValueError:
+            return False
+        ok = False
+        units = set(unit.split("|")) if unit not in ("%", "pp") else set()
+        for val, pct, pp, after, before, nxt in occ:
+            if abs(val - fv) > 1e-9:
+                continue
+            if unit == "%":
+                ok = pct and not pp
+            elif unit == "pp":
+                ok = pp or pct                       # "15 percentage points" against "a 15-point rise" (or "15%")
+            elif unit:
+                if pct or pp:
+                    continue
+                near = [_c45_unit(w) for w in re.findall(r"[A-Za-z][A-Za-z\-]*", after)[:4]]
+                near += [_c45_unit(w) for w in re.findall(r"[A-Za-z][A-Za-z\-]*", before)[-3:]]
+                # the evidence doesn't say what it counts when no noun follows ("aged 6–12 took part")
+                ok = (bool(units & set(near)) or not nxt or nxt in _C45_STOP or nxt in _C45_VERBS
+                      or bool(re.search(r"(?:ed|ing|ly)$", nxt)))
+            else:
+                ok = True
+            if ok:
+                break
+        if not ok:
+            return False
+    return True
+
+
+C34_CHUNK = 30          # sentences per check
+C34_MAX_CHUNKS = 6      # checks per answer, run side by side (a 3,000-word piece is about 150 sentences)
+
+
+def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, deadline, allow_skip,
+                 cited_ids=None, unmark=None, evidence_text=None, abstract_text=None, report=None):
+    """Every sentence that states something gets a source that supports it, or goes. 4.5: a sentence that already
+    carries a citation is checked too: kept only when its own source supports it, given the right source when the
+    model picked a wrong one (a narrative "Mensah (2021) found…" can't be re-attributed, so it goes), and dropped when
+    it gives a figure its source doesn't. 4.5.1: every sentence is checked (30 to a check, the checks side by side), a
+    figure must count the same thing as in its source, and a sentence that copies ten or more words in a row from its
+    source's abstract goes (it isn't a paraphrase, and has no quotation marks). A sentence the web search itself
+    grounded stays as it is. report["unchecked"]: the sentences no check could look at (the person is told).
+    Returns (text, unsourced): the sentences left without a source, when taking them out would remove most of it."""
+    cited_ids = cited_ids or (lambda s: set())
+    unmark = unmark or (lambda s: s)
+    sents = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+    todo = [s for s in sents if not C34_WMARK.search(text[s[0]:s[1]])]
     if not todo:
         return text, 0
-    todo = todo[:30]
-    any_cited = len(todo) < len(need)
-    dec = _c34_check(kind, request_text, evidence_lines, [text[a:b] for a, b in todo], text, deadline)
-    if dec and dec["skip"] and allow_skip and not any_cited:
-        logger.info(f"Citations ({kind}): the request doesn't call for evidence \u2014 left as it is")
+    any_cited = any(cited_ids(text[a:b]) or is_cited(text[a:b]) for a, b in todo)
+    shown = [(unmark(text[a:b]) or text[a:b]) for a, b in todo]
+    n_chunks = min(C34_MAX_CHUNKS, (len(todo) + C34_CHUNK - 1) // C34_CHUNK)
+    results = [None] * n_chunks
+
+    def run(ci):
+        return _c34_check(kind, request_text, evidence_lines, shown[ci * C34_CHUNK:(ci + 1) * C34_CHUNK], text, deadline)
+
+    if n_chunks == 1:
+        results[0] = run(0)
+    else:
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = {pool.submit(run, ci): ci for ci in range(n_chunks)}
+            for job, ci in jobs.items():
+                try:
+                    results[ci] = job.result(timeout=max(2, deadline - time.time() + 3))
+                except Exception:
+                    results[ci] = None
+    ran = [r for r in results if r]
+    if ran and all(r["skip"] for r in ran) and allow_skip and not any_cited:
+        logger.info(f"Citations ({kind}): the request doesn't call for evidence — left as it is")
         return text, 0
-    fixed = dropped = 0
-    if dec:
-        for i in sorted(range(len(todo)), key=lambda i: -todo[i][0]):
-            a, b = todo[i]
-            mark = make_mark(dec["cite"][i]) if i in dec["cite"] else None
-            if mark:
-                text = text[:a] + _c34_put(text[a:b], mark) + text[b:]
-                fixed += 1
-            elif i in dec["drop"] or i in dec["cite"]:
-                text = _c34_cut(text, a, b)
-                dropped += 1
-        text = _c34_tidy(text)
+
+    def decision(i):
+        r = results[i // C34_CHUNK] if i // C34_CHUNK < n_chunks else None
+        return None if r is None else set(r["cite"].get(i % C34_CHUNK, []))
+
+    fixed = dropped = moved = unchecked = 0
+    for i in sorted(range(len(todo)), key=lambda i: -todo[i][0]):
+        a, b = todo[i]
+        sent = text[a:b]
+        old = set(cited_ids(sent))
+        new = decision(i)
+        if new is None:
+            # no check looked at it: a cited sentence must still not give a figure its source doesn't, or copy it
+            unchecked += 1
+            if old and evidence_text and ((_c45_numbers(sent) and not _c45_numbers_in(_c45_numbers(sent), evidence_text(old)))
+                                          or (abstract_text and _c45_copied(unmark(sent) or sent, abstract_text(old), run=10))):
+                text = _c34_cut(text, a, b); dropped += 1
+            continue
+        if not new:
+            text = _c34_cut(text, a, b); dropped += 1
+            continue
+        keep = (old & new) if old & new else new
+        if old and not (old & new) and unmark(sent) is None:
+            text = _c34_cut(text, a, b); dropped += 1      # "Mensah (2021) found…", but Mensah (2021) doesn't say so
+            continue
+        nums = _c45_numbers(sent)
+        if nums and evidence_text and not _c45_numbers_in(nums, evidence_text(keep)):
+            text = _c34_cut(text, a, b); dropped += 1      # a figure the source doesn't give
+            continue
+        if abstract_text and _c45_copied(unmark(sent) or sent, abstract_text(keep), run=10):
+            text = _c34_cut(text, a, b); dropped += 1      # its source's own words, unquoted
+            continue
+        if old and keep == old:
+            continue
+        base = unmark(sent) if old else sent
+        if base is None:
+            continue
+        mark = make_mark(sorted(keep))
+        if mark:
+            text = text[:a] + _c34_put(base.rstrip(), mark) + text[b:]
+            fixed += 0 if old else 1
+            moved += 1 if old else 0
+        else:
+            text = _c34_cut(text, a, b); dropped += 1
+    text = _c34_tidy(text)
     need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
     left = [s for s in need if not is_cited(text[s[0]:s[1]])]
     unsourced = 0
     if left:
-        if not dec and not any_cited and allow_skip:
+        if not ran and not any_cited and allow_skip and kind != "writing":
             left = []                    # the check couldn't run and nothing is cited: most likely not a request for evidence
-        elif len(left) * 2 <= len(need):
+        elif ran and len(left) * 2 <= len(need):
             for a, b in sorted(left, key=lambda s: -s[0]):
                 text = _c34_cut(text, a, b)
             text = _c34_tidy(text)
@@ -5708,8 +6544,10 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
             left = []
         else:
             unsourced = len(left)
-    logger.info(f"Citations ({kind}): {len(need) + dropped} sentences, {len(todo)} had no source \u2192 {fixed} given one, "
-                f"{dropped} taken out, {unsourced} kept with a note")
+    if report is not None:
+        report["unchecked"] = unchecked if (ran or any_cited or kind == "writing") else 0
+    logger.info(f"Citations ({kind}): {len(todo)} sentences checked in {n_chunks} part(s) → {fixed} given a source, "
+                f"{moved} given the right one, {dropped} taken out, {unsourced} kept with a note, {unchecked} not checked")
     return text, unsourced
 
 
@@ -5764,7 +6602,7 @@ def _c34_remy_cited(papers):
 def _c34_number(text, papers, pages):
     """Papers and web pages numbered 1, 2, 3\u2026 in one series, in the order the answer first cites them. A number
     that matches no paper is taken out (when there are papers). Returns (text, papers cited, pages cited)."""
-    pat = re.compile(r"\u27e6w:(\d+)\u27e7|(?<![\w\]\[])\[(\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*)\]")
+    pat = re.compile(r"\u27e6w:(\d+)\u27e7|(?<![\w\[])\[(\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*)\]")
 
     def keys(m):
         if m.group(1) is not None:
@@ -5783,7 +6621,7 @@ def _c34_number(text, papers, pages):
 
     def rewrite(m):
         if m.group(2) is not None and not papers:
-            return m.group(0)
+            return ""
         nums = sorted({new[k] for k in keys(m)})
         if not nums:
             return ""
@@ -5811,7 +6649,7 @@ def _c34_number(text, papers, pages):
     return out, used, web
 
 
-def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment):
+def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment, report=None):
     """Scholar AI's answer with a source on every sentence that states something (see the top of this patch).
     Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced)."""
     text = _C34_AFTER.sub(lambda m: (" " if m.group(2).strip().startswith("[") else "") + m.group(2).strip() + m.group(1), text)
@@ -5835,7 +6673,22 @@ def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment)
                     ms.append(f"\u27e6w:{int(x[1:]) - 1}\u27e7")
             return "".join(ms) or None
 
-        text, unsourced = _c34_enforce("remy", text, message, is_cited, lines, mark, started + 50, allow_skip=not has_cite)
+        def own(sent):
+            return {f"P{k}" for m in _REMY_CITE.finditer(sent) for k in _c34_nums(m.group(1)) if 1 <= k <= len(papers)}
+
+        def bare(sent):
+            return re.sub(r"[ \t]+([.,;:!?])", r"\1", _REMY_CITE.sub("", sent))
+
+        def ev(ids):
+            return " ".join((papers[int(x[1:]) - 1].get("title") or "") + " " + (papers[int(x[1:]) - 1].get("abstract") or "")
+                            for x in ids if x[:1] == "P" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(papers))
+
+        def abstracts(ids):
+            return " ".join(papers[int(x[1:]) - 1].get("abstract") or ""
+                            for x in ids if x[:1] == "P" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(papers))
+
+        text, unsourced = _c34_enforce("remy", text, message, is_cited, lines, mark, started + 50, allow_skip=not has_cite,
+                                       cited_ids=own, unmark=bare, evidence_text=ev, abstract_text=abstracts, report=report)
     elif topic_q and not has_cite:
         # a question about facts, and nothing found to back the answer: it stays, and says so
         need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
@@ -5869,16 +6722,49 @@ def _c34_write_parts(sources):
 
 
 def _c34_write(text, sources, style, request_text, note, started):
-    """Evidence-Based Writing: every sentence cited (see the top of this patch). Returns (text, cited indices)."""
-    if not sources or not text:
-        return text, keep_known_citations(text, sources, style)[1] if text else set()
+    """Automatic research writing: every sentence cited, by a source that supports it. Returns (text, cited indices)."""
+    if not text:
+        return text, set()
+    if not sources:
+        # no papers: no citation can stand (any the model wrote point at nothing), and the person is told
+        text, _ = keep_known_citations(text, [], style)
+        need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+        if need:
+            note["text"] = (note["text"] + " " if note["text"] else "") + \
+                "No papers were found for this, so nothing in it is cited. Check every statement before you use it."
+        return text, set()
     is_cited = lambda s: bool(keep_known_citations(s, sources, style)[1])
     lines, mark = _c34_write_parts(sources)
     has_cite = bool(keep_known_citations(text, sources, style)[1])
-    text, unsourced = _c34_enforce("writing", text, request_text, is_cited, lines, mark, started + 150, allow_skip=not has_cite)
+
+    def own(sent):
+        return {f"S{i + 1}" for i in keep_known_citations(sent, sources, style)[1]}
+
+    def bare(sent):
+        if any(_NARRATIVE.finditer(sent)):
+            return None
+        def drop_keys(m):
+            return "" if keep_known_citations("(" + m.group(1) + ")", sources, style)[1] else m.group(0)
+        out = re.sub(r"[ \t]*\(([^()]{2,400})\)", drop_keys, sent)
+        return re.sub(r"[ \t]+([.,;:!?])", r"\1", out)
+
+    def ev(ids):
+        return " ".join((sources[int(x[1:]) - 1].get("title") or "") + " " + (sources[int(x[1:]) - 1].get("abstract") or "")
+                        for x in ids if x[:1] == "S" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
+
+    def abstracts(ids):
+        return " ".join(sources[int(x[1:]) - 1].get("abstract") or ""
+                        for x in ids if x[:1] == "S" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
+
+    report = {}
+    text, unsourced = _c34_enforce("writing", text, request_text, is_cited, lines, mark, started + 150, allow_skip=not has_cite,
+                                   cited_ids=own, unmark=bare, evidence_text=ev, abstract_text=abstracts, report=report)
     if unsourced:
         note["text"] = (note["text"] + " " if note["text"] else "") + \
             "Some sentences in this piece have no source \u2014 check them before you use it."
+    if report.get("unchecked"):
+        note["text"] = (note["text"] + " " if note["text"] else "") + \
+            "Not every sentence could be checked against its paper this time \u2014 check the citations before you use it."
     return keep_known_citations(text, sources, style)
 
 
@@ -5923,6 +6809,10 @@ def sage_endpoint():
                 continue
             role = turn.get("role")
             content = (turn.get("content") or "").strip()[:4000]
+            if role == "assistant":
+                # an earlier answer's [n] pointed at that answer's papers; this answer gets a new list, so the old
+                # numbers are taken out before the model sees them (they could be reused for a different paper)
+                content = re.sub(r"[ \t]*(?<![\w\[])\[\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*\]", "", content)
             if role in ("user", "assistant") and content:
                 turns.append({"role": role, "content": content})
 
@@ -5992,13 +6882,17 @@ def sage_endpoint():
     thinking = C34_WMARK.sub("", thinking) if thinking else thinking
     note, reply = split_memory_note(result or "")
     note = C34_WMARK.sub("", note).strip() if note else note
-    if note and memory_on:
-        add_user_memory(request.current_user["id"], note)
+    noted = None
+    if note and memory_on and add_user_memory(request.current_user["id"], note):
+        noted = note[:300]          # 4.5: the person sees what Scholar AI noted, and can change it
+    report = {}
     reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
-                                           message, topic_q, started, bool(attachment))
+                                           message, topic_q or (not attachment and _remy_live_q(message)), started,
+                                           bool(attachment), report)
     reply = C34_WMARK.sub("", reply)
     return jsonify({"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
-                    "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced})
+                    "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced,
+                    "unchecked": int(report.get("unchecked") or 0), "noted": noted})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
@@ -6865,11 +7759,11 @@ def write_endpoint():
                 history.append({"role": role, "content": content})
 
     # 4.0: Evidence-Based Writing is Scholar's, and a draft costs POINTS_WRITE — taken before any call, given back on failure
-    gate = _scholar_gate(request.current_user, "Evidence-Based Writing")
+    gate = _scholar_gate(request.current_user, "Automatic research writing", research=True)
     if gate:
         return gate
     try:
-        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_WRITE)
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_WRITE, research=True)
     except ConversionError as e:
         return _points_reply(e)
     outline = parse_outline(topic)
@@ -6952,6 +7846,31 @@ def write_endpoint():
             return jsonify({"error": "Nothing to continue"}), 400
         try:
             cont_sources, cont_diag = _find(topic)
+            # 4.5: the papers the earlier part cites keep their in-text citations, and a paper found again keeps its key.
+            # 4.5.1: a new paper whose first author shares a surname with one the earlier part cites would need the
+            # earlier citations changed (2021a/2021b, initials, more names): it is left out, so every citation stays right
+            prev = []
+            for r in (data.get("previous_refs") or [])[:40]:
+                if isinstance(r, dict) and str(r.get("key") or "").startswith("(") and r.get("text"):
+                    plain_ref = re.sub(r"[*_]", "", str(r["text"]))
+                    key = str(r["key"])[:200]
+                    prev.append({"citation_key": key, "ref_text": str(r["text"])[:1200], "url": str(r.get("url") or "")[:600],
+                                 "pdf": r.get("pdf") or None, "doi": _norm_doi(r.get("doi")), "title": plain_ref[:300],
+                                 "abstract": None, "group": re.sub(r"[^a-z0-9:]", "", str(r.get("group") or "").lower())[:120] or _key_group(key),
+                                 "ref_after": str(r.get("after") or "")[:80], "_sort": _sort_back(r.get("sort"), r["text"])})
+            if prev:
+                groups = {p["group"] for p in prev if p["group"]}
+                fresh = []
+                for c in cont_sources or []:
+                    twin = next((p for p in prev if (c.get("doi") and c.get("doi") == p.get("doi")) or (c.get("url") and c.get("url") == p.get("url"))), None)
+                    if twin is not None:
+                        twin["abstract"] = c.get("abstract")         # the same paper: its key stays, its abstract helps the check
+                        twin["title"] = c.get("title") or twin["title"]
+                        continue
+                    if (c.get("group") or _paper_group(c)) in groups:
+                        continue
+                    fresh.append(c)
+                cont_sources = prev + fresh
             if cont_sources:
                 cont_sources_block = build_sources_block(cont_sources)
                 cont_system_prompt = (
@@ -6989,14 +7908,17 @@ def write_endpoint():
                 raise ConversionError("Couldn't continue — try again")
             cont_text, cont_cited = keep_known_citations(cont_text, cont_sources, style)
             cont_text, cont_cited = _c34_write(cont_text, cont_sources, style, topic, note, started)
+            if prev:
+                cont_cited = set(cont_cited) | set(range(len(prev)))     # the earlier part still cites its papers
             return jsonify({
                 "type": "result",
                 "text": cont_text,
-                "references": build_references_list(cont_sources, cont_cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "references": build_references_list(cont_sources, cont_cited), "references_all": bool(prev),
+                "references_title": CS["heading"], "source_note": note["text"], "style": style,
                 "truncated": cont_result["stop_reason"] == "max_tokens",
             })
         except ConversionError as e:
-            _refund_sage_message(request.current_user, charged_from, POINTS_WRITE)
+            _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
             return jsonify({"error": str(e)}), 502
 
     try:
@@ -7174,8 +8096,9 @@ def write_endpoint():
         thinking, after_thinking = split_thinking(raw_text)
         is_clarify, text = split_clarify(after_thinking)
         memory_note, text = split_memory_note(text)
-        if memory_note and memory_on:
-            add_user_memory(user_id, memory_note)
+        noted = None
+        if memory_note and memory_on and add_user_memory(user_id, memory_note):
+            noted = memory_note[:300]
 
         if not text:
             raise ConversionError("Couldn't generate a reply — try rephrasing")
@@ -7183,7 +8106,7 @@ def write_endpoint():
             raise ConversionError("Couldn't generate a reply — try rephrasing")
 
         if is_clarify:
-            return jsonify({"type": "clarify", "text": text, "thinking": thinking})
+            return jsonify({"type": "clarify", "text": text, "thinking": thinking, "noted": noted})
 
         text, cited = keep_known_citations(text, sources, style)
         text, cited = _c34_write(text, sources, style, topic, note, started)
@@ -7193,10 +8116,10 @@ def write_endpoint():
             "thinking": thinking,
             "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             "title": _topic_title(topic) if not attachment else None,
-            "truncated": truncated,
+            "truncated": truncated, "noted": noted,
         })
     except ConversionError as e:
-        _refund_sage_message(request.current_user, charged_from, POINTS_WRITE)
+        _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
         return jsonify({"error": str(e)}), 502
 
 
@@ -7233,7 +8156,7 @@ def guide_outline():
     kind = _guide_clip(data.get("kind"), 40) or "essay"
     if not topic:
         return jsonify({"error": "Type the topic first."}), 400
-    gate = _scholar_gate(request.current_user, "Guided citing")
+    gate = _scholar_gate(request.current_user, "Manual research writing", research=True)
     if gate:
         return gate
     try:
@@ -7261,6 +8184,26 @@ def guide_outline():
     return jsonify({"topic": topic, "subtopics": subs[:8]})
 
 
+def _c45_pick_papers(papers, known):
+    """The papers to offer, in order: one per first-author surname, and none whose surname a different paper already
+    cited in the page has (known: [{key, group, doi, url}] from the app)."""
+    used = {}
+    for k in (known or [])[:80]:
+        if isinstance(k, dict) and (k.get("key") or k.get("group")):
+            grp = re.sub(r"[^a-z0-9:]", "", str(k.get("group") or "").lower())[:120] or _key_group(k.get("key"))
+            if grp:
+                used.setdefault(grp, set()).add(_norm_doi(k.get("doi")) or str(k.get("url") or "")[:600] or str(k.get("key") or "")[:200])
+    picked, groups = [], set()
+    for p in papers:
+        grp = _paper_group(p)
+        pid = p.get("doi") or p.get("url") or ""
+        if grp and (grp in groups or (grp in used and pid not in used[grp])):
+            continue
+        groups.add(grp)
+        picked.append(p)
+    return picked
+
+
 @app.route("/api/guide/statements", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -7275,13 +8218,13 @@ def guide_statements():
         style = "apa"
     since = data.get("recent_years")
     try:
-        since = datetime.now(timezone.utc).year - int(since) if since else None
+        since = datetime.now(timezone.utc).year - int(since) + 1 if since else None   # "the last 10 years": this year and the 9 before
     except (TypeError, ValueError):
         since = None
     exclude = set(str(x) for x in (data.get("exclude") or [])[:60] if x)
     if not (topic or sub):
         return jsonify({"error": "Type the topic first."}), 400
-    gate = _scholar_gate(request.current_user, "Guided citing")
+    gate = _scholar_gate(request.current_user, "Manual research writing", research=True)
     if gate:
         return gate
     query = f"{topic} {sub}".strip() if sub and topic and sub.lower() not in topic.lower() else (sub or topic)
@@ -7290,13 +8233,21 @@ def guide_statements():
         more, _ = search_papers(topic or sub, max_results=GUIDE_PAPERS, since=since)
         seen = {p.get("doi") or p["title"] for p in papers}
         papers += [p for p in more if (p.get("doi") or p["title"]) not in seen]
-    papers = [p for p in papers if (p.get("doi") or p.get("url") or "") not in exclude][:GUIDE_PAPERS]
+    papers = [p for p in papers if (p.get("doi") or p.get("url") or "") not in exclude and p.get("abstract")][:GUIDE_PAPERS]
     if not papers:
-        return jsonify({"error": "No open papers with a PDF were found for that. Try other words, or a wider topic.",
+        return jsonify({"error": "No open papers with a PDF and an abstract were found for that. Try other words, or a wider topic.",
                         "no_papers": True}), 404
-    sources = enrich_sources(papers, style)
+    # 4.5.1: a paper whose first author shares a surname with one already cited in the page would need the page's own
+    # citation changed (2021a/2021b, initials, more names), and two such papers here could leave an "a" with no "b":
+    # each surname comes once, and never one the page already has (from a different paper), so every citation in the
+    # page stays right as it is
+    picked = _c45_pick_papers(papers, data.get("known"))
+    if not picked:
+        return jsonify({"error": "The papers found for that are by authors already cited in your page. Try other words, or a wider topic.",
+                        "no_papers": True}), 404
+    sources = enrich_sources(picked, style)
     try:
-        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_RESEARCH)
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_RESEARCH, research=True)
     except ConversionError as e:
         return _points_reply(e)
     heading = sub or topic
@@ -7319,7 +8270,7 @@ def guide_statements():
     try:
         raw = call_claude(system, user, max_tokens=3200, timeout=120, feature="guide")
     except ConversionError as e:
-        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH)
+        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
         return jsonify({"error": str(e)}), 502
     obj = _guide_json(raw)
     out = []
@@ -7339,19 +8290,36 @@ def guide_statements():
         if len(para.split()) < 6 or para.lower() == text.lower():
             para = text
         src = sources[n - 1]
+        ab = (src.get("title") or "") + " " + (src.get("abstract") or "")
+        nums = _c45_numbers(text) + _c45_numbers(para)
+        if nums and not _c45_numbers_in(nums, ab):
+            continue                                  # a figure the abstract doesn't give
+        if _c45_copied(para, src.get("abstract") or ""):
+            continue                                  # the words that would go in are the abstract's own: not a paraphrase
         out.append({"id": f"{len(out) + 1}", "paper": n, "text": text, "paraphrase": para,
                     "kind": x.get("kind") if x.get("kind") in kinds else "finding",
                     "cite": src["citation_key"],
                     "ref": {"text": src["ref_text"], "url": src["url"], "pdf": src.get("pdf") or None, "doi": src.get("doi") or None,
-                            "key": src["citation_key"], "title": src["title"], "year": src.get("year"), "authors": src.get("authors") or []}})
+                            "key": src["citation_key"], "title": src["title"], "year": src.get("year"), "authors": src.get("authors") or [],
+                            "group": src.get("group") or "", "after": src.get("ref_after") or ""}})
         if len(out) >= GUIDE_STATEMENTS:
             break
+    # each statement is checked against the papers by a second pass: it stays only when its own paper supports it
+    checked = False
+    if out:
+        ev = [f"[P{i}] {s.get('title', '')} \u2014 {str(s.get('abstract') or '')[:900]}" for i, s in enumerate(sources, 1)]
+        dec = _c34_check("guide", heading, ev, [o["paraphrase"] for o in out], "", time.time() + 40)   # the words that go in
+        if dec and not dec["skip"]:
+            checked = True
+            out = [o for i, o in enumerate(out) if f"P{o['paper']}" in (dec["cite"].get(i) or [])]
+            for i, o in enumerate(out):
+                o["id"] = f"{i + 1}"
     if len(out) < 3:
-        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH)
-        return jsonify({"error": "Scholar AI couldn't build statements from those papers — try again, or say the topic in other words."}), 502
+        _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
+        return jsonify({"error": "Scholar AI couldn't build statements those papers fully support. Try again, or say the topic in other words."}), 502
     return jsonify({"topic": topic, "subtopic": sub, "style": style, "style_name": CITE_STYLES[style]["name"],
                     "references_title": CITE_STYLES[style]["heading"], "statements": out,
-                    "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or ""})
+                    "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or "", "checked": checked})
 
 
 
@@ -7364,10 +8332,10 @@ quiz: a practice quiz from a topic, pasted notes or an attached file. params: to
 deck: a whole slide deck drafted from a topic, from real research papers; no file needed. params: topic, group (student or tutor).
 summarize: notes or an attached file turned into slides, a one-page revision sheet, a mind map, likely exam questions or
   key terms. Needs text or an attached file. params: kind (slides, sheet, map, questions or terms), audience (student or tutor).
-write: an essay, report or section written with real sources cited. params: topic, style (apa, harvard, mla or chicago;
-  default apa), length_words (300 to 3000; default 800).
-cite: Guided citing in the Word editor: real papers, one statement at a time, each with its citation and reference, while
-  the person writes. params: topic.
+write: automatic research writing: Scholar AI drafts an essay, report or section from real papers, with citations and
+  references. params: topic, style (apa, harvard, mla or chicago; default apa), length_words (300 to 3000; default 800).
+cite: manual research writing in the Word editor: the person writes; real papers wait beside the page, one statement at a
+  time, each with its citation and reference. params: topic.
 convert: convert a file to another format. params: from_kind (docs, slides, pics, sheets, sound or video), to (the format
   wanted, like pdf, docx, pptx, jpg, mp3, or empty).
 meeting: start an online meeting or class, with an agenda Scholar AI can write. params: title, minutes (30 to 300).
@@ -7378,7 +8346,7 @@ scan: scan paper pages with the camera into a clean PDF. No params.
 studio: open Slide Studio to make or edit slides by hand. No params.
 """
 REMY_PLAN_POINTS = {"quiz": POINTS_REMY, "deck": POINTS_DECK, "summarize": POINTS_REMY, "write": POINTS_WRITE, "cite": POINTS_RESEARCH, "chat": POINTS_REMY}
-REMY_PLAN_SCHOLAR = {"write": "Writing with sources", "cite": "Guided citing"}
+REMY_PLAN_SCHOLAR = {"write": "Automatic research writing", "cite": "Manual research writing"}
 REMY_PLAN_SYSTEM = (
     "You are Scholar AI's planner inside Academic-Home, a study app. You read what a person asks for and decide how Scholar AI should "
     "respond, in one JSON object and nothing else. You never do the task yourself.\n\nWhat the app can do:" + REMY_PLAN_TOOLS +
@@ -7417,10 +8385,8 @@ def remy_plan():
             turns.append({"role": t["role"], "content": str(t["content"]).strip()[:1200]})
     has_file = bool(data.get("has_file"))
     file_name = str(data.get("file_name") or "")[:120]
-    recent = [str(x)[:80] for x in (data.get("recent") or [])[:5] if str(x).strip()]
+    # 4.5: the names of other recent files are not used (an older app may still send them)
     context = ("The person attached a file" + (f" called {file_name}" if file_name else "") + ".\n" if has_file else "No file is attached.\n")
-    if recent:
-        context += "Things they made or opened lately: " + "; ".join(recent) + ".\n"
     # the exchange so far, then the new message, flattened so the planner sees it in one go
     convo = "".join(("Person: " if t["role"] == "user" else "Scholar AI asked: ") + t["content"] + "\n" for t in turns)
     user_msg = context + (("Earlier in this exchange:\n" + convo) if convo else "") + "Person now says: " + text
@@ -7446,7 +8412,7 @@ def remy_plan():
                     "params": {str(k)[:30]: (clip(v, 400) if isinstance(v, str) else v) for k, v in params.items() if k},
                     "next": [clip(n, 90) for n in (obj.get("next") or []) if clip(n, 90)][:3],
                     "points": REMY_PLAN_POINTS.get(tool, 0)})
-        if tool in REMY_PLAN_SCHOLAR and not _is_pro(request.current_user):
+        if tool in REMY_PLAN_SCHOLAR and not _is_pro(request.current_user) and _free_state(request.current_user)[1] <= 0:
             out["scholar"] = REMY_PLAN_SCHOLAR[tool]
     try:
         pts = _points_state(request.current_user)
@@ -8132,6 +9098,30 @@ def _deck_points(raw, limit=8):
     return out
 
 
+def _chart_nearest(x, m, cats, common, words):
+    """Which category a number in an abstract sentence is about: the nearest words that set a category apart, looking
+    back ("tutored pupils gained 12% in fluency"), or ahead after "of", "among" or "for" ("12% of tutored pupils")."""
+    low = x.lower()
+    ahead = bool(re.match(r"\s?(?:%|percent|per cent)?\s*(?:of|among|for)\b", low[m.end():]))
+    best = None
+    for cj, c in enumerate(cats):
+        for w in words(c) - common:
+            for mm in re.finditer(r"\b" + re.escape(w) + r"\b", low):
+                d = (mm.start() - m.end()) if ahead else (m.start() - mm.end())
+                if d < 0:
+                    continue
+                if best is None or d < best[0]:
+                    best = (d, cj)
+    if best is None:                       # nothing on that side: the nearest on the other
+        for cj, c in enumerate(cats):
+            for w in words(c) - common:
+                for mm in re.finditer(r"\b" + re.escape(w) + r"\b", low):
+                    d = abs(mm.start() - m.start())
+                    if best is None or d < best[0]:
+                        best = (d, cj)
+    return best[1] if best else None
+
+
 def _chart_from_paper(spec, sources):
     """A chart only when every number in it is stated in the abstract of the paper it cites."""
     if not isinstance(spec, dict):
@@ -8153,17 +9143,115 @@ def _chart_from_paper(spec, sources):
         series.append({"name": str(s.get("name") or "Value")[:40], "values": vals})
     if not paper or not cats or not series or any(len(s["values"]) != len(cats) for s in series):
         return None
-    shown = set(re.findall(r"\d+(?:\.\d+)?", abstract.replace(",", "")))
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+", abstract.replace(",", "")) if x.strip()]
+    words = lambda t: {w for w in re.findall(r"[a-z]{4,}", str(t).lower())}
+    # 4.5.1: each number must be stated about its own bar: the words that set its category apart from the others in the
+    # same sentence (or, when nothing does, the series' name), any year the category names, and the number must not
+    # count something else there ("40 schools" is not a fluency gain of 40)
+    common = set.intersection(*(words(c) for c in cats)) if len(cats) > 1 else set()
     for s in series:
-        for v in s["values"]:
+        sw = words(s["name"]) - {"value", "values"}
+        for ci, v in enumerate(s["values"]):
             forms = {f"{v:g}"} | ({str(int(v))} if v == int(v) else set())
-            if not forms & shown:          # a number the paper doesn't state: no chart
-                return None
+            dist = words(cats[ci]) - common
+            years = set(re.findall(r"\b(?:1[5-9]|20)\d{2}\b", cats[ci]))
+            label = words(cats[ci]) | sw
+            ok = False
+            for x in sentences:
+                xw = words(x)
+                if (dist and not dist & xw) or (not dist and sw and not sw & xw) or (years and not all(y in x for y in years)):
+                    continue
+                for m in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d])", x):
+                    if m.group(1) not in forms or m.group(1) in years:
+                        continue
+                    if len(cats) > 1 and dist and _chart_nearest(x, m, cats, common, words) != ci:
+                        continue                 # "tutored 12% and untutored 5%": 5 is the untutored bar's
+                    after = x[m.end():]
+                    if re.match(r"\s?(?:%|percent|per cent)", after, re.I):
+                        ok = True
+                        break
+                    nxt = re.match(r"\s*([A-Za-z][A-Za-z\-]*)", after)
+                    u = nxt.group(1).lower() if nxt else ""
+                    if not u or u in _C45_STOP or any(u[:4] == w[:4] for w in label):
+                        ok = True
+                        break
+                if ok:
+                    break
+            if not ok:
+                return None                  # a number the paper doesn't state, or states about something else: no chart
     kind = spec.get("chart_type") if spec.get("chart_type") in ("column", "bar", "line", "pie") else "column"
     return {"type": "chart", "chart_type": kind, "categories": cats, "series": series, "title": str(spec.get("title") or "")[:80]}
 
 
-def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
+def _c45_deck_verify(slides, sources, style, topic, deadline):
+    """4.5.1: a deck's points are checked like a piece of writing. A point that states something keeps its citation only
+    when that paper supports it (or gets the paper that does); a point no paper supports goes, and so does one that
+    copies ten or more words of an abstract. A point that states no fact (a topic, an activity, a question) stays."""
+    items = [b for sl in slides for name in ("bullets", "left", "right") for b in (sl.get(name) or [])]
+    if not items or not sources:
+        return True
+    if time.time() > deadline - 12:
+        return False
+    lines, mark = _c34_write_parts(sources)
+
+    def own(t):
+        return {f"S{i + 1}" for i in keep_known_citations(t, sources, style)[1]}
+
+    def bare(t):
+        out = re.sub(r"[ \t]*\(([^()]{2,400})\)", lambda m: "" if keep_known_citations("(" + m.group(1) + ")", sources, style)[1] else m.group(0), t)
+        return re.sub(r"[ \t]+([.,;:!?])", r"\1", out).strip()
+
+    todo = [b for b in items if own(b["text"]) or _c34_needs(b["text"])]
+    if not todo:
+        return True
+    shown = [bare(b["text"]) for b in todo]
+    context = "\n".join(shown)[:6000]
+    chunks = [list(range(i, min(i + C34_CHUNK, len(todo)))) for i in range(0, len(todo), C34_CHUNK)][:C34_MAX_CHUNKS]
+    results = [None] * len(chunks)
+    with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+        jobs = {pool.submit(_c34_check, "deck", topic, lines, [shown[i] for i in ch], context, deadline): ci for ci, ch in enumerate(chunks)}
+        for job, ci in jobs.items():
+            try:
+                results[ci] = job.result(timeout=max(2, deadline - time.time() + 3))
+            except Exception:
+                results[ci] = None
+    dropped = moved = given = 0
+    for ci, ch in enumerate(chunks):
+        r = results[ci]
+        if not r or r["skip"]:
+            continue
+        for j, k in enumerate(ch):
+            b = todo[k]
+            if j in r["keep"] and not own(b["text"]):
+                continue
+            new = set(r["cite"].get(j, []))
+            old = own(b["text"])
+            if not new:
+                b["text"] = ""; dropped += 1
+                continue
+            keep = (old & new) or new
+            ev = " ".join(sources[int(x[1:]) - 1].get("abstract") or "" for x in keep if x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
+            if _c45_copied(bare(b["text"]), ev, run=10):
+                b["text"] = ""; dropped += 1
+                continue
+            if keep == old:
+                continue
+            m = mark(sorted(keep))
+            if m:
+                b["text"] = _c34_put(bare(b["text"]), m)
+                moved += 1 if old else 0
+                given += 0 if old else 1
+            else:
+                b["text"] = ""; dropped += 1
+    for sl in slides:
+        for name in ("bullets", "left", "right"):
+            if sl.get(name):
+                sl[name] = [b for b in sl[name] if str(b.get("text") or "").strip()]
+    logger.info(f"Citations (deck): {len(todo)} points checked → {given} given a source, {moved} given the right one, {dropped} taken out")
+    return all(r and not r["skip"] for r in results) and len(todo) <= C34_CHUNK * C34_MAX_CHUNKS
+
+
+def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", deadline=None):
     """The AI's deck as Slide Studio's deck: points checked against the papers, more than 5 points
     split onto a second slide, drawings drawn, charts kept only with real numbers, a References
     slide for the papers cited, and the closing slide."""
@@ -8188,13 +9276,19 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
     else:
         lines = [clip(l, 120) for l in (ts_raw.get("lines") or []) if clip(l, 120)][:3]
         title_slide = {"lines": lines, "main": clip(ts_raw.get("main"), 200), "sub": clip(ts_raw.get("sub"), 200)}
-    cited = set()
-
     def check(points):
+        """Only real citations stay; a point that gives a figure needs a source that gives that figure."""
+        kept = []
         for b in points:
             b["text"], c = keep_known_citations(b["text"], sources, style)
-            cited.update(c)
-        return [b for b in points if b["text"].strip()]
+            nums = _c45_numbers(b["text"])
+            if nums and sources:
+                ev = " ".join((sources[i].get("title") or "") + " " + (sources[i].get("abstract") or "") for i in c)
+                if not c or not _c45_numbers_in(nums, ev):
+                    continue
+            if b["text"].strip():
+                kept.append(b)
+        return kept
 
     slides = []
     deck_max = deck_max or _DECK_MAX
@@ -8203,7 +9297,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
             continue
         kind = sd.get("kind") if sd.get("kind") in ("content", "columns", "section") else "content"
         title = clip(sd.get("title"), 140)
-        notes = clip(sd.get("notes"), 900)
+        notes = keep_known_citations(clip(sd.get("notes"), 900), sources or [], style)[0]   # no papers: no citation can stand
         if kind == "section":
             slides.append({"kind": "section", "title": title, "sub": clip(sd.get("sub"), 200)})
             continue
@@ -8230,11 +9324,22 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
                 s["media"] = media
                 s["media_position"] = "right" if chunk else "full"
             slides.append(s)
+    unchecked = False
+    if sources and deadline:
+        unchecked = not _c45_deck_verify(slides, sources, style, topic, deadline)
+        slides = [sl for sl in slides if sl["kind"] == "section" or sl.get("media") or sl.get("bullets") or sl.get("left") or sl.get("right")]
     body = slides[:deck_max]
     if not any(s["kind"] != "section" for s in body):
         raise ConversionError("Scholar AI couldn't write this deck — please try again, or add a bit more detail.")
+    # the References slide lists the papers the slides that are left cite (not those of slides that were cut)
+    cited = set()
+    for sl in body:
+        for b in (sl.get("bullets") or []) + (sl.get("left") or []) + (sl.get("right") or []):
+            cited.update(keep_known_citations(b.get("text") or "", sources, style)[1])
+        if sl.get("notes"):
+            cited.update(keep_known_citations(sl["notes"], sources, style)[1])
     refs = build_references_list(sources, cited) if sources else []
-    lines = lambda rs: [re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else "") for r in rs]
+    lines = lambda rs: [re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else "") + (" " + r["after"] if r.get("after") else "") for r in rs]
 
     def plain(title, items, per=5):
         return [{"kind": "content", "title": title, "list_style": "bullets", "bullets": [{"text": t, "level": 0} for t in items[i:i + per]]}
@@ -8253,7 +9358,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None):
         out = plain("Presented by", items("presenters", 10, 120) or ["Your name and index number"], 6)
         out += plain("Presentation Outline", outline, 6) + body + plain("References", lines(refs), 4)
     return {"template": ("tutor" if group == "tutor" else "student") + "-plain", "title_slide": title_slide, "slide_numbers": True,
-            "slides": out}, refs
+            "slides": out, "unchecked": unchecked}, refs
 
 
 @app.route("/api/slides/draft", methods=["POST", "OPTIONS"])   # a whole deck: POINTS_DECK
@@ -8265,6 +9370,7 @@ def slides_draft_endpoint():
     topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
     if not topic:
         return jsonify({"error": "Tell Scholar AI what the deck is about first."}), 400
+    started = time.time()
     pro = _is_pro(request.current_user)
     content_max = DECK_CONTENT_PRO if pro else DECK_CONTENT_FREE   # room for 2 section dividers on top
     # Evidence first: real papers for the topic, and the request's own wishes (drawings, charts).
@@ -8297,7 +9403,7 @@ def slides_draft_endpoint():
         return _points_reply(e)
     try:
         raw = call_claude(system, f"Request: {topic}", max_tokens=12000 if pro else 9000, timeout=150 if pro else None, feature="deck")
-        deck, refs = _parse_full_deck(raw, group, sources, deck_max=content_max + 2)
+        deck, refs = _parse_full_deck(raw, group, sources, deck_max=content_max + 2, topic=topic, deadline=started + 160)
         # named after the deck's own title — never the request
         ts = deck["title_slide"]
         name = (ts.get("main") or ts.get("subtitle") or ts.get("course") or _topic_title(topic) or "").strip()
@@ -8605,6 +9711,10 @@ def delete_account_endpoint():
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM store_purchases WHERE user_id = %s", (user["id"],))
+            # 4.5: the day counts of invitation emails are tied to the account number and have no link to the account row
+            cur.execute("SELECT to_regclass('public.meeting_invites') AS t")
+            if (cur.fetchone() or {}).get("t"):
+                cur.execute("DELETE FROM meeting_invites WHERE user_id = %s", (user["id"],))
             cur.execute("DELETE FROM users WHERE id = %s", (user["id"],))
         conn.commit()
     except Exception as e:
@@ -9255,6 +10365,8 @@ def meet_notes_send(cur, code):
     m = _meet_get(cur, code, lock=True)
     if user["id"] != m["host_id"]:
         raise MeetError("Only the host can send the notes.", 403)
+    if m["e2ee"]:
+        raise MeetError("Notes can’t be emailed from an end-to-end encrypted meeting.", 400)
     notes = _text(_json_body().get("notes")).replace("\r", "").strip()[:12000]
     if not notes:
         raise MeetError("There are no notes to send yet.", 400)
@@ -9667,6 +10779,10 @@ def meet_notes(cur, code):
     m = _meet_get(cur, code)
     if request.current_user["id"] != m["host_id"]:
         raise MeetError("Only the host can ask Scholar AI for the notes.", 403)
+    if m["e2ee"]:
+        # 4.5: an end-to-end encrypted meeting's chat and words stay between the people in it — never sent to us or the AI
+        raise MeetError("Scholar AI’s notes aren’t available in an end-to-end encrypted meeting: its chat and words stay "
+                        "between the people in it.", 400)
     lines = []
     for it in (data.get("chat") or [])[:400]:
         if isinstance(it, dict) and _text(it.get("text")).strip():
