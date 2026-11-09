@@ -27,7 +27,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context
 from flask_compress import Compress
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -81,7 +81,7 @@ Compress(app)
 # processes, each keeping its own count, so a limit here can let through
 # up to twice its number. That's fine for what these limits are for —
 # stopping scripts making hundreds or thousands of requests — not precise
-# quotas (Scholar AI's monthly allowance is exact; it's counted in the database).
+# quotas (RamzAI's monthly allowance is exact; it's counted in the database).
 def _client_ip():
     """The visitor's own address. Render's edge sets True-Client-IP to it (replacing any value a visitor sends);
     elsewhere (a computer, the tests) the connection's own address."""
@@ -294,7 +294,7 @@ GOOGLE_PLAY_PACKAGE_NAME = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME", "")
 # not something settable from here.
 STORE_PRODUCT_TO_PLAN = {
     # The ids to register in App Store Connect and Play Console:
-    #   Pay-per-Use — one full use of Pro: PAYPERUSE_MESSAGES Scholar AI messages
+    #   Pay-per-Use — one full use of Pro: PAYPERUSE_MESSAGES RamzAI messages
     #   that never expire (Apple: Consumable; Google Play: one-time product,
     #   consumed after it's granted). Each store transaction is credited
     #   once only (store_purchases).
@@ -317,8 +317,11 @@ PRO_PLANS = SCHOLAR_PASSES + ("monthly", "halfyear", "yearly")
 _PRO_SQL = "('day', 'week', 'month', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
 PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "semester": "Scholar Semester", "year": "Scholar Year",
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
-# Points: the unit of AI work. A Scholar AI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
+# Points: the unit of AI work. A RamzAI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
 POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
+# 4.6: Research a question (RamzAI's Research) is 1 point (the owner, 9 Nov 2026: "1 point each time"); on Free it
+# still counts as one of the month's research writings
+POINTS_ASK_RESEARCH = 1
 # 4.5 (the owner, 9 Nov 2026): Free gets 5 points every calendar month (UTC), once per phone, and at most 2 of its uses
 # a month may be research writing — an automatic draft (/api/write) or a batch of statements for manual research
 # writing (/api/guide/statements). Research writing still costs its usual 2 points each.
@@ -328,10 +331,10 @@ TRIAL_POINTS = FREE_MONTH_POINTS   # the old name; older apps read "trial_points
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
 BONUS_MONTH_POINTS = 450   # a referral bonus month works like Scholar Month
 # What Pro adds beyond Free (none of Free's own allowances change).
-REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file Scholar AI reads (~8 / ~25 pages)
+REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file RamzAI reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
-DECK_CONTENT_FREE, DECK_CONTENT_PRO = 14, 22         # content slides in a deck Scholar AI drafts
-PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: Scholar AI messages that never expire
+DECK_CONTENT_FREE, DECK_CONTENT_PRO = 14, 22         # content slides in a deck RamzAI drafts
+PAYPERUSE_MESSAGES = 30   # one Pay-per-Use purchase: RamzAI messages that never expire
 
 TOKEN_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 RESET_TOKEN_MAX_AGE = 60 * 60  # 1 hour — short-lived on purpose
@@ -411,7 +414,7 @@ def init_db():
             # When a Pay-per-Use pass ends. NULL for Free and for store
             # subscriptions (the stores handle their renewals).
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMPTZ")
-            # Pay-per-Use: Scholar AI messages bought once, used after the monthly
+            # Pay-per-Use: RamzAI messages bought once, used after the monthly
             # allowance, never expiring — and every store transaction that
             # granted them, so the same purchase is never credited twice.
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS remy_credits INTEGER NOT NULL DEFAULT 0")
@@ -543,7 +546,7 @@ def add_user_memory(user_id, note):
                     "INSERT INTO user_memory (user_id, note) VALUES (%s, %s)",
                     (user_id, note),
                 )
-                return True             # 4.5: the app says "Scholar AI will remember…" only for a note really saved
+                return True             # 4.5: the app says "RamzAI will remember…" only for a note really saved
         finally:
             conn.close()
     except Exception:
@@ -554,7 +557,7 @@ MEMORY_LIMIT = 50
 
 
 def _memory_on(user_row):
-    """Whether this person lets Scholar AI remember (Profile -> Scholar AI's memory)."""
+    """Whether this person lets RamzAI remember (Profile -> RamzAI's memory)."""
     try:
         return user_row.get("memory_enabled", True) is not False
     except Exception:
@@ -1232,7 +1235,7 @@ def user_row_to_dict(row):
         # Where Pro came from — the app describes it truthfully: a store plan
         # renews, a Paystack pass or a bonus month runs to its date.
         "plan_source": (row.get("plan_source") if hasattr(row, "get") else None) if (row.get("plan") if hasattr(row, "get") else None) != "free" else None,
-        # The Scholar AI message meter: this window's allowance, used so far, and
+        # The RamzAI message meter: this window's allowance, used so far, and
         # when it renews (30 days after it began).
         "remy_messages_used": msgs_used,
         "remy_messages_limit": msgs_limit,
@@ -1339,7 +1342,7 @@ _UNCONFIRMED_OK = {"me", "verify_email", "resend_code", "change_email", "delete_
 
 
 # 3.2: what each AI call used, logged as counts with an estimated cost (USD per million tokens; web search per
-# search) so the real cost of a Scholar AI answer can be checked — never anyone's words or account.
+# search) so the real cost of a RamzAI answer can be checked — never anyone's words or account.
 _AI_RATES = {"claude-opus-5": (5.0, 25.0), "claude-sonnet-5": (2.0, 10.0)}
 _AI_SEARCH_COST = 0.01
 
@@ -1359,11 +1362,11 @@ def _log_ai_use(model, usage, feature):
 
 # 3.3.1: what people see when the AI can't answer. Never the AI service's own words — they can name this account's
 # credit balance or keys. The real reason goes to the server log for the owner (see _ai_failure).
-AI_MSG_UNAVAILABLE = "Scholar AI isn\u2019t available right now. Please try again a little later."
-AI_MSG_BUSY = "Scholar AI is busy right now. Please try again in a minute."
-AI_MSG_SLOW = "Scholar AI took too long to answer. Please try again."
-AI_MSG_TOO_BIG = "That\u2019s more than Scholar AI can read at once. Please try a shorter message or file."
-AI_MSG_FAILED = "Scholar AI couldn\u2019t answer just now. Please try again."
+AI_MSG_UNAVAILABLE = "RamzAI isn\u2019t available right now. Please try again a little later."
+AI_MSG_BUSY = "RamzAI is busy right now. Please try again in a minute."
+AI_MSG_SLOW = "RamzAI took too long to answer. Please try again."
+AI_MSG_TOO_BIG = "That\u2019s more than RamzAI can read at once. Please try a shorter message or file."
+AI_MSG_FAILED = "RamzAI couldn\u2019t answer just now. Please try again."
 AI_MSG_NOT_COUNTED = " This didn\u2019t use any of your messages."
 
 
@@ -1849,12 +1852,51 @@ def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, c
     return {"title": title[:400], "authors": authors or None, "year": year, "venue": (str(venue).strip()[:200] or None) if venue else None,
             "doi": doi, "pdf": str(pdf)[:600], "landing": (str(landing)[:600] if landing else None),
             "url": f"https://doi.org/{doi}" if doi else str(pdf)[:600],
-            "abstract": abstract[:2000] if abstract else None, "found_in": found_in, "cites": int(cites or 0), "biblio": biblio or {},
+            "abstract": abstract[:2000] if abstract else None, "abstract_full": abstract[:9000] if abstract else None,
+            "found_in": found_in, "cites": int(cites or 0), "biblio": biblio or {},
             "preprint": _is_preprint(venue, doi)}
 
 
-def _openalex_papers(query, n, since=None):
+# 4.6: what kind of work a paper is (Research lets people choose): a journal article, a review of many studies, a book or a
+# chapter, a preprint (not yet peer reviewed), or something else (an editorial, a dataset, a thesis), which Research leaves out
+_OA_KIND = {"article": "article", "proceedings-article": "article", "review": "review", "book": "book", "book-chapter": "book",
+            "monograph": "book", "book-section": "book", "edited-book": "book", "reference-book": "book", "preprint": "preprint",
+            "posted-content": "preprint"}
+_OA_TYPES = {"article": "article", "review": "review", "book": "book|book-chapter", "preprint": "preprint"}
+
+
+def _kind_s2(types, venue=None):
+    """Semantic Scholar's publicationTypes: an editorial, a letter, a comment, news or a dataset is never taken for an
+    article, even when it is also marked JournalArticle; a record with no type counts as an article only when a journal
+    or a venue is named."""
+    t = {str(x).lower() for x in (types or [])}
+    if t & {"editorial", "lettersandcomments", "news", "dataset"}:
+        return "other"
+    if t & {"review", "metaanalysis"}:
+        return "review"
+    if t & {"book", "booksection"}:
+        return "book"
+    if t & {"journalarticle", "study", "clinicaltrial", "casereport", "conference"}:
+        return "article"
+    return "article" if (not t and venue) else "other"
+
+
+def _kind_epmc(types):
+    t = " ".join(str(x).lower() for x in (types or []))
+    if "preprint" in t:
+        return "preprint"
+    if re.search(r"\b(?:retract\w*|erratum|errata|correction|corrigendum|editorial|comment|letter|news|expression of concern|"
+                 r"protocol|guideline|thesis|dissertation)\b", t):
+        return "other"
+    if re.search(r"\b(?:review|meta-analysis|systematic)\b", t):
+        return "review"
+    return "article"
+
+
+def _openalex_papers(query, n, since=None, kinds=None):
     flt = "is_oa:true,is_retracted:false" + (f",publication_year:>{since - 1}" if since else "")
+    if kinds and set(kinds) != set(_OA_TYPES):
+        flt += ",type:" + "|".join(_OA_TYPES[k] for k in kinds if k in _OA_TYPES)
     params = {"search": query[:300], "filter": flt, "per-page": max(n * 3, 15),
               "select": "id,doi,display_name,publication_year,authorships,primary_location,best_oa_location,locations,"
                         "abstract_inverted_index,biblio,cited_by_count,type"}
@@ -1883,18 +1925,23 @@ def _openalex_papers(query, n, since=None):
                    {k: b.get(k) for k in ("volume", "issue", "first_page", "last_page") if b.get(k)})
         if p:
             p["preprint"] = p["preprint"] or str(w.get("type") or "").lower() == "preprint"
+            p["kind"] = "preprint" if p["preprint"] else _OA_KIND.get(str(w.get("type") or "").lower(), "other")
             out.append(p)
     return out, None if out else "OpenAlex found no open papers with a PDF"
 
 
-def _s2_papers(query, n, since=None):
+def _s2_papers(query, n, since=None, kinds=None):
     headers = dict(_PAPER_UA)
     if SEMANTIC_SCHOLAR_API_KEY:
         headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
     params = {"query": query[:300], "limit": max(n * 3, 15), "openAccessPdf": "",
-              "fields": "title,url,year,authors,abstract,venue,openAccessPdf,externalIds,citationCount,journal"}
+              "fields": "title,url,year,authors,abstract,venue,openAccessPdf,externalIds,citationCount,journal,publicationTypes"}
     if since:
         params["year"] = f"{since}-"
+    if kinds and "article" not in kinds:          # many records carry no type: filter there only when articles aren't wanted
+        types = [t for k in kinds for t in {"review": ["Review", "MetaAnalysis"], "book": ["Book", "BookSection"]}.get(k, [])]
+        if types:
+            params["publicationTypes"] = ",".join(types)
     if not _s2_slot():
         return [], _S2_BUSY
     resp = requests.get("https://api.semanticscholar.org/graph/v1/paper/search", params=params, headers=headers, timeout=_PAPER_TIMEOUT)
@@ -1918,11 +1965,12 @@ def _s2_papers(query, n, since=None):
                    x.get("venue") or j.get("name"), (x.get("externalIds") or {}).get("DOI"), pdf, x.get("url"), x.get("abstract"),
                    "Semantic Scholar", x.get("citationCount"), biblio)
         if p:
+            p["kind"] = "preprint" if p["preprint"] else _kind_s2(x.get("publicationTypes"), x.get("venue") or (x.get("journal") or {}).get("name"))
             out.append(p)
     return out, None if out else "Semantic Scholar found no open papers with a PDF"
 
 
-def _epmc_papers(query, n, since=None):
+def _epmc_papers(query, n, since=None, kinds=None):
     q = f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y AND NOT PUB_TYPE:\"retracted publication\"" + (f" AND PUB_YEAR:[{since} TO 3000]" if since else "")
     params = {"query": q, "format": "json", "resultType": "core", "pageSize": max(n * 2, 12)}
     resp = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
@@ -1952,6 +2000,7 @@ def _epmc_papers(query, n, since=None):
                    "Europe PMC", x.get("citedByCount"), biblio)
         if p:
             p["preprint"] = p["preprint"] or str(x.get("source") or "").upper() == "PPR"
+            p["kind"] = "preprint" if p["preprint"] else _kind_epmc(((x.get("pubTypeList") or {}).get("pubType")) or [])
             out.append(p)
     return out, None if out else "Europe PMC found no open papers with a PDF"
 
@@ -2029,16 +2078,18 @@ def _pdf_alive(url):
         return True
 
 
-def search_papers(query, max_results=8, since=None, check_links=True):
+def search_papers(query, max_results=8, since=None, check_links=True, kinds=None, stats=None):
     """Real, downloadable papers for a topic: [{title, authors, year, venue, doi, pdf, url,
-    abstract, ...}] most relevant first, and a reason when there are none."""
+    abstract, ...}] most relevant first, and a reason when there are none. kinds (4.6, Research): the kinds of work
+    asked for, passed to the indexes that can filter by them. stats (a dict, optional) gets how many different papers
+    the indexes found ("found") and which indexes found any ("from")."""
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         return [], "no topic"
     order = (("OpenAlex", _openalex_papers), ("Semantic Scholar", _s2_papers), ("Europe PMC", _epmc_papers))
     got, why = {}, []
     with _futures.ThreadPoolExecutor(max_workers=3) as pool:
-        jobs = {name: pool.submit(fn, query, max_results, since) for name, fn in order}
+        jobs = {name: pool.submit(fn, query, max_results, since, **({"kinds": list(kinds)} if kinds else {})) for name, fn in order}
         for name, _ in order:
             try:
                 papers, diag = jobs[name].result(timeout=_PAPER_TIMEOUT * 2 + 3)
@@ -2058,15 +2109,30 @@ def search_papers(query, max_results=8, since=None, check_links=True):
             continue
         # the same paper from another index: keep whatever this copy adds. Another version of it (a different DOI —
         # a preprint and its journal article) lends only its abstract, so a reference never mixes two versions.
-        same_record = bool(twin.get("doi") and twin.get("doi") == p.get("doi")) or not (twin.get("doi") and p.get("doi"))
+        if twin.get("doi") and p.get("doi"):
+            same_record = twin.get("doi") == p.get("doi")
+        else:   # a DOI is missing: one record only when the year, the kind and the journal agree (a preprint is another version)
+            vn = lambda x: re.sub(r"[^a-z0-9]+", " ", str(x.get("venue") or "").lower()).strip()
+            same_record = bool(twin.get("year") and twin.get("year") == p.get("year") and bool(twin.get("preprint")) == bool(p.get("preprint"))
+                               and vn(twin) and vn(twin) == vn(p))
+        if same_record and twin.get("abstract_lent") and p.get("abstract"):
+            twin["abstract"], twin["abstract_full"], twin["abstract_lent"] = p["abstract"], p.get("abstract_full") or p["abstract"], False
         for k in (("abstract", "venue", "doi", "authors", "year") if same_record else ("abstract",)):
             if not twin.get(k) and p.get(k):
                 twin[k] = p[k]
+                if k == "abstract":
+                    twin["abstract_full"] = p.get("abstract_full") or p[k]
+                    # 4.6: another version's abstract (a preprint's, for its journal article) may differ in its figures:
+                    # Research never quotes it under this paper's reference
+                    twin["abstract_lent"] = not same_record
         if same_record and not twin.get("biblio") and p.get("biblio"):
             twin["biblio"] = p["biblio"]
         twin["preprint"] = bool(twin.get("preprint") or (same_record and p.get("preprint")))
         if twin.get("doi"):
             twin["url"] = f"https://doi.org/{twin['doi']}"
+    if stats is not None:
+        stats["found"] = len(merged)
+        stats["from"] = [name for name, _ in order if got.get(name)]
     ranked = _rank_papers(merged, query)[: max_results * 2]
     if check_links and ranked:
         alive = {}
@@ -2202,6 +2268,8 @@ _ORG_FIRST = re.compile(r"^(?:World|National|International|Global|Central|Federa
 
 def _person_like(full):
     """A two-word name whose org word is only its last ("Robert Service", "Mikkel Bank") names a person."""
+    if re.fullmatch(r"[A-ZÀ-ɏ][\w'’\-]+,\s*(?:[A-ZÀ-ɏ]\.\s*-?\s*){1,3}(?:,?\s*(?:Jr|Sr|II|III|IV)\.?)?", full):
+        return True                                   # "Bank, A.", "Service, R. W." — a surname, then initials
     toks = full.split()
     if "," in full or len(toks) != 2 or _ORG_WORDS.search(toks[0]) or not _ORG_WORDS.fullmatch(toks[1]):
         return False
@@ -2867,7 +2935,7 @@ def handle_too_large(e):
 def handle_rate_limited(e):
     # Flask-Limiter's default reply is an HTML page; the app reads replies
     # as JSON, so without this a limited user saw a parsing error ("Unexpected
-    # token '<'") instead of an explanation. Scholar AI's monthly allowance returns
+    # token '<'") instead of an explanation. RamzAI's monthly allowance returns
     # its own 429 message directly and never reaches this handler.
     return jsonify({"error": "You've made a lot of requests in a short time. Please wait a few minutes, then try again."}), 429
 
@@ -3965,7 +4033,7 @@ def plan_upgrade():
                                 (holder["user_id"], holder["product"]))
                     logger.info(f"Store purchase {transaction_key} moved from user {holder['user_id']} to {request.current_user['id']}")
             if plan == "payperuse":
-                # One full use of Pro: Scholar AI messages that never expire, on top
+                # One full use of Pro: RamzAI messages that never expire, on top
                 # of the monthly allowance; the plan itself doesn't change.
                 # A transaction already credited (a retried or replayed
                 # request) adds nothing the second time.
@@ -4005,7 +4073,7 @@ def plan_upgrade():
 # ------------------------------------------------------------ Paystack (web only)
 # On the web (acadhome.vercel.app) Pro is bought with Paystack — card or
 # mobile money, charged in Ghana cedis — as a one-time pass: 30 or 365 days of
-# Pro, or 30 Scholar AI messages. The App Store and Google Play apps must use the
+# Pro, or 30 RamzAI messages. The App Store and Google Play apps must use the
 # stores' own purchases (their rules), so requests from the store apps are
 # refused here and the app hides Paystack there too. The secret key is read
 # only from the server's environment — never from code or the app.
@@ -4372,8 +4440,8 @@ if _paystack_on() and "fake" not in os.environ.get("DATABASE_URL", "fake"):
     _threading.Thread(target=_paystack_reconcile_loop, daemon=True, name="paystack-check").start()
 
 
-# ------------------------------------------------------------ Scholar AI's memory
-# What Scholar AI remembers about a person is theirs to see and control: list it,
+# ------------------------------------------------------------ RamzAI's memory
+# What RamzAI remembers about a person is theirs to see and control: list it,
 # add a note, edit or delete one, clear everything, or switch memory off
 # (then nothing is read or saved). Every change is limited to the person's
 # own notes.
@@ -4394,11 +4462,11 @@ def memory_endpoint():
             if request.method == "POST":
                 note = re.sub(r"\s+", " ", str((request.get_json(silent=True) or {}).get("note") or "")).strip()[:300]
                 if not note:
-                    return jsonify({"error": "Write something for Scholar AI to remember."}), 400
+                    return jsonify({"error": "Write something for RamzAI to remember."}), 400
                 cur.execute("SELECT note FROM user_memory WHERE user_id = %s", (user["id"],))
                 existing = [r["note"].strip().lower() for r in cur.fetchall()]
                 if len(existing) >= MEMORY_LIMIT:
-                    return jsonify({"error": f"Scholar AI can remember up to {MEMORY_LIMIT} notes — delete one first."}), 400
+                    return jsonify({"error": f"RamzAI can remember up to {MEMORY_LIMIT} notes — delete one first."}), 400
                 if note.lower() not in existing:
                     cur.execute("INSERT INTO user_memory (user_id, note) VALUES (%s, %s)", (user["id"], note))
             elif request.method == "DELETE":
@@ -4775,11 +4843,11 @@ def _log_sage_message_and_consume(user_row, points=1, research=False):
                     conn.rollback()
                     if row["plan"] == "free":
                         raise ConversionError(
-                            f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with Scholar AI this month. "
-                            f"A Scholar pass adds points for Scholar AI and every other AI feature."
+                            f"You've used your {SAGE_FREE_MESSAGES_LIMIT} free messages with RamzAI this month. "
+                            f"A Scholar pass adds points for RamzAI and every other AI feature."
                         )
                     raise ConversionError(
-                        f"You've reached Scholar AI's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
+                        f"You've reached RamzAI's monthly limit ({SAGE_PAID_MESSAGES_LIMIT} messages) for this "
                         f"account. It resets next month, or a Scholar pass adds points now."
                     )
             if source == "allowance":
@@ -5520,7 +5588,7 @@ def word_open_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# ======================= 3.14: Scholar AI in the Word editor =======================
+# ======================= 3.14: RamzAI in the Word editor =======================
 WORD_AI_ACTIONS = {
     "write": "Write what the person asks for, ready to go into their document.",
     "continue": "Carry on the document from where TEXT ends: one or two paragraphs that follow on naturally, in the same voice. Only the new words — don't repeat any of TEXT.",
@@ -5551,8 +5619,8 @@ WORD_AI_LANGS = (
 def _word_proofread(user, text, charged):
     """A list of fixes for TEXT: each one the exact words to change, the words to put instead, and why, in plain
     English. The app applies them one by one or all at once, so the person stays in charge of every change.
-    The point was already taken by the endpoint; it is given back if Scholar AI fails."""
-    system = ("You are Scholar AI, the proofreader inside Academic-Home's Word editor. Read TEXT and list what should be fixed: "
+    The point was already taken by the endpoint; it is given back if RamzAI fails."""
+    system = ("You are RamzAI, the proofreader inside Academic-Home's Word editor. Read TEXT and list what should be fixed: "
               "spelling, grammar, punctuation, wrong words, agreement, tense, capital letters, repeated words, and sentences that "
               "are unclear or too long. Reply with one JSON object only, no code fences: "
               '{"issues": [{"from": "<the exact words in TEXT to change, 1 to 12 words, copied exactly>", "to": "<the words to put '
@@ -5569,7 +5637,7 @@ def _word_proofread(user, text, charged):
     obj = _guide_json(raw)
     if not isinstance(obj, dict) or not isinstance(obj.get("issues"), list):
         _refund_sage_message(user, charged)
-        return jsonify({"error": "Scholar AI couldn't read the text this time — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "RamzAI couldn't read the text this time — please try again." + AI_MSG_NOT_COUNTED}), 502
     issues = []
     for x in obj["issues"][:25]:
         if not isinstance(x, dict):
@@ -5586,7 +5654,7 @@ def _word_proofread(user, text, charged):
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def word_ai_endpoint():
-    """3.14 — Scholar AI in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
+    """3.14 — RamzAI in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
     far), ask (what to write, for write and outline), lang (for translate), title (the document's name). Returns
     {"text": …} in plain text with light marks: "# " a title, "## " a heading, "- " a point, "1. " a numbered point."""
     if request.method == "OPTIONS":
@@ -5594,13 +5662,13 @@ def word_ai_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in WORD_AI_ACTIONS:
-        return jsonify({"error": "Scholar AI can't do that here."}), 400
+        return jsonify({"error": "RamzAI can't do that here."}), 400
     text = str(data.get("text") or "").replace("\r", "").strip()[:14000]
     ask = str(data.get("ask") or "").strip()[:1500]
     lang = str(data.get("lang") or "")
     title = str(data.get("title") or "").strip()[:120]
     if action in ("write", "outline") and not ask:
-        return jsonify({"error": "Say what Scholar AI should write."}), 400
+        return jsonify({"error": "Say what RamzAI should write."}), 400
     if action not in ("write", "outline") and not text:
         return jsonify({"error": "Choose some words first — or put the cursor in a paragraph."}), 400
     if action == "translate" and lang not in WORD_AI_LANGS:
@@ -5611,7 +5679,7 @@ def word_ai_endpoint():
         return _points_reply(e)
     if action == "proofread":
         return _word_proofread(request.current_user, text, charged)
-    system = ("You are Scholar AI, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
+    system = ("You are RamzAI, the writing helper inside Academic-Home's Word editor, used by students and tutors. "
               + WORD_AI_ACTIONS[action].replace("LANGUAGE", lang) +
               " Reply with the words for the document only: no greeting, no note about what you did, no quotation marks around "
               "it. Plain text with these marks only: '# ' starts a title, '## ' a heading, '### ' a smaller heading, '- ' a "
@@ -5636,12 +5704,12 @@ def word_ai_endpoint():
     out = _c45_word_citations(out, text)
     if not out:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Scholar AI had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "RamzAI had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"text": out[:30000]})
 
 
 def _c45_word_citations(out, text):
-    """4.5: Scholar AI in the Word editor never adds a citation of its own: only those already in the person's text stay,
+    """4.5: RamzAI in the Word editor never adds a citation of its own: only those already in the person's text stay,
     as they wrote them (a page they gave stays), and so do their narrative ones ("Mensah and Boateng (2022) found…")."""
     present = []
     for m in re.finditer(r"\(([^()]{2,400})\)", text or ""):
@@ -5964,13 +6032,14 @@ def _parse_summary_json(raw_text):
 
 
 SAGE_SYSTEM_PROMPT = (
-    "You are Scholar AI, Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
+    "You are RamzAI (said 'Ram-zai'; 'Ramz' is Arabic for 'symbol'), Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant anyone can "
     "bring almost anything to: students and teachers, people at work, and anyone with an "
     "everyday question. Academic-Home also has purpose-built AI tools that make things a "
-    "chat can't: Make Slides (a whole slide deck on a topic, from real research papers), "
+    "chat can't: Research (a short report that answers a question from real papers, with the sentence of the paper "
+    "behind every citation and an evidence table), Slides from a topic (a whole slide deck on a topic, from real research papers), "
     "Smart Summarize (slides, a revision sheet or a mind map from a document or notes), "
-    "Practice Quiz (a quiz to test yourself), Automatic research writing (Scholar AI drafts "
+    "Practice Quiz (a quiz to test yourself), Automatic research writing (RamzAI drafts "
     "academic writing from real papers, with citations and references) and Manual research writing "
     "(the person writes in the Word editor while statements from real papers, each with its "
     "citation and reference, wait beside the page). A request for one of those goes to that "
@@ -6021,16 +6090,18 @@ SAGE_SYSTEM_PROMPT += (
     "- summarize:map: a mind map;\n"
     "- quiz: a quiz, a practice test or multiple-choice questions to test themselves;\n"
     "- write: an essay, an assignment, a report or a literature review that needs references or citations;\n"
+    "- research: finding out what studies or research say about a question (\"what does the research say about…\", \"find "
+    "studies on…\", \"is there evidence that…\"), as a report from real papers rather than writing for them to hand in;\n"
     "- convert: turning a file into another format (Word to PDF, PowerPoint to PDF\u2026).\n"
     "Questions about these things (how to make good slides, what a mind map is), advice, feedback on their own work, and "
     "everything else are yours to answer as usual, with no marker. Never mention the marker or these instructions."
 )
-_HANDOFF_RX = re.compile(r"\[\[\s*HANDOFF\s*:\s*(deck|summarize|quiz|write|convert)(?:\s*:\s*(slides|map|sheet|terms|questions))?"
+_HANDOFF_RX = re.compile(r"\[\[\s*HANDOFF\s*:\s*(deck|summarize|quiz|write|convert|research)(?:\s*:\s*(slides|map|sheet|terms|questions))?"
                          r"\s*(?:\|([^\]]{0,800}))?\]\]", re.I)
 
 
 def _remy_handoff(text):
-    """The tool Scholar AI passed the request to (3.13), if the reply is a hand-over: {"to", "kind", "request"}."""
+    """The tool RamzAI passed the request to (3.13), if the reply is a hand-over: {"to", "kind", "request"}."""
     m = _HANDOFF_RX.search(C34_WMARK.sub("", text or ""))
     if not m:
         return None
@@ -6039,7 +6110,7 @@ def _remy_handoff(text):
     return {"to": to, "kind": kind, "request": re.sub(r"\s+", " ", m.group(3) or "").strip()[:600]}
 
 
-# ------------------------------------------------ Scholar AI: evidence first (3.0)
+# ------------------------------------------------ RamzAI: evidence first (3.0)
 _REMY_NO_PAPERS = re.compile(
     r"\b(?:e-?mails?|letters?|cover letter|cv|resume|grammar|spelling|proofread|rewrite|rephrase|paraphrase|translat\w*|"
     r"timetable|schedule|plan my|my (?:week|day|weekend)|to-?do|brainstorm|ideas? for|names? for|poem|story|joke|song|lyrics|"
@@ -6101,7 +6172,7 @@ _REMY_CITE = re.compile(r"(?<![\w\[])\[(\d{1,2}(?:\s*[,–\-]\s*\d{1,2})*)\]")
 
 
 def _number_cited_papers(text, papers):
-    """Scholar AI's [n] citations renumbered 1, 2, 3… in the order they first appear; a number that
+    """RamzAI's [n] citations renumbered 1, 2, 3… in the order they first appear; a number that
     matches no paper is taken out. Returns (text, the cited papers in that order)."""
     if not papers or not text:
         return text, []
@@ -6551,7 +6622,7 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
     return text, unsourced
 
 
-# ---- Scholar AI
+# ---- RamzAI
 def _c34_marked_text(content):
     """The answer's text with a private mark after each passage the web search grounded (its page's index), and the
     pages: title, address, and the lines the answer drew on."""
@@ -6650,7 +6721,7 @@ def _c34_number(text, papers, pages):
 
 
 def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment, report=None):
-    """Scholar AI's answer with a source on every sentence that states something (see the top of this patch).
+    """RamzAI's answer with a source on every sentence that states something (see the top of this patch).
     Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced)."""
     text = _C34_AFTER.sub(lambda m: (" " if m.group(2).strip().startswith("[") else "") + m.group(2).strip() + m.group(1), text)
     is_cited = _c34_remy_cited(papers)
@@ -6829,7 +6900,7 @@ def sage_endpoint():
     except ConversionError as e:
         return _points_reply(e)
 
-    # Scholar AI's memory (when the person allows it): what Scholar AI noted before, and
+    # RamzAI's memory (when the person allows it): what RamzAI noted before, and
     # permission to note one new durable thing — taken out of the reply below.
     memory_on = _memory_on(request.current_user)
     system_prompt = SAGE_SYSTEM_PROMPT
@@ -6848,7 +6919,7 @@ def sage_endpoint():
         try:
             papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
         except Exception as e:
-            logger.warning(f"Scholar AI's paper search failed: {e}")
+            logger.warning(f"RamzAI's paper search failed: {e}")
             papers = []
     if papers:
         system_prompt += "\n\n" + _remy_papers_block(papers)
@@ -6884,7 +6955,7 @@ def sage_endpoint():
     note = C34_WMARK.sub("", note).strip() if note else note
     noted = None
     if note and memory_on and add_user_memory(request.current_user["id"], note):
-        noted = note[:300]          # 4.5: the person sees what Scholar AI noted, and can change it
+        noted = note[:300]          # 4.5: the person sees what RamzAI noted, and can change it
     report = {}
     reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
                                            message, topic_q or (not attachment and _remy_live_q(message)), started,
@@ -7443,7 +7514,7 @@ STYLE_WORDS = (
     "and no filler. Plain, specific, accurate words."
 )
 _STYLE_PATHS = (
-    (re.compile(r"^/api/(write|sage)$"), STYLE_PROSE),
+    (re.compile(r"^/api/(write|sage|research)$"), STYLE_PROSE),
     (re.compile(r"^/api/meet/[^/]+/notes$"), STYLE_PROSE),
     (re.compile(r"^/api/(word/ai|study-notes|quiz/generate|summarize|slides/(draft|assist|assist-all))$"), STYLE_WORDS),
 )
@@ -7708,7 +7779,7 @@ MEMORY_INSTRUCTION = (
     "next time — omit it entirely otherwise, and never repeat something you already noted "
     "before. Never note sensitive personal details (health, money, religion, relationships, "
     "passwords or anything they'd keep private). They can see, edit and delete these notes "
-    "in Profile -> Scholar AI's memory."
+    "in Profile -> RamzAI's memory."
 )
 
 
@@ -8180,7 +8251,7 @@ def guide_outline():
             subs.append({"title": _guide_clip(x.get("title"), 90), "why": _guide_clip(x.get("why"), 200)})
     if not subs:
         _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
-        return jsonify({"error": "Scholar AI couldn't outline that — try a few more words about the topic."}), 502
+        return jsonify({"error": "RamzAI couldn't outline that — try a few more words about the topic."}), 502
     return jsonify({"topic": topic, "subtopics": subs[:8]})
 
 
@@ -8316,14 +8387,923 @@ def guide_statements():
                 o["id"] = f"{i + 1}"
     if len(out) < 3:
         _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
-        return jsonify({"error": "Scholar AI couldn't build statements those papers fully support. Try again, or say the topic in other words."}), 502
+        return jsonify({"error": "RamzAI couldn't build statements those papers fully support. Try again, or say the topic in other words."}), 502
     return jsonify({"topic": topic, "subtopic": sub, "style": style, "style_name": CITE_STYLES[style]["name"],
                     "references_title": CITE_STYLES[style]["heading"], "statements": out,
                     "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or "", "checked": checked})
 
 
 
-# ---------- 4.1 Scholar AI plans before it works ----------
+# ======================= 4.6: Research (RamzAI) =======================
+# The owner, 9 Nov 2026 (from the JustDone and Skolar pictures he sent): research that asks first (the years, the kinds of
+# sources), shows its steps as they happen, and shows for every citation the sentence of the paper behind it
+# ("Supports" / "Partly supports"), with an evidence table and the person's own library as sources.
+# One request, answered one line of JSON at a time (application/x-ndjson) as each step really happens (and a heartbeat
+# line every few seconds, so a person who leaves is noticed and given the point back). Nothing is shown as sourced unless
+# whole sentences of a paper's own abstract (or of the person's own PDF) state it: the AI names a sentence by its label and
+# the server copies it out, so every quote is word for word; every figure, in digits or in words, must be in the quoted
+# sentences; a sentence its papers don't fully back is taken out; and so is one copied from any paper.
+RS_KINDS = ("article", "review", "book", "preprint")
+RS_YEARS = (0, 5, 10, 20)
+RS_MAX_PAPERS = 10
+RS_MIN_PAPERS = 3
+RS_SECTIONS = (("short", "Short answer"), ("found", "What the studies found"), ("unsure", "Where they disagree or are unsure"))
+RS_KIND_WORDS = {"article": ("journal article", "journal articles"), "review": ("review", "reviews"),
+                 "book": ("book or chapter", "books or chapters"), "preprint": ("preprint", "preprints"), "mine": ("of your PDFs", "of your PDFs")}
+_RS_ABBR = re.compile(r"(?:\b(?:e\.g|i\.e|et al|etc|vs|cf|approx|ca|fig|figs|no|nos|vol|pp?|eds?|dr|mr|mrs|ms|prof|st|jr|sr|inc|ltd|"
+                      r"co|resp|u\.s|u\.k|n|sd|se|ci|or)|(?<![\w.])[A-Za-z])\.$", re.I)
+_RS_END = re.compile(r"[.!?][\"”’')\]]*(?=\s+[\"“'(\[]?[A-Z0-9])")
+_RS_WHOLE = re.compile(r"[.!?][\"”’')\]]*$")
+
+
+def _rs_split(text, limit=60):
+    """An abstract's whole sentences, word for word (spaces tidied). A label such as "Results:" or a short piece stays with
+    the sentence after it. A piece that doesn't end as a sentence ends (cut off) or is too long to be one is left out:
+    a quote is always a whole sentence of the paper."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    out, start = [], 0
+    for m in _RS_END.finditer(text):
+        if _RS_ABBR.search(text[max(start, m.start() - 12):m.start() + 1]):
+            continue
+        out.append(text[start:m.end()].strip())
+        start = m.end()
+    if text[start:].strip():
+        out.append(text[start:].strip())
+    merged = []
+    for s in out:
+        if merged and len(re.findall(r"[A-Za-z]+", merged[-1])) < 4:          # "Background." or "Methods." joins what follows
+            merged[-1] = merged[-1] + " " + s
+        else:
+            merged.append(s)
+    return [s for s in merged if s and _RS_WHOLE.search(s) and len(s) <= 1200][:limit]
+
+
+# ---- numbers, in digits or in words
+_RS_UNITS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+             "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+             "nineteen": 19}
+_RS_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+_RS_W = "|".join(sorted(list(_RS_UNITS) + list(_RS_TENS), key=len, reverse=True))
+_RS_NUMWORD = re.compile(r"\b(?:" + _RS_W + r")(?:[\s-]+(?:and[\s-]+)?(?:" + _RS_W + r"|hundred|thousand|million))*\b", re.I)
+
+
+def _rs_wordnum(phrase):
+    """ "three hundred and twelve" -> 312; "forty" -> 40; None when it isn't a number."""
+    total, cur, seen = 0, 0, False
+    for w in re.findall(r"[a-z]+", phrase.lower()):
+        if w in _RS_UNITS:
+            cur += _RS_UNITS[w]; seen = True
+        elif w in _RS_TENS:
+            cur += _RS_TENS[w]; seen = True
+        elif w == "hundred":
+            cur = (cur or 1) * 100; seen = True
+        elif w in ("thousand", "million"):
+            total += (cur or 1) * (1000 if w == "thousand" else 1000000); cur = 0; seen = True
+        elif w != "and":
+            return None
+    return total + cur if seen else None
+
+
+def _rs_digits(text, strict, papers_ok=True, counts=None):
+    """The text with numbers written in words as digits ("thirty percent" -> "30 percent", "twice" -> "2 times").
+    strict (the report's own sentence): "one" stays a word unless it counts something ("one school", "one year"); when
+    papers_ok, a count of the papers themselves stays out of the figures ("two studies", "three of the four trials",
+    "2 studies", "Of the four trials, three found…") and goes into counts as (value, of_all) — of_all when it counts
+    the papers read ("of the four studies"), not the papers that found something. Both sides turn an ordinal into
+    digits only as a label ("sixth-grade" is Grade 6; "the second school" is not 2 schools)."""
+    t = re.sub(r"\btwice\b", "2 times", str(text or ""), flags=re.I)
+    t = re.sub(r"\bthrice\b", "3 times", t, flags=re.I)
+    for rx, mark in _RS_FRAC_MARKS:
+        t = rx.sub(mark, t)
+    keep = counts if counts is not None else []
+    of_all = lambda before: bool(re.search(r"\b(?:of|among|across)\s+(?:(?:the|these|those|all)\s+)?$", before, re.I))
+    if strict and papers_ok:
+        def lead(m):
+            keep.append((_rs_wordnum(m.group(2)) if not m.group(2).isdigit() else int(m.group(2)), False))
+            return m.group(1) + "some"
+        t = _RS_OF_PAPERS.sub(lead, t)
+
+    def one(m):
+        phrase = m.group(0)
+        v = _rs_wordnum(phrase)
+        if v is None:
+            return phrase
+        if strict and v <= 10 and not re.search(r"hundred|thousand|million", phrase, re.I):
+            after = t[m.end():m.end() + 60]
+            if papers_ok and _RS_PAPER_NOUN.match(after):
+                keep.append((v, of_all(t[max(0, m.start() - 24):m.start()])))
+                return phrase                    # "two studies", "three of the papers"
+            if v == 1 and phrase.lower() == "one" and not _RS_COUNTED.match(after) \
+                    and not re.match(r"\s*(?:%|percent\b|per cent\b|percentage\b)", after, re.I):
+                return phrase                    # "one of the", "one reason" — a word, not a figure
+        return str(v)
+    t = _RS_NUMWORD.sub(one, t)
+    t = _RS_ORD_LABEL.sub(lambda m: str(_RS_ORDINALS[m.group(1).lower()]), t)
+    if strict and papers_ok:
+        def dig(m):
+            keep.append((int(m.group(0)), of_all(t[max(0, m.start() - 24):m.start()])))
+            return "some"
+        t = re.sub(r"(?<![\w.,\-])(?:10|[1-9])(?=" + _RS_PAPER_NOUN.pattern + ")", dig, t, flags=re.I)
+    return t
+
+
+_RS_DIGITS = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d*\.\d+|\d+)(?![\w])")
+_RS_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+                "eleventh": 11, "twelfth": 12}
+_RS_ORD_LABEL = re.compile(r"\b(" + "|".join(_RS_ORDINALS) + r")(?=[\s-]+(?:grade|graders?|year|form|standard|class|trimester|semester|"
+                           r"wave|round|cycle|term|phase)\b)", re.I)
+# a count of the papers themselves ("two studies", "one trial") is the writer's, not a figure of a paper — unless the
+# quotes count papers too (a review's "Of 24 studies, 18 found gains"); "two study arms" counts something in a paper
+_RS_PAPER_WORD = (r"(?:stud(?:y|ies)|papers?|trials?|reviews?|articles?|authors?|sources?|reports?)\b"
+                  r"(?!\s+(?:arms?|groups?|sites?|areas?|periods?|participants|populations?|samples?|schools?|districts?|regions?|"
+                  r"countries|conditions?|days?|weeks?|months?|years?|sessions?|visits?|centres?|centers?|clinics?|hospitals?|"
+                  r"villages?|communities)\b)")
+_RS_NOT_PREP = r"(?!(?:in|per|of|from|for|with|at|by|on|to|across|than|among|over|under|about|during|after|before|and|or)\b)"
+_RS_SMALL = r"(?:one|two|three|four|five|six|seven|eight|nine|ten|10|[1-9])"
+_RS_PAPER_NOUN = re.compile(r"\s+(?:of\s+(?:(?:the|these|those|all)\s+)?)?(?:" + _RS_NOT_PREP + r"[\w-]+\s+){0,2}?" + _RS_PAPER_WORD, re.I)
+# "Of the four trials, three found gains": the count right after the comma counts those papers too
+_RS_OF_PAPERS = re.compile(r"(\b(?:of|among|across|in)\s+(?:(?:the|these|those|all)\s+)?" + _RS_SMALL + r"\s+(?:" + _RS_NOT_PREP + r"[\w-]+\s+){0,2}?"
+                           + _RS_PAPER_WORD + r"[^,;.]{0,60}?,\s*)" + r"(?<![\w.])(" + _RS_SMALL + r")"
+                           r"(?=\s+(?:of\s+(?:them|these|those)\b|(?:also\s+|each\s+|all\s+)?(?:found|find|finds|showed|show|shows|reported|"
+                           r"report|reports|saw|see|sees|noted|note|notes|observed|observe|observes|suggested|suggest|suggests|concluded|"
+                           r"conclude|concludes|measured|measure|measures|looked|look|looks|tested|test|tests|compared|compare|compares|"
+                           r"focused|focus|focuses|studied|described|describe|describes|linked|link|links|pointed|point|points|agreed|"
+                           r"agree|agrees|differed)\b))", re.I)
+# a fraction in words stands as one sign, so its numbers ("two" of "two-thirds") are never read as figures
+_RS_FRAC_MARKS = tuple((re.compile(rx, re.I), mark) for rx, mark in (
+    (r"\b(?:one|a)[\s-]+half\b", "½"), (r"\btwo[\s-]+thirds\b", "⅔"), (r"\b(?:one|a)[\s-]+third\b", "⅓"),
+    (r"\bthree[\s-]+quarters\b", "¾"), (r"\b(?:one|a)[\s-]+quarter\b", "¼"), (r"\b(?:one|a)[\s-]+fifth\b", "⅕"),
+    (r"\b(?:two|three|four)[\s-]+fifths\b", "⅘"), (r"\b(?:one|a)[\s-]+tenth\b", "⅒")))
+# fractions in words, and the percentages that are the same
+_RS_FRACS = ((re.compile(r"\b(?:(?:one|a)[\s-]+half|half\s+(?:of|the)|halves|halved)\b", re.I), "1/2", (50,)),
+             (re.compile(r"\b(?:one|a)[\s-]+third\b|\bthird\s+of\b", re.I), "1/3", (33, 33.3, 33.33, 34)),
+             (re.compile(r"\btwo[\s-]+thirds\b", re.I), "2/3", (66, 66.7, 66.67, 67)),
+             (re.compile(r"\b(?:one|a)[\s-]+quarter\b|\bquarter\s+of\b", re.I), "1/4", (25,)),
+             (re.compile(r"\bthree[\s-]+quarters\b", re.I), "3/4", (75,)),
+             (re.compile(r"\b(?:one|a)[\s-]+fifth\b", re.I), "1/5", (20,)),
+             (re.compile(r"\b(?:one|a)[\s-]+tenth\b", re.I), "1/10", (10,)),
+             (re.compile(r"\bdoubled\b", re.I), "x2", ()), (re.compile(r"\btripled\b", re.I), "x3", ()))
+_RS_COUNTS_PAPERS = re.compile(r"(?<![\w.,\-])(?!(?:1[5-9]|20)\d\d\b)(?:\d[\d,]*|" + _RS_W + r")\s+(?:" + _RS_NOT_PREP + r"[\w-]+\s+){0,2}?"
+                               r"(?:stud(?:y|ies)|papers?|trials?|reviews?|articles?|reports?|sources?)\b", re.I)
+
+
+def _rs_values(text):
+    """The numbers in a text (".45" and "0.45" are one value; 1,200 and 1200 too)."""
+    out = set()
+    for m in _RS_DIGITS.finditer(text):
+        try:
+            out.add(round(float(m.group(1).replace(",", "")), 6))
+        except ValueError:
+            pass
+    return out
+
+
+def _rs_figures_ok(sentence, quoted, n_cited=None, n_read=None):
+    """Every figure the report's sentence states (in digits or in words) is in the quoted sentences, as the same value
+    and counting the same thing; percentage points are never a percentage; a fraction ("half", "a third") is the same
+    fraction or its percentage there. A count of the papers themselves ("two studies found…") is the writer's own,
+    unless the quotes count papers too — then it is checked like any figure; when n_cited is given, it can't be more
+    than the papers the sentence cites (or, counting all the papers, "of the five studies", than the papers read)."""
+    q = _rs_digits(quoted, False)
+    own = not _RS_COUNTS_PAPERS.search(str(quoted or ""))
+    counts = []
+    s = _rs_digits(sentence, True, papers_ok=own, counts=counts)
+    if n_cited is not None and any(not v or v > (max(n_cited, n_read or 0) if of_all else n_cited) for v, of_all in counts):
+        return False
+    if not _rs_values(s) <= _rs_values(q):
+        return False
+    q_vals = _rs_values(q)
+    for rx, name, pcts in _RS_FRACS:
+        if rx.search(sentence) and not rx.search(quoted) and not any(v in q_vals for v in pcts):
+            return False
+    if re.search(r"percentage[- ]points?|\bpp\b", s, re.I) and not re.search(r"percentage[- ]points?|\bpoints?\b|\bpp\b", q, re.I):
+        return False
+    nums = _c45_numbers(s)
+    return not nums or _c45_numbers_in(nums, q)
+
+
+# ---- design and who it studied, from the abstract's sentences about the study itself
+_RS_DESIGNS = (
+    (re.compile(r"\bmeta-?analys[ie]s\b", re.I), "Meta-analysis"),
+    (re.compile(r"\bsystematic (?:literature )?review\b", re.I), "Systematic review"),
+    (re.compile(r"\bscoping review\b", re.I), "Scoping review"),
+    (re.compile(r"\brandomi[sz]ed (?:controlled |clinical |cluster |field )?trials?\b|\brandomly (?:assigned|allocated)\b|\bRCT\b", re.I), "Randomised trial"),
+    (re.compile(r"\bquasi-?experiment", re.I), "Quasi-experimental"),
+    (re.compile(r"\bmixed[- ]methods?\b", re.I), "Mixed methods"),
+    (re.compile(r"\blongitudinal\b|\bcohort stud(?:y|ies)\b|\bprospective (?:cohort|study)\b|\bfollowed (?:up )?for\b", re.I), "Longitudinal study"),
+    (re.compile(r"\bcross-?sectional\b", re.I), "Cross-sectional study"),
+    (re.compile(r"\bcase stud(?:y|ies)\b", re.I), "Case study"),
+    (re.compile(r"\bsurvey(?:ed|s)?\b|\bquestionnaires?\b", re.I), "Survey"),
+    (re.compile(r"\binterview(?:ed|s)?\b|\bfocus groups?\b|\bqualitative\b|\bthematic analysis\b", re.I), "Qualitative"),
+    (re.compile(r"\bexperiment(?:s|al)?\b", re.I), "Experiment"),
+)
+# a sentence about this study (not about other studies, or what research should do next)
+_RS_SELF = re.compile(r"\b(?:we|our|us|this (?:study|paper|article|review|meta-?analysis|trial|survey|research|report|analysis|work|chapter|book|project)|"
+                      r"the (?:present|current) (?:study|review|research|paper)|a total of|participants|respondents|data (?:were|was) (?:collected|drawn|gathered)|"
+                      r"(?:were|was)\s+(?:randomly\s+)?(?:assigned|allocated|recruited|surveyed|interviewed|enrolled|selected|sampled|followed|tested|"
+                      r"compared|observed|included|analy[sz]ed|asked|invited))\b", re.I)
+# "unlike previous randomised trials, we…": what other studies did is taken out before the design is read
+_RS_OTHERS = re.compile(r"\b(?:unlike|like|as in|following|in contrast to|compared (?:with|to)|building on|extending)\s+(?:the\s+)?(?:previous|prior|earlier|other|most|many|existing|past|recent)\b[^,.;:]*", re.I)
+_RS_NOT_SELF = re.compile(r"\b(?:needed|should be|future|further research|more research|recommend\w*|warrant\w*|call(?:s|ed)? for|will|"
+                          r"plan(?:s|ned)?\s+to|aims?\s+to\s+(?:recruit|enrol|enroll|assign|randomi[sz]e)|to be (?:recruited|enrolled|randomi[sz]ed|assigned))\b|"
+                          r"\b(?:should|would|could|might)\s+(?:[\w-]+\s+){0,2}?(?:stud|research|work|trial)", re.I)
+# a clause about other studies ("earlier randomised trials had found gains") says nothing of this study's design
+_RS_OTHER_CLAUSE = re.compile(r"\b(?:previous|prior|earlier|existing|other|past|recent|many|most|some|several|few)\s+(?:[\w-]+\s+){0,2}?"
+                              r"(?:stud(?:y|ies)|research|work|trials?|reviews?|surveys?|experiments?|literature|evidence)\b", re.I)
+_RS_WHO = ("participants|students|pupils|learners|children|adolescents|youths?|adults|teachers|educators|lecturers|patients|"
+           "respondents|women|men|girls|boys|mothers|fathers|parents|nurses|doctors|physicians|clinicians|schools|classrooms|"
+           "households|families|farmers|employees|workers|residents|undergraduates|graduates|individuals|people|persons|subjects|"
+           "volunteers|cases|infants|newborns|babies|smallholders|firms|companies|countries|communities|villages|districts|"
+           "hospitals|clinics|universities|colleges|studies|trials|articles|papers")
+# "one" counts something when a counted thing follows it ("one school", "one rural school", "one year")
+_RS_COUNTED = re.compile(r"\s+(?:[\w-]+\s+)?(?:" + _RS_WHO + r"|participant|student|pupil|learner|child|adolescent|youth|adult|teacher|"
+                         r"educator|lecturer|patient|respondent|woman|man|girl|boy|mother|father|parent|nurse|doctor|physician|clinician|"
+                         r"school|classroom|household|family|farmer|employee|worker|resident|undergraduate|graduate|individual|person|"
+                         r"subject|volunteer|case|infant|newborn|baby|smallholder|firm|company|country|community|village|district|"
+                         r"hospital|clinic|university|college|weeks?|months?|years?|days?|hours?|minutes?|sessions?|lessons?|terms?|"
+                         r"semesters?|grades?|groups?|arms?|sites?|times?|classes|class|regions?|provinces?|states?)\b", re.I)
+_RS_N = re.compile(r"(?<![\w.,\-])(?:n\s*=\s*(\d{1,3}(?:,\d{3})+|\d+)(?![\w.,])|(\d{1,3}(?:,\d{3})+|\d{2,7})\s+((?:[A-Za-z0-9-]+\s+){0,2}?(?:" + _RS_WHO + r"))\b)", re.I)
+_RS_ROUGH = re.compile(r"(?:more|less|fewer|greater|higher|lower)\s+than\s+$|(?:over|under|about|around|nearly|almost|roughly|approximately|up to|at least|at most|some|each|per|every)\s+$", re.I)
+
+
+def _rs_own_part(s):
+    """The part of a sentence about this study: clauses about other studies left out."""
+    s = _RS_OTHERS.sub(" ", s)
+    parts = re.split(r"[;:]|,(?!\d{3})|\s(?:but|whereas|while|although|though|however|yet)\s", s)
+    return " ".join(x for x in parts if x.strip() and not _RS_OTHER_CLAUSE.search(x)).strip()
+
+
+def _rs_self(sents):
+    """The sentences about this study itself (only their own part), not about other studies or about plans."""
+    out = []
+    for s in sents:
+        own = _rs_own_part(s)
+        if own and _RS_SELF.search(own) and not _RS_NOT_SELF.search(own):
+            out.append(own)
+    return out
+
+
+def _rs_design(sents, kind=None):
+    for s in _rs_self(sents):
+        for rx, name in _RS_DESIGNS:
+            if rx.search(s):
+                return name
+    return "Review" if kind == "review" else None
+
+
+def _rs_people(sents):
+    """Who the study looked at, in its abstract's own words ("312 pupils", "24 studies"), from a sentence about the study
+    itself; never a rough number ("more than 50 pupils"), a label ("Grade 10 pupils") or part of a name ("COVID-19")."""
+    for sent in _rs_self(sents):
+        if len(re.findall(r"\bn\s*=\s*\d", sent, re.I)) > 1:
+            continue                        # the sizes of several groups: the whole sample isn't one number here
+        for m in _RS_N.finditer(sent):
+            if m.group(1):
+                return f"{m.group(1)} participants"
+            n, what = m.group(2), m.group(3)
+            if re.fullmatch(r"(?:1[5-9]|20)\d{2}", n):
+                continue
+            if set(what.lower().split()[:-1]) & {"percent", "per", "of", "in", "than", "more", "less", "fewer", "times", "out", "from", "to",
+                                                 "and", "or", "with", "at", "for", "by", "the", "a", "an"}:
+                continue
+            before = sent[max(0, m.start() - 24):m.start()]
+            if _RS_ROUGH.search(before) or _C45_LABEL.search(before):
+                continue
+            return f"{n} {what}".strip()
+    return None
+
+
+def _rs_cite_short(key):
+    k = str(key or "").strip()
+    return k[1:-1] if k.startswith("(") and k.endswith(")") else k
+
+
+# ---- the person's library
+_RS_INITIALS = re.compile(r"^(?:[A-ZÀ-ɏ]\.\s*(?:-\s*)?)+$")
+
+
+_RS_BODY = re.compile(r"\b(?:ministry|department|organi[sz]ation|agency|council|institute|university|college|commission|"
+                      r"office|service|association|society|board|authority|centre|center|committee|foundation|programme|program|"
+                      r"government|unesco|unicef|united nations|world bank|world health|bureau|secretariat|directorate)\b", re.I)
+_RS_PARTICLE = r"(?:van|von|der|den|de|del|della|da|di|du|la|le|bin|ibn|al|el|dos|das)"
+_RS_PERSONLIKE = re.compile(r"^(?:" + _RS_PARTICLE + r"\s+)*[A-ZÀ-ɏ][\w'’\-]+(?:\s+(?:" + _RS_PARTICLE + r"\s+)*[A-ZÀ-ɏ][\w'’\-.]*){1,3}$")
+# "Mensah K", "Mensah K.", "van der Berg JA" (surname, then initials); never "John Smith II"
+_RS_VANCOUVER = re.compile(r"^((?:[a-z]{1,4}\s+)*[A-ZÀ-ɏ][\w'’\-]+(?:\s+(?:[a-z]{1,4}\s+)*[A-ZÀ-ɏ][\w'’\-]+){0,2})\s+((?:[A-Z]\.?\s?-?){1,3})$")
+_RS_SUFFIX = re.compile(r"^(?:jr|sr|ii|iii|iv)\.?$", re.I)
+# two-letter surnames written in capitals ("Wei LI") that are seldom initials
+_RS_SHORT_SURNAMES = {"LI", "WU", "XU", "HU", "YU", "LU", "NG"}
+
+
+def _rs_vancouver(a, caps_mode=None):
+    """(surname, initials) when a reads as "Surname I" / "Surname I." — None when it's a name with its surname in
+    capitals ("Kofi ADU", "Wei LI"). caps_mode: what the other authors of the list show ("initials" or "surname")."""
+    m = _RS_VANCOUVER.match(a.strip())
+    if not m:
+        return None
+    raw, letters = m.group(2), re.findall(r"[A-Z]", m.group(2))
+    if re.fullmatch(r"(?:II|III|IV)", raw.strip()):
+        return None
+    if "." not in raw and len(letters) >= 2 and (caps_mode == "surname" or (caps_mode is None and (len(letters) >= 3 or "".join(letters) in _RS_SHORT_SURNAMES))):
+        return None
+    return m.group(1), letters
+
+
+def _rs_authors(raw):
+    """Authors as a person typed them -> one name per author, in a form the reference builder reads:
+    "Mensah, K., Boateng, A., & Owusu, Y." / "Kofi Mensah, Adwoa Boateng" / "Mensah, Kofi; Boateng, Adwoa" /
+    "Mensah K, Boateng AB" / "Mensah K., Boateng A." / "Kofi ADU" (-> "Kofi Adu"); "Mensah, K., Jr." keeps its suffix;
+    a body's name stays whole ("Food and Agriculture Organization", "Ministry of Education, Ghana"); an affiliation
+    typed after the people ("…, University of Ghana") is left out."""
+    text = re.sub(r"\s*\([^()]*\)", "", str(raw or ""))                       # "(University of Ghana)"
+    text = re.sub(r"(?<=[A-Za-zÀ-ɏ.])[\d*†‡§¶]+(?=\s*(?:,|;|&|\band\b|$))", "", text)   # "Mensah1", "Boateng*"
+    text = re.sub(r"\s+", " ", text).strip(" ,;")
+    if not text:
+        return []
+    initials = bool(re.search(r"(?:^|[\s,])[A-Z]\.(?=[\s,;&-]|$)", text))
+    pieces = [x.strip() for x in re.split(r"[;,&]|\band\b", text) if x.strip()]
+    if _RS_BODY.search(text) and not initials and not any(_rs_vancouver(x) for x in pieces):
+        parts = [x.strip() for x in re.split(r"\s*;\s*|,", text) if x.strip()]
+        people = [x for x in parts if not _RS_BODY.search(x) and _RS_PERSONLIKE.match(x) and not re.search(r"\b(?:and|of|for|the)\b", x)]
+        if not people:
+            return [text[:200]]                # one body
+        text = ", ".join(x for x in parts if not _RS_BODY.search(x))
+    out = []
+    for chunk in re.split(r"\s*;\s*|\s*&\s*|\s+and\s+", text):
+        chunk = chunk.strip(" ,")
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",") if p.strip()]
+        names, suffix = [], {}
+        for p_ in parts:                       # "Jr." goes with the name before it
+            if _RS_SUFFIX.match(p_) and names:
+                suffix[len(names) - 1] = p_.rstrip(".") + "."
+            else:
+                names.append(p_)
+        parts = names
+        if len(parts) == 1:
+            got = [parts[0]]
+        elif all(_RS_INITIALS.match(p_) for p_ in parts[1::2]) and len(parts) % 2 == 0:
+            got = [f"{parts[i]}, {parts[i + 1]}" for i in range(0, len(parts), 2)]       # "Surname, I., Surname, I."
+            suffix = {i // 2: v for i, v in suffix.items()}
+        elif len(parts) % 2 == 0 and all(len(p_.split()) == 1 for p_ in parts):
+            got = [f"{parts[i]}, {parts[i + 1]}" for i in range(0, len(parts), 2)]       # "Mensah, Kofi, Boateng, Adwoa"
+            suffix = {i // 2: v for i, v in suffix.items()}
+        elif len(parts) == 2 and len(parts[0].split()) == 1:
+            got = [f"{parts[0]}, {parts[1]}"]                                            # "Surname, Given"
+            suffix = {0: v for v in suffix.values()}
+        else:
+            got = parts                                                                  # "Kofi Mensah, Adwoa Boateng"
+        out.extend(f"{g}, {suffix[i]}" if i in suffix else g for i, g in enumerate(got))
+    # "Mensah KA" or "Kofi ADU"? The other names of the list decide; on their own, three capitals are a surname
+    modes = set()
+    for a in out:
+        m = _RS_VANCOUVER.match(a.strip())
+        if m and "," not in a:
+            raw_i = m.group(2)
+            caps = "".join(re.findall(r"[A-Z]", raw_i))
+            if "." in raw_i or len(caps) == 1:
+                modes.add("initials")               # "Mensah K", "Mensah K."
+            elif len(caps) >= 3 or caps in _RS_SHORT_SURNAMES:
+                modes.add("surname")                # "Kofi ADU", "Wei LI"
+    mode = modes.pop() if len(modes) == 1 else None
+    fixed = []
+    for a in out:
+        v = _rs_vancouver(a, mode) if "," not in a else None
+        if v:
+            fixed.append(f"{v[0]}, " + " ".join(c + "." for c in v[1]))
+        else:
+            fixed.append(" ".join(w.title() if len(w) >= 2 and w.isalpha() and w.isupper() and not re.fullmatch(r"II|III|IV", w) else w for w in a.split()))
+    return [a[:120] for a in fixed][:20]
+
+
+def _rs_biblio(b):
+    if not isinstance(b, dict):
+        return {}
+    return {k: str(b.get(k))[:20] for k in ("volume", "issue", "first_page", "last_page") if b.get(k) and re.fullmatch(r"[\w.\-–]{1,20}", str(b.get(k)))}
+
+
+def _rs_library(raw):
+    """What the person sent from their library: papers they saved, and their own PDFs' first pages. Checked and capped."""
+    out = []
+    for it in (raw if isinstance(raw, list) else [])[:25]:
+        if not isinstance(it, dict):
+            continue
+        kind = it.get("kind")
+        title = re.sub(r"\s+", " ", str(it.get("title") or "")).strip()[:300]
+        if not title:
+            continue
+        year = it.get("year")
+        try:
+            year = int(str(year)[:4]) if year else None
+        except (TypeError, ValueError):
+            year = None
+        if year and not 1500 <= year <= datetime.now(timezone.utc).year + 1:
+            year = None
+        if kind == "saved":
+            abstract = re.sub(r"\s+", " ", str(it.get("abstract") or "")).strip()[:9000]
+            if len(abstract) < 120:
+                continue
+            authors = [re.sub(r"\s+", " ", str(a)).strip()[:120] for a in (it.get("authors") or []) if str(a or "").strip()][:40]
+            url = str(it.get("url") or "")[:600]
+            pdf = str(it.get("pdf") or "")[:600]
+            was = it.get("was") if it.get("was") in RS_KINDS else "article"
+            out.append({"title": title, "authors": authors or None, "year": year, "venue": (str(it.get("venue") or "")[:200] or None),
+                        "doi": _norm_doi(it.get("doi")), "pdf": pdf if pdf.startswith("http") else None, "url": url if url.startswith("http") else None,
+                        "abstract": abstract, "abstract_full": abstract, "kind": was, "preprint": was == "preprint", "lib": "saved",
+                        "cites": 0, "biblio": _rs_biblio(it.get("biblio"))})
+        elif kind == "mine":
+            text = re.sub(r"[ \t]+", " ", str(it.get("text") or "")).strip()[:12000]
+            if len(text) < 300:
+                continue
+            out.append({"title": title, "authors": _rs_authors(it.get("authors")) or None, "year": year, "venue": None, "doi": None,
+                        "pdf": None, "url": None, "abstract": text, "abstract_full": text, "kind": "mine", "preprint": False, "lib": "mine",
+                        "cites": 0, "biblio": {}})
+    return out
+
+
+# a protocol describes a study still to be done: it has no findings to quote
+_RS_PROTOCOL = re.compile(r"\b(?:study|trial|review|research|evaluation)\s+protocol\b|(?:^|[:\-–—]\s*)(?:(?:a|the)\s+)?protocol\b(?:\s+(?:of|for)\b|\s*$)|"
+                          r"\bprotocol\s+(?:of|for)\s+(?:a|an|the)\b|\brationale\s+and\s+(?:study\s+)?design\b|\bdesign\s+and\s+rationale\b|"
+                          r"\bstudy\s+design\s+and\s+methods\b|\bplanned\s+(?:[\w-]+\s+){0,3}?(?:trial|study|evaluation|review)\b|"
+                          r"\b(?:design|methods?)\s+(?:of|for)\s+(?:a|an|the)\s+(?:[\w-]+\s+){0,4}?(?:trial|study|evaluation)\b", re.I)
+_RS_PROTOCOL_TEXT = re.compile(r"^\W*(?:(?:background|introduction|objectives?|aims?)\W+)?(?:this|the|a|our)\s+(?:study\s+|trial\s+|review\s+)?protocol\b|"
+                               r"\b(?:this|the)\s+(?:study\s+|trial\s+|review\s+)?protocol\s+(?:describes|outlines|presents|reports|sets out)\b|"
+                               r"\bwe\s+(?:describe|present|outline|report)\s+(?:the|a|our)\s+(?:study\s+|trial\s+)?protocol\b|"
+                               r"\b(?:this|the|our)\s+(?:paper|article|report)\s+(?:describes|outlines|presents|sets out)\s+the\s+(?:design|methods?|rationale)\b|"
+                               r"^\W*(?:[^.!?]{0,300}[.!?]\s+)?(?:we|this\s+(?:study|trial|evaluation))\s+will\s+(?:randomly\s+)?(?:assign|recruit|enrol|enroll|"
+                               r"conduct|evaluate|test|compare|examine|investigate|measure|follow|allocate|collect|interview|survey)\b", re.I)
+# a sentence about what a study will do is a plan, not a finding
+_RS_PLAN = re.compile(r"\b(?:we|they|it|this|these|that|which|who|pupils|students|participants|data|results|findings|outcomes|study|trial|review)\s+will\b|"
+                      r"\bwill\s+(?:be|not|also|then|need|help|have|allow|show|provide|inform|examine|assess|test|compare|explore|investigate|"
+                      r"evaluate|measure|determine|use|follow|recruit|assign|enrol|enroll|conduct|collect)\b|\b(?:is|are)\s+planned\b", re.I)
+
+
+def _rs_pick(found, library, question, kinds, since):
+    """The papers the research reads: from the library first (when they're about the question and fit the years and
+    kinds; a saved paper the search also found comes with the search's fuller record), then the search's best, up to
+    RS_MAX_PAPERS; each with whole sentences of its own abstract to stand on (never an abstract lent by another version)."""
+    terms = _paper_terms(question)
+
+    def text_of(p):
+        return p.get("abstract_full") or p.get("abstract") or ""
+
+    def about(p, need):
+        hay = ((p.get("title") or "") + " " + text_of(p)[:4000]).lower()
+        return sum(1 for t in terms if t in hay) >= need
+
+    def usable(p):
+        return (not p.get("abstract_lent") and len(text_of(p)) >= 200 and len(_rs_split(text_of(p))) >= 2
+                and not _RS_PROTOCOL.search(p.get("title") or "") and not _RS_PROTOCOL_TEXT.search(text_of(p)[:400]))
+
+    need = 2 if len(terms) >= 3 else 1
+    picked = []
+    for p in library:
+        if p["kind"] != "mine" and p["kind"] not in kinds:
+            continue
+        if since and p.get("year") and p["year"] < since:
+            continue
+        if not about(p, need) or len(picked) >= 5:
+            continue
+        if p["kind"] == "mine" and len([x for x in picked if x["kind"] == "mine"]) >= 3:
+            continue
+        if p["lib"] == "saved":
+            twin = next((q for q in found if _same_work(p, q) and usable(q)), None)
+            if twin:
+                p = dict(twin, kind=twin.get("kind") or p["kind"], lib="saved")
+        picked.append(p)
+    for p in found:
+        if len(picked) >= RS_MAX_PAPERS:
+            break
+        kind = p.get("kind") or ("preprint" if p.get("preprint") else "article")
+        if kind not in kinds or kind == "other":
+            continue
+        if not usable(p):
+            continue
+        if since and p.get("year") and p["year"] < since:
+            continue
+        if any(_same_work(p, q) for q in picked):
+            continue
+        picked.append(dict(p, kind=kind))
+    out = []
+    for p in picked:
+        sents = [x for x in _rs_split(text_of(p)) if not _RS_PLAN.search(x)]
+        if sents:
+            out.append(dict(p, n=len(out) + 1, sents=sents))
+    return out
+
+
+def _rs_json(raw):
+    a, b = str(raw or "").find("{"), str(raw or "").rfind("}")
+    obj = json.loads(raw[a:b + 1]) if 0 <= a < b else None
+    if not isinstance(obj, dict):
+        raise ValueError("its reply wasn't the JSON asked for")
+    return obj
+
+
+def _rs_papers_text(papers, labelled=False, cap=2600):
+    out = []
+    for p in papers:
+        head = f"[{p['n']}] {p['title']} ({p.get('year') or 'no date'}; " + ("the person's own PDF" if p["kind"] == "mine" else RS_KIND_WORDS.get(p["kind"], ("paper",))[0]) + ")"
+        if labelled:
+            body = "\n".join(f"  P{p['n']}-S{i}: {s}" for i, s in enumerate(p["sents"]))
+        else:
+            body = "  " + " ".join(p["sents"])[:cap]
+        out.append(head + "\n" + body)
+    return "\n\n".join(out)
+
+
+def _rs_idx(raw, pn, n_sents):
+    """The sentence numbers the AI gave for paper pn, checked: whole numbers or labels like "P3-S2" for this paper, each
+    a real sentence. None when anything given is not (a wrong label voids the claim; nothing is guessed)."""
+    items = raw if isinstance(raw, list) else [raw]
+    out = []
+    for x in items[:2]:
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            k = x
+        elif isinstance(x, str):
+            m = re.fullmatch(r"\s*(?:P(\d+)\s*-\s*)?S?(\d+)\s*", x, re.I)
+            if not m or (m.group(1) and int(m.group(1)) != pn):
+                return None
+            k = int(m.group(2))
+        else:
+            return None                    # 1.10 and the like: not a label this server gave
+        if not 0 <= k < n_sents:
+            return None
+        if k not in out:
+            out.append(k)
+    return sorted(out) or None
+
+
+def _rs_write(question, papers, deadline):
+    """The report's sentences, by part, each ending in the numbers of the papers that state it."""
+    system = (
+        "You are RamzAI, the research helper in Academic-Home, used by students and teachers. Answer the person's QUESTION "
+        "from the numbered PAPERS only (their abstracts, or the first pages of the person's own PDF). Rules:\n"
+        "- Say only what the papers state. No outside knowledge, no background of your own, no advice, no guesses.\n"
+        "- Every sentence ends with the numbers of the papers that state what it says, in square brackets before the full "
+        "stop, like [2] or [1, 4]. Cite a paper only for what its own text states. Give each figure exactly as the paper does. "
+        "When you count the papers themselves, use words (\"two studies\").\n"
+        "- Put it in your own words: never six or more words in a row from a paper. Don't name authors or years in the "
+        "sentences (the brackets are the citations), and don't mention 'the abstract'.\n"
+        "- Formal, plain English a first-year student understands. One idea per sentence.\n"
+        "- If the papers don't answer the question, say so plainly in the short answer, and say what they do show.\n"
+        "Reply with JSON only: {\"short\": [2 or 3 sentences that answer the question], \"found\": [3 to 6 sentences on what "
+        "the studies found], \"unsure\": [0 to 3 sentences on where they disagree, are limited or are unsure]}."
+        + STYLE_PROSE)
+    user = "QUESTION: " + question + "\n\nPAPERS:\n" + _rs_papers_text(papers)
+    raw = call_claude(system_prompt=system, user_message=user, max_tokens=1400,
+                      timeout=max(10, min(90, deadline - time.time() - 60)), feature="research-write")
+    obj = _rs_json(raw)
+    parts = []
+    for key, head in RS_SECTIONS:
+        sents = [re.sub(r"\s+", " ", _finish_text(str(s), "words")).strip() for s in (obj.get(key) or []) if isinstance(s, str) and s.strip()]
+        parts.append((head, [s for s in sents if s][:8]))
+    return parts
+
+
+_RS_MARK = re.compile(r"\s*\[(\d{1,2}(?:\s*[,;–\-]\s*\d{1,2})*)\]")
+
+
+def _rs_unmark(sentence):
+    """A written sentence without its [n] marks, and the papers it named."""
+    named = set()
+    for m in _RS_MARK.finditer(sentence):
+        for x in re.split(r"\s*[,;]\s*", m.group(1)):
+            if re.fullmatch(r"\d{1,2}\s*[–\-]\s*\d{1,2}", x):
+                a, b = [int(y) for y in re.split(r"\s*[–\-]\s*", x)]
+                named.update(range(a, min(b, a + 9) + 1))
+            elif x.strip().isdigit():
+                named.add(int(x))
+    text = _RS_MARK.sub("", sentence).strip()
+    text = re.sub(r"\s+([.!?,;:])", r"\1", text)
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text, named
+
+
+def _rs_check(question, papers, sentences, deadline):
+    """For each sentence: the papers, and their sentences by label, that state it ("full") or part of it ("part").
+    Returns ({i: [(paper n, [sentence numbers], "full"|"part")]}, {i: True when something the AI gave for it was
+    invalid}) and the set dropped, or None (no check)."""
+    system = (
+        "You check a research summary so that every sentence is backed by the papers' own words. Below: the PAPERS, each "
+        "sentence of each paper labelled like P3-S2 (paper 3, sentence 2), then the person's QUESTION, then the numbered "
+        "SENTENCES of the summary. For each summary sentence, give the paper sentences that state what it says:\n"
+        "- \"full\" when that paper's sentences you give state everything the summary sentence says, every figure included;\n"
+        "- \"part\" when they state only part of it.\n"
+        "Keep a summary sentence only when the papers you give together state all of it (at least one \"full\", or \"part\" "
+        "ones that together cover every part). Otherwise mark it drop. Any paper may back any sentence. At most 3 papers per "
+        "sentence and at most 2 sentences per paper. Never pair a summary sentence with a paper sentence that doesn't state "
+        "it. Reply with JSON only, like {\"sentences\": [{\"n\": 1, \"cite\": [{\"p\": 3, \"s\": [\"P3-S2\"], \"v\": \"full\"}]}, "
+        "{\"n\": 2, \"drop\": true}]}.\n\nPAPERS:\n" + _rs_papers_text(papers, labelled=True))
+    user = ("QUESTION: " + question + "\n\nSENTENCES:\n" + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences)))
+    obj = None
+    for attempt in (1, 2):
+        try:
+            raw = call_claude(system_prompt=system, user_message=user, max_tokens=min(2500, 90 * len(sentences) + 200),
+                              timeout=max(8, min(60, deadline - time.time())), feature="research-check")
+            obj = _rs_json(raw)
+            break
+        except Exception as e:
+            logger.warning(f"Research: the sentence check didn't run ({str(e)[:100]})")
+            if attempt == 2 or deadline - time.time() < 40:
+                return None
+    by_n = {p["n"]: p for p in papers}
+    out, doubt, drop = {}, {}, set()
+    for it in obj.get("sentences") or []:
+        try:
+            if not isinstance(it, dict):
+                continue
+            i = it.get("n")
+            if isinstance(i, bool) or not isinstance(i, int):
+                i = int(str(i)) if re.fullmatch(r"\d{1,3}", str(i or "")) else None
+            if i is None or not 1 <= i <= len(sentences):
+                continue
+            i -= 1
+            if it.get("drop"):
+                drop.add(i)
+                continue
+            cites, bad = [], False
+            given = it.get("cite") if isinstance(it.get("cite"), list) else []
+            for c in given[:3]:
+                pn = c.get("p") if isinstance(c, dict) else None
+                if isinstance(pn, bool) or not isinstance(pn, int):
+                    pn = int(pn) if isinstance(pn, str) and re.fullmatch(r"\s*\d{1,2}\s*", pn) else None
+                p = by_n.get(pn)
+                v = c.get("v") if isinstance(c, dict) else None
+                nums = _rs_idx(c.get("s"), pn, len(p["sents"])) if p else None
+                if not p or not nums or v not in ("full", "part") or any(pn == x[0] for x in cites):
+                    bad = True
+                    continue
+                cites.append((pn, nums, v))
+            if len(given) > 3:
+                bad = True
+            if cites:
+                out[i] = cites
+                doubt[i] = bad
+            else:
+                drop.add(i)
+        except Exception:
+            continue
+    return out, doubt, drop
+
+
+def _rs_keep(sentence, cites, doubtful, by_n, all_text):
+    """Whether a checked sentence may stay: backed fully (one "full"; or "part" from at least two papers when nothing the
+    AI gave was wrong), every figure in its quoted sentences, and in its own words (no run of ten words from any paper)."""
+    if not cites:
+        return False
+    full = any(v == "full" for _, _, v in cites)
+    if not full and (doubtful or len(cites) < 2):
+        return False
+    quoted = " ".join(by_n[pn]["sents"][k] for pn, ks, _ in cites for k in ks)
+    if not _rs_figures_ok(sentence, quoted, n_cited=len({pn for pn, _, _ in cites}), n_read=len(by_n)):
+        return False
+    if _c45_copied(sentence, all_text, run=10):
+        return False
+    return True
+
+
+def _rs_evidence(question, papers, deadline):
+    """For each paper: the sentence(s) of its own that best state what it found about the question, and whether that
+    answers the question yes, partly, no, or is unclear (only when the question can be answered yes or no)."""
+    system = (
+        "For each numbered PAPER below (each sentence labelled like P3-S2: paper 3, sentence 2), pick the one or two sentences "
+        "that best state what that paper found about the person's QUESTION. If the QUESTION can be answered yes or no, also "
+        "say how that paper's finding answers it: \"yes\", \"partly\", \"no\", or \"unclear\" (when it doesn't really answer "
+        "it). Judge only by the paper's own sentences. Reply with JSON only, like {\"yesno\": true, \"papers\": [{\"p\": 1, "
+        "\"s\": [\"P1-S2\"], \"a\": \"yes\"}]}; when the question isn't a yes-or-no question, give \"yesno\": false and leave "
+        "\"a\" out.")
+    user = "QUESTION: " + question + "\n\nPAPERS:\n" + _rs_papers_text(papers, labelled=True)
+    obj = None
+    for attempt in (1, 2):
+        try:
+            raw = call_claude(system_prompt=system, user_message=user, max_tokens=min(1500, 60 * len(papers) + 200),
+                              timeout=max(8, min(70, deadline - time.time() - 40)), feature="research-evidence")
+            obj = _rs_json(raw)
+            break
+        except Exception as e:
+            logger.warning(f"Research: the evidence table's reading didn't run ({str(e)[:100]})")
+            if attempt == 2 or deadline - time.time() < 70:
+                return {}
+    by_n = {p["n"]: p for p in papers}
+    yesno = obj.get("yesno") is True
+    out = {}
+    for it in obj.get("papers") or []:
+        try:
+            pn = it.get("p") if isinstance(it, dict) else None
+            if isinstance(pn, bool) or not isinstance(pn, int):
+                pn = int(pn) if isinstance(pn, str) and re.fullmatch(r"\s*\d{1,2}\s*", pn) else None
+            p = by_n.get(pn)
+            if not p or pn in out:
+                continue
+            nums = _rs_idx(it.get("s"), pn, len(p["sents"])) or []
+            a = it.get("a") if yesno and nums and it.get("a") in ("yes", "partly", "no", "unclear") else None
+            out[pn] = (nums, a)
+        except Exception:
+            continue
+    return out
+
+
+def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="apa"):
+    """What the app shows: the report (sentences with their papers, quotes by number and verdicts), the papers (with their
+    references, citations, quotes, design and who they studied) and what it rests on. The citations and the reference
+    list are worked out from the cited papers alone (APA), so a paper that isn't cited never changes them."""
+    cited = set()
+    sections = []
+    for head, sents in parts:
+        keep = [s for s in sents if s.get("c")]
+        for s in keep:
+            cited.update(c["p"] for c in s["c"])
+        if keep:
+            sections.append({"h": head, "s": keep})
+    strip = lambda p: {k: v for k, v in p.items() if k not in ("sents", "abstract_full")}
+    on_list = [p for p in papers if p["n"] in cited]
+    keys = {p["n"]: e for p, e in zip(on_list, enrich_sources([strip(p) for p in on_list], style))}
+    # a paper read but not cited: its reference and label are worked out alone (no a/b from the other papers), with the
+    # start of its title added when a cited paper, or another paper read, has the same label
+    alone = {p["n"]: enrich_sources([strip(p)], style)[0] for p in papers if p["n"] not in keys}
+    taken = {_rs_cite_short(e.get("citation_key")) for e in keys.values()}
+    clash = Counter(_rs_cite_short(e.get("citation_key")) for e in alone.values())
+    out_papers = []
+    for p in papers:
+        e = keys.get(p["n"]) or alone[p["n"]]
+        cite = _rs_cite_short(e.get("citation_key"))
+        if p["n"] in alone and (cite in taken or clash[cite] > 1):
+            words = (p.get("title") or "").split()
+            cite = f"{cite}, “{' '.join(words[:5])}{'…' if len(words) > 5 else ''}”"
+        url = p.get("url") or (f"https://doi.org/{p['doi']}" if p.get("doi") else None)
+        ref = e.get("ref_text") or p["title"]
+        if url:
+            ref = ref.rstrip() + " " + url
+        finding, answer = evidence.get(p["n"], ([], None))
+        out_papers.append({
+            "n": p["n"], "title": p["title"], "authors": p.get("authors") or [], "year": p.get("year"), "venue": p.get("venue"),
+            "kind": p["kind"], "doi": p.get("doi"), "url": url, "pdf": p.get("pdf"), "biblio": p.get("biblio") or {},
+            "cite": cite, "ref": ref, "sents": p["sents"],
+            "design": _rs_design(p["sents"], p["kind"]), "people": _rs_people(p["sents"]),
+            "finding": finding, "answer": answer if finding else None, "cited": p["n"] in cited, "lib": p.get("lib")})
+    yrs = [p["year"] for p in papers if p.get("year")]
+    counts = Counter(p["kind"] for p in papers)
+    kinds_words = ", ".join(f"{counts[k]} {RS_KIND_WORDS[k][0 if counts[k] == 1 else 1]}" for k in ("article", "review", "book", "preprint", "mine") if counts.get(k))
+    limits = (f"{len(papers)} paper{'' if len(papers) == 1 else 's'}" + (f" from {min(yrs)} to {max(yrs)}" if yrs and min(yrs) != max(yrs) else f" from {yrs[0]}" if yrs else "")
+              + (f": {kinds_words}" if kinds_words else "") + ". RamzAI read their abstracts"
+              + (", and the first pages of your PDFs," if counts.get("mine") else "") + " not the whole papers, so read a paper before you rely on it.")
+    if counts.get("preprint"):
+        limits += " Preprints are not yet peer reviewed."
+    return {"v": 1, "question": question, "asked": {"years": years, "kinds": kinds}, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "style": style, "papers": out_papers, "sections": sections, "limits": limits,
+            "stats": dict(stats, years=[min(yrs), max(yrs)] if yrs else None, kinds=dict(counts))}
+
+
+_RS_DOWN = re.compile(r"HTTP (?:4(?:08|29)|5\d\d)|failed|timed? ?out|busy|Timeout|ConnectionError|rate", re.I)
+
+
+@app.route("/api/research", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def research_endpoint():
+    started = time.time()
+    data = request.get_json(silent=True) or {}
+    question = re.sub(r"\s+", " ", str(data.get("question") or "")).strip()
+    if len(question) < 12 or len(question.split()) < 3:
+        return jsonify({"error": "Say a little more: who, where and what you want to know."}), 400
+    if len(question) > 400:
+        return jsonify({"error": "Make the question shorter (400 characters at most)."}), 400
+    try:
+        years = int(data.get("years") or 0)
+    except (TypeError, ValueError):
+        years = 0
+    years = years if years in RS_YEARS else 0
+    kinds = [k for k in RS_KINDS if k in (data.get("kinds") or [])] or ["article", "review"]
+    library = _rs_library(data.get("library"))
+    user = request.current_user
+    gate = _scholar_gate(user, "Research", research=True)
+    if gate:
+        return gate
+    try:
+        charged = _log_sage_message_and_consume(user, POINTS_ASK_RESEARCH, research=True)
+    except ConversionError as e:
+        return _points_reply(e)
+    state = {"settled": False}
+
+    def settle(ok):
+        if state["settled"]:
+            return
+        state["settled"] = True
+        if not ok:
+            _refund_sage_message(user, charged, POINTS_ASK_RESEARCH, research=True)
+
+    def line(obj):
+        return json.dumps(obj, ensure_ascii=False) + "\n"
+
+    def run():
+        deadline = started + 200
+        pool = _futures.ThreadPoolExecutor(max_workers=3)
+
+        def waiting(futs):
+            """Yields a heartbeat every 4 seconds until one of futs is done (so a person who left is noticed soon)."""
+            while True:
+                done, _ = _futures.wait(futs, timeout=4, return_when=_futures.FIRST_COMPLETED)
+                if done:
+                    return
+                if time.time() > deadline + 15:
+                    raise ConversionError("timed out")
+                yield line({"beat": 1})
+
+        try:
+            yield line({"step": "search", "state": "now"})
+            stats = {}
+            since = (datetime.now(timezone.utc).year - years + 1) if years else None
+            terms = _paper_terms(question)
+            query = " ".join(terms[:8]) if len(terms) >= 2 else _search_topic(question)
+            fs = pool.submit(search_papers, query, 24, since, True, kinds, stats)
+            yield from waiting({fs})
+            found, diag = fs.result()
+            yield line({"step": "search", "state": "done", "found": stats.get("found", len(found)), "from": stats.get("from", [])})
+            yield line({"step": "keep", "state": "now"})
+            papers = _rs_pick(found, library, question, kinds, since)
+            if len(papers) < RS_MIN_PAPERS:
+                if not found and diag and _RS_DOWN.search(diag):
+                    msg = "The paper search services aren’t answering right now. Please try again in a few minutes."
+                else:
+                    msg = ((f"RamzAI found only {len(papers)} free paper{'' if len(papers) == 1 else 's'} that fit" if papers
+                            else "RamzAI found no free papers that fit") + ". Try other words, more years or more kinds of sources.")
+                yield line({"step": "keep", "error": msg + " This didn’t use any points."})
+                return
+            yrs = [p["year"] for p in papers if p.get("year")]
+            yield line({"step": "keep", "state": "done", "kept": len(papers), "years": [min(yrs), max(yrs)] if yrs else None,
+                        "kinds": dict(Counter(p["kind"] for p in papers))})
+            yield line({"step": "write", "state": "now"})
+            yield line({"step": "evidence", "state": "now"})
+            by_n = {p["n"]: p for p in papers}
+            all_text = " ".join(" ".join(p["sents"]) for p in papers)
+            fw = pool.submit(_rs_write, question, papers, deadline)
+            fe = pool.submit(_rs_evidence, question, papers, deadline)
+            pending, evidence, flat, fc = {fw, fe}, None, [], None
+            while pending:
+                yield from waiting(pending)
+                for f in [x for x in pending if x.done()]:
+                    pending.discard(f)
+                    if f is fe:
+                        evidence = f.result()
+                        yield line({"step": "evidence", "state": "done", "rows": len(papers)})
+                    elif f is fw:
+                        parts = f.result()          # may raise: the research stops, and the point is given back
+                        yield line({"step": "write", "state": "done"})
+                        yield line({"step": "check", "state": "now"})
+                        for head, sents in parts:
+                            for s in sents:
+                                text, _named = _rs_unmark(s)
+                                flat.append({"h": head, "t": text})
+                        fc = pool.submit(_rs_check, question, papers, [x["t"] for x in flat], deadline)
+                        pending.add(fc)
+                    elif f is fc:
+                        chk = f.result()
+                        if chk is None:
+                            raise ConversionError("the check didn't run")
+                        cites, doubt, drop = chk
+                        for i, x in enumerate(flat):
+                            c = cites.get(i)
+                            if i in drop or not c or not _rs_keep(x["t"], c, doubt.get(i, False), by_n, all_text):
+                                x["c"] = None
+                                continue
+                            x["c"] = [{"p": pn, "q": ks, "v": v} for pn, ks, v in c]
+                        kept = sum(1 for x in flat if x.get("c"))
+                        yield line({"step": "check", "state": "done", "checked": len(flat), "removed": len(flat) - kept})
+            kept = [x for x in flat if x.get("c")]
+            if len(kept) < 2:
+                yield line({"step": "check", "error": "The papers RamzAI found don’t back a report on this question. Try other words, "
+                                                      "more years or more kinds of sources. This didn’t use any points."})
+                return
+            parts_out = [(head, [{"t": x["t"], "c": x["c"]} for x in flat if x["h"] == head and x.get("c")]) for _key, head in RS_SECTIONS]
+            stats.update(checked=len(flat), removed=len(flat) - len(kept))
+            result = _rs_result(question, years, kinds, papers, parts_out, evidence or {}, stats)
+            yield line({"done": True, "result": result})
+            settle(True)
+            logger.info(f"Research: {len(papers)} papers, {len(flat)} sentences, {len(kept)} kept, {time.time() - started:.0f}s")
+        except GeneratorExit:
+            settle(False)
+            raise
+        except Exception as e:
+            logger.warning(f"Research failed: {e.__class__.__name__}: {str(e)[:160]}")
+            settle(False)
+            yield line({"error": "RamzAI couldn’t finish this research. Please try again. This didn’t use any points."})
+        finally:
+            settle(False)
+            pool.shutdown(wait=False, cancel_futures=True)      # a person who left doesn't hold a thread for the AI's answer
+
+    resp = Response(stream_with_context(run()), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
+    resp.call_on_close(lambda: settle(False))
+    return resp
+
+
+# ---------- 4.1 RamzAI plans before it works ----------
 REMY_PLAN_TOOLS = """
 chat: answer a question, explain something, talk, or write a short text (an email, a message, a study plan). No params.
 quiz: a practice quiz from a topic, pasted notes or an attached file. params: topic (what it is on, or "the attached file"),
@@ -8332,13 +9312,13 @@ quiz: a practice quiz from a topic, pasted notes or an attached file. params: to
 deck: a whole slide deck drafted from a topic, from real research papers; no file needed. params: topic, group (student or tutor).
 summarize: notes or an attached file turned into slides, a one-page revision sheet, a mind map, likely exam questions or
   key terms. Needs text or an attached file. params: kind (slides, sheet, map, questions or terms), audience (student or tutor).
-write: automatic research writing: Scholar AI drafts an essay, report or section from real papers, with citations and
+write: automatic research writing: RamzAI drafts an essay, report or section from real papers, with citations and
   references. params: topic, style (apa, harvard, mla or chicago; default apa), length_words (300 to 3000; default 800).
 cite: manual research writing in the Word editor: the person writes; real papers wait beside the page, one statement at a
   time, each with its citation and reference. params: topic.
 convert: convert a file to another format. params: from_kind (docs, slides, pics, sheets, sound or video), to (the format
   wanted, like pdf, docx, pptx, jpg, mp3, or empty).
-meeting: start an online meeting or class, with an agenda Scholar AI can write. params: title, minutes (30 to 300).
+meeting: start an online meeting or class, with an agenda RamzAI can write. params: title, minutes (30 to 300).
 focus: start the focus timer with calm sounds. params: minutes (25, 45 or 60).
 pdf: edit, sign, fill in, protect or shrink a PDF. No params.
 word: open or start a Word document to edit by hand. No params.
@@ -8348,20 +9328,20 @@ studio: open Slide Studio to make or edit slides by hand. No params.
 REMY_PLAN_POINTS = {"quiz": POINTS_REMY, "deck": POINTS_DECK, "summarize": POINTS_REMY, "write": POINTS_WRITE, "cite": POINTS_RESEARCH, "chat": POINTS_REMY}
 REMY_PLAN_SCHOLAR = {"write": "Automatic research writing", "cite": "Manual research writing"}
 REMY_PLAN_SYSTEM = (
-    "You are Scholar AI's planner inside Academic-Home, a study app. You read what a person asks for and decide how Scholar AI should "
+    "You are RamzAI's planner inside Academic-Home, a study app. You read what a person asks for and decide how RamzAI should "
     "respond, in one JSON object and nothing else. You never do the task yourself.\n\nWhat the app can do:" + REMY_PLAN_TOOLS +
     "\nAnswer with exactly one of these shapes:\n"
     '1. {"do":"chat"} when the person asks a question, wants something explained, is talking, or wants a short text written '
     "(an email, a message, a plan). Most messages are this.\n"
     '2. {"do":"ask","say":"<one short question>","options":["<choice>","<choice>"],"free":true} when the task is clear but one '
-    "thing Scholar AI must know is missing (for a quiz, deck, essay or citing: the topic; for summarize: whether there are notes or a "
+    "thing RamzAI must know is missing (for a quiz, deck, essay or citing: the topic; for summarize: whether there are notes or a "
     "file). Ask ONE question at a time, in plain words; give 2 to 4 short tappable choices when choices make sense, else an "
     "empty list. free is true when typing an answer makes sense.\n"
-    '3. {"do":"plan","tool":"<tool>","title":"<one line: what Scholar AI will make>","detail":["<a choice made, in plain words>", ...],'
+    '3. {"do":"plan","tool":"<tool>","title":"<one line: what RamzAI will make>","detail":["<a choice made, in plain words>", ...],'
     '"params":{...},"next":["<something useful to do afterwards>", ...]} when enough is known. Fill every param, using the '
     "defaults when the person did not say; put the choices that matter in detail (2 to 4 lines, so the person can change them). "
     "next has 2 or 3 short things. For tools with no params use an empty object.\n"
-    '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing Scholar AI can do>", ...]} when the person is vague '
+    '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing RamzAI can do>", ...]} when the person is vague '
     'about what they want ("help me study", "I have an exam on Friday", "what can you do"). Give 3 or 4 concrete, specific '
     "options written as things the person could say.\n\n"
     "Rules: keep every word short and plain, the way you would speak to a first-year student; never invent facts, names or "
@@ -8378,7 +9358,7 @@ def remy_plan():
     data = request.get_json(silent=True) or {}
     text = re.sub(r"\s+", " ", str(data.get("text") or "")).strip()[:1500]
     if not text:
-        return jsonify({"error": "Say what you want Scholar AI to do."}), 400
+        return jsonify({"error": "Say what you want RamzAI to do."}), 400
     turns = []
     for t in (data.get("history") or [])[-8:]:
         if isinstance(t, dict) and t.get("role") in ("user", "assistant") and str(t.get("content") or "").strip():
@@ -8388,7 +9368,7 @@ def remy_plan():
     # 4.5: the names of other recent files are not used (an older app may still send them)
     context = ("The person attached a file" + (f" called {file_name}" if file_name else "") + ".\n" if has_file else "No file is attached.\n")
     # the exchange so far, then the new message, flattened so the planner sees it in one go
-    convo = "".join(("Person: " if t["role"] == "user" else "Scholar AI asked: ") + t["content"] + "\n" for t in turns)
+    convo = "".join(("Person: " if t["role"] == "user" else "RamzAI asked: ") + t["content"] + "\n" for t in turns)
     user_msg = context + (("Earlier in this exchange:\n" + convo) if convo else "") + "Person now says: " + text
     try:
         raw = call_claude(REMY_PLAN_SYSTEM, user_msg, max_tokens=500, timeout=40, feature="plan")
@@ -8408,7 +9388,7 @@ def remy_plan():
         if tool not in REMY_PLAN_POINTS and tool not in ("convert", "meeting", "focus", "pdf", "word", "scan", "studio"):
             return jsonify({"do": "chat"})
         params = obj.get("params") if isinstance(obj.get("params"), dict) else {}
-        out.update({"tool": tool, "title": clip(obj.get("title"), 140) or "Scholar AI will do this", "detail": [clip(d, 160) for d in (obj.get("detail") or []) if clip(d, 160)][:4],
+        out.update({"tool": tool, "title": clip(obj.get("title"), 140) or "RamzAI will do this", "detail": [clip(d, 160) for d in (obj.get("detail") or []) if clip(d, 160)][:4],
                     "params": {str(k)[:30]: (clip(v, 400) if isinstance(v, str) else v) for k, v in params.items() if k},
                     "next": [clip(n, 90) for n in (obj.get("next") or []) if clip(n, 90)][:3],
                     "points": REMY_PLAN_POINTS.get(tool, 0)})
@@ -8543,10 +9523,10 @@ def slides_build_endpoint():
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
-# Scholar AI inside Slide Studio: one tap to tighten a slide's points, put them in
+# RamzAI inside Slide Studio: one tap to tighten a slide's points, put them in
 # simpler words, draft points from its title, or write its speaker notes.
 # Like Smart Summarize it's a slide tool, free on every plan, so it doesn't
-# use the Scholar AI message allowance — only the per-account AI rate limit.
+# use the RamzAI message allowance — only the per-account AI rate limit.
 _ASSIST_ACTIONS = {
     "tighten": ("Rewrite the slide's points so each is short and punchy — ideally under 12 words — keeping every idea "
                 "and its meaning. Keep sub-points as sub-points (level 1). Use at most 7 points.", 700),
@@ -8558,7 +9538,7 @@ _ASSIST_ACTIONS = {
               "of natural spoken English, about 80 to 150 words, covering each point.", 900),
 }
 _ASSIST_SYSTEM = (
-    "You are Scholar AI, the study assistant in Academic-Home, improving one slide of a student's or lecturer's presentation. "
+    "You are RamzAI, the study assistant in Academic-Home, improving one slide of a student's or lecturer's presentation. "
     "Reply with one JSON object only — no preamble and no code fences. For points reply "
     '{"bullets": [{"text": "...", "level": 0}]} (level 0 for main points, 1 for sub-points); for speaker notes reply '
     '{"notes": "..."}. Only rework what the slide already says or clearly implies: never invent statistics, dates, '
@@ -8574,13 +9554,13 @@ def _parse_assist_json(raw, action):
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
+        raise ConversionError("RamzAI couldn't improve this slide — please try again.")
     if not isinstance(data, dict):
-        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
+        raise ConversionError("RamzAI couldn't improve this slide — please try again.")
     if action == "notes":
         notes = data.get("notes")
         if not isinstance(notes, str) or not notes.strip():
-            raise ConversionError("Scholar AI couldn't write notes for this slide — please try again.")
+            raise ConversionError("RamzAI couldn't write notes for this slide — please try again.")
         return {"notes": notes.strip()[:2000]}
     points = []
     for b in data.get("bullets") or []:
@@ -8599,11 +9579,11 @@ def _parse_assist_json(raw, action):
         if len(points) >= 10:
             break
     if not points:
-        raise ConversionError("Scholar AI couldn't improve this slide — please try again.")
+        raise ConversionError("RamzAI couldn't improve this slide — please try again.")
     return {"bullets": points}
 
 
-# ======================= 3.14: Scholar AI for a whole deck (Slide Studio → All slides) =======================
+# ======================= 3.14: RamzAI for a whole deck (Slide Studio → All slides) =======================
 _ALL_ASSIST = {
     "notes": ("For every slide, write speaker notes: what the presenter says while it is shown — 2 to 4 short paragraphs of "
               "natural spoken English, about 80 to 150 words, covering each point. Reply for each slide with "
@@ -8648,7 +9628,7 @@ def slides_assist_all_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in _ALL_ASSIST:
-        return jsonify({"error": "Unknown request for Scholar AI."}), 400
+        return jsonify({"error": "Unknown request for RamzAI."}), 400
     lang = str(data.get("lang") or "")
     if action == "translate" and lang not in _ALL_LANGS:
         return jsonify({"error": "Choose a language."}), 400
@@ -8666,7 +9646,7 @@ def slides_assist_all_endpoint():
         if title or pts or (action == "translate" and notes):
             slides.append((i, title, pts, notes))
     if not slides:
-        return jsonify({"error": "There's nothing on the slides for Scholar AI yet."}), 400
+        return jsonify({"error": "There's nothing on the slides for RamzAI yet."}), 400
     deck = str(data.get("deck_title") or "").strip()[:160]
     lines = [f"Presentation: {deck}"] if deck else []
     for i, title, pts, notes in slides:
@@ -8681,7 +9661,7 @@ def slides_assist_all_endpoint():
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return _points_reply(e)
-    system = ("You are Scholar AI, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
+    system = ("You are RamzAI, the study assistant in Academic-Home, improving a whole presentation slide by slide. Reply with "
               'one JSON object only — no preamble, no code fences: {"slides": [ ... one object per slide given, with its number '
               'as "i" ... ]}. ' + instruction + " Only rework what the slides already say or clearly imply: never invent "
               "statistics, dates, citations or facts. Write in the slides' own language unless asked to translate.")
@@ -8698,10 +9678,10 @@ def slides_assist_all_endpoint():
             got = json.loads(m.group(0)) if m else None
         items = got.get("slides") if isinstance(got, dict) else None
         if not isinstance(items, list):
-            raise ConversionError("Scholar AI couldn't finish that — please try again.")
+            raise ConversionError("RamzAI couldn't finish that — please try again.")
     except (ConversionError, ValueError) as e:
         _refund_sage_message(request.current_user, charged)
-        msg = str(e) if isinstance(e, ConversionError) else "Scholar AI couldn't finish that — please try again."
+        msg = str(e) if isinstance(e, ConversionError) else "RamzAI couldn't finish that — please try again."
         return jsonify({"error": msg + AI_MSG_NOT_COUNTED}), 502
     asked = {i for i, *_ in slides}
     out = []
@@ -8727,7 +9707,7 @@ def slides_assist_all_endpoint():
             out.append(o)
     if not out:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Scholar AI couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "RamzAI couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"slides": out})
 
 
@@ -8738,7 +9718,7 @@ def slides_assist_endpoint():
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in _ASSIST_ACTIONS:
-        return jsonify({"error": "Unknown request for Scholar AI."}), 400
+        return jsonify({"error": "Unknown request for RamzAI."}), 400
     slide = data.get("slide") if isinstance(data.get("slide"), dict) else {}
     title = str(slide.get("title") or "").strip()[:200]
     points = []
@@ -8768,19 +9748,19 @@ def slides_assist_endpoint():
         return jsonify({"error": str(e)}), 502
     except Exception as e:
         logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
-        return jsonify({"error": "Scholar AI couldn't reach the AI just now — please try again."}), 502
+        return jsonify({"error": "RamzAI couldn't reach the AI just now — please try again."}), 502
 
 
 # --------------------------------------------------------- drafting a whole deck
 # Starting a new deck in Slide Studio no longer has to mean a blank slide:
-# given a topic, Scholar AI drafts a full outline (title slide plus content slides)
-# that opens straight into the editor to fix up. It uses one Scholar AI message per
-# draft (the same allowance and Pay-per-Use messages as Scholar AI chat), since a
+# given a topic, RamzAI drafts a full outline (title slide plus content slides)
+# that opens straight into the editor to fix up. It uses one RamzAI message per
+# draft (the same allowance and Pay-per-Use messages as RamzAI chat), since a
 # whole deck is a substantial AI request; editing the deck afterwards, and
-# Scholar AI's per-slide help, stay free.
+# RamzAI's per-slide help, stay free.
 _DRAFT_MAX_SLIDES = 10
 _DRAFT_SYSTEM = (
-    "You are Scholar AI, the study assistant in Academic-Home, drafting a full slide-deck outline from a short topic someone "
+    "You are RamzAI, the study assistant in Academic-Home, drafting a full slide-deck outline from a short topic someone "
     "gives you, for a {group} to open and edit. Reply with one JSON object only — no preamble, no code fences: "
     '{{"title_slide": {{...}}, "slides": [...]}}.\n'
     "{title_fields}"
@@ -8832,7 +9812,7 @@ def _parse_draft_deck_json(raw, group):
     except json.JSONDecodeError:
         data = None
     if not isinstance(data, dict):
-        raise ConversionError("Scholar AI couldn't draft this topic — please try again, or add a bit more detail.")
+        raise ConversionError("RamzAI couldn't draft this topic — please try again, or add a bit more detail.")
 
     ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
     clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
@@ -8872,7 +9852,7 @@ def _parse_draft_deck_json(raw, group):
     else:
         body, end = slides, {"kind": "end", "title": "Any questions" if group == "tutor" else "End", "big": "Thank you"}
     if not body:
-        raise ConversionError("Scholar AI couldn't draft this topic — please try again, or add a bit more detail.")
+        raise ConversionError("RamzAI couldn't draft this topic — please try again, or add a bit more detail.")
     return {
         "template": ("tutor" if group == "tutor" else "student") + "-classic",
         "title_slide": title_slide, "slide_numbers": True, "slides": body[: _DRAFT_MAX_SLIDES - 1] + [end],
@@ -9038,7 +10018,7 @@ _DECK_ORDER_FIELDS = {
               'and at most 14 words.\ndiscussion: 2 or 3 short questions for a class discussion at the end.\n'),
 }
 _DECK_SYSTEM = (
-    "You are Scholar AI, the assistant in Academic-Home, writing a COMPLETE slide deck from a short request, for a {group} to present. "
+    "You are RamzAI, the assistant in Academic-Home, writing a COMPLETE slide deck from a short request, for a {group} to present. "
     "Reply with ONE JSON object only — no preamble, no code fences: {{\"title_slide\": {{...}}, \"slides\": [...]}}.\n"
     "{title_fields}"
     "slides: {min_slides} to {max_slides} items in teaching order: an introduction or overview first, then the content, then key "
@@ -9267,7 +10247,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", 
             except json.JSONDecodeError:
                 data = None
     if not isinstance(data, dict):
-        raise ConversionError("Scholar AI couldn't write this deck — please try again, or add a bit more detail.")
+        raise ConversionError("RamzAI couldn't write this deck — please try again, or add a bit more detail.")
     ts_raw = data.get("title_slide") if isinstance(data.get("title_slide"), dict) else {}
     clip = lambda v, n: re.sub(r"\s+", " ", str(v or "")).strip()[:n]
     if group == "tutor":
@@ -9330,7 +10310,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", 
         slides = [sl for sl in slides if sl["kind"] == "section" or sl.get("media") or sl.get("bullets") or sl.get("left") or sl.get("right")]
     body = slides[:deck_max]
     if not any(s["kind"] != "section" for s in body):
-        raise ConversionError("Scholar AI couldn't write this deck — please try again, or add a bit more detail.")
+        raise ConversionError("RamzAI couldn't write this deck — please try again, or add a bit more detail.")
     # the References slide lists the papers the slides that are left cite (not those of slides that were cut)
     cited = set()
     for sl in body:
@@ -9369,7 +10349,7 @@ def slides_draft_endpoint():
     group = "tutor" if data.get("group") == "tutor" else "student"
     topic = re.sub(r"\s+", " ", str(data.get("topic") or "")).strip()[:300]
     if not topic:
-        return jsonify({"error": "Tell Scholar AI what the deck is about first."}), 400
+        return jsonify({"error": "Tell RamzAI what the deck is about first."}), 400
     started = time.time()
     pro = _is_pro(request.current_user)
     content_max = DECK_CONTENT_PRO if pro else DECK_CONTENT_FREE   # room for 2 section dividers on top
@@ -9392,8 +10372,8 @@ def slides_draft_endpoint():
         system += _DECK_DRAWINGS
     if sources and _CHART_WORDS.search(topic):
         system += _DECK_CHARTS
-    # A whole drafted deck is real AI work, so it draws on the same Scholar AI
-    # messages as chatting with Scholar AI: the month's allowance first, then any
+    # A whole drafted deck is real AI work, so it draws on the same RamzAI
+    # messages as chatting with RamzAI: the month's allowance first, then any
     # Pay-per-Use messages. Checked before the AI call (never spend on a
     # request already over its limit), and given back below if no usable
     # deck arrives — a message only counts when the answer does.
@@ -9689,7 +10669,7 @@ def _colour_not_bold(pptx_path):
 # ------------------------------------------------------------ deleting an account
 # Required by the App Store and Google Play for any app where people create
 # an account: deleting it from inside the app. Everything stored with the
-# account goes with it — conversion history and Scholar AI's memory notes (removed
+# account goes with it — conversion history and RamzAI's memory notes (removed
 # by the database with the account), and the store purchase records; promo
 # codes someone created stay usable but no longer point at them. The
 # password is asked again, so a borrowed phone that's already signed in
@@ -10333,12 +11313,12 @@ def meet_agenda():
     except (TypeError, ValueError):
         minutes = 60
     if not title and not about:
-        return jsonify({"error": "Give the meeting a name first — Scholar AI writes the agenda from it."}), 400
+        return jsonify({"error": "Give the meeting a name first — RamzAI writes the agenda from it."}), 400
     try:
         charged = _log_sage_message_and_consume(request.current_user)
     except ConversionError as e:
         return _points_reply(e)
-    system = ("You are Scholar AI, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
+    system = ("You are RamzAI, in Academic-Home's meetings, writing the agenda for a meeting, class or study group. Reply with the "
               f"agenda only: 4 to 7 lines, each \"- <minutes> min — <item>\", the minutes adding up to about {minutes}; start "
               "with a short welcome and end with questions or next steps. Plain words, no heading, no other text. Never invent "
               "names, dates or facts that weren't given.")
@@ -10352,7 +11332,7 @@ def meet_agenda():
     lines = [l if l.startswith("- ") else "- " + l.lstrip("-•* ") for l in lines if not l.lower().startswith(("here", "agenda:"))][:10]
     if not lines:
         _refund_sage_message(request.current_user, charged)
-        return jsonify({"error": "Scholar AI couldn’t write the agenda — please try again." + AI_MSG_NOT_COUNTED}), 502
+        return jsonify({"error": "RamzAI couldn’t write the agenda — please try again." + AI_MSG_NOT_COUNTED}), 502
     return jsonify({"agenda": "\n".join(lines)})
 
 
@@ -10381,7 +11361,7 @@ def meet_notes_send(cur, code):
     host = (user.get("name") or "The host").strip()[:60]
     for e in to:
         try:
-            send_email(e, ("Notes from " + m["title"])[:180], f"{host} shared the notes from “{m['title']}”, written by Scholar AI.\n\n{notes}\n")
+            send_email(e, ("Notes from " + m["title"])[:180], f"{host} shared the notes from “{m['title']}”, written by RamzAI.\n\n{notes}\n")
             sent += 1
         except Exception as ex:
             logger.warning(f"Meet: notes weren't sent to one person ({ex.__class__.__name__})")
@@ -10774,14 +11754,14 @@ def meet_attendance(cur, code):
 @auth_required
 @_meet_reply
 def meet_notes(cur, code):
-    """Scholar AI's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
+    """RamzAI's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
     data = _json_body()
     m = _meet_get(cur, code)
     if request.current_user["id"] != m["host_id"]:
-        raise MeetError("Only the host can ask Scholar AI for the notes.", 403)
+        raise MeetError("Only the host can ask RamzAI for the notes.", 403)
     if m["e2ee"]:
         # 4.5: an end-to-end encrypted meeting's chat and words stay between the people in it — never sent to us or the AI
-        raise MeetError("Scholar AI’s notes aren’t available in an end-to-end encrypted meeting: its chat and words stay "
+        raise MeetError("RamzAI’s notes aren’t available in an end-to-end encrypted meeting: its chat and words stay "
                         "between the people in it.", 400)
     lines = []
     for it in (data.get("chat") or [])[:400]:
