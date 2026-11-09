@@ -312,10 +312,13 @@ STORE_PRODUCT_TO_PLAN = {
 }
 PASS_DAYS = 30   # kept for any account on the earlier 30-day pass
 # 4.0: Scholar is bought as a pass — Day, Week, Month, Semester or Year. The earlier Pro plans still count while they last.
-SCHOLAR_PASSES = ("day", "week", "month", "semester", "year")
+# 4.7: Month, Half a year and Year are sold; Day, Week and Semester passes bought before still count while they last.
+SCHOLAR_PASSES = ("day", "week", "month", "half", "semester", "year")
 PRO_PLANS = SCHOLAR_PASSES + ("monthly", "halfyear", "yearly")
-_PRO_SQL = "('day', 'week', 'month', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
-PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "semester": "Scholar Semester", "year": "Scholar Year",
+_PRO_SQL = "('day', 'week', 'month', 'half', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
+# research writing as often as the points allow (the owner, 9 Nov 2026): Half a year and Year, and the passes like them
+RESEARCH_PLANS = ("half", "semester", "year", "halfyear", "yearly")
+PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "half": "Scholar Half Year", "semester": "Scholar Semester", "year": "Scholar Year",
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
 # Points: the unit of AI work. A RamzAI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
 POINTS_REMY, POINTS_DECK, POINTS_WRITE, POINTS_RESEARCH = 1, 3, 2, 2
@@ -329,7 +332,7 @@ FREE_MONTH_POINTS = 5
 FREE_MONTH_RESEARCH = 2
 TRIAL_POINTS = FREE_MONTH_POINTS   # the old name; older apps read "trial_points" from /api/paystack/config
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
-BONUS_MONTH_POINTS = 450   # a referral bonus month works like Scholar Month
+BONUS_MONTH_POINTS = 200   # a referral bonus month works like Scholar Month (4.7: 200 points)
 # What Pro adds beyond Free (none of Free's own allowances change).
 REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file RamzAI reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
@@ -478,6 +481,8 @@ def init_db():
             )
             cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS referral_code TEXT")
             cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS referral_applied BOOLEAN NOT NULL DEFAULT FALSE")
+            # 4.7: the points a payment was offered, written when it starts (prices can change while someone pays)
+            cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS points INTEGER")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS store_purchases (
@@ -1203,6 +1208,15 @@ def _free_state(row):
     return points_left, max(0, FREE_MONTH_RESEARCH - research_used), _next_month_start()
 
 
+def _research_full(row):
+    """Research writing as often as the points allow: Half a year and Year (and the passes like them, while they last).
+    Free, Month and the other passes: FREE_MONTH_RESEARCH a month (the owner, 9 Nov 2026)."""
+    try:
+        return effective_plan(_with_promo(row)) in RESEARCH_PLANS
+    except Exception:
+        return False
+
+
 def user_row_to_dict(row):
     row = _with_promo(row)
     exp = row.get("plan_expires_at") if hasattr(row, "get") else None
@@ -1219,6 +1233,8 @@ def user_row_to_dict(row):
         "free_points_month": FREE_MONTH_POINTS,
         "free_research_left": _free_state(row)[1],
         "free_research_month": FREE_MONTH_RESEARCH,
+        # 4.7: research writing as often as the points allow (Half a year, Year); otherwise free_research_left a month
+        "research_full": _research_full(row),
         "free_resets_on": _free_state(row)[2].isoformat(),
         "points_today_left": today_left,
         "points_day_cap": day_cap,
@@ -4082,12 +4098,14 @@ PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY", "").strip()
 PAYSTACK_API = "https://api.paystack.co"
 PAYSTACK_PLANS = {
     # plan: (price in pesewas, days of Scholar, points). A pass's points end with the pass; "points" never end.
-    # 4.1: GH₵20 a day; the longer the pass, the less a day costs (a week is 3 days' price, a month 8, a semester 24, a year 60)
+    # 4.7 (the owner, 9 Nov 2026): Month GH₵160 = 200 points; Half a year GH₵480 = 620; Year GH₵1,200 = 1,560
+    "month": (16000, 30, 200),
+    "half": (48000, 182, 620),
+    "year": (120000, 365, 1560),
+    # 4.1 to 4.6: no longer sold, kept so a pass bought then still applies
     "day": (2000, 1, 40),
     "week": (6000, 7, 150),
-    "month": (16000, 30, 450),
     "semester": (48000, 120, 1400),
-    "year": (120000, 365, 3500),
     "points": (4000, 0, 100),
     # earlier plans: no longer sold, kept so an older payment still applies
     "monthly": (10000, 30, 400),
@@ -4095,7 +4113,9 @@ PAYSTACK_PLANS = {
     "payperuse": (3000, 0, 30),
     "yearly": (30000, 365, 3000),
 }
-PAYSTACK_ON_SALE = ("day", "week", "month", "semester", "year", "points")
+PAYSTACK_ON_SALE = ("month", "half", "year")
+# a payment started before 4.7 has no points of its own written down: it gets what was offered then
+PAYSTACK_POINTS_BEFORE_47 = {"month": 450, "year": 3500}
 
 
 def _paystack_on():
@@ -4140,6 +4160,10 @@ def _paystack_apply(reference, paid_amount, currency):
                 logger.warning(f"Paystack {reference}: paid {paid_amount} {currency}, expected {pay['amount']} GHS — not applied")
                 return pay["user_id"], "mismatch"
             _, days, credits = PAYSTACK_PLANS[pay["plan"]]
+            if pay.get("points") is not None:
+                credits = int(pay["points"])                 # what was offered when the payment started
+            elif pay["plan"] in PAYSTACK_POINTS_BEFORE_47:
+                credits = PAYSTACK_POINTS_BEFORE_47[pay["plan"]]   # started before 4.7
             if days:
                 # Bought during the free-Pro promotion: the paid days start when it ends.
                 start = _promo_until() if _promo_active() else datetime.now(timezone.utc)
@@ -4155,7 +4179,7 @@ def _paystack_apply(reference, paid_amount, currency):
                     "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), "
                     "plan_source = 'paystack', pass_points = pass_points + %s WHERE id = %s",
                     (new_plan, start, days, credits, pay["user_id"]))
-                if pay["plan"] in ("month", "semester", "year", "monthly", "halfyear", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
+                if pay["plan"] in ("month", "half", "semester", "year", "monthly", "halfyear", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
                     cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
             elif credits:
                 cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s WHERE id = %s", (credits, pay["user_id"]))
@@ -4191,7 +4215,7 @@ def paystack_initialize():
         return jsonify({"error": "In the Academic-Home app from a store, Scholar is bought through the App Store or Google Play."}), 403
     plan = str((request.get_json(silent=True) or {}).get("plan") or "")
     if plan not in PAYSTACK_ON_SALE:
-        return jsonify({"error": "Choose a Scholar pass (Day, Week, Month, Semester or Year), or Points."}), 400
+        return jsonify({"error": "Choose a Scholar pass: Month, Half a year or Year."}), 400
     user = request.current_user
     if plan in PRO_PLANS and user.get("plan") in PRO_PLANS and _owns_store_plan(user["id"]):
         return jsonify({"error": "You already have Scholar through the App Store or Google Play; manage it there."}), 409
@@ -4204,8 +4228,8 @@ def paystack_initialize():
             if friend_code and plan in PRO_PLANS:
                 if not _find_referrer(cur, friend_code, user["id"]):
                     return jsonify({"error": "That referral code wasn't found (or it's your own) — check it, or leave it empty.", "field": "referral"}), 400
-            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code) VALUES (%s, %s, %s, %s, %s)",
-                        (reference, user["id"], plan, amount, friend_code or None))
+            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code, points) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (reference, user["id"], plan, amount, friend_code or None, PAYSTACK_PLANS[plan][2]))
     finally:
         conn.close()
     try:
@@ -4722,8 +4746,10 @@ def _refund_sage_message(user_row, source="allowance", points=1, research=False)
                 cur.execute("UPDATE users SET trial_points_used = GREATEST(trial_points_used - %s, 0) WHERE id = %s", (points, user_row["id"]))
             else:
                 cur.execute("UPDATE users SET sage_messages_used = GREATEST(sage_messages_used - 1, 0) WHERE id = %s", (user_row["id"],))
-            # a research writing on Free that never arrived doesn't count against the month's research writings
-            if research and source in ("trial", "credit") and effective_plan(user_row) == "free":
+            # a research writing that never arrived doesn't count against the month's research writings: on Free, and
+            # (4.7) on a pass that isn't Half a year or Year
+            plan = effective_plan(user_row)
+            if research and ((plan == "free" and source in ("trial", "credit")) or (plan != "free" and plan not in RESEARCH_PLANS)):
                 cur.execute("UPDATE users SET free_research_used = GREATEST(free_research_used - 1, 0) WHERE id = %s", (user_row["id"],))
         conn.commit()
     except Exception as e:
@@ -4763,16 +4789,19 @@ def _points_reply(e):
 
 def _no_points_error(row, points):
     plan = effective_plan(row)
-    pack = PAYSTACK_PLANS["points"]
-    buy = f"Add {pack[2]} points for GH₵{pack[0] // 100:.0f}"
+    month = PAYSTACK_PLANS["month"]
+    offer = f"Scholar Month is GH₵{month[0] // 100:.0f} for {month[2]} points"
     if plan == "free":
         back = _free_back_words()
         if row.get("trial_blocked"):
-            return PointsError("This phone’s free points belong to another account. "
-                                   f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
-        return PointsError(f"You’ve used this month’s {FREE_MONTH_POINTS} free points. They come back on {back}. "
-                               f"A Scholar Day pass is GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}, or {buy.lower()}.")
-    return PointsError(f"Your pass has no points left. {buy}, or a new pass adds more.")
+            return PointsError(f"This phone’s free points belong to another account. {offer}.")
+        return PointsError(f"You’ve used this month’s {FREE_MONTH_POINTS} free points. They come back on {back}. {offer}.")
+    return PointsError(f"Your pass has no points left. A new pass adds its points on top: {offer}.")
+
+
+def _research_used_error():
+    return PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} research writings. They come back on "
+                       f"{_free_back_words()}. Half a year or Year: as many as your points allow.")
 
 
 def _free_back_words():
@@ -4795,6 +4824,18 @@ def _log_sage_message_and_consume(user_row, points=1, research=False):
             row = _with_promo(cur.fetchone())
             plan = effective_plan(row)
             old_way = plan != "free" and row.get("plan_source") in ("store", "promo") and not (row.get("pass_points") or 0)
+            month = _month_start()
+            same_month = row.get("free_month") == month
+            # 4.7: on a pass that isn't Half a year or Year, research writing counts against the month's few, as on Free
+            counted = bool(research and plan != "free" and plan not in RESEARCH_PLANS)
+            if counted and _free_state(row)[1] <= 0:
+                conn.rollback()
+                raise _research_used_error()
+            if counted:
+                cur.execute("UPDATE users SET free_research_used = %s, free_month = %s WHERE id = %s",
+                            ((int(row.get("free_research_used") or 0) if same_month else 0) + 1, month, row["id"]))
+                if not same_month:
+                    cur.execute("UPDATE users SET trial_points_used = 0 WHERE id = %s", (row["id"],))
             if not old_way:
                 bought = int(row.get("remy_credits") or 0)
                 if plan != "free":
@@ -4819,8 +4860,7 @@ def _log_sage_message_and_consume(user_row, points=1, research=False):
                 if research and research_left <= 0:
                     conn.rollback()
                     raise PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
-                                      f"{_free_back_words()}. With a Scholar pass there are more; a Day pass is "
-                                      f"GH₵{PAYSTACK_PLANS['day'][0] // 100:.0f}.")
+                                      f"{_free_back_words()}. Half a year or Year: as many as your points allow.")
                 if trial_left + bought < points:
                     conn.rollback()
                     raise _no_points_error(row, points)
@@ -5399,18 +5439,20 @@ def _is_pro(user):
 
 
 def _scholar_gate(user, feature, research=False):
-    """A JSON answer (402) when a Scholar feature is asked for on Free; None when the account may go on. Research
-    writing (research=True) is open on Free while the month's research writings last."""
+    """A JSON answer (402) when a Scholar feature is asked for and the account can't have it now; None when it may go
+    on. Research writing (research=True): as often as the points allow on Half a year and Year; on Free, Month and the
+    other passes while the month's research writings last (4.7)."""
+    month = PAYSTACK_PLANS["month"][0] // 100
+    if research:
+        if _research_full(user) or _free_state(user)[1] > 0:
+            return None
+        free = not _is_pro(user)
+        return jsonify({"error": f"You’ve used this month’s {FREE_MONTH_RESEARCH} {'free ' if free else ''}research writings. They come back on "
+                                 f"{_free_back_words()}. Half a year or Year: as many as your points allow.",
+                        "scholar_needed": True, "feature": feature, "plan_needed": "half"}), 402
     if _is_pro(user):
         return None
-    day = PAYSTACK_PLANS["day"][0] // 100
-    if research:
-        if _free_state(user)[1] > 0:
-            return None
-        return jsonify({"error": f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
-                                 f"{_free_back_words()}. {feature} is part of Scholar: a Day pass is GH₵{day:.0f}.",
-                        "scholar_needed": True, "feature": feature}), 402
-    return jsonify({"error": f"{feature} is part of Scholar. A Day pass is GH₵{day:.0f}; everything on your phone stays free.",
+    return jsonify({"error": f"{feature} is part of Scholar. Scholar Month is GH₵{month:.0f}; everything on your phone stays free.",
                     "scholar_needed": True, "feature": feature}), 402
 
 
