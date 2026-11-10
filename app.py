@@ -27,7 +27,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
-from flask import Flask, request, send_file, jsonify, Response, stream_with_context
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context, g
 from flask_compress import Compress
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -515,6 +515,23 @@ def init_db():
                 )
                 """
             )
+            # 4.9: a request sent again (a slow or dropped connection) is answered once — see _once below
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS request_once (
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    status INTEGER,
+                    body BYTEA,
+                    mimetype TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (user_id, key)
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS request_once_created ON request_once (created_at)")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_memory (
@@ -1351,6 +1368,138 @@ def auth_required(fn):
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+# ---------- 4.9 (10 Nov 2026): a request sent again is answered once ----------
+# On a slow or dropped connection the same request can reach the server twice: the app sends it again after an answer
+# that never arrived (Retry, or its own wait), and the first one may have done the work after all. The app adds
+# ?once=<key> to the requests that take points or make rows; the first to arrive does the work and its answer is kept,
+# and the same key again gets that same answer: no second charge, no second meeting, invitation, payment or history row.
+# A request still being worked on answers 409 {"working": true}; GET /api/once/<key> tells the app when it's ready.
+# Answers are kept less than an hour (the privacy notice says up to an hour), only the account's own, and go with the account.
+ONCE_KEEP = "50 minutes"           # deleted by the tidy-up every 5 minutes: never kept an hour
+ONCE_MAX_BODY = 4 * 1024 * 1024
+_ONCE_KEY = re.compile(r"^[A-Za-z0-9_-]{16,80}$")
+_ONCE_STUCK_S = 600          # "working" longer than this (the longest request takes about 5 minutes): it died with its worker, the next one does the work
+
+
+def _once_key():
+    k = (request.args.get("once") or request.headers.get("Idempotency-Key") or "").strip()
+    return k if _ONCE_KEY.match(k) else ""
+
+
+def _once_replay(row):
+    r = Response(bytes(row["body"]) if row["body"] is not None else b"", status=row["status"] or 200,
+                 mimetype=row["mimetype"] or "application/json")
+    r.headers["X-Once"] = "replay"
+    return r
+
+
+def _once_working():
+    r = jsonify({"error": "Still working on this. It will be ready in a moment.", "working": True, "retry_in": 3})
+    r.status_code = 409
+    return r
+
+
+def _once_age(row):
+    return (datetime.now(timezone.utc) - row["created_at"]).total_seconds()
+
+
+def _once_settle(uid, key, resp):
+    """Keeps a good answer to send again; anything else is forgotten, so the same request runs again (whatever it
+    charged was given back with the error)."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                good = (resp is not None and 200 <= resp.status_code < 300 and not resp.is_streamed and not resp.direct_passthrough
+                        and not resp.headers.get("Content-Encoding"))
+                data = resp.get_data() if good else None
+                if good and len(data) <= ONCE_MAX_BODY:
+                    cur.execute("UPDATE request_once SET state = 'done', status = %s, body = %s, mimetype = %s WHERE user_id = %s AND key = %s",
+                                (resp.status_code, psycopg2.Binary(data), resp.mimetype, uid, key))
+                else:
+                    cur.execute("DELETE FROM request_once WHERE user_id = %s AND key = %s", (uid, key))
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"once: couldn't keep an answer: {e}")
+
+
+@app.after_request
+def _once_keep(resp):
+    """The answer is kept as it was sent. This hook is registered before the others, so it runs after them (the AI's
+    words already finished, see _finish_ai_answers) and before the gzip step (Compress, registered first of all)."""
+    pending = g.pop("_once_pending", None)
+    if pending:
+        _once_settle(pending[0], pending[1], resp)
+    return resp
+
+
+@app.teardown_request
+def _once_teardown(_exc):
+    """A request that ended without an answer (an error while answering) is forgotten, so it can run again."""
+    pending = g.pop("_once_pending", None)
+    if pending:
+        _once_settle(pending[0], pending[1], None)
+
+
+def _once(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        key = _once_key() if request.method == "POST" else ""
+        user = getattr(request, "current_user", None)
+        if not key or not user or not DATABASE_URL:
+            return fn(*args, **kwargs)
+        uid, route = user["id"], request.path
+        try:
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    if random.random() < 0.05:
+                        cur.execute(f"DELETE FROM request_once WHERE created_at < now() - interval '{ONCE_KEEP}'")
+                    cur.execute("INSERT INTO request_once (user_id, key, route, state) VALUES (%s, %s, %s, 'working') "
+                                "ON CONFLICT (user_id, key) DO NOTHING RETURNING key", (uid, key, route))
+                    if cur.fetchone() is None:
+                        cur.execute("SELECT route, state, status, body, mimetype, created_at FROM request_once WHERE user_id = %s AND key = %s", (uid, key))
+                        row = cur.fetchone()
+                        if row and row["route"] != route:
+                            return jsonify({"error": "Something went wrong with this request. Please try again."}), 409
+                        if row and row["state"] == "done":
+                            logger.info(f"once: sent a kept answer again ({route})")
+                            return _once_replay(row)
+                        if row and _once_age(row) < _ONCE_STUCK_S:
+                            return _once_working()
+                        cur.execute("INSERT INTO request_once (user_id, key, route, state) VALUES (%s, %s, %s, 'working') "
+                                    "ON CONFLICT (user_id, key) DO UPDATE SET state = 'working', status = NULL, body = NULL, created_at = now()",
+                                    (uid, key, route))
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"once: {e}")              # the table isn't there yet: work as before
+            return fn(*args, **kwargs)
+        g._once_pending = (uid, key)       # kept (or forgotten) by _once_keep when the answer leaves
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            g.pop("_once_pending", None)
+            _once_settle(uid, key, None)
+            raise
+
+    return wrapper
+
+
+def _once_logged(cur, user_id):
+    """The conversion history: a conversion sent again with the same key is recorded once. A batch request records
+    each of its files under its own sub-key."""
+    key = _once_key()
+    if not key:
+        return False
+    n = g.get("_once_n", 0)
+    g._once_n = n + 1
+    cur.execute("INSERT INTO request_once (user_id, key, route, state, status) VALUES (%s, %s, %s, 'logged', 200) "
+                "ON CONFLICT (user_id, key) DO NOTHING RETURNING key", (user_id, f"{key}.{n}", request.path))
+    return cur.fetchone() is None
 
 
 # What an account that hasn't confirmed its email yet may still do.
@@ -2918,7 +3067,7 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
     resp.headers["Access-Control-Allow-Methods"] = "POST, GET, DELETE, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Device"      # 4.9: X-Device (sent with /api/auth/me since 4.1) was refused by browsers
     resp.headers["Access-Control-Expose-Headers"] = "X-Batch-Summary, X-Docente-Note, X-Size-Info"
     # 3.11: the browser may remember a preflight's answer for two hours (it asked before almost every request)
     if request.method == "OPTIONS":
@@ -4208,6 +4357,7 @@ def paystack_config():
 @app.route("/api/paystack/initialize", methods=["POST", "OPTIONS"])
 @limiter.limit("20 per hour", key_func=_account_or_ip_key)
 @auth_required
+@_once
 def paystack_initialize():
     if not _paystack_on():
         return jsonify({"error": "Payments aren't set up yet — please try again later."}), 503
@@ -4706,6 +4856,15 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
             row = cur.fetchone()
+            try:
+                if _once_logged(cur, row["id"]):      # 4.9: this conversion was sent again: it's in the history already
+                    conn.commit()
+                    return
+            except Exception as e:
+                logger.warning(f"once (conversion history): {e}")
+                conn.rollback()
+                cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
+                row = cur.fetchone()
             now = datetime.now(timezone.utc)
             used = row["conversions_used"]
             reset_at = row["conversions_reset_at"]
@@ -5695,6 +5854,7 @@ def _word_proofread(user, text, charged):
 @app.route("/api/word/ai", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def word_ai_endpoint():
     """3.14 — RamzAI in the Word editor. JSON: action (see WORD_AI_ACTIONS), text (the words chosen, or the document so
     far), ask (what to write, for write and outline), lang (for translate), title (the document's name). Returns
@@ -6895,6 +7055,7 @@ def _c34_write_sections(outline, sources, style, request_text, note, started):
 
 @app.route("/api/sage", methods=["POST", "OPTIONS"])
 @auth_required
+@_once
 def sage_endpoint():
     started = time.time()
     data = request.get_json(silent=True) or {}
@@ -7011,6 +7172,7 @@ def sage_endpoint():
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def summarize_endpoint():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -7406,6 +7568,7 @@ def _parse_quiz_json(raw_text):
 @app.route("/api/quiz/generate", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def quiz_generate_endpoint():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -7714,8 +7877,8 @@ def _finish_ai_answers(resp):
     try:
         if request.method != "POST" or resp.status_code != 200 or resp.mimetype != "application/json":
             return resp
-        if resp.direct_passthrough or resp.headers.get("Content-Encoding"):
-            return resp
+        if resp.direct_passthrough or resp.headers.get("Content-Encoding") or resp.headers.get("X-Once"):
+            return resp        # 4.9: a kept answer sent again was finished the first time
         kind = next((k for rx, k in _FIN_PATHS if rx.match(request.path or "")), None)
         if not kind:
             return resp
@@ -7842,6 +8005,7 @@ def split_memory_note(text):
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def write_endpoint():
     started = time.time()
     data = request.get_json(silent=True) or {}
@@ -8262,6 +8426,7 @@ def _guide_clip(v, n):
 @app.route("/api/guide/outline", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def guide_outline():
     """Subtopics a researcher could build a piece of writing from, for one main topic."""
     data = request.get_json(silent=True) or {}
@@ -8320,6 +8485,7 @@ def _c45_pick_papers(papers, known):
 @app.route("/api/guide/statements", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def guide_statements():
     """About ten statements for one topic or subtopic, each grounded in one real, downloadable paper, with
     the in-text citation and the reference entry in the chosen style, and a paraphrase ready to insert."""
@@ -9202,6 +9368,29 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
             "stats": dict(stats, years=[min(yrs), max(yrs)] if yrs else None, kinds=dict(counts))}
 
 
+@app.route("/api/once/<key>", methods=["GET", "OPTIONS"])
+@limiter.limit("900 per hour", key_func=_account_or_ip_key)
+@auth_required
+def once_state(key):
+    """4.9: the answer to a request whose answer never arrived (a dropped connection): the kept answer, or 202 while
+    it's still being worked on, or 404 if it never arrived or didn't go through (the app then says so)."""
+    if not _ONCE_KEY.match(key or ""):
+        return jsonify({"error": "Not found", "unknown": True}), 404
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT route, state, status, body, mimetype, created_at FROM request_once WHERE user_id = %s AND key = %s",
+                        (request.current_user["id"], key))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row and row["state"] == "done":
+        return _once_replay(row)
+    if row and row["state"] == "working" and _once_age(row) < _ONCE_STUCK_S:
+        return jsonify({"working": True, "retry_in": 3}), 202
+    return jsonify({"error": "Not found", "unknown": True}), 404
+
+
 _RS_DOWN = re.compile(r"HTTP (?:4(?:08|29)|5\d\d)|failed|timed? ?out|busy|Timeout|ConnectionError|rate", re.I)
 
 
@@ -9664,6 +9853,7 @@ def _all_points(raw, limit=12):
 @app.route("/api/slides/assist-all", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def slides_assist_all_endpoint():
     if request.method == "OPTIONS":
         return "", 204
@@ -10386,6 +10576,7 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", 
 @app.route("/api/slides/draft", methods=["POST", "OPTIONS"])   # a whole deck: POINTS_DECK
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def slides_draft_endpoint():
     data = request.get_json(silent=True) or {}
     group = "tutor" if data.get("group") == "tutor" else "student"
@@ -11279,6 +11470,7 @@ def meet_ics(cur, code):
 @app.route("/api/meet/<code>/invite", methods=["POST", "OPTIONS"])
 @limiter.limit("12 per hour", key_func=_account_or_ip_key)
 @auth_required
+@_once
 @_meet_reply
 def meet_invite(cur, code):
     user = request.current_user
@@ -11344,6 +11536,7 @@ def meet_invite(cur, code):
 @app.route("/api/meet/agenda", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 def meet_agenda():
     if request.method == "OPTIONS":
         return "", 204
@@ -11381,6 +11574,7 @@ def meet_agenda():
 @app.route("/api/meet/<code>/notes/send", methods=["POST", "OPTIONS"])
 @limiter.limit("10 per hour", key_func=_account_or_ip_key)
 @auth_required
+@_once
 @_meet_reply
 def meet_notes_send(cur, code):
     user = request.current_user
@@ -11422,6 +11616,7 @@ def meet_config():
 @app.route("/api/meet", methods=["POST", "OPTIONS"])
 @limiter.limit("20 per hour", key_func=_account_or_ip_key)
 @auth_required
+@_once
 @_meet_reply
 def meet_create(cur):
     user = request.current_user
@@ -11794,6 +11989,7 @@ def meet_attendance(cur, code):
 @app.route("/api/meet/<code>/notes", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
+@_once
 @_meet_reply
 def meet_notes(cur, code):
     """RamzAI's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
@@ -11954,6 +12150,32 @@ def _meet_reap_loop():
 
 if _meet_on() and "fake" not in os.environ.get("DATABASE_URL", "fake"):
     _threading.Thread(target=_meet_reap_loop, daemon=True, name="meet-tidy").start()
+
+
+def _once_tidy():
+    """4.9: answers kept for a request sent again are deleted when they're 50 minutes old. Returns how many went."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DELETE FROM request_once WHERE created_at < now() - interval '{ONCE_KEEP}'")
+            return cur.rowcount
+    finally:
+        conn.close()
+
+
+def _once_tidy_loop():
+    """Every 5 minutes, so nothing is kept an hour."""
+    time.sleep(45)
+    while True:
+        try:
+            _once_tidy()
+        except Exception as e:
+            logger.warning(f"once: tidy-up failed: {e}")
+        time.sleep(300)
+
+
+if "fake" not in os.environ.get("DATABASE_URL", "fake"):
+    _threading.Thread(target=_once_tidy_loop, daemon=True, name="once-tidy").start()
 
 
 init_db()
