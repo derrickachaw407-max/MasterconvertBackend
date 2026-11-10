@@ -9800,16 +9800,26 @@ def _add_markdown_aware_pptx_text(paragraph, text):
     _link_urls_in_runs(paragraph)
 
 
-def _add_page_number_footer(doc):
+def _add_page_number_footer(doc, where=None, font=None, size=None, prefix=""):
     """Adds a centered auto-updating page number to the footer — standard
-    for academic documents."""
-    footer = doc.sections[0].footer
-    p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for academic documents. 5.0: or at the bottom right, at the top right (APA's place), or none; prefix goes before
+    the number (MLA's header: the author's surname)."""
+    where = where or "bottom-center"
+    if where == "none":
+        return
+    sec = doc.sections[0]
+    part = sec.header if where == "top-right" else sec.footer
+    p = part.paragraphs[0] if part.paragraphs else part.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER if where == "bottom-center" else WD_ALIGN_PARAGRAPH.RIGHT
     p.paragraph_format.line_spacing = 1.0
+    if prefix:
+        pre = p.add_run(prefix + " ")
+        pre.font.name = font or "Times New Roman"
+        pre.font.size = DocxPt(size or 12)
+        pre.font.color.rgb = DocxRGBColor(0, 0, 0)
     run = p.add_run()
-    run.font.name = "Times New Roman"
-    run.font.size = DocxPt(12)
+    run.font.name = font or "Times New Roman"
+    run.font.size = DocxPt(size or 12)
     run.font.color.rgb = DocxRGBColor(0, 0, 0)
     fld_begin = OxmlElement("w:fldChar")
     fld_begin.set(qn("w:fldCharType"), "begin")
@@ -9829,6 +9839,56 @@ def _add_page_number_footer(doc):
 # tables with captions, in-text citations linked to their references, live reference links.
 _DOC_FONT = "Times New Roman"
 _LINK_BLUE = "0563C1"
+# 5.0 (the owner, 10 Nov 2026: "The Word file stays formal… — remove that limitation by asking users how they want it"):
+# the person chooses how the Word file looks. "style" is what their citation style asks (APA, MLA and Chicago: text to
+# the left margin, ragged on the right); the others are looks people ask for; "custom" is their own choices.
+DOC_FONTS = ("Times New Roman", "Arial", "Calibri", "Cambria", "Georgia", "Garamond", "Book Antiqua", "Palatino Linotype",
+             "Century Gothic", "Verdana", "Tahoma", "Segoe UI")
+DOC_LOOKS = {
+    "style": {"font": "Times New Roman", "size": 12, "spacing": 2.0, "align": "left", "indent": True, "numbers": "bottom-center", "rule": False},
+    "classic": {"font": "Times New Roman", "size": 12, "spacing": 1.5, "align": "justify", "indent": True, "numbers": "bottom-center", "rule": False},
+    "clean": {"font": "Calibri", "size": 11, "spacing": 1.15, "align": "left", "indent": False, "numbers": "bottom-right", "rule": False},
+    "elegant": {"font": "Garamond", "size": 12, "spacing": 1.5, "align": "justify", "indent": True, "numbers": "bottom-center", "rule": True},
+}
+_LOOK = threading.local()
+
+
+def _look():
+    return getattr(_LOOK, "v", None) or DOC_LOOKS["style"]
+
+
+def doc_look(raw, style=None):
+    """The look asked for, made safe: a known font, 9-16 pt, line spacing 1-2, left or justified, first-line indents or a
+    space between paragraphs, where the page numbers go. With no choice: what the citation style asks (left-aligned for
+    APA, MLA and Chicago; the page number at the top right for APA 7, and with the author's surname for MLA 9), or for
+    a style with no layout of its own, the usual academic one (justified, as most university guides show)."""
+    raw = raw if isinstance(raw, dict) else {}
+    preset = str(raw.get("preset") or "style")
+    base = dict(DOC_LOOKS.get(preset) or DOC_LOOKS["style"])
+    if preset == "style" and str(style or "apa") not in ("apa", "mla", "chicago"):
+        base["align"] = "justify"
+    if preset == "style" and str(style or "apa") in ("apa", "mla"):
+        base["numbers"] = "top-right"
+        base["surname"] = str(style or "apa") == "mla"
+    if preset == "custom" or preset not in DOC_LOOKS:
+        f = str(raw.get("font") or "")
+        base["font"] = f if f in DOC_FONTS else base["font"]
+        try:
+            base["size"] = max(9, min(16, float(raw.get("size") or base["size"])))
+        except (TypeError, ValueError):
+            pass
+        try:
+            base["spacing"] = max(1.0, min(2.0, float(raw.get("spacing") or base["spacing"])))
+        except (TypeError, ValueError):
+            pass
+        if raw.get("align") in ("left", "justify"):
+            base["align"] = raw["align"]
+        if isinstance(raw.get("indent"), bool):
+            base["indent"] = raw["indent"]
+        if raw.get("numbers") in ("bottom-center", "bottom-right", "top-right", "none"):
+            base["numbers"] = raw["numbers"]
+    base["margin_left"] = 1.5 if raw.get("binding") is True else 1.0
+    return base
 _MD_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
 _MD_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
 _MD_CAPTION = re.compile(r"^\s*(?:\*\*|__)?\s*(table|figure)\s*(\d+)?\s*(?:\*\*|__)?\s*[:.\-–—]?\s*(?:\*\*|__)?\s*(.*?)\s*(?:\*\*|__)?\s*$", re.I)
@@ -9871,13 +9931,15 @@ def _emphasis_runs(text):
     return [r for r in out if r[0]]
 
 
-def _xrun(text, bold=False, italic=False, color=None, underline=None, size=12):
-    """One run of text, in the document's font."""
+def _xrun(text, bold=False, italic=False, color=None, underline=None, size=None, sup=False):
+    """One run of text, in the document's font (the look's); sup: raised (a citation number)."""
+    lk = _look()
+    size = size or lk["size"]
     r = OxmlElement("w:r")
     rpr = OxmlElement("w:rPr")
     fonts = OxmlElement("w:rFonts")
     for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-        fonts.set(qn(a), _DOC_FONT)
+        fonts.set(qn(a), lk["font"])
     rpr.append(fonts)
     if bold:
         rpr.append(OxmlElement("w:b"))
@@ -9893,6 +9955,10 @@ def _xrun(text, bold=False, italic=False, color=None, underline=None, size=12):
         u = OxmlElement("w:u")
         u.set(qn("w:val"), underline)
         rpr.append(u)
+    if sup:
+        va = OxmlElement("w:vertAlign")
+        va.set(qn("w:val"), "superscript")
+        rpr.append(va)
     r.append(rpr)
     t = OxmlElement("w:t")
     t.set(qn("xml:space"), "preserve")
@@ -9933,13 +9999,18 @@ def _xbookmark(p_el, name, bid):
     p_el.append(e)
 
 
+_SUP_DIGITS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹˒⁻", "0123456789,–")
+_SUP_RUN = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹˒⁻]+")
+
+
 class _CiteLinks:
     """Where the in-text citations are in a piece of text, and which reference each points at:
     "(Mensah & Boateng, 2023)" (also inside a group, or narrative "Mensah and Boateng (2023)"),
     or Remy's numbers "[1]", "[2, 3]"."""
 
-    def __init__(self, references, numbered):
+    def __init__(self, references, numbered, marks=None):
         self.numbered = numbered
+        self.marks = marks
         self.pats = []
         if numbered:
             self.count = len(references)
@@ -9959,8 +10030,14 @@ class _CiteLinks:
 
     def spans(self, text):
         found = []
-        if self.numbered:
-            for m in re.finditer(r"\[(\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*)\]", text):
+        if self.numbered and self.marks == "raised":
+            for m in re.finditer(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+", text):
+                k = int(m.group(0).translate(_SUP_DIGITS))
+                if 1 <= k <= self.count:
+                    found.append((m.start(), m.end(), f"ref_{k}"))
+        elif self.numbered:
+            rx = r"\((\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*)\)" if self.marks == "parens" else r"\[(\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*)\]"
+            for m in re.finditer(rx, text):
                 for n in re.finditer(r"\d{1,3}", m.group(1)):
                     k = int(n.group(0))
                     if 1 <= k <= self.count:
@@ -9979,22 +10056,35 @@ class _CiteLinks:
         return out
 
 
+def _plain_or_raised(p, text, b, it):
+    """Text, with any raised citation numbers ("¹˒²") written as real superscript (digits and their commas)."""
+    pos = 0
+    for m in _SUP_RUN.finditer(text):
+        if m.start() > pos:
+            p._p.append(_xrun(text[pos:m.start()], b, it))
+        p._p.append(_xrun(m.group(0).translate(_SUP_DIGITS), b, it, sup=True))
+        pos = m.end()
+    if pos < len(text):
+        p._p.append(_xrun(text[pos:], b, it))
+
+
 def _write_rich(p, text, links=None, bold=False, italic=False):
     """Markdown emphasis as Word formatting; each in-text citation a link to its reference."""
+    raised = bool(links and getattr(links, "marks", None) == "raised")
     for seg, b, it in _emphasis_runs(text):
         b, it = b or bold, it or italic
         pos = 0
         for s, e, anchor in (links.spans(seg) if links else []):
             if s > pos:
-                p._p.append(_xrun(seg[pos:s], b, it))
+                (_plain_or_raised(p, seg[pos:s], b, it) if raised else p._p.append(_xrun(seg[pos:s], b, it)))
             h = OxmlElement("w:hyperlink")
             h.set(qn("w:anchor"), anchor)
             h.set(qn("w:history"), "1")
-            h.append(_xrun(seg[s:e], b, it, underline="dotted"))
+            h.append(_xrun(seg[s:e].translate(_SUP_DIGITS), b, it, underline="dotted", sup=raised))
             p._p.append(h)
             pos = e
         if pos < len(seg):
-            p._p.append(_xrun(seg[pos:], b, it))
+            (_plain_or_raised(p, seg[pos:], b, it) if raised else p._p.append(_xrun(seg[pos:], b, it)))
 
 
 def _write_url(p, url):
@@ -10010,9 +10100,11 @@ def _write_url(p, url):
 
 def _apa_styles(doc):
     """Normal and Heading 1-3 in APA's look (theme fonts and colours taken off, so they hold)."""
+    lk = _look()
+
     def plain(st, bold=False, italic=False):
-        st.font.name = _DOC_FONT
-        st.font.size = DocxPt(12)
+        st.font.name = lk["font"]
+        st.font.size = DocxPt(lk["size"])
         st.font.bold = bold
         st.font.italic = italic
         st.font.color.rgb = DocxRGBColor(0, 0, 0)
@@ -10025,7 +10117,7 @@ def _apa_styles(doc):
             if a.endswith("Theme") or a.endswith("theme"):
                 del rf.attrib[a]
         for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-            rf.set(qn(a), _DOC_FONT)
+            rf.set(qn(a), lk["font"])
         col = rpr.find(qn("w:color"))
         if col is not None:
             for a in list(col.attrib):
@@ -10034,7 +10126,7 @@ def _apa_styles(doc):
         pf = st.paragraph_format
         pf.space_before = DocxPt(0)
         pf.space_after = DocxPt(0)
-        pf.line_spacing = 2.0
+        pf.line_spacing = lk["spacing"]
     plain(doc.styles["Normal"])
     for lvl in (1, 2, 3):
         st = doc.styles[f"Heading {lvl}"]
@@ -10212,14 +10304,20 @@ def _laid_out_pages(docx_path, work_dir, headings, captions):
 def _build_word(payload, pages):
     """The document itself; pages maps each heading/caption bookmark to its page number."""
     doc = Document()
+    lk = _look()
     sec = doc.sections[0]
     sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = DocxInches(1)
-    _add_page_number_footer(doc)
+    sec.left_margin = DocxInches(lk.get("margin_left", 1.0))
+    front = payload.get("front") if isinstance(payload.get("front"), dict) else {}
+    surname = re.sub(r"\s+", " ", str(front.get("author") or "")).strip().split(" ")[-1][:40] if lk.get("surname") else ""
+    _add_page_number_footer(doc, lk["numbers"], lk["font"], lk["size"], prefix=surname)
     _apa_styles(doc)
-    numbered = bool(payload.get("numbered"))
+    # 5.0: numbered citations in the look the person chose: IEEE "[1]", "[1,2]", "(1)" or raised numbers
+    marks = payload.get("marks") if payload.get("marks") in ("ieee", "brackets", "parens", "raised") else None
+    numbered = bool(payload.get("numbered")) or bool(marks)
     references = [r for r in (payload.get("references") or []) if isinstance(r, dict) and (r.get("text") or r.get("url"))]
     # the list comes in the order its style asks (worked out on the server: n.d. first, one author before several, …)
-    links = _CiteLinks(references, numbered) if references else None
+    links = _CiteLinks(references, numbered, marks) if references else None
     title = re.sub(r"\s+", " ", str(payload.get("title") or "Academic Response")).strip()[:200]
 
     # ---- the body as blocks
@@ -10268,14 +10366,42 @@ def _build_word(payload, pages):
         bid[0] += 1
         return bid[0]
 
-    def para(align=None, indent_first=False, spacing=2.0):
+    def para(align=None, indent_first=False, spacing=None):
         p = doc.add_paragraph()
-        p.paragraph_format.line_spacing = spacing
+        p.paragraph_format.line_spacing = spacing or lk["spacing"]
         if align is not None:
             p.alignment = align
         if indent_first:
             p.paragraph_format.first_line_indent = DocxInches(0.5)
         return p
+
+    # ---- 5.0: a title page when the person said who the work is by or for (the APA student/professional title page:
+    # the title in bold three or four lines down, then one centred line each for the name, the institution or
+    # organisation, the purpose and the date; the writing starts on the next page under its title)
+    front = payload.get("front") if isinstance(payload.get("front"), dict) else {}
+    front_lines = [re.sub(r"\s+", " ", str(front.get(k) or "")).strip()[:120] for k in ("author", "affiliation", "purpose", "date")]
+    front_lines = [x for x in front_lines if x]
+    if front_lines:
+        for _ in range(3):
+            para(WD_ALIGN_PARAGRAPH.CENTER)
+        fp = para(WD_ALIGN_PARAGRAPH.CENTER)
+        _write_rich(fp, title, bold=True)
+        if lk.get("rule"):          # the elegant look: a short, fine line under the title
+            ppr = fp._p.get_or_add_pPr()
+            bdr = OxmlElement("w:pBdr")
+            bt = OxmlElement("w:bottom")
+            for k, v in (("w:val", "single"), ("w:sz", "6"), ("w:space", "10"), ("w:color", "8A6D2B")):
+                bt.set(qn(k), v)
+            bdr.append(bt)
+            ppr.append(bdr)
+            fp.paragraph_format.left_indent = DocxInches(1.6)
+            fp.paragraph_format.right_indent = DocxInches(1.6)
+        para(WD_ALIGN_PARAGRAPH.CENTER)
+        for line in front_lines:
+            lp = para(WD_ALIGN_PARAGRAPH.CENTER)
+            lp._p.append(_xrun(line))
+        from docx.enum.text import WD_BREAK as _WDB
+        doc.add_paragraph().add_run().add_break(_WDB.PAGE)
 
     # ---- the title
     tp = para(WD_ALIGN_PARAGRAPH.CENTER)
@@ -10287,7 +10413,7 @@ def _build_word(payload, pages):
         hp._p.append(_xrun(heading, bold=True))
         first = None
         for n, (bm, text, level) in enumerate(entries):
-            p = para(spacing=2.0)
+            p = para()
             pf = p.paragraph_format
             pf.left_indent = DocxInches(0.25 * (level - 1)) if level > 1 else DocxInches(0)
             from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
@@ -10332,7 +10458,7 @@ def _build_word(payload, pages):
     # ---- the body
     def caption(label, n, cap, bm):
         p = doc.add_paragraph(style="Caption")
-        p.paragraph_format.line_spacing = 2.0
+        p.paragraph_format.line_spacing = lk["spacing"]
         p._p.append(_xrun(f"{label} ", bold=True))
         p._p.append(_xfield("begin"))
         p._p.append(_xinstr(f"SEQ {label} \\* ARABIC"))
@@ -10354,11 +10480,13 @@ def _build_word(payload, pages):
             _write_rich(p, text, links, bold=True, italic=(lvl == 3))
             _xbookmark(p._p, bm, next_id())
         elif kind == "p":
-            p = para(WD_ALIGN_PARAGRAPH.JUSTIFY, indent_first=True)
+            p = para(WD_ALIGN_PARAGRAPH.JUSTIFY if lk["align"] == "justify" else WD_ALIGN_PARAGRAPH.LEFT, indent_first=lk["indent"])
+            if not lk["indent"]:
+                p.paragraph_format.space_after = DocxPt(round(lk["size"] * 0.8))
             _write_rich(p, b[1], links)
         elif kind == "li":
             p = doc.add_paragraph(style="List Number" if b[2] else "List Bullet")
-            p.paragraph_format.line_spacing = 2.0
+            p.paragraph_format.line_spacing = lk["spacing"]
             _write_rich(p, b[1], links)
         elif kind == "table":
             _, cap, rows, n, bm = b
@@ -10412,8 +10540,8 @@ def _build_word(payload, pages):
             p.paragraph_format.left_indent = DocxInches(0.5)
             p.paragraph_format.first_line_indent = DocxInches(-0.5)
             text = str(ref.get("text") or "").strip()
-            if numbered:
-                p._p.append(_xrun(f"[{i + 1}] "))
+            if numbered:     # IEEE (and RamzAI's own notes) number in brackets; Vancouver and the others "1."
+                p._p.append(_xrun(f"[{i + 1}] " if marks in (None, "ieee") else f"{i + 1}. "))
             if text:
                 _write_rich(p, text + " ")
             url = str(ref.get("url") or "").strip()
@@ -10445,6 +10573,111 @@ def academic_essay_to_docx(payload, out_dir):
     captions; in-text citations linked to their references; live reference links."""
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "Academic_Response.docx")
+    _LOOK.v = doc_look(payload.get("look"), payload.get("style"))
+    try:
+        return _essay_docx(payload, out_dir, out_path)
+    finally:
+        _LOOK.v = None
+
+
+def _bidi_of(text):
+    """The direction a paragraph's words begin in: "rtl" (Arabic, Hebrew…), "ltr", or "" when it has no letters."""
+    import unicodedata
+    for ch in text or "":
+        b = unicodedata.bidirectional(ch)
+        if b in ("R", "AL"):
+            return "rtl"
+        if b == "L":
+            return "ltr"
+    return ""
+
+
+def _rpr_child_in_order(rPr, new_el):
+    new_local = new_el.tag.split("}")[-1]
+    order = _WD_RPR_ORDER
+    new_idx = order.index(new_local) if new_local in order else len(order)
+    for child in rPr:
+        local = child.tag.split("}")[-1]
+        if (order.index(local) if local in order else len(order)) > new_idx:
+            child.addprevious(new_el)
+            return
+    rPr.append(new_el)
+
+
+def _rtl_cs(rPr):
+    """A run's complex-script font and size the same as its own (Word sizes Arabic text by w:szCs, 10 pt when missing)."""
+    fonts = rPr.find(qn("w:rFonts"))
+    if fonts is not None and fonts.get(qn("w:ascii")) and not fonts.get(qn("w:cs")):
+        fonts.set(qn("w:cs"), fonts.get(qn("w:ascii")))
+    sz = rPr.find(qn("w:sz"))
+    if sz is not None and rPr.find(qn("w:szCs")) is None:
+        el = OxmlElement("w:szCs")
+        el.set(qn("w:val"), sz.get(qn("w:val")))
+        _rpr_child_in_order(rPr, el)
+    for a, b in (("w:b", "w:bCs"), ("w:i", "w:iCs")):
+        src = rPr.find(qn(a))
+        if src is not None and rPr.find(qn(b)) is None:
+            el = OxmlElement(b)
+            if src.get(qn("w:val")) is not None:          # <w:b w:val="0"/> is "not bold": the same for its script twin
+                el.set(qn("w:val"), src.get(qn("w:val")))
+            _rpr_child_in_order(rPr, el)
+
+
+def _rtl_keep_ltr(p):
+    """A citation in a left-to-right script inside a right-to-left paragraph ("(Mensah, 2021)" in Arabic) the right way
+    round: the whole citation, brackets and all, is embedded left to right."""
+    ts = list(p._p.iter(qn("w:t")))
+    text, at = "", []
+    for t in ts:
+        for k in range(len(t.text or "")):
+            at.append((t, k))
+        text += t.text or ""
+    edits = []          # (position, what): "<" the embedding starts before it, ">" it ends after it
+    for m in re.finditer(r"\(([^()]{1,200})\)", text):
+        if _bidi_of(m.group(1)) != "ltr":
+            continue
+        edits.append((m.start(), "<"))
+        edits.append((m.end() - 1, ">"))
+    for pos, what in sorted(edits, key=lambda e: -e[0]):
+        t, k = at[pos]
+        s = t.text
+        if what == "<":
+            t.text = s[:k] + "\u202a" + s[k:]          # left-to-right embedding, from the opening bracket…
+        else:
+            t.text = s[:k + 1] + "\u202c" + s[k + 1:]  # …to the closing one
+
+
+def _rtl_pass(doc):
+    """5.0: a piece written in Arabic (or another right-to-left language) reads right to left in Word. Each paragraph whose
+    words begin in such a script becomes a right-to-left paragraph (its alignment stays logical: "left" is where its
+    lines start), with its script's font and size set as the rest. A paragraph in a left-to-right script (a reference,
+    a quotation) stays as it is. Nothing changes for a piece with no right-to-left words."""
+    paras = list(doc.paragraphs)
+    for t in doc.tables:
+        for row in t.rows:
+            for cell in row.cells:
+                paras.extend(cell.paragraphs)
+    rtl = [p for p in paras if _bidi_of(p.text) == "rtl"]
+    if not rtl:
+        return False
+    for p in rtl:
+        pPr = p._p.get_or_add_pPr()
+        if pPr.find(qn("w:bidi")) is None:
+            _insert_pPr_child_in_order(pPr, OxmlElement("w:bidi"))
+        _rtl_keep_ltr(p)
+        # (each run's script formatting follows its own letters; no run is forced right to left, so a bracket next to an
+        # English citation keeps its side)
+        for r in p._p.iter(qn("w:r")):
+            _rtl_cs(r.get_or_add_rPr())
+    # the styles too: text with no size of its own takes the style's
+    for st in doc.styles.element.iter(qn("w:style")):
+        rPr = st.find(qn("w:rPr"))
+        if rPr is not None:
+            _rtl_cs(rPr)
+    return True
+
+
+def _essay_docx(payload, out_dir, out_path):
     doc, heads, caps = _build_word(payload, {})
     fronted = len(heads) >= 3 or bool(caps)
     if fronted:
@@ -10464,6 +10697,7 @@ def academic_essay_to_docx(payload, out_dir):
         wanted += [bm for bm, _, _, _ in caps]
         if any(bm not in pages for bm in wanted):
             _ask_word_to_update(doc)
+    _rtl_pass(doc)
     doc.save(out_path)
     return out_path
 

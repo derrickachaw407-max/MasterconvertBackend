@@ -316,8 +316,17 @@ PASS_DAYS = 30   # kept for any account on the earlier 30-day pass
 SCHOLAR_PASSES = ("day", "week", "month", "half", "semester", "year")
 PRO_PLANS = SCHOLAR_PASSES + ("monthly", "halfyear", "yearly")
 _PRO_SQL = "('day', 'week', 'month', 'half', 'semester', 'year', 'monthly', 'halfyear', 'yearly')"
-# research writing as often as the points allow (the owner, 9 Nov 2026): Half a year and Year, and the passes like them
-RESEARCH_PLANS = ("half", "semester", "year", "halfyear", "yearly")
+# research writing as often as the points allow: every Scholar pass since 5.0 (4.7 to 4.9: Half a year and Year only)
+RESEARCH_PLANS = PRO_PLANS        # 5.0 (the owner, 10 Nov 2026): every Scholar plan opens everything, Month too; only points limit it
+# 5.0 (the owner, 10 Nov 2026, 08:24): "I want monthly points to be 100 with limits applied so that out of the 100 only 10
+# point is for research (user can decide to spend them on other features as well), the rest shouldn't be restricted on the
+# rest of the ai features. Use the same idea on the half year … except yearly which will have no limits."
+# A pass's research points: how many of its points may go on research (Research a question, automatic research writing,
+# manual research writing). They are part of the pass's points, not a second purse: whatever isn't spent on research
+# works on every other AI feature. A pass that isn't listed has no research limit (Year; and a pass bought before 5.0
+# keeps what it was bought with).
+PASS_RESEARCH_POINTS = {"month": 10, "half": 60}
+SCHOLAR_MORE_RESEARCH = "Scholar gives you more research."
 PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "half": "Scholar Half Year", "semester": "Scholar Semester", "year": "Scholar Year",
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
 # Points: the unit of AI work. A RamzAI answer, a summary or a quiz is 1; a whole deck is 3; ten cited statements are 2.
@@ -332,7 +341,20 @@ FREE_MONTH_POINTS = 5
 FREE_MONTH_RESEARCH = 2
 TRIAL_POINTS = FREE_MONTH_POINTS   # the old name; older apps read "trial_points" from /api/paystack/config
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
-BONUS_MONTH_POINTS = 200   # a referral bonus month works like Scholar Month (4.7: 200 points)
+BONUS_MONTH_POINTS = 100   # a bonus month given before 5.0 works like Scholar Month (5.0: 100 points, 10 of them for research)
+# 5.0 (the owner, 10 Nov 2026, 08:44): "Inviting a friend fetches you 10 points including two research points."
+# The person whose code a friend joined with gets INVITE_POINTS points that never end; INVITE_RESEARCH of them may go on
+# research (users.bonus_research, used after a pass's own research points or Free's research writings of the month).
+# A friend counts once: when they have confirmed their email on a phone that has had no account before (the rule Free's
+# points already follow), or the first time they buy a pass with the code. At most INVITE_MONTH_MAX friends count in a
+# calendar month (the owner, 10 Nov 10:05: "make 2 friends count a month"): every point is real AI work that is paid for.
+# "What if the person signed up already, will they have to sign up again? Watch that well." — no: an account that
+# exists can enter a friend's code once (/api/referral/use); and signing up again on the same phone earns nothing.
+# "Protect users' invite code": a code ends in four random characters (1.6 million endings), checking and using codes
+# is limited per hour, a right code shows only its owner's first name, nobody can use their own, and it counts once.
+INVITE_POINTS = 10
+INVITE_RESEARCH = 2
+INVITE_MONTH_MAX = 2
 # What Pro adds beyond Free (none of Free's own allowances change).
 REMY_ATTACH_FREE, REMY_ATTACH_PRO = 20000, 60000     # characters of an attached file RamzAI reads (~8 / ~25 pages)
 REMY_PAPERS_FREE, REMY_PAPERS_PRO = 6, 12            # research papers behind each answer
@@ -431,6 +453,20 @@ def init_db():
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS free_month DATE")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS free_research_used INTEGER NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_blocked BOOLEAN NOT NULL DEFAULT FALSE")
+            # 5.0: how many of the running pass's points may still go on research; NULL = no research limit
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS research_points INTEGER")
+            # 5.0: research points that never end (from inviting friends), and each friend who counted
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_research INTEGER NOT NULL DEFAULT 0")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS invite_rewards (
+                    friend_id INTEGER PRIMARY KEY,
+                    inviter_id INTEGER NOT NULL,
+                    points INTEGER NOT NULL,
+                    research INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS invite_rewards_inviter ON invite_rewards (inviter_id, created_at)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trial_devices (
                     device_id TEXT PRIMARY KEY,
@@ -483,6 +519,8 @@ def init_db():
             cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS referral_applied BOOLEAN NOT NULL DEFAULT FALSE")
             # 4.7: the points a payment was offered, written when it starts (prices can change while someone pays)
             cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS points INTEGER")
+            # 5.0: the research points offered when the payment started (NULL: no research limit, or started before 5.0)
+            cur.execute("ALTER TABLE paystack_payments ADD COLUMN IF NOT EXISTS research_points INTEGER")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS store_purchases (
@@ -1135,9 +1173,10 @@ def _clean_code(code):
     return re.sub(r"[^A-Z0-9]", "", str(code or "").upper())[:40]
 
 
-def _find_referrer(cur, code, user_id=None):
+def _find_referrer(cur, code, user_id=None, any_age=False):
     """The account a referral code belongs to: someone's personal code, or a
-    14-day code they made. Never the person's own code."""
+    14-day code they made. Never the person's own code. (any_age: a 14-day code that was good when the friend signed
+    up still counts when the friend confirms their email a little later.)"""
     code = _clean_code(code)
     if not code:
         return None
@@ -1145,7 +1184,7 @@ def _find_referrer(cur, code, user_id=None):
     ref = cur.fetchone()
     if not ref:
         cur.execute("SELECT u.id, u.name FROM promo_codes p JOIN users u ON u.id = p.created_by "
-                    "WHERE p.code = %s AND p.expires_at > now()", (code,))
+                    "WHERE p.code = %s" + ("" if any_age else " AND p.expires_at > now()"), (code,))
         ref = cur.fetchone()
     if ref and user_id and ref["id"] == user_id:
         return None
@@ -1153,22 +1192,60 @@ def _find_referrer(cur, code, user_id=None):
 
 
 def _reward_referral(cur, user_id, code=None):
-    """A friend's code: both accounts get a bonus month, once per account — the
-    first time it buys Monthly or Yearly with a code (typed at checkout, or the
-    one saved at sign-up). Returns True when the bonus was given."""
+    """A friend's code (5.0, the owner on 10 Nov 2026: "Inviting a friend fetches you 10 points including two research
+    points"): the person who invited gets INVITE_POINTS points that never end, INVITE_RESEARCH of them usable on research.
+    Once per friend account (user_id is the friend), with the code typed at checkout or the one saved at sign-up.
+    Returns True when it was given. (4.9 and before: both got a bonus month; one already banked still starts.)"""
     cur.execute("SELECT id, referred_code, referral_rewarded FROM users WHERE id = %s FOR UPDATE", (user_id,))
     me = cur.fetchone()
     if not me or me["referral_rewarded"]:
         return False
     code = _clean_code(code) or _clean_code(me.get("referred_code"))
-    ref = _find_referrer(cur, code, user_id) if code else None
+    ref = _find_referrer(cur, code, user_id, any_age=True) if code else None
     if not ref:
         return False
-    cur.execute("UPDATE users SET bonus_credit_months = bonus_credit_months + 1 WHERE id = %s", (ref["id"],))
-    cur.execute("UPDATE users SET bonus_credit_months = bonus_credit_months + 1, referral_rewarded = TRUE, referred_code = %s WHERE id = %s",
-                (code, user_id))
-    logger.info(f"Referral bonus: user {user_id} with code from user {ref['id']}")
+    # a month's worth of friends at most; one more friend waits for next month (nothing is marked, so it still counts then)
+    cur.execute("SELECT count(*) AS n FROM invite_rewards WHERE inviter_id = %s AND created_at >= date_trunc('month', now())", (ref["id"],))
+    if int((cur.fetchone() or {}).get("n") or 0) >= INVITE_MONTH_MAX:
+        return False
+    cur.execute("INSERT INTO invite_rewards (friend_id, inviter_id, points, research) VALUES (%s, %s, %s, %s) ON CONFLICT (friend_id) DO NOTHING RETURNING friend_id",
+                (user_id, ref["id"], INVITE_POINTS, INVITE_RESEARCH))
+    if not cur.fetchone():
+        return False
+    cur.execute("UPDATE users SET remy_credits = COALESCE(remy_credits, 0) + %s, bonus_research = bonus_research + %s WHERE id = %s",
+                (INVITE_POINTS, INVITE_RESEARCH, ref["id"]))
+    cur.execute("UPDATE users SET referral_rewarded = TRUE, referred_code = %s WHERE id = %s", (code, user_id))
+    logger.info(f"Invite: user {ref['id']} got {INVITE_POINTS} points for user {user_id}")
     return True
+
+
+def _invite_joined(row, device_id):
+    """The friend has joined: they signed up with a code, their email is confirmed, and theirs is the first account on
+    this phone (the rule Free's points follow — so many addresses on one phone earn nothing). Then the person who
+    invited them gets the points. Looked at whenever the app opens, so it arrives as soon as the email is confirmed."""
+    try:
+        if (not row.get("referred_code") or row.get("referral_rewarded") or row.get("trial_blocked") or _needs_verification(row)
+                or not device_id or not _DEVICE_RE.match(device_id) or not DATABASE_URL):
+            return row
+        conn = get_db()
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM trial_devices WHERE device_id = %s", (device_id,))
+                seen = cur.fetchone()
+                given = bool(seen and seen["user_id"] == row["id"] and _reward_referral(cur, row["id"]))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        if given:
+            row = dict(row)
+            row["referral_rewarded"] = True
+    except Exception as e:
+        logger.warning(f"Couldn't look at the invite of user {row.get('id')}: {e}")
+    return row
 
 
 def _pass_expired(row):
@@ -1226,12 +1303,46 @@ def _free_state(row):
 
 
 def _research_full(row):
-    """Research writing as often as the points allow: Half a year and Year (and the passes like them, while they last).
-    Free, Month and the other passes: FREE_MONTH_RESEARCH a month (the owner, 9 Nov 2026)."""
+    """Research is open (no monthly count of research writings): every Scholar pass (5.0, the owner on 10 Nov 2026).
+    Free: FREE_MONTH_RESEARCH a month. How MANY points a pass may spend on research is _research_left."""
     try:
         return effective_plan(_with_promo(row)) in RESEARCH_PLANS
     except Exception:
         return False
+
+
+def _bonus_research(row):
+    """Research points that never end (from inviting friends): used after a pass's own research points, or after
+    Free's research writings of the month."""
+    try:
+        return max(0, int(row.get("bonus_research") or 0))
+    except Exception:
+        return 0
+
+
+def _research_left(row, own=False):
+    """How many points may still go on research on the running pass: a number on Month and Half year (5.0) — the
+    pass's own research points plus those that never end (own=True: the pass's own only) — and None when there is no
+    research limit (Year, a pass bought before 5.0, the promotion) and on Free (which has its own rule:
+    FREE_MONTH_RESEARCH research writings a month, then the research points that never end)."""
+    try:
+        if effective_plan(row) == "free" or row.get("plan_source") in ("store", "promo"):
+            return None
+        v = row.get("research_points")
+        return None if v is None else max(0, int(v)) + (0 if own else _bonus_research(row))
+    except Exception:
+        return None
+
+
+def _research_open(row):
+    """Research may be asked for: a pass, a research writing left this month on Free, or research points that never end."""
+    return _research_full(row) or _free_state(row)[1] > 0 or _bonus_research(row) > 0
+
+
+class _Charged(str):
+    """Where a spend came from ('pass', 'credit', 'trial', 'allowance'), with how many research points that never end
+    it took (bonus), so that giving it back returns each to its place."""
+    bonus = 0
 
 
 def user_row_to_dict(row):
@@ -1252,12 +1363,20 @@ def user_row_to_dict(row):
         "free_research_month": FREE_MONTH_RESEARCH,
         # 4.7: research writing as often as the points allow (Half a year, Year); otherwise free_research_left a month
         "research_full": _research_full(row),
+        # 5.0: on Month and Half year, how many of the pass's points may still go on research (None: no research limit)
+        "research_points_left": _research_left(row),
+        # 5.0: research points that never end (from inviting friends), and what an invite gives
+        "bonus_research_left": _bonus_research(row),
+        "invite": {"points": INVITE_POINTS, "research": INVITE_RESEARCH, "month_max": INVITE_MONTH_MAX},
+        # whether a friend's code has already counted for this account (it counts once; until then one can be entered)
+        "friend_code_counted": bool(row.get("referral_rewarded")) if hasattr(row, "get") else False,
         "free_resets_on": _free_state(row)[2].isoformat(),
         "points_today_left": today_left,
         "points_day_cap": day_cap,
         "plan_name": PLAN_NAMES.get(effective_plan(row), "Scholar"),
         "scholar": effective_plan(row) in PRO_PLANS,
-        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "points": v[2], "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "points": v[2], "research_points": PASS_RESEARCH_POINTS.get(k),
+                      "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
         "id": row["id"],
         "name": row["name"],
         "email": row["email"],
@@ -1318,7 +1437,7 @@ def auth_required(fn):
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0 WHERE id = %s AND plan_expires_at <= now()", (user_id,))
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0, research_points = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
                 conn.commit()
             except Exception as e:
                 logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
@@ -1353,7 +1472,9 @@ def auth_required(fn):
             try:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE users SET plan = 'month', plan_expires_at = now() + interval '30 days', plan_source = 'bonus', pass_points = pass_points + %s, "
-                                "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *", (BONUS_MONTH_POINTS, user_id))
+                                "research_points = %s, "
+                                "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *",
+                                (BONUS_MONTH_POINTS, PASS_RESEARCH_POINTS["month"], user_id))
                     started = cur.fetchone()
                 conn.commit()
                 if started:
@@ -2027,7 +2148,24 @@ def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, c
 _OA_KIND = {"article": "article", "proceedings-article": "article", "review": "review", "book": "book", "book-chapter": "book",
             "monograph": "book", "book-section": "book", "edited-book": "book", "reference-book": "book", "preprint": "preprint",
             "posted-content": "preprint"}
-_OA_TYPES = {"article": "article", "review": "review", "book": "book|book-chapter", "preprint": "preprint"}
+_OA_TYPES = {"article": "article", "review": "review", "book": "book|book-chapter", "preprint": "preprint",
+             # 5.0 (the owner: "remove that limitation by asking users how they want it"): more kinds a person may ask for
+             "conference": "article", "thesis": "dissertation", "report": "report"}
+# 5.0: the kinds a piece of writing may draw on when the person didn't say (everything but editorials, letters, datasets…)
+WRITE_KINDS = ("article", "review", "book", "conference", "thesis", "report", "preprint")
+
+
+def _oa_kind(w):
+    """OpenAlex's type (and its source's type) as one of the kinds people choose from."""
+    t = str(w.get("type") or "").lower()
+    src = (((w.get("primary_location") or {}).get("source")) or {})
+    if t in ("article", "proceedings-article") and str(src.get("type") or "").lower() == "conference":
+        return "conference"
+    if t == "dissertation":
+        return "thesis"
+    if t == "report":
+        return "report"
+    return _OA_KIND.get(t, "other")
 
 
 def _kind_s2(types, venue=None):
@@ -2041,6 +2179,8 @@ def _kind_s2(types, venue=None):
         return "review"
     if t & {"book", "booksection"}:
         return "book"
+    if "conference" in t and not (t & {"journalarticle"}):
+        return "conference"
     if t & {"journalarticle", "study", "clinicaltrial", "casereport", "conference"}:
         return "article"
     return "article" if (not t and venue) else "other"
@@ -2050,18 +2190,21 @@ def _kind_epmc(types):
     t = " ".join(str(x).lower() for x in (types or []))
     if "preprint" in t:
         return "preprint"
+    if re.search(r"\b(?:thesis|dissertation)\b", t) and not re.search(r"\b(?:retract\w*|erratum|correction)\b", t):
+        return "thesis"
     if re.search(r"\b(?:retract\w*|erratum|errata|correction|corrigendum|editorial|comment|letter|news|expression of concern|"
-                 r"protocol|guideline|thesis|dissertation)\b", t):
+                 r"protocol|guideline)\b", t):
         return "other"
     if re.search(r"\b(?:review|meta-analysis|systematic)\b", t):
         return "review"
     return "article"
 
 
-def _openalex_papers(query, n, since=None, kinds=None):
-    flt = "is_oa:true,is_retracted:false" + (f",publication_year:>{since - 1}" if since else "")
-    if kinds and set(kinds) != set(_OA_TYPES):
-        flt += ",type:" + "|".join(_OA_TYPES[k] for k in kinds if k in _OA_TYPES)
+def _openalex_papers(query, n, since=None, kinds=None, until=None):
+    flt = ("is_oa:true,is_retracted:false" + (f",publication_year:>{since - 1}" if since else "")
+           + (f",publication_year:<{until + 1}" if until else ""))
+    if kinds and not set(_OA_TYPES) <= set(kinds):
+        flt += ",type:" + "|".join(sorted({_OA_TYPES[k] for k in kinds if k in _OA_TYPES}))
     params = {"search": query[:300], "filter": flt, "per-page": max(n * 3, 15),
               "select": "id,doi,display_name,publication_year,authorships,primary_location,best_oa_location,locations,"
                         "abstract_inverted_index,biblio,cited_by_count,type"}
@@ -2090,21 +2233,26 @@ def _openalex_papers(query, n, since=None, kinds=None):
                    {k: b.get(k) for k in ("volume", "issue", "first_page", "last_page") if b.get(k)})
         if p:
             p["preprint"] = p["preprint"] or str(w.get("type") or "").lower() == "preprint"
-            p["kind"] = "preprint" if p["preprint"] else _OA_KIND.get(str(w.get("type") or "").lower(), "other")
+            p["kind"] = "preprint" if p["preprint"] else _oa_kind(w)
+            if p["kind"] == "thesis":       # a thesis names the university that gave the degree (its author's, then)
+                inst = next((((i or {}).get("display_name")) for a in (w.get("authorships") or [])[:1] for i in ((a or {}).get("institutions") or [])
+                             if (i or {}).get("display_name")), None)
+                if inst:
+                    p["institution"] = str(inst)[:160]
             out.append(p)
     return out, None if out else "OpenAlex found no open papers with a PDF"
 
 
-def _s2_papers(query, n, since=None, kinds=None):
+def _s2_papers(query, n, since=None, kinds=None, until=None):
     headers = dict(_PAPER_UA)
     if SEMANTIC_SCHOLAR_API_KEY:
         headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
     params = {"query": query[:300], "limit": max(n * 3, 15), "openAccessPdf": "",
               "fields": "title,url,year,authors,abstract,venue,openAccessPdf,externalIds,citationCount,journal,publicationTypes"}
-    if since:
-        params["year"] = f"{since}-"
+    if since or until:
+        params["year"] = f"{since or ''}-{until or ''}"
     if kinds and "article" not in kinds:          # many records carry no type: filter there only when articles aren't wanted
-        types = [t for k in kinds for t in {"review": ["Review", "MetaAnalysis"], "book": ["Book", "BookSection"]}.get(k, [])]
+        types = [t for k in kinds for t in {"review": ["Review", "MetaAnalysis"], "book": ["Book", "BookSection"], "conference": ["Conference"]}.get(k, [])]
         if types:
             params["publicationTypes"] = ",".join(types)
     if not _s2_slot():
@@ -2135,8 +2283,9 @@ def _s2_papers(query, n, since=None, kinds=None):
     return out, None if out else "Semantic Scholar found no open papers with a PDF"
 
 
-def _epmc_papers(query, n, since=None, kinds=None):
-    q = f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y AND NOT PUB_TYPE:\"retracted publication\"" + (f" AND PUB_YEAR:[{since} TO 3000]" if since else "")
+def _epmc_papers(query, n, since=None, kinds=None, until=None):
+    q = (f"({query[:250]}) AND OPEN_ACCESS:y AND HAS_PDF:y AND NOT PUB_TYPE:\"retracted publication\""
+         + (f" AND PUB_YEAR:[{since or 1000} TO {until or 3000}]" if (since or until) else ""))
     params = {"query": q, "format": "json", "resultType": "core", "pageSize": max(n * 2, 12)}
     resp = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search", params=params, headers=_PAPER_UA, timeout=_PAPER_TIMEOUT)
     if resp.status_code != 200:
@@ -2243,18 +2392,20 @@ def _pdf_alive(url):
         return True
 
 
-def search_papers(query, max_results=8, since=None, check_links=True, kinds=None, stats=None):
+def search_papers(query, max_results=8, since=None, check_links=True, kinds=None, stats=None, until=None):
     """Real, downloadable papers for a topic: [{title, authors, year, venue, doi, pdf, url,
     abstract, ...}] most relevant first, and a reason when there are none. kinds (4.6, Research): the kinds of work
     asked for, passed to the indexes that can filter by them. stats (a dict, optional) gets how many different papers
-    the indexes found ("found") and which indexes found any ("from")."""
+    the indexes found ("found") and which indexes found any ("from"). since / until (5.0): the first and the last
+    year of publication wanted."""
     query = re.sub(r"\s+", " ", str(query or "")).strip()
     if not query:
         return [], "no topic"
     order = (("OpenAlex", _openalex_papers), ("Semantic Scholar", _s2_papers), ("Europe PMC", _epmc_papers))
     got, why = {}, []
     with _futures.ThreadPoolExecutor(max_workers=3) as pool:
-        jobs = {name: pool.submit(fn, query, max_results, since, **({"kinds": list(kinds)} if kinds else {})) for name, fn in order}
+        more = dict(({"kinds": list(kinds)} if kinds else {}), **({"until": until} if until else {}))
+        jobs = {name: pool.submit(fn, query, max_results, since, **more) for name, fn in order}
         for name, _ in order:
             try:
                 papers, diag = jobs[name].result(timeout=_PAPER_TIMEOUT * 2 + 3)
@@ -2298,6 +2449,10 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
     if stats is not None:
         stats["found"] = len(merged)
         stats["from"] = [name for name, _ in order if got.get(name)]
+    if until:          # an index that couldn't filter by the last year (or a record dated later) is filtered here
+        merged = [p for p in merged if not p.get("year") or int(p["year"]) <= until]
+    if kinds:          # 5.0: an index that couldn't filter by kind is filtered here (a record with no kind counts as an article)
+        merged = [p for p in merged if (p.get("kind") or "article") in kinds]
     ranked = _rank_papers(merged, query)[: max_results * 2]
     if check_links and ranked:
         alive = {}
@@ -2319,12 +2474,12 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
     return papers, (None if papers else ("; ".join(why) or "no open papers with a PDF were found"))
 
 
-def paper_topic_search(text, max_results=8, since=None):
+def paper_topic_search(text, max_results=8, since=None, until=None, kinds=None):
     """search_papers for what a person wrote: by its topic, and not at all for small talk."""
     query = _search_topic(text)
     if not _worth_searching(query):
         return [], "not a topic"
-    return search_papers(query, max_results=max_results, since=since)
+    return search_papers(query, max_results=max_results, since=since, **({"until": until} if until else {}), **({"kinds": kinds} if kinds else {}))
 
 
 def _no_sources_note(diag, subject):
@@ -2369,7 +2524,11 @@ _ORG_WORDS = re.compile(r"\b(?:Organi[sz]ations?|Collaborat(?:ors?|ions?|ives?)|
                         r"Clinics?|College|Library|Museum|Laborator(?:y|ies)|Observatory|Administration|Corps|League|Cooperative|"
                         r"Co-operative|Nations|Statistics|Survey|Collective)\b")
 _SMALL_TITLE = {"a", "an", "the", "and", "but", "or", "nor", "for", "so", "yet", "as", "at", "by", "in", "of", "off", "on", "per", "to",
-                "up", "via", "vs", "with", "from", "into", "onto", "over", "upon", "than", "versus"}
+                "up", "via", "vs", "with", "from", "into", "onto", "over", "upon", "than", "versus",
+                # 5.0: MLA 9 and Chicago 17 lower-case prepositions of any length (those that are never anything else)
+                "among", "amongst", "amid", "between", "through", "throughout", "during", "without", "within", "against", "across",
+                "behind", "below", "beneath", "beside", "besides", "beyond", "despite", "except", "inside", "outside", "toward",
+                "towards", "under", "underneath", "unlike"}
 
 
 def _name_parts(full):
@@ -2614,6 +2773,12 @@ def _intext_names(names, style, n_full=None):
     return sur[0] + " et al."
 
 
+def _it_dot(t):
+    """A title in italics, with one full stop after it ("*Does it work?*" keeps its question mark, inside)."""
+    t = str(t or "").strip().rstrip(".")
+    return f"*{t}*" + ("" if t.endswith(("?", "!")) else ".")
+
+
 def _no_date(style):
     return "no date" if style == "harvard" else "n.d."
 
@@ -2698,6 +2863,16 @@ def enrich_sources(sources, style="apa"):
                 tail = f" *{venue}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "") + (f", {pages}" if pages else "") + "."
             elif venue:
                 tail = f" {venue}."
+            # 5.0: a paper in published proceedings (APA 10.5), a thesis (10.6) and a report (10.4)
+            kind, inst = e.get("kind"), (e.get("institution") or "").strip()
+            if kind == "conference" and venue and not e.get("preprint"):
+                body, tail = _end_dot(title), f" In *{venue}*" + (f" (pp. {pages})" if pages else "") + "."
+            elif kind == "thesis" and not e.get("preprint"):
+                body, tail = f"*{title}*" + (f" [Thesis, {inst}]." if inst else " [Thesis]."), (f" {venue}." if venue and venue != inst else "")
+            elif kind == "report" and not e.get("preprint"):
+                body, tail = _it_dot(title), (f" {venue}." if venue else "")
+            if kind in ("conference", "thesis", "report") and not e["_names"] and not e.get("preprint"):
+                head, body = "", body + f" ({yd})."
             e["ref_text"] = (head + body + tail).strip()
         elif style == "harvard":
             nm = e["_names"]
@@ -2708,18 +2883,31 @@ def enrich_sources(sources, style="apa"):
                 src = f"*{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "") + (f", pp. {pages}" if pages else "") + "."
             else:
                 src = ""
+            kind, inst = e.get("kind"), (e.get("institution") or "").strip()
+            special = None       # 5.0: Cite Them Right's conference paper, thesis and report
+            if kind == "conference" and venue and not e.get("preprint"):
+                special = f"‘{title}’, in *{venue}*" + (f", pp. {pages}" if pages else "") + "."
+            elif kind == "thesis" and not e.get("preprint"):
+                special = _it_dot(title) + " Thesis." + (f" {inst}." if inst else "")
+            elif kind == "report" and not e.get("preprint"):
+                special = _it_dot(title) + (f" {venue}." if venue else "")
             if nm:
                 parts = [_au_inverted_apa(a) for a in nm]
                 auth = parts[0] + " et al." if len(parts) > 3 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
                 key = f"({e['_intext']}, {yd})"
-                if src:
+                if special:
+                    body = special
+                elif src:
                     body = f"‘{title}’, {src}"
                 else:
                     body = f"*{title}*" + (f" [Preprint]. {venue}." if e.get("preprint") and venue else ("" if title.endswith(("?", "!")) else "."))
                 e["ref_text"] = f"{auth} ({yd}) {body}{avail}"
             else:
                 key = f"(*{_short_title(title)}*, {yd})"
-                e["ref_text"] = (f"‘{title}’ ({yd}) {src}" if src else f"*{title}* ({yd})" + (f" [Preprint]. {venue}." if e.get("preprint") and venue else ".")) + avail
+                if special:
+                    e["ref_text"] = re.sub(r"^(‘[^’]*’|\*[^*]*\*\.?)", lambda m: m.group(1).rstrip(".") + f" ({yd})", special, count=1) + avail
+                else:
+                    e["ref_text"] = (f"‘{title}’ ({yd}) {src}" if src else f"*{title}* ({yd})" + (f" [Preprint]. {venue}." if e.get("preprint") and venue else ".")) + avail
         elif style == "chicago":
             nm = e["_names"]
             full = [_au_full(a) for a in nm]
@@ -2738,6 +2926,14 @@ def enrich_sources(sources, style="apa"):
             src = (f" *{venue}*" + (f" {vol}" if vol else "") + (f" ({iss})" if vol and iss else "") + (f": {pages}" if pages else "") + ".") if venue and not e.get("preprint") else (f" {venue}." if venue else "")
             lead = (_end_dot(auth) + " " + _end_dot(yd) + " ") if nm else ""
             ttl_part = f"“{_end_dot(ttl)}”" + (" Preprint." if e.get("preprint") else "")
+            # 5.0: a paper in proceedings, a thesis and a report (Chicago 17, author-date)
+            kind, inst = e.get("kind"), (e.get("institution") or "").strip()
+            if kind == "conference" and venue and not e.get("preprint"):
+                src = f" In *{venue}*" + (f", {pages}" if pages else "") + "."
+            elif kind == "thesis" and not e.get("preprint"):
+                src = " Thesis" + (f", {inst}" if inst else "") + "."
+            elif kind == "report" and not e.get("preprint"):
+                ttl_part, src = _it_dot(ttl), (f" {venue}." if venue else "")
             e["ref_text"] = (lead + ttl_part + (" " + _end_dot(yd) if not nm else "") + src).strip()
         else:   # MLA 9
             nm = e["_names"]
@@ -2749,6 +2945,7 @@ def enrich_sources(sources, style="apa"):
             else:
                 key = f"(“{_short_title(ttl)}”)"
                 lead = ""
+            kind, inst = e.get("kind"), (e.get("institution") or "").strip()
             bits = []
             if venue:
                 bits.append(f"*{_title_case(venue)}*" if not e.get("preprint") else venue)
@@ -2761,6 +2958,11 @@ def enrich_sources(sources, style="apa"):
             if pages:
                 bits.append(f"pp. {pages}")
             e["ref_text"] = (lead + f"“{_end_dot(ttl)}” " + (", ".join(bits) + "." if bits else "")).strip()
+            # 5.0: a thesis (MLA 9: title in italics, the year, the institution and the kind of work) and a report
+            if kind == "thesis" and not e.get("preprint"):
+                e["ref_text"] = (lead + _it_dot(ttl) + (f" {e['_year']}." if e["_year"] else "") + (f" {inst}, Thesis." if inst else " Thesis.")).strip()
+            elif kind == "report" and not e.get("preprint"):
+                e["ref_text"] = (lead + _it_dot(ttl) + " " + ", ".join(x for x in (_title_case(venue) if venue else "", e["_year"]) if x) + ".").strip().replace(" .", ".")
         e["citation_key"] = key
         e["author_intext"] = e["_intext"] or _short_title(title)
         e["_sort"] = (tuple((_au_surname(a).lower(), _initials(a.get("given") or []).lower()) for a in e["_names"]) if e["_names"] else ((_sort_title(title), ""),),
@@ -3058,6 +3260,443 @@ def keep_known_citations(text, sources, style="apa", locators=False, allow=None)
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"[ \t]+(?=\n|$)", "", out)
     return out, cited
+
+
+# ---------- 5.0 citation styles beyond the four (the owner, 10 Nov 2026: "Remove that limitations by asking users how they
+# want it"). The writing is always made, and checked, with author-date citations (every check above relies on them); only
+# then is it turned into the style the person asked for:
+#   - Vancouver and IEEE, built exactly: numbers in order of first citation, and the reference list in that order;
+#   - another style: the person says how its citations look in the text, and may give one reference as their guide
+#     writes it. RamzAI lays out each reference like that example, and each one is checked against the paper's own data
+#     (every name, number and word must be the paper's); one that fails is written in the nearest built-in style, and
+#     the person is told.
+NUM_STYLES = {"vancouver": {"name": "Vancouver", "heading": "References"}, "ieee": {"name": "IEEE", "heading": "References"}}
+NUM_MARKS = ("brackets", "parens", "raised")
+OTHER_INTEXT = {"author-comma": "harvard", "author-space": "chicago", "author-only": "mla",
+                "brackets": "numbers", "parens": "numbers", "raised": "numbers"}
+_SUP = str.maketrans("0123456789,-", "⁰¹²³⁴⁵⁶⁷⁸⁹˒⁻")
+
+
+def _cite_plan(data):
+    """What a request asks for: (the style the writing is made and checked in, what it is turned into). The second is
+    None for the four built-in styles, else {"style", "name", "marks", "refs", "example"}."""
+    style = str(data.get("style") or "apa").lower()
+    if style in CITE_STYLES:
+        return style, None
+    if style in NUM_STYLES:
+        marks = "ieee" if style == "ieee" else (str(data.get("cite_marks") or "parens") if str(data.get("cite_marks") or "") in NUM_MARKS else "parens")
+        return "apa", {"style": style, "name": NUM_STYLES[style]["name"], "marks": marks, "refs": style, "example": ""}
+    if style == "other":
+        o = data.get("cite_other") if isinstance(data.get("cite_other"), dict) else {}
+        name = re.sub(r"\s+", " ", str(o.get("name") or "")).strip()[:60] or "Your style"
+        shape = str(o.get("intext") or "author-comma")
+        shape = shape if shape in OTHER_INTEXT else "author-comma"
+        example = re.sub(r"[ \t]+", " ", str(o.get("example") or "")).strip()[:600]
+        if OTHER_INTEXT[shape] == "numbers":
+            return "apa", {"style": "other", "name": name, "marks": shape, "refs": "vancouver", "example": example}
+        base = OTHER_INTEXT[shape]
+        return base, {"style": "other", "name": name, "marks": None, "refs": base, "example": example}
+    return "apa", None
+
+
+def _van_author(a):
+    """Vancouver (NLM): the surname, then the initials with no full stops or spaces ("Mensah KA")."""
+    if a.get("org"):
+        return a["name"]
+    ini = ""
+    for g in a.get("given") or []:
+        g = g.strip()
+        if not g or g[0].islower():
+            continue
+        if re.fullmatch(r"(?:[A-ZÀ-ɏ]\.?){1,3}", g) and g.replace(".", "").isupper():
+            ini += g.replace(".", "")
+        else:
+            ini += "".join(p[0].upper() for p in re.split(r"[-\s.]+", g) if p)
+    return a["surname"] + (" " + ini if ini else "") + (" " + a["suffix"].rstrip(".") if a.get("suffix") else "")
+
+
+def _ieee_author(a):
+    """IEEE: the initials first, with full stops ("K. A. Mensah")."""
+    if a.get("org"):
+        return a["name"]
+    ini = _initials(a.get("given") or [])
+    return (ini + " " if ini else "") + a["surname"] + (", " + a["suffix"] if a.get("suffix") else "")
+
+
+def _nlm_pages(pages):
+    """NLM's page ranges: the repeated leading digits of the last page are left out ("123–128" -> "123-8")."""
+    a, _, b = str(pages or "").replace("–", "-").partition("-")
+    a, b = a.strip(), b.strip()
+    if a.isdigit() and b.isdigit() and len(a) == len(b) and a != b:
+        i = 0
+        while i < len(a) - 1 and a[i] == b[i]:
+            i += 1
+        return f"{a}-{b[i:]}"
+    return f"{a}-{b}" if a and b and a != b else a
+
+
+def numbered_ref(src, style):
+    """One source's reference in Vancouver (NLM, as most universities teach it: up to six authors) or IEEE."""
+    names = [a for a in (_name_parts(x) for x in (src.get("authors") or [])) if a]
+    title = _tidy_title(src.get("title") or "")
+    venue = (src.get("venue") or "").strip()
+    year = str(src.get("year") or "")
+    vol, iss, pages = _biblio_parts(src)
+    doi = _norm_doi(src.get("doi"))
+    url = str(src.get("url") or "").strip()
+    kind = "preprint" if src.get("preprint") else (src.get("kind") or "article")
+    inst = (src.get("institution") or "").strip()
+    if style == "vancouver":
+        au = [_van_author(a) for a in names]
+        auth = (", ".join(au[:6]) + ", et al." if len(au) > 6 else ", ".join(au) + ".") if au else ""
+        yr = year or "[date unknown]"
+        t = _end_dot(title)
+        link = f" doi:{doi}" if doi else (f" Available from: {url}" if url else "")
+        if kind == "preprint":
+            body = f"{title} [Preprint]." + (f" {venue}." if venue else "") + f" {yr}."
+        elif kind == "thesis":
+            body = f"{title} [thesis]." + (f" {inst};" if inst else "") + f" {yr}."
+        elif kind == "conference" and venue:
+            body = f"{t} In: {venue}; {yr}." + (f" p. {_nlm_pages(pages)}." if pages else "")
+        elif kind in ("book", "report") or not venue:
+            body = f"{t}" + (f" {venue};" if venue else "") + f" {yr}."
+        else:
+            body = f"{t} {venue}. {yr}" + (f";{vol}" if vol else "") + (f"({iss})" if iss else "") + (f":{_nlm_pages(pages)}" if pages else "") + "."
+        return re.sub(r"\s+", " ", f"{auth} {body}{link}").strip()
+    # IEEE
+    au = [_ieee_author(a) for a in names]
+    if len(au) > 6:
+        auth = au[0] + " *et al.*"
+    elif len(au) > 2:
+        auth = ", ".join(au[:-1]) + ", and " + au[-1]
+    else:
+        auth = " and ".join(au)
+    q = title.rstrip(".")
+    qt = f"“{q}”" if q.endswith(("?", "!")) else f"“{q},”"
+    pp = f"pp. {pages}" if pages and ("-" in pages or "–" in pages) else (f"p. {pages}" if pages else "")
+    tail = (f", doi: {doi}." if doi else (f". [Online]. Available: {url}" if url else "."))
+    if kind == "book" or (not venue and kind not in ("thesis", "report", "preprint")):
+        out = f"*{q}*." + (f" {venue}," if venue else "") + f" {year}" + (f". doi: {doi}." if doi else ".")
+        return re.sub(r"\s+", " ", ((auth + ", ") if auth else "") + out).strip()
+    if kind == "conference":
+        parts = [qt, f"in *{venue}*", year, pp]
+    elif kind == "thesis":
+        parts = [qt, "Thesis", inst, year]
+    elif kind == "report":
+        parts = [qt, venue, year]
+    elif kind == "preprint":
+        parts = [qt, (venue + " (preprint)") if venue else "Preprint", year]
+    else:
+        parts = [qt, f"*{venue}*", f"vol. {vol}" if vol else "", f"no. {iss}" if iss else "", pp, year]
+    first, rest = parts[0], [x for x in parts[1:] if x]
+    out = first + (" " + ", ".join(rest) if rest else "")
+    return re.sub(r"\s+", " ", ((auth + ", ") if auth else "") + out.rstrip(",") + tail).strip()
+
+
+def _mark(nums, marks):
+    """The numbers of one citation, in the look the person chose: IEEE "[1], [2]" and "[1]–[3]"; "[1,2]", "(1–3)", or
+    raised "¹˒²" (for Vancouver and the person's own numbered style)."""
+    nums = sorted(set(int(n) for n in nums))
+    runs = []
+    for n in nums:
+        if runs and n == runs[-1][1] + 1:
+            runs[-1][1] = n
+        else:
+            runs.append([n, n])
+    if marks == "ieee":
+        out = []
+        for a, b in runs:
+            out += [f"[{a}]"] if a == b else ([f"[{a}]", f"[{b}]"] if b == a + 1 else [f"[{a}]–[{b}]"])
+        return ", ".join(out)
+    items = []
+    for a, b in runs:
+        items += [str(a)] if a == b else ([str(a), str(b)] if b == a + 1 else [f"{a}–{b}"])
+    inner = ",".join(items)
+    if marks == "raised":
+        return inner.replace("–", "-").translate(_SUP)
+    return f"[{inner}]" if marks == "brackets" else f"({inner})"
+
+
+def to_numbered(text, sources, marks, given=None):
+    """The text's author-date citations (exactly the sources' keys, as keep_known_citations left them) as numbers, in
+    order of first citation: given (source index -> number) keeps the numbers an earlier part gave. Returns
+    (text, {source index: number})."""
+    if not text:
+        return text, dict(given or {})
+    inners, narr = {}, {}
+    for i, s in enumerate(sources or []):
+        key = str(s.get("citation_key") or "")
+        if key.startswith("(") and key.endswith(")"):
+            inner = key[1:-1]
+            inners.setdefault(_cite_norm(inner), i)
+            m = re.match(r"^(.*?)(?:,\s*|\s+)((?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?|no date)$", inner)
+            if m:
+                narr.setdefault((_cite_norm(m.group(1)), _cite_norm(m.group(2))), i)
+    hits = []          # (start, end, [source indices], kind, extra)
+    for m in re.finditer(r"\(([^()]{2,400})\)", text):
+        known, other = [], []
+        for part in m.group(1).split(";"):
+            p = _CITE_LEAD.sub("", part.strip())
+            q = _CITE_LOCATOR.sub("", p).rstrip(" ,")
+            i = inners.get(_cite_norm(p), inners.get(_cite_norm(q)))
+            (known if i is not None else other).append(i if i is not None else part.strip())
+        if known:
+            hits.append((m.start(), m.end(), known, "paren", other))
+    taken = [(a, b) for a, b, _, _, _ in hits]
+    for m in _NARRATIVE.finditer(text):
+        a = m.end(1)
+        b = m.end()
+        if any(x <= a < y for x, y in taken):
+            continue
+        yr = _cite_norm(m.group(2))
+        before = _cite_norm(text[max(0, m.start(1) - 300):m.end(1)])
+        found = None
+        for (nm, yy), i in narr.items():
+            if yy == yr and nm and (before == nm or before.endswith(" " + nm) or before.endswith(nm)):
+                found = i
+                break
+        if found is not None:
+            paren = text.rfind("(", a, b)
+            hits.append((paren, b, [found], "narr", []))
+    hits.sort(key=lambda h: h[0])
+    nums = dict(given or {})
+    nxt = max(nums.values(), default=0) + 1
+    for _, _, idx, _, _ in hits:
+        for i in idx:
+            if i not in nums:
+                nums[i] = nxt
+                nxt += 1
+    out = text
+    for a, b, idx, kind, other in sorted(hits, key=lambda h: -h[0]):
+        mk = _mark([nums[i] for i in idx], marks)
+        if kind == "paren" and other:
+            rep = "(" + "; ".join(other) + ")" + ("" if marks == "raised" else " ") + mk
+        else:
+            rep = mk
+        lead = out[:a]
+        if marks == "raised":
+            lead = lead.rstrip(" \t")
+        else:
+            lead = lead.rstrip(" \t") + " "
+        out = lead + rep + out[b:]
+    if marks == "raised":
+        # raised numbers sit outside a full stop or a comma, inside a colon or a semicolon (AMA, as most guides teach)
+        out = re.sub(r"([⁰¹²³⁴⁵⁶⁷⁸⁹˒⁻]+)([.,])", r"\2\1", out)
+    out = re.sub(r"[ \t]+([.,;:])", r"\1", out)
+    return out, nums
+
+
+def numbered_refs(sources, nums, style, marks):
+    """The reference list in number order; each with its number's mark (key), its number (n) and its author-date key
+    (akey: the next part of a long piece goes on from it)."""
+    out = []
+    for i, n in sorted(nums.items(), key=lambda x: x[1]):
+        s = sources[i]
+        out.append({"text": numbered_ref(s, style), "url": s.get("url"), "pdf": s.get("pdf") or None, "doi": s.get("doi") or None,
+                    "key": _mark([n], marks), "n": n, "akey": s.get("citation_key") or "", "group": s.get("group") or _key_group(s.get("citation_key")),
+                    "sort": None, "after": ""})
+    return out
+
+
+_EXAMPLE_WORDS = set("""a an and the of in on for to at by from with et al ed eds edn edition editor editors vol volume no
+number issue iss pp p pages page doi https http www org com net html pdf available online internet cited accessed retrieved
+viewed preprint thesis dissertation phd master masters doctoral report rep technical proceedings proc conference conf
+journal university press publisher abstract article review book chapter series accessed date unknown nd n d s sd no
+january february march april may june july august september october november december jan feb mar apr jun jul aug sep sept
+oct nov dec""".split())
+
+
+def _example_check(text, src):
+    """A reference RamzAI laid out like the person's example is kept only when everything in it is the paper's own:
+    every number is the year, the volume, the issue, a page, or part of its DOI or link; every word comes from its
+    authors, title, journal, institution or link, or is a word references use ("In", "Available", "vol"…); and the
+    first author's surname, the year and the title are all there."""
+    plain = re.sub(r"[*_]", "", str(text or ""))
+    if not plain or len(plain) > 1500:
+        return False
+    names = [a for a in (_name_parts(x) for x in (src.get("authors") or [])) if a]
+    vol, iss, pages = _biblio_parts(src)
+    data = " ".join(str(x or "") for x in (src.get("title"), src.get("venue"), src.get("institution"), src.get("doi"), src.get("url"),
+                                           src.get("year"), vol, iss, pages) + tuple(src.get("authors") or []))
+    asc = lambda x: unicodedata.normalize("NFKD", re.sub(r"[\u2010-\u2015\u2212]", " ", x)).encode("ascii", "ignore").decode().lower()
+    low = asc(data)
+    words = set(re.findall(r"[a-z]+", low))
+    nums = set(re.findall(r"\d+", low))
+    pl = asc(plain)
+    for n in re.findall(r"\d+", pl):
+        # a page range may be written short ("123-8"): a number that ends one of the paper's numbers is the paper's
+        if n not in nums and not any(x.endswith(n) for x in nums):
+            return False
+    for w in re.findall(r"[a-z]+", pl):
+        if len(w) > 1 and w not in words and w not in _EXAMPLE_WORDS:
+            # initials of the authors' given names are the paper's too
+            if not (len(w) <= 3 and all(any(g[:1].lower() == c for a in names if not a.get("org") for g in a.get("given") or []) for c in w)):
+                return False
+    if names:
+        sur = unicodedata.normalize("NFKD", _au_surname(names[0])).encode("ascii", "ignore").decode().lower()
+        if re.sub(r"[^a-z]", "", sur) not in re.sub(r"[^a-z]", "", pl):
+            return False
+    if src.get("year") and str(src["year"]) not in pl:
+        return False
+    tw = [w for w in re.findall(r"[a-z]{4,}", unicodedata.normalize("NFKD", str(src.get("title") or "")).encode("ascii", "ignore").decode().lower())]
+    if tw and sum(1 for w in tw if w in pl) < 0.8 * len(tw):
+        return False
+    return True
+
+
+def refs_like_example(entries, example, name):
+    """Each source's reference in the person's own style, laid out like their example. entries: [(source, the reference
+    in the nearest built-in style)]. Returns a list of (text, kept): kept is False where the check failed and the
+    built-in reference stands."""
+    if not example or not entries:
+        return [(t, False) for _, t in entries]
+    data = []
+    for src, _ in entries:
+        vol, iss, pages = _biblio_parts(src)
+        data.append({k: v for k, v in (("authors", src.get("authors") or []), ("year", src.get("year")), ("title", _tidy_title(src.get("title") or "")),
+                                        ("journal_or_source", src.get("venue")), ("volume", vol), ("issue", iss), ("pages", pages),
+                                        ("doi", src.get("doi")), ("link", src.get("url")), ("kind", src.get("kind") or "article"),
+                                        ("institution", src.get("institution"))) if v})
+    system = ("You lay out references in a citation style that a person showed you by example. Reply with one JSON object only, "
+              'no code fences: {"refs": ["…", "…"]}, one reference for each item, in the same order. Copy the example\'s layout '
+              "exactly: the order of the parts, the punctuation, the capitalisation, how authors' names and initials are written, "
+              "abbreviations such as vol. or pp., and where italics go (mark italics with *asterisks*). Use ONLY the data given for "
+              "each item: never add, guess or change a name, a number, a word of a title, a journal, a place or a publisher. Leave "
+              "out a part the data doesn't have. The style is called: " + name[:60])
+    user = "THE PERSON'S EXAMPLE:\n<<<\n" + example[:600] + "\n>>>\n\nTHE ITEMS:\n" + json.dumps(data, ensure_ascii=False)
+    try:
+        raw = call_claude(system, user, max_tokens=2500, feature="cite-style")
+        obj = _guide_json(raw) or {}
+        got = obj.get("refs") if isinstance(obj.get("refs"), list) else []
+    except Exception as e:
+        logger.warning(f"Couldn't lay out references like the example: {e}")
+        got = []
+    out = []
+    for k, (src, built) in enumerate(entries):
+        t = re.sub(r"\s+", " ", str(got[k] if k < len(got) else "")).strip()
+        ok = bool(t) and _example_check(t, src)
+        out.append((t if ok else built, ok))
+    return out
+
+
+# 5.0: the reference list's heading in the language the piece is written in (the references themselves stay as published)
+REF_TITLES = {"french": "Références", "français": "Références", "francais": "Références", "spanish": "Referencias", "español": "Referencias",
+              "espanol": "Referencias", "portuguese": "Referências", "português": "Referências", "portugues": "Referências",
+              "german": "Literaturverzeichnis", "deutsch": "Literaturverzeichnis", "arabic": "المراجع", "العربية": "المراجع",
+              "kiswahili": "Marejeleo", "swahili": "Marejeleo"}
+
+
+def ref_title_for(language):
+    return REF_TITLES.get(re.sub(r"\s+", " ", str(language or "")).strip().lower())
+
+
+def restyle_result(result, sources, cited, plan, given=None, language=None):
+    """Turns a finished piece (made with author-date citations, all checked) into the style the person asked for.
+    result: the reply about to be sent (text or sections, references). cited: the indices of the sources it cites."""
+    if not plan:
+        if ref_title_for(language):
+            result["references_title"] = ref_title_for(language)
+        return result
+    cited = set(cited or ())
+    if plan["marks"]:
+        nums = dict(given or {})
+        if result.get("sections"):
+            for sec in result["sections"]:
+                sec["text"], nums = to_numbered(sec.get("text") or "", sources, plan["marks"], nums)
+        else:
+            result["text"], nums = to_numbered(result.get("text") or "", sources, plan["marks"], nums)
+        # a source cited only in an earlier part keeps its number; one cited nowhere isn't listed
+        nums = {i: n for i, n in nums.items() if i in cited or (given and i in given)}
+        refs = numbered_refs(sources, nums, plan["refs"], plan["marks"])
+        result["references"] = refs
+        result["references_title"] = "References"
+        result["cite_marks"] = plan["marks"]
+    else:
+        result["cite_marks"] = None
+        refs = result.get("references") or []
+    result["style"] = plan["style"]
+    result["style_name"] = plan["name"]
+    if plan["style"] == "other" and plan.get("example") and refs:
+        by_key = {str(s.get("citation_key") or ""): s for s in sources}
+        entries = [(by_key.get(r.get("akey") or r.get("key"), {}), r["text"]) for r in refs]
+        laid = refs_like_example([(src, t) for src, t in entries if src] , plan["example"], plan["name"]) if any(src for src, _ in entries) else []
+        k = 0
+        failed = 0
+        for r, (src, _) in zip(refs, entries):
+            if not src:
+                continue
+            r["text"], ok = laid[k]
+            r["after"] = "" if ok else r.get("after", "")
+            failed += 0 if ok else 1
+            k += 1
+        if failed:
+            note = (f"{failed} of the {len(refs)} references couldn't be laid out like your example and checked, so "
+                    + ("they follow Vancouver." if plan["marks"] else f"they follow {CITE_STYLES[plan['refs']]['name']}."))
+            result["source_note"] = ((result.get("source_note") or "") + " " + note).strip()
+    elif plan["style"] == "other" and not plan.get("example"):
+        note = ("You didn't give an example reference, so the references follow "
+                + ("Vancouver" if plan["marks"] else CITE_STYLES[plan["refs"]]["name"]) + ".")
+        result["source_note"] = ((result.get("source_note") or "") + " " + note).strip()
+    if ref_title_for(language):
+        result["references_title"] = ref_title_for(language)
+    return result
+
+
+_MARK_GROUPS = {
+    "ieee": re.compile(r"\[\d{1,3}\](?:\s*(?:,|–|-)\s*\[\d{1,3}\])*"),
+    "brackets": re.compile(r"\[\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*\]"),
+    "parens": re.compile(r"\(\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*\)"),
+    "raised": re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+(?:[˒⁻][⁰¹²³⁴⁵⁶⁷⁸⁹]+)*"),
+}
+_SUP_BACK = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹˒⁻", "0123456789,-")
+
+
+def _mark_numbers(mark):
+    """The numbers one mark stands for ("[1]–[3]" and "(1–3)" are 1, 2, 3)."""
+    t = mark.translate(_SUP_BACK)
+    out = []
+    for m in re.finditer(r"(\d{1,3})(?:\]?\s*[–\-]\s*\[?(\d{1,3}))?", t):
+        a, b = int(m.group(1)), int(m.group(2)) if m.group(2) else None
+        out += list(range(a, b + 1)) if b and b >= a and b - a < 60 else [a]
+    return out
+
+
+def marks_back(text, marks, n_to_key):
+    """An earlier part's numbers as the author-date citations they stand for, so the writing goes on from its words (a
+    mark with a number that isn't known stays as it is)."""
+    rx = _MARK_GROUPS.get(marks)
+    if not rx or not text:
+        return text
+
+    def back(m):
+        keys = [n_to_key.get(n) for n in _mark_numbers(m.group(0))]
+        if not keys or not all(keys):
+            return m.group(0)
+        return " (" + "; ".join(k[1:-1] for k in keys) + ")"
+    out = rx.sub(back, text)
+    return re.sub(r"[ \t]{2,}", " ", out)
+
+
+def _strip_invented(text):
+    """Numbers in square brackets, or raised, that the model wrote itself: never citations (they'd lead nowhere)."""
+    out = _MARK_GROUPS["brackets"].sub("", str(text or ""))
+    out = _MARK_GROUPS["raised"].sub("", out)
+    return re.sub(r"[ \t]+([.,;:])", r"\1", out)
+
+
+# 5.0: the language a piece is written in (asked before research starts). Citations stay exactly as given, numbers are
+# written in digits (so every figure can still be checked against the papers), and a quotation stays in its own language.
+LANGUAGES_RTL = {"arabic", "hebrew", "urdu", "persian", "farsi"}
+
+
+def language_rule(language):
+    lang = re.sub(r"[^\w\s\-’'()]", "", str(language or "")).strip()[:40]
+    if not lang or lang.lower() in ("english", "en", "british english", "american english", "us english", "uk english"):
+        return "" if not lang or lang.lower() in ("english", "en") else (f"\n\nLANGUAGE: write in {lang}.")
+    return (f"\n\nLANGUAGE: write everything you write in {lang}, in the formal register of academic writing in {lang}. Keep every "
+            "citation key exactly as given (its names, its \"&\", \"and\" or \"et al.\" and its year are never translated), and always "
+            "place citations in brackets after the claim (never as \"Name (Year)\" inside a sentence). Write every number in digits. "
+            "A paper's title or a quotation from it stays in its own language.")
 
 
 @app.after_request
@@ -3858,6 +4497,7 @@ def _device_seen(row, device_id):
 @auth_required
 def me():
     row = _device_seen(request.current_user, request.headers.get("X-Device", ""))
+    row = _invite_joined(row, request.headers.get("X-Device", ""))
     if _needs_verification(row) and not _active_code(row["id"]):
         sent, _, _ = _send_verification_code(row)
         return jsonify({"user": user_row_to_dict(row), "verify": _verify_info(row, sent)})
@@ -4248,7 +4888,10 @@ PAYSTACK_API = "https://api.paystack.co"
 PAYSTACK_PLANS = {
     # plan: (price in pesewas, days of Scholar, points). A pass's points end with the pass; "points" never end.
     # 4.7 (the owner, 9 Nov 2026): Month GH₵160 = 200 points; Half a year GH₵480 = 620; Year GH₵1,200 = 1,560
-    "month": (16000, 30, 200),
+    # 5.0 (the owner, 10 Nov 2026): Month = 100 points, 10 of them for research; Half year "stays 620" (his answer at
+    # 10:05), 60 of them for research (six months of Month's 10); Year unchanged, with no research limit
+    # (PASS_RESEARCH_POINTS)
+    "month": (16000, 30, 100),
     "half": (48000, 182, 620),
     "year": (120000, 365, 1560),
     # 4.1 to 4.6: no longer sold, kept so a pass bought then still applies
@@ -4313,21 +4956,30 @@ def _paystack_apply(reference, paid_amount, currency):
                 credits = int(pay["points"])                 # what was offered when the payment started
             elif pay["plan"] in PAYSTACK_POINTS_BEFORE_47:
                 credits = PAYSTACK_POINTS_BEFORE_47[pay["plan"]]   # started before 4.7
+            # 5.0: the research points this pass came with (None: no research limit — Year, or a payment started before 5.0)
+            research = pay.get("research_points")
             if days:
                 # Bought during the free-Pro promotion: the paid days start when it ends.
                 start = _promo_until() if _promo_active() else datetime.now(timezone.utc)
                 # A shorter pass bought on top of a longer one that is still running keeps the longer one's name;
                 # the days and points are added either way.
-                cur.execute("SELECT plan, plan_expires_at FROM users WHERE id = %s FOR UPDATE", (pay["user_id"],))
+                cur.execute("SELECT plan, plan_expires_at, research_points FROM users WHERE id = %s FOR UPDATE", (pay["user_id"],))
                 cur_row = cur.fetchone() or {}
                 new_plan = pay["plan"]
                 cur_plan, cur_exp = cur_row.get("plan"), cur_row.get("plan_expires_at")
-                if cur_plan in PAYSTACK_PLANS and cur_exp and cur_exp > datetime.now(timezone.utc) and PAYSTACK_PLANS[cur_plan][1] > days:
+                running = bool(cur_plan in PAYSTACK_PLANS and cur_exp and cur_exp > datetime.now(timezone.utc))
+                if running and PAYSTACK_PLANS[cur_plan][1] > days:
                     new_plan = cur_plan
+                # research points are added like the points themselves; no limit wins (this pass has none, or the pass
+                # still running has none), and a pass that had already ended leaves nothing behind
+                if research is None or (running and cur_row.get("research_points") is None):
+                    new_research = None
+                else:
+                    new_research = (max(0, int(cur_row.get("research_points") or 0)) if running else 0) + int(research)
                 cur.execute(
                     "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), "
-                    "plan_source = 'paystack', pass_points = pass_points + %s WHERE id = %s",
-                    (new_plan, start, days, credits, pay["user_id"]))
+                    "plan_source = 'paystack', pass_points = pass_points + %s, research_points = %s WHERE id = %s",
+                    (new_plan, start, days, credits, new_research, pay["user_id"]))
                 if pay["plan"] in ("month", "half", "semester", "year", "monthly", "halfyear", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
                     cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
             elif credits:
@@ -4348,7 +5000,8 @@ def paystack_config():
         "enabled": _paystack_on(), "public_key": PAYSTACK_PUBLIC_KEY if _paystack_on() else None, "currency": "GHS",
         # live or test keys — never the key itself — so the setup can be checked at a glance
         "mode": ("live" if PAYSTACK_SECRET_KEY.startswith("sk_live") else "test") if _paystack_on() else None,
-        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2], "points": v[2], "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
+        "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "credits": v[2], "points": v[2], "research_points": PASS_RESEARCH_POINTS.get(k),
+                      "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
         "trial_points": TRIAL_POINTS, "day_cap": SCHOLAR_DAY_CAP,
         "free_points": FREE_MONTH_POINTS, "free_research": FREE_MONTH_RESEARCH,
     })
@@ -4365,7 +5018,7 @@ def paystack_initialize():
         return jsonify({"error": "In the Academic-Home app from a store, Scholar is bought through the App Store or Google Play."}), 403
     plan = str((request.get_json(silent=True) or {}).get("plan") or "")
     if plan not in PAYSTACK_ON_SALE:
-        return jsonify({"error": "Choose a Scholar pass: Month, Half a year or Year."}), 400
+        return jsonify({"error": "Choose a Scholar pass: Month, Half year or Year."}), 400
     user = request.current_user
     if plan in PRO_PLANS and user.get("plan") in PRO_PLANS and _owns_store_plan(user["id"]):
         return jsonify({"error": "You already have Scholar through the App Store or Google Play; manage it there."}), 409
@@ -4378,8 +5031,8 @@ def paystack_initialize():
             if friend_code and plan in PRO_PLANS:
                 if not _find_referrer(cur, friend_code, user["id"]):
                     return jsonify({"error": "That referral code wasn't found (or it's your own) — check it, or leave it empty.", "field": "referral"}), 400
-            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code, points) VALUES (%s, %s, %s, %s, %s, %s)",
-                        (reference, user["id"], plan, amount, friend_code or None, PAYSTACK_PLANS[plan][2]))
+            cur.execute("INSERT INTO paystack_payments (reference, user_id, plan, amount, referral_code, points, research_points) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (reference, user["id"], plan, amount, friend_code or None, PAYSTACK_PLANS[plan][2], PASS_RESEARCH_POINTS.get(plan)))
     finally:
         conn.close()
     try:
@@ -4687,8 +5340,9 @@ def memory_settings_endpoint():
 
 # ------------------------------------------------------------ referral codes
 # A person can make one referral code a month; each lasts 14 days. When a
-# friend subscribes with it, both get a bonus month — the same reward as a
-# personal referral code. Kept in promo_codes (created_by = the referrer).
+# friend joins with it, the person who invited gets INVITE_POINTS points (5.0;
+# before: both got a bonus month when the friend subscribed) — the same reward as
+# a personal referral code. Kept in promo_codes (created_by = the referrer).
 # The old /api/promo/generate address does the same, for older app versions.
 REFERRAL_CODE_DAYS = 14
 REFERRAL_CODE_EVERY_DAYS = 30
@@ -4719,13 +5373,38 @@ def referral_current():
     conn = get_db()
     try:
         with conn.cursor() as cur:
-            return jsonify(_referral_state(_latest_referral(cur, request.current_user["id"])))
+            uid = request.current_user["id"]
+            state = _referral_state(_latest_referral(cur, uid))
+            # 5.0: the friends who have counted, and what an invite gives
+            cur.execute("SELECT count(*) AS n, COALESCE(sum(points), 0) AS p, count(*) FILTER (WHERE created_at >= date_trunc('month', now())) AS m "
+                        "FROM invite_rewards WHERE inviter_id = %s", (uid,))
+            r = cur.fetchone() or {}
+            state.update({"invited": int(r.get("n") or 0), "invited_points": int(r.get("p") or 0), "invited_this_month": int(r.get("m") or 0),
+                          "invite": {"points": INVITE_POINTS, "research": INVITE_RESEARCH, "month_max": INVITE_MONTH_MAX}})
+            return jsonify(state)
     finally:
         conn.close()
 
 
+def _wrong_code(resp):
+    """5.0 (the owner: "Protect users' invite code"): only wrong codes count toward the stricter limit, so guessing other
+    people's codes is stopped after a few tries while a person typing their friend's code is never held up."""
+    try:
+        j = resp.get_json(silent=True) or {}
+        return j.get("valid") is False or j.get("field") == "code"
+    except Exception:
+        return False
+
+
+def _wrong_code_limit():
+    """Signed in: 12 wrong codes an hour for the account. Signed out (the sign-up page), the count is per network, and many
+    people share one network (a school, a mobile provider), so it is higher there."""
+    return "12 per hour" if str(_account_or_ip_key()).startswith("user:") else "30 per hour"
+
+
 @app.route("/api/referral/check", methods=["POST", "OPTIONS"])
 @limiter.limit("40 per hour")
+@limiter.limit(_wrong_code_limit, deduct_when=_wrong_code, key_func=_account_or_ip_key)
 def referral_check():
     """Is this a real referral code? Used as it's typed (sign-up and checkout)."""
     if request.method == "OPTIONS":
@@ -4747,11 +5426,64 @@ def referral_check():
                 cur.execute("SELECT referral_rewarded FROM users WHERE id = %s", (uid,))
                 me = cur.fetchone()
                 if me and me["referral_rewarded"]:
-                    return jsonify({"valid": False, "error": "You've already had a referral bonus — it's once per account."})
+                    return jsonify({"valid": False, "error": "A friend’s code has already counted for this account. It counts once."})
     finally:
         conn.close()
     first = (str(ref.get("name") or "").strip().split() or ["a friend"])[0][:30]
     return jsonify({"valid": True, "from": first})
+
+
+@app.route("/api/referral/use", methods=["POST", "OPTIONS"])
+@limiter.limit("10 per hour", key_func=_account_or_ip_key)
+@limiter.limit("6 per hour", deduct_when=_wrong_code, key_func=_account_or_ip_key)
+@auth_required
+def referral_use():
+    """An account that already exists enters the code of the friend who invited it — once, with the same care as a
+    new one: its email is confirmed (auth_required), it is the first account on this phone, and it isn't its own code.
+    Nobody has to sign up again for a friend to get their points."""
+    user = request.current_user
+    code = _clean_code((request.get_json(silent=True) or {}).get("code"))
+    if len(code) < 4:
+        return jsonify({"error": "Enter the whole code.", "field": "code"}), 400
+    device = request.headers.get("X-Device", "")
+    if not device or not _DEVICE_RE.match(device):
+        return jsonify({"error": "Open Academic-Home on your phone and try again."}), 400
+    user = _device_seen(user, device)
+    conn = get_db()
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, referral_code, referral_rewarded FROM users WHERE id = %s FOR UPDATE", (user["id"],))
+            me_row = cur.fetchone()
+            if not me_row:
+                conn.rollback()
+                return jsonify({"error": "Not authenticated"}), 401
+            if me_row["referral_rewarded"]:
+                conn.rollback()
+                return jsonify({"error": "A friend’s code has already counted for this account. It counts once."}), 409
+            if _clean_code(me_row.get("referral_code")) == code:
+                conn.rollback()
+                return jsonify({"error": "That’s your own code. Share it with friends instead.", "field": "code"}), 400
+            ref = _find_referrer(cur, code, user["id"])
+            if not ref:
+                conn.rollback()
+                return jsonify({"error": "That code wasn’t found. Check the spelling, or ask your friend for it again.", "field": "code"}), 400
+            cur.execute("SELECT user_id FROM trial_devices WHERE device_id = %s", (device,))
+            seen = cur.fetchone()
+            if not seen or seen["user_id"] != user["id"] or user.get("trial_blocked"):
+                conn.rollback()
+                return jsonify({"error": "This phone already had another account before this one, so a friend’s code can’t count here."}), 409
+            cur.execute("UPDATE users SET referred_code = %s WHERE id = %s", (code, user["id"]))
+            given = _reward_referral(cur, user["id"], code)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    first = (str(ref.get("name") or "").strip().split() or ["Your friend"])[0][:30]
+    # (when this month's friends have already counted, this one counts next month, when this account next opens the app)
+    return jsonify({"ok": True, "from": first, "given": bool(given), "points": INVITE_POINTS})
 
 
 @app.route("/api/referral/generate", methods=["POST", "OPTIONS"])
@@ -4888,9 +5620,10 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
         conn.close()
 
 
-def _refund_sage_message(user_row, source="allowance", points=1, research=False):
+def _refund_sage_message(user_row, source="allowance", points=1, research=False, in_research=False):
     """Gives back what a request spent when it never got a reply: pass points, bought points, Free's points (and,
-    for research writing, that month's research writing) or a message of the old monthly allowance. Best-effort."""
+    for research writing, that month's research writing) or a message of the old monthly allowance; and, on a pass
+    with research points (5.0), the research points it took. Best-effort."""
     points = max(1, int(points or 1))
     conn = None
     try:
@@ -4908,8 +5641,15 @@ def _refund_sage_message(user_row, source="allowance", points=1, research=False)
             # a research writing that never arrived doesn't count against the month's research writings: on Free, and
             # (4.7) on a pass that isn't Half a year or Year
             plan = effective_plan(user_row)
-            if research and ((plan == "free" and source in ("trial", "credit")) or (plan != "free" and plan not in RESEARCH_PLANS)):
+            bonus = max(0, min(points, int(getattr(source, "bonus", 0) or 0)))     # research points that never end, taken by this spend
+            if research and not bonus and ((plan == "free" and source in ("trial", "credit")) or (plan != "free" and plan not in RESEARCH_PLANS)):
                 cur.execute("UPDATE users SET free_research_used = GREATEST(free_research_used - 1, 0) WHERE id = %s", (user_row["id"],))
+            # 5.0: research that never arrived gives its research points back where they came from: the pass's own (a pass
+            # without a research limit has none written down, and stays that way), and the ones that never end
+            if bonus:
+                cur.execute("UPDATE users SET bonus_research = bonus_research + %s WHERE id = %s", (bonus, user_row["id"]))
+            if (research or in_research) and plan != "free" and source in ("pass", "credit") and points - bonus > 0:
+                cur.execute("UPDATE users SET research_points = research_points + %s WHERE id = %s AND research_points IS NOT NULL", (points - bonus, user_row["id"]))
         conn.commit()
     except Exception as e:
         logger.error("Couldn't refund points for user %s: %s", user_row.get("id"), e)
@@ -4960,7 +5700,24 @@ def _no_points_error(row, points):
 
 def _research_used_error():
     return PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} research writings. They come back on "
-                       f"{_free_back_words()}. Half a year or Year: as many as your points allow.")
+                       f"{_free_back_words()}. {SCHOLAR_MORE_RESEARCH}")
+
+
+class ResearchPointsError(PointsError):
+    """A Month or Half year pass has used the part of its points that may go on research (5.0). The rest of its
+    points are untouched; the app says so and doesn't offer points, only the plans."""
+    extra = {"points_needed": True, "research_limit": True}
+
+
+def _research_points_error(left, points):
+    left = max(0, int(left or 0))
+    rest = "Your other points still work on everything else in RamzAI. The Year pass has no research limit."
+    if left <= 0:
+        e = ResearchPointsError("This pass’s research points are used. " + rest)
+    else:
+        e = ResearchPointsError(f"This needs {points} research points, and you have {left} left. " + rest)
+    e.extra = dict(ResearchPointsError.extra, research_points_left=left)
+    return e
 
 
 def _free_back_words():
@@ -4968,12 +5725,14 @@ def _free_back_words():
     return f"{d.day} {d.strftime('%B')}"
 
 
-def _log_sage_message_and_consume(user_row, points=1, research=False):
+def _log_sage_message_and_consume(user_row, points=1, research=False, in_research=False):
     """Spend points for one piece of AI work, under a row lock so two requests at once can't both slip past.
     A pass's points first, then points bought on their own. On Free: the month's free points first, then bought
     points, and research writing at most FREE_MONTH_RESEARCH times a month. Any pass spends at most SCHOLAR_DAY_CAP
-    a day. Store and promo accounts keep the earlier monthly allowance. Returns where the points came from: 'pass',
-    'credit', 'trial' (Free's month) or 'allowance'."""
+    a day. On a pass with research points (5.0: Month, Half year), work inside a research feature (research=True, or
+    in_research=True for the plan of a manual research writing, which is not one of Free's research writings) may use
+    at most those; every other feature is not limited by them. Store and promo accounts keep the earlier monthly
+    allowance. Returns where the points came from: 'pass', 'credit', 'trial' (Free's month) or 'allowance'."""
     points = max(1, int(points or 1))
     conn = get_db()
     conn.autocommit = False
@@ -5008,29 +5767,50 @@ def _log_sage_message_and_consume(user_row, points=1, research=False):
                     if pp + bought < points:
                         conn.rollback()
                         raise _no_points_error(row, points)
+                    # 5.0: research uses the pass's research points (Month, Half year), then the research points that
+                    # never end (from inviting friends); None = no research limit
+                    r_own = _research_left(row, own=True) if (research or in_research) else None
+                    from_bonus = 0
+                    if r_own is not None:
+                        if r_own + _bonus_research(row) < points:
+                            conn.rollback()
+                            raise _research_points_error(r_own + _bonus_research(row), points)
+                        from_bonus = points - min(r_own, points)
                     from_pass = min(pp, points)
                     cur.execute("UPDATE users SET pass_points = pass_points - %s, remy_credits = remy_credits - %s, day_points_used = %s, day_points_at = %s WHERE id = %s",
                                 (from_pass, points - from_pass, used_today + points, today, row["id"]))
+                    if r_own is not None:
+                        cur.execute("UPDATE users SET research_points = %s, bonus_research = bonus_research - %s WHERE id = %s",
+                                    (r_own - (points - from_bonus), from_bonus, row["id"]))
                     conn.commit()
-                    return "pass" if from_pass else "credit"
+                    charged = _Charged("pass" if from_pass else "credit")
+                    charged.bonus = from_bonus
+                    return charged
                 trial_left, research_left, _ = _free_state(row)
                 month = _month_start()
                 same = row.get("free_month") == month
+                # 5.0: when the month's research writings are used, research points that never end (from inviting
+                # friends) still pay for research
+                from_bonus = 0
                 if research and research_left <= 0:
-                    conn.rollback()
-                    raise PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
-                                      f"{_free_back_words()}. Half a year or Year: as many as your points allow.")
+                    if _bonus_research(row) < points:
+                        conn.rollback()
+                        raise PointsError(f"You’ve used this month’s {FREE_MONTH_RESEARCH} free research writings. They come back on "
+                                          f"{_free_back_words()}. {SCHOLAR_MORE_RESEARCH}")
+                    from_bonus = points
                 if trial_left + bought < points:
                     conn.rollback()
                     raise _no_points_error(row, points)
                 from_trial = min(trial_left, points)
                 used = (int(row.get("trial_points_used") or 0) if same else 0) + from_trial
-                research_used = (int(row.get("free_research_used") or 0) if same else 0) + (1 if research else 0)
+                research_used = (int(row.get("free_research_used") or 0) if same else 0) + (1 if (research and not from_bonus) else 0)
                 cur.execute("UPDATE users SET trial_points_used = %s, free_research_used = %s, free_month = %s, "
-                            "remy_credits = remy_credits - %s WHERE id = %s",
-                            (used, research_used, month, points - from_trial, row["id"]))
+                            "remy_credits = remy_credits - %s, bonus_research = bonus_research - %s WHERE id = %s",
+                            (used, research_used, month, points - from_trial, from_bonus, row["id"]))
                 conn.commit()
-                return "trial" if from_trial else "credit"
+                charged = _Charged("trial" if from_trial else "credit")
+                charged.bonus = from_bonus
+                return charged
             used, limit, reset_at = _sage_status(row)
             source = "allowance"
             if used >= limit:
@@ -5603,12 +6383,12 @@ def _scholar_gate(user, feature, research=False):
     other passes while the month's research writings last (4.7)."""
     month = PAYSTACK_PLANS["month"][0] // 100
     if research:
-        if _research_full(user) or _free_state(user)[1] > 0:
+        if _research_open(user):
             return None
         free = not _is_pro(user)
         return jsonify({"error": f"You’ve used this month’s {FREE_MONTH_RESEARCH} {'free ' if free else ''}research writings. They come back on "
-                                 f"{_free_back_words()}. Half a year or Year: as many as your points allow.",
-                        "scholar_needed": True, "feature": feature, "plan_needed": "half"}), 402
+                                 f"{_free_back_words()}. {SCHOLAR_MORE_RESEARCH}",
+                        "scholar_needed": True, "feature": feature}), 402
     if _is_pro(user):
         return None
     return jsonify({"error": f"{feature} is part of Scholar. Scholar Month is GH₵{month:.0f}; everything on your phone stays free.",
@@ -8002,6 +8782,30 @@ def split_memory_note(text):
     return (note or None), remaining
 
 
+# 5.0: how long a piece may be, how much one answer holds, and the line that says "there is more to come"
+WRITE_MAX_WORDS = 12000
+WRITE_ONE_WORDS = 3000          # up to here a piece is one answer, as before 5.0
+WRITE_PART_WORDS = 2400
+WRITE_MORE_MARK = "\u27e6more\u27e7"
+_WRITE_MORE = re.compile(r"\s*\u27e6\s*more\s*\u27e7\s*", re.I)
+
+
+def _brief_year(v, this_year):
+    """A year the person typed (1800 to this year), or None."""
+    try:
+        y = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return y if 1800 <= y <= this_year else None
+
+
+def _write_more(text):
+    """(the text without the "more to come" line, whether it was there)."""
+    if not text or not _WRITE_MORE.search(text):
+        return text, False
+    return _WRITE_MORE.sub("\n\n", text).strip(), True
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -8045,65 +8849,94 @@ def write_endpoint():
         return _points_reply(e)
     outline = parse_outline(topic)
 
-    # Citation style and how recent the sources must be (both optional).
-    style = str(data.get("style") or "apa").lower()
-    style = style if style in CITE_STYLES else "apa"
+    # Citation style and how recent the sources must be (both optional). 5.0: a style beyond the four is made and checked
+    # in author-date citations, then turned into what the person asked for (cite_plan)
+    style, cite_plan = _cite_plan(data)
     CS = CITE_STYLES[style]
+    # 5.0: the kinds of sources the person chose (when they didn't: everything but editorials, letters and datasets)
+    kinds = [k for k in WRITE_KINDS if k in (data.get("kinds") or [])] or list(WRITE_KINDS)
     try:
         recent_years = int(data.get("recent_years") or 0)
     except (TypeError, ValueError):
         recent_years = 0
-    recent_years = recent_years if recent_years in (5, 10) else 0
+    recent_years = recent_years if 1 <= recent_years <= 100 else 0       # 5.0: any number of years (4.9: 5 or 10 only)
     note = {"text": ""}
+    # 5.0: or the years the person chose themselves ("from 2010 to 2018"); and the length they asked for, which also
+    # says how many papers the piece draws on (a long piece needs more than a short one)
+    this_year = datetime.now(timezone.utc).year
+    year_from, year_to = _brief_year(data.get("year_from"), this_year), _brief_year(data.get("year_to"), this_year)
+    if year_from and year_to and year_from > year_to:
+        year_from, year_to = year_to, year_from
+    since = year_from or ((this_year - recent_years + 1) if recent_years else None)
+    until = year_to if (year_to and year_to < this_year) else None
+    if year_from or until:
+        span_words = (f"from {year_from} to {until}" if (year_from and until) else f"from {year_from} on" if year_from else f"up to {until}")
+    else:
+        span_words = f"from the last {recent_years} years"
+    try:
+        length_words = int(data.get("length_words") or 0)
+    except (TypeError, ValueError):
+        length_words = 0
+    length_words = max(150, min(WRITE_MAX_WORDS, length_words)) if length_words > 0 else 0
+    n_sources = 8 if length_words <= 1500 else 12 if length_words <= 3000 else 16 if length_words <= 6000 else 20
 
-    since = (datetime.now(timezone.utc).year - recent_years + 1) if recent_years else None
-
-    def _find(text, n=8, topic=True):
-        """Real, downloadable papers for this request, cited in the chosen style — recent ones
-        when the student asked for them, older ones added (with a note) when too few came up."""
+    def _find(text, n=None, topic=True):
+        """Real, downloadable papers for this request, cited in the chosen style — from the years the person asked
+        for, others added (with a note) when too few came up."""
+        n = n or n_sources
         look = paper_topic_search if topic else search_papers
-        papers, diag = look(text, max_results=n, since=since)
-        if since and len(papers) < 3 and diag != "not a topic":
-            older, _ = look(text, max_results=n)
+        papers, diag = look(text, max_results=n, since=since, kinds=kinds, **({"until": until} if until else {}))
+        papers = [p for p in papers if (p.get("kind") or "article") in kinds]
+        if (since or until) and len(papers) < 3 and diag != "not a topic":
+            older, _ = look(text, max_results=n, kinds=kinds)
+            older = [p for p in older if (p.get("kind") or "article") in kinds]
             have = {p["url"] for p in papers}
             fresh = len(papers)
             papers = papers + [p for p in older if p["url"] not in have][: n - len(papers)]
             if len(papers) > fresh:
-                note["text"] = (f"Only {fresh} paper{'' if fresh == 1 else 's'} from the last {recent_years} years came up, "
-                                "so older ones were added to support the writing properly.")
+                note["text"] = (f"Only {fresh} paper{'' if fresh == 1 else 's'} {span_words} came up, "
+                                f"so {'others' if until else 'older ones'} were added to support the writing properly.")
             if papers:
                 diag = None
         return enrich_sources(papers, style), diag
-
-    def _prep(srcs):
-        if recent_years and srcs:
-            cutoff = datetime.now(timezone.utc).year - recent_years
-            fresh = [s for s in srcs if (s.get("year") or 0) >= cutoff]
-            if len(fresh) >= 3:
-                srcs = fresh
-            else:
-                note["text"] = (f"Only {len(fresh)} source{'' if len(fresh) == 1 else 's'} from the last {recent_years} years came up, "
-                                "so older ones were kept to support the writing properly.")
-        return enrich_sources(srcs, style)
 
     # The student's own brief (word count, sections, focus…) and a target
     # length, added to EVERY writing call below — including continuations —
     # by this local wrapper, so no path can miss them. They never override
     # the real-sources and exact-citation rules.
-    reqs = str(data.get("requirements") or "").strip()[:1500]
-    try:
-        length_words = int(data.get("length_words") or 0)
-    except (TypeError, ValueError):
-        length_words = 0
-    length_words = length_words if length_words in (500, 800, 1000, 1500, 2000, 3000) else 0
+    reqs = str(data.get("requirements") or "").strip()[:2500]
+    # 5.0: the person's own template or guide (read by /api/brief/template), or the name of one of ours
+    template = str(data.get("template") or "").strip()[:4000]
     extra = ""
     if reqs:
-        extra += ("\n\nTHE STUDENT'S REQUIREMENTS (from their assignment brief) \u2014 follow them exactly: structure, sections, "
-                  "focus, tone, audience and any word count. They never override the rules above about using only the "
+        extra += ("\n\nTHE PERSON'S REQUIREMENTS (what they said before starting: who the piece is for, its purpose, its "
+                  "readers, and what it must follow) \u2014 follow them exactly: structure, sections, focus, tone, level, "
+                  "audience and any word count. They never override the rules above about using only the "
                   "listed real sources with their exact citations.\n<<<\n" + reqs + "\n>>>")
-    if length_words:
+    if template:
+        extra += ("\n\nTHE PERSON'S TEMPLATE OR GUIDE \u2014 follow its structure: use its headings, in its order, and its "
+                  "instructions on style and layout. Where it asks for something the listed real sources can't support, write "
+                  "what they do support under that heading and say plainly what is missing. It never overrides the rules above "
+                  "about using only the listed real sources with their exact citations.\n<<<\n" + template + "\n>>>")
+    # 5.0: the language the person chose; and kinds they named that aren't in the list
+    extra += language_rule(data.get("language"))
+    kinds_more = re.sub(r"\s+", " ", str(data.get("kinds_more") or "")).strip()[:200]
+    if kinds_more:
+        extra += ("\n\nTHE PERSON ALSO ASKED FOR THESE KINDS OF SOURCES: " + kinds_more + ". Use any of the listed sources that are of "
+                  "those kinds; never claim a source is of a kind it isn't.")
+    extra_fixed = extra
+    if length_words and length_words <= WRITE_ONE_WORDS:
         extra += (f"\n\nLENGTH: write about {length_words} words in total (within 10%), not counting the reference list. "
                   "If the piece needs more room than one answer allows, stop at a natural break \u2014 it will be continued.")
+    elif length_words:
+        # 5.0: a long piece (a thesis chapter, a full report) is written in parts, each one answer long; the person
+        # asks for the next part. The mark tells the app there is more to come.
+        extra += (f"\n\nLENGTH: the whole piece is about {length_words} words (within 10%), not counting the reference list, "
+                  f"written in parts. In THIS answer write at most about {WRITE_PART_WORDS} words: whole sections, ending at the "
+                  "end of a section, never in the middle of a sentence. Plan the whole piece so its sections share the length "
+                  "sensibly, and write only as much as the listed real sources support \u2014 never pad. If the piece is NOT "
+                  f"finished at the end of this answer, write the single line {WRITE_MORE_MARK} after your last paragraph. When "
+                  "the piece is complete (its last section written), don't write that line.")
     _call_claude = globals()["call_claude"]
 
     def call_claude(*args, **kw):
@@ -8127,10 +8960,26 @@ def write_endpoint():
             # 4.5.1: a new paper whose first author shares a surname with one the earlier part cites would need the
             # earlier citations changed (2021a/2021b, initials, more names): it is left out, so every citation stays right
             prev = []
+            given = {}       # 5.0: in a numbered style, the numbers the earlier parts gave (prev's index -> number)
+            n_to_key = {}
             for r in (data.get("previous_refs") or [])[:40]:
-                if isinstance(r, dict) and str(r.get("key") or "").startswith("(") and r.get("text"):
+                try:
+                    if isinstance(r, dict) and str(r.get("akey") or "").startswith("(") and int(r.get("n") or 0) > 0:
+                        n_to_key[int(r["n"])] = str(r["akey"])[:200]
+                except (TypeError, ValueError):
+                    pass
+            if cite_plan and cite_plan["marks"]:
+                previous_text = marks_back(previous_text, cite_plan["marks"], n_to_key)
+            for r in (data.get("previous_refs") or [])[:40]:
+                rkey = str(r.get("akey") or r.get("key") or "") if isinstance(r, dict) else ""
+                if isinstance(r, dict) and rkey.startswith("(") and r.get("text"):
                     plain_ref = re.sub(r"[*_]", "", str(r["text"]))
-                    key = str(r["key"])[:200]
+                    key = rkey[:200]
+                    try:
+                        if cite_plan and cite_plan["marks"] and int(r.get("n") or 0) > 0:
+                            given[len(prev)] = int(r["n"])
+                    except (TypeError, ValueError):
+                        pass
                     prev.append({"citation_key": key, "ref_text": str(r["text"])[:1200], "url": str(r.get("url") or "")[:600],
                                  "pdf": r.get("pdf") or None, "doi": _norm_doi(r.get("doi")), "title": plain_ref[:300],
                                  "abstract": None, "group": re.sub(r"[^a-z0-9:]", "", str(r.get("group") or "").lower())[:120] or _key_group(key),
@@ -8180,20 +9029,22 @@ def write_endpoint():
                 use_search=False,
                 return_meta=True,
             )
-            cont_text = cont_result["text"].strip()
+            cont_text, cont_more = _write_more(cont_result["text"].strip())
             if not cont_text:
                 raise ConversionError("Couldn't continue — try again")
             cont_text, cont_cited = keep_known_citations(cont_text, cont_sources, style)
             cont_text, cont_cited = _c34_write(cont_text, cont_sources, style, topic, note, started)
             if prev:
                 cont_cited = set(cont_cited) | set(range(len(prev)))     # the earlier part still cites its papers
-            return jsonify({
+            if cite_plan and cite_plan["marks"]:
+                cont_text = _strip_invented(cont_text)      # a number the model wrote itself is never one of ours
+            return jsonify(restyle_result({
                 "type": "result",
                 "text": cont_text,
                 "references": build_references_list(cont_sources, cont_cited), "references_all": bool(prev),
                 "references_title": CS["heading"], "source_note": note["text"], "style": style,
-                "truncated": cont_result["stop_reason"] == "max_tokens",
-            })
+                "truncated": cont_result["stop_reason"] == "max_tokens" or cont_more,
+            }, cont_sources, cont_cited, cite_plan, given, language=data.get("language")))
         except ConversionError as e:
             _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
             return jsonify({"error": str(e)}), 502
@@ -8204,6 +9055,8 @@ def write_endpoint():
             # Cap section count so one request can't run unbounded.
             outline = outline[:14]
             combined_headings = "; ".join(s["heading"] for s in outline)
+            if length_words > WRITE_ONE_WORDS:
+                extra = extra_fixed          # an outline is written section by section: the "in parts" rule isn't for it
 
             # One shared search across the whole outline — a bigger, single pool
             # of real sources every section draws from, instead of one search per
@@ -8246,6 +9099,7 @@ def write_endpoint():
                     max_tokens=400,
                     use_search=False,
                 ).strip()
+                sec_text = _write_more(sec_text)[0]
                 sec["text"] = sec_text if len(sec_text) >= 25 else "(Couldn't generate this subsection — try again.)"
             cited_all = set()
             for sec in outline:
@@ -8254,7 +9108,10 @@ def write_endpoint():
             if sources:
                 cited_all = _c34_write_sections(outline, sources, style, topic, note, started)
 
-            return jsonify({
+            if cite_plan and cite_plan["marks"]:
+                for sec in outline:
+                    sec["text"] = _strip_invented(sec["text"])
+            return jsonify(restyle_result({
                 "type": "result",
                 "sections": [
                     {"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"]}
@@ -8262,7 +9119,7 @@ def write_endpoint():
                 ],
                 "references": build_references_list(sources, cited_all), "references_title": CS["heading"], "source_note": note["text"], "style": style,
                 "title": next((s["heading"] for s in outline if s.get("level", 1) <= 1 and s.get("heading")), None),
-            })
+            }, sources, cited_all, cite_plan, language=data.get("language")))
 
         # Chat mode (history present) and simple mode (first message, no history
         # yet) share the same citation and clarify-guardrail logic below — they
@@ -8367,8 +9224,8 @@ def write_endpoint():
             use_search=False,
             return_meta=True,
         )
-        raw_text = result["text"].strip()
-        truncated = result["stop_reason"] == "max_tokens"
+        raw_text, more_to_come = _write_more(result["text"].strip())
+        truncated = result["stop_reason"] == "max_tokens" or more_to_come
 
         thinking, after_thinking = split_thinking(raw_text)
         is_clarify, text = split_clarify(after_thinking)
@@ -8387,14 +9244,16 @@ def write_endpoint():
 
         text, cited = keep_known_citations(text, sources, style)
         text, cited = _c34_write(text, sources, style, topic, note, started)
-        return jsonify({
+        if cite_plan and cite_plan["marks"]:
+            text = _strip_invented(text)
+        return jsonify(restyle_result({
             "type": "result",
             "text": text,
             "thinking": thinking,
             "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             "title": _topic_title(topic) if not attachment else None,
             "truncated": truncated, "noted": noted,
-        })
+        }, sources, cited, cite_plan, language=data.get("language")))
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
         return jsonify({"error": str(e)}), 502
@@ -8438,7 +9297,7 @@ def guide_outline():
     if gate:
         return gate
     try:
-        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_REMY)
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_REMY, in_research=True)
     except ConversionError as e:
         return _points_reply(e)
     system = ("You help a researcher plan a piece of academic writing. Reply with one JSON object only, no code fences: "
@@ -8447,9 +9306,13 @@ def guide_outline():
               "8 words in sentence case; each why is one sentence (at most 18 words) on what that part should establish. "
               "Write in the topic's language. Never invent studies, numbers or names.")
     try:
-        raw = call_claude(system, f"Topic: {topic}\nKind of writing: {kind}", max_tokens=900, feature="guide")
+        context = _guide_clip(data.get("context"), 700)      # 5.0: who it is for, as the person said before starting
+        lang = re.sub(r"[^\w\s\-’'()]", "", str(data.get("language") or "")).strip()[:40]
+        raw = call_claude(system + (f" Write the titles and the whys in {lang}." if lang and lang.lower() not in ("english", "en") else ""),
+                          f"Topic: {topic}\nKind of writing: {kind}" + (f"\nWritten for: {context}" if context else ""),
+                          max_tokens=900, feature="guide")
     except ConversionError as e:
-        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY, in_research=True)
         return jsonify({"error": str(e)}), 502
     obj = _guide_json(raw)
     subs = []
@@ -8457,7 +9320,7 @@ def guide_outline():
         if isinstance(x, dict) and _guide_clip(x.get("title"), 90):
             subs.append({"title": _guide_clip(x.get("title"), 90), "why": _guide_clip(x.get("why"), 200)})
     if not subs:
-        _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
+        _refund_sage_message(request.current_user, charged_from, POINTS_REMY, in_research=True)
         return jsonify({"error": "RamzAI couldn't outline that — try a few more words about the topic."}), 502
     return jsonify({"topic": topic, "subtopics": subs[:8]})
 
@@ -8492,14 +9355,23 @@ def guide_statements():
     data = request.get_json(silent=True) or {}
     topic = _guide_clip(data.get("topic"), 300)
     sub = _guide_clip(data.get("subtopic"), 200)
-    style = str(data.get("style") or "apa").lower()
-    if style not in CITE_STYLES:
-        style = "apa"
+    # 5.0: any style (Vancouver, IEEE, or the person's own): the statements carry author-date citations, which the page
+    # turns into numbers where the style numbers them; the references are written in the style asked
+    style, cite_plan = _cite_plan(data)
+    kinds = [k for k in WRITE_KINDS if k in (data.get("kinds") or [])] or list(WRITE_KINDS)
+    lang = re.sub(r"[^\w\s\-’'()]", "", str(data.get("language") or "")).strip()[:40]
     since = data.get("recent_years")
     try:
         since = datetime.now(timezone.utc).year - int(since) + 1 if since else None   # "the last 10 years": this year and the 9 before
     except (TypeError, ValueError):
         since = None
+    # 5.0: or the years the person chose themselves ("from 2010 to 2018")
+    _this = datetime.now(timezone.utc).year
+    _yf, _yt = _brief_year(data.get("year_from"), _this), _brief_year(data.get("year_to"), _this)
+    if _yf and _yt and _yf > _yt:
+        _yf, _yt = _yt, _yf
+    since = _yf or since
+    until_kw = {"until": _yt} if (_yt and _yt < _this) else {}
     exclude = set(str(x) for x in (data.get("exclude") or [])[:60] if x)
     if not (topic or sub):
         return jsonify({"error": "Type the topic first."}), 400
@@ -8507,9 +9379,11 @@ def guide_statements():
     if gate:
         return gate
     query = f"{topic} {sub}".strip() if sub and topic and sub.lower() not in topic.lower() else (sub or topic)
-    papers, diag = search_papers(query, max_results=GUIDE_PAPERS, since=since)
+    papers, diag = search_papers(query, max_results=GUIDE_PAPERS, since=since, kinds=kinds, **until_kw)
+    papers = [p for p in papers if (p.get("kind") or "article") in kinds]
     if len(papers) < 3 and sub:                     # the subtopic alone was too narrow: widen to the topic
-        more, _ = search_papers(topic or sub, max_results=GUIDE_PAPERS, since=since)
+        more, _ = search_papers(topic or sub, max_results=GUIDE_PAPERS, since=since, kinds=kinds, **until_kw)
+        more = [p for p in more if (p.get("kind") or "article") in kinds]
         seen = {p.get("doi") or p["title"] for p in papers}
         papers += [p for p in more if (p.get("doi") or p["title"]) not in seen]
     papers = [p for p in papers if (p.get("doi") or p.get("url") or "") not in exclude and p.get("abstract")][:GUIDE_PAPERS]
@@ -8537,7 +9411,8 @@ def guide_statements():
               "that builds the argument: context and definitions first, then findings and evidence, then limits, gaps or "
               "implications. Each statement says ONE thing the abstract of its paper actually supports; never go beyond the "
               "abstract, never invent numbers, and quote a figure only when the abstract gives it. 18 to 40 words each, plain "
-              "academic English (or the topic's language), no citation inside the text (the app adds it). paraphrase says the "
+              + (f"academic {lang} (numbers in digits)" if lang and lang.lower() != "english" else "academic English (or the topic's language)")
+              + ", no citation inside the text (the app adds it). paraphrase says the "
               "same thing in clearly different words and sentence shape, the version that will go into the document. kind is one "
               "of: context, definition, finding, method, evidence, limitation, gap, implication. Use at least 6 different papers; "
               "each paper at most twice. Use only the numbers given.")
@@ -8596,9 +9471,37 @@ def guide_statements():
     if len(out) < 3:
         _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
         return jsonify({"error": "RamzAI couldn't build statements those papers fully support. Try again, or say the topic in other words."}), 502
-    return jsonify({"topic": topic, "subtopic": sub, "style": style, "style_name": CITE_STYLES[style]["name"],
-                    "references_title": CITE_STYLES[style]["heading"], "statements": out,
-                    "papers": len(sources), "points": POINTS_RESEARCH, "source_note": diag or "", "checked": checked})
+    note = diag or ""
+    marks = None
+    if cite_plan:
+        # the references in the style asked: Vancouver or IEEE exactly; the person's own style like their example (checked)
+        marks = cite_plan["marks"]
+        by_paper = {}
+        for o in out:
+            by_paper.setdefault(o["paper"], []).append(o)
+        papers_used = sorted(by_paper)
+        if cite_plan["marks"] and cite_plan["refs"] in NUM_STYLES:
+            texts = {n: numbered_ref(sources[n - 1], cite_plan["refs"]) for n in papers_used}
+        else:
+            texts = {n: sources[n - 1]["ref_text"] for n in papers_used}
+        if cite_plan["style"] == "other" and cite_plan.get("example"):
+            laid = refs_like_example([(sources[n - 1], texts[n]) for n in papers_used], cite_plan["example"], cite_plan["name"])
+            bad = 0
+            for n, (t, ok) in zip(papers_used, laid):
+                texts[n] = t
+                bad += 0 if ok else 1
+            if bad:
+                note = (note + " " + f"{bad} reference{'s' if bad > 1 else ''} couldn't be laid out like your example and checked, so "
+                        + ("it follows" if bad == 1 else "they follow") + " " + ("Vancouver" if cite_plan["marks"] else CITE_STYLES[cite_plan["refs"]]["name"]) + ".").strip()
+        for o in out:
+            o["ref"]["text"] = texts[o["paper"]]
+            o["ref"]["akey"] = o["cite"]
+            if cite_plan["marks"]:
+                o["ref"]["after"] = ""
+    return jsonify({"topic": topic, "subtopic": sub, "style": cite_plan["style"] if cite_plan else style,
+                    "style_name": cite_plan["name"] if cite_plan else CITE_STYLES[style]["name"],
+                    "references_title": ref_title_for(lang) or ("References" if marks else CITE_STYLES[style]["heading"]), "statements": out, "cite_marks": marks,
+                    "papers": len(sources), "points": POINTS_RESEARCH, "source_note": note, "checked": checked})
 
 
 
@@ -8611,12 +9514,23 @@ def guide_statements():
 # whole sentences of a paper's own abstract (or of the person's own PDF) state it: the AI names a sentence by its label and
 # the server copies it out, so every quote is word for word; every figure, in digits or in words, must be in the quoted
 # sentences; a sentence its papers don't fully back is taken out; and so is one copied from any paper.
-RS_KINDS = ("article", "review", "book", "preprint")
+RS_KINDS = ("article", "review", "book", "preprint", "conference", "thesis", "report")
 RS_YEARS = (0, 5, 10, 20)
 RS_MAX_PAPERS = 10
 RS_MIN_PAPERS = 3
 RS_SECTIONS = (("short", "Short answer"), ("found", "What the studies found"), ("unsure", "Where they disagree or are unsure"))
+# 5.0: a report written in another language has its three headings in that language too
+RS_SECTIONS_LANG = {
+    "french": ("Réponse courte", "Ce que montrent les études", "Divergences et incertitudes"),
+    "spanish": ("Respuesta breve", "Lo que muestran los estudios", "Discrepancias e incertidumbres"),
+    "portuguese": ("Resposta curta", "O que os estudos mostram", "Divergências e incertezas"),
+    "german": ("Kurze Antwort", "Ergebnisse der Studien", "Widersprüche und Unsicherheiten"),
+    "arabic": ("الإجابة المختصرة", "ما توصلت إليه الدراسات", "مواضع الاختلاف وعدم اليقين"),
+    "kiswahili": ("Jibu fupi", "Tafiti zilichogundua", "Tofauti na mashaka"),
+}
+RS_SECTIONS_LANG["swahili"] = RS_SECTIONS_LANG["kiswahili"]
 RS_KIND_WORDS = {"article": ("journal article", "journal articles"), "review": ("review", "reviews"),
+                 "conference": ("conference paper", "conference papers"), "thesis": ("thesis", "theses"), "report": ("report", "reports"),
                  "book": ("book or chapter", "books or chapters"), "preprint": ("preprint", "preprints"), "mine": ("of your PDFs", "of your PDFs")}
 _RS_ABBR = re.compile(r"(?:\b(?:e\.g|i\.e|et al|etc|vs|cf|approx|ca|fig|figs|no|nos|vol|pp?|eds?|dr|mr|mrs|ms|prof|st|jr|sr|inc|ltd|"
                       r"co|resp|u\.s|u\.k|n|sd|se|ci|or)|(?<![\w.])[A-Za-z])\.$", re.I)
@@ -9048,7 +9962,7 @@ _RS_PLAN = re.compile(r"\b(?:we|they|it|this|these|that|which|who|pupils|student
                       r"evaluate|measure|determine|use|follow|recruit|assign|enrol|enroll|conduct|collect)\b|\b(?:is|are)\s+planned\b", re.I)
 
 
-def _rs_pick(found, library, question, kinds, since):
+def _rs_pick(found, library, question, kinds, since, until=None):
     """The papers the research reads: from the library first (when they're about the question and fit the years and
     kinds; a saved paper the search also found comes with the search's fuller record), then the search's best, up to
     RS_MAX_PAPERS; each with whole sentences of its own abstract to stand on (never an abstract lent by another version)."""
@@ -9072,6 +9986,8 @@ def _rs_pick(found, library, question, kinds, since):
             continue
         if since and p.get("year") and p["year"] < since:
             continue
+        if until and p.get("year") and p["year"] > until:
+            continue
         if not about(p, need) or len(picked) >= 5:
             continue
         if p["kind"] == "mine" and len([x for x in picked if x["kind"] == "mine"]) >= 3:
@@ -9090,6 +10006,8 @@ def _rs_pick(found, library, question, kinds, since):
         if not usable(p):
             continue
         if since and p.get("year") and p["year"] < since:
+            continue
+        if until and p.get("year") and p["year"] > until:
             continue
         if any(_same_work(p, q) for q in picked):
             continue
@@ -9146,8 +10064,9 @@ def _rs_idx(raw, pn, n_sents):
     return sorted(out) or None
 
 
-def _rs_write(question, papers, deadline):
-    """The report's sentences, by part, each ending in the numbers of the papers that state it."""
+def _rs_write(question, papers, deadline, context="", language=""):
+    """The report's sentences, by part, each ending in the numbers of the papers that state it. 5.0: in the language the
+    person chose (the quotations under each citation stay in the paper's own language)."""
     system = (
         "You are RamzAI, the research helper in Academic-Home, used by students and teachers. Answer the person's QUESTION "
         "from the numbered PAPERS only (their abstracts, or the first pages of the person's own PDF). Rules:\n"
@@ -9157,15 +10076,30 @@ def _rs_write(question, papers, deadline):
         "When you count the papers themselves, use words (\"two studies\").\n"
         "- Put it in your own words: never six or more words in a row from a paper. Don't name authors or years in the "
         "sentences (the brackets are the citations), and don't mention 'the abstract'.\n"
-        "- Formal, plain English a first-year student understands. One idea per sentence.\n"
+        "- Formal, plain English a first-year student understands, unless WRITTEN FOR says who the reader is: then write "
+        "for that reader (a doctoral researcher or an organisation reads fuller, more exact language; a school pupil simpler). "
+        "One idea per sentence. WRITTEN FOR never changes the rules above.\n"
         "- If the papers don't answer the question, say so plainly in the short answer, and say what they do show.\n"
         "Reply with JSON only: {\"short\": [2 or 3 sentences that answer the question], \"found\": [3 to 6 sentences on what "
         "the studies found], \"unsure\": [0 to 3 sentences on where they disagree, are limited or are unsure]}."
-        + STYLE_PROSE)
-    user = "QUESTION: " + question + "\n\nPAPERS:\n" + _rs_papers_text(papers)
-    raw = call_claude(system_prompt=system, user_message=user, max_tokens=1400,
-                      timeout=max(10, min(90, deadline - time.time() - 60)), feature="research-write")
-    obj = _rs_json(raw)
+        + STYLE_PROSE
+        + (f"\n- Write every sentence in {language}, in the formal register of academic writing in {language}, numbers in digits; "
+           "keep the paper numbers in square brackets exactly as above." if language and language.lower() not in ("english", "en") else ""))
+    user = "QUESTION: " + question + ("\nWRITTEN FOR: " + context if context else "") + "\n\nPAPERS:\n" + _rs_papers_text(papers)
+    obj = None
+    for attempt in (1, 2):
+        # 4.9.1: one more try when the AI is busy, slow or answers with something unreadable (the evidence table reads
+        # the same papers at the same moment, and a busy answer to one of the two stopped the whole research)
+        try:
+            raw = call_claude(system_prompt=system, user_message=user, max_tokens=1400,
+                              timeout=max(10, min(90, deadline - time.time() - 60)), feature="research-write")
+            obj = _rs_json(raw)
+            break
+        except Exception as e:
+            logger.warning(f"Research: the writing didn't run (try {attempt}): {e.__class__.__name__}: {str(e)[:120]}")
+            if attempt == 2 or deadline - time.time() < 95:
+                raise
+            time.sleep(5)
     parts = []
     for key, head in RS_SECTIONS:
         sents = [re.sub(r"\s+", " ", _finish_text(str(s), "words")).strip() for s in (obj.get(key) or []) if isinstance(s, str) and s.strip()]
@@ -9357,7 +10291,7 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
             "finding": finding, "answer": answer if finding else None, "cited": p["n"] in cited, "lib": p.get("lib")})
     yrs = [p["year"] for p in papers if p.get("year")]
     counts = Counter(p["kind"] for p in papers)
-    kinds_words = ", ".join(f"{counts[k]} {RS_KIND_WORDS[k][0 if counts[k] == 1 else 1]}" for k in ("article", "review", "book", "preprint", "mine") if counts.get(k))
+    kinds_words = ", ".join(f"{counts[k]} {RS_KIND_WORDS[k][0 if counts[k] == 1 else 1]}" for k in ("article", "review", "book", "conference", "thesis", "report", "preprint", "mine") if counts.get(k))
     limits = (f"{len(papers)} paper{'' if len(papers) == 1 else 's'}" + (f" from {min(yrs)} to {max(yrs)}" if yrs and min(yrs) != max(yrs) else f" from {yrs[0]}" if yrs else "")
               + (f": {kinds_words}" if kinds_words else "") + ". RamzAI read their abstracts"
               + (", and the first pages of your PDFs," if counts.get("mine") else "") + " not the whole papers, so read a paper before you rely on it.")
@@ -9391,6 +10325,311 @@ def once_state(key):
     return jsonify({"error": "Not found", "unknown": True}), 404
 
 
+# ---------- 5.0 the brief: what RamzAI finds out before research begins (the owner, 10 Nov 2026) ----------
+# "The app is set to support users, not to dictate for them": someone unsure of a topic is helped to choose one, an
+# unclear answer is asked about again, and the person's own template (any file with the guide in readable words) is
+# read into its headings and instructions. "Make everything broad … everyone stands a chance to make research": the
+# questions never assume a student: a pupil, a student at any level up to a doctorate, a teacher, a researcher, a
+# professional, an organisation, an institution or someone looking into something for themselves. Every question
+# comes with a wide range of answers to tap, and the person can always answer in their own words instead.
+# None of these takes points; none of them keeps the file or the words.
+BRIEF_LIMIT = "90 per hour;400 per day"
+BRIEF_KINDS = {"question": "a research question to look up in published papers",
+               "auto": "a piece of writing (an essay, a report, a thesis chapter, a policy brief, an article…) drafted from published papers",
+               "manual": "a piece of writing the person will write themselves, citing published papers"}
+BRIEF_ANYONE = ("The person may be anyone: a school pupil, a student at any level up to a doctorate, a teacher, a lecturer, a "
+                "researcher, a professional, an organisation, an institution, or someone looking into a subject for themselves. "
+                "Never assume they are a student unless ABOUT THE PERSON says so.")
+
+
+def _brief_json(raw):
+    a, b = str(raw or "").find("{"), str(raw or "").rfind("}")
+    obj = json.loads(raw[a:b + 1]) if 0 <= a < b else None
+    if not isinstance(obj, dict):
+        raise ValueError("not the JSON asked for")
+    return obj
+
+
+def _brief_line(v, cap):
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:cap]
+
+
+def _brief_list(v, n, cap):
+    """Up to n short lines from a list the app sent."""
+    return [x for x in (_brief_line(i, cap) for i in (v if isinstance(v, list) else [])[:n * 2]) if x][:n]
+
+
+def _brief_options(v, avoid=()):
+    """The answers to tap: short, different from each other, none the person has already been shown."""
+    seen, out = {re.sub(r"\W+", "", a.lower()) for a in avoid}, []
+    for o in (v if isinstance(v, list) else [])[:10]:
+        if not isinstance(o, str):
+            continue
+        t = _finish_text(_brief_line(o, 80), "words").strip(" .")
+        k = re.sub(r"\W+", "", t.lower())
+        if not t or not k or k in seen or k in ("other", "somethingelse", "noneoftheabove", "noneofthese"):
+            continue           # "something else" is always there in the app: the person's own words
+        seen.add(k)
+        out.append(t)
+    return out[:6]
+
+
+@app.route("/api/brief/topics", methods=["POST", "OPTIONS"])
+@limiter.limit(BRIEF_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def brief_topics():
+    """Someone who isn't sure what to research: five topics to choose from, from what they study, do or care about."""
+    data = request.get_json(silent=True) or {}
+    interest = _brief_line(data.get("interest"), 400)
+    kind = data.get("kind") if data.get("kind") in BRIEF_KINDS else "auto"
+    about = _brief_line(data.get("about") or data.get("level"), 400)
+    avoid = _brief_list(data.get("avoid"), 15, 200)
+    if len(interest) < 3:
+        return jsonify({"error": "Say what you study, work on or are curious about, in a few words."}), 400
+    system = (
+        "You help a person who isn't sure what to research choose a topic. " + BRIEF_ANYONE + " From what they say they "
+        "study, work on or care about, suggest five different, specific, researchable topics for " + BRIEF_KINDS[kind] + ". "
+        "Each must be narrow enough to finish, likely to have free published papers, fitted to who they are and what the "
+        "work is for (ABOUT THE PERSON, when given: a doctoral thesis needs a sharper, more original angle than a school "
+        "assignment; an organisation needs a question it can act on), and worded plainly (at most 18 words)"
+        + (", as a question that papers can answer" if kind == "question" else "") + ". Range widely: different angles, "
+        "groups, places, methods or sides of the subject, not five wordings of one idea. Never invent facts. Give each one "
+        "short reason (at most 14 words) why it is a good choice. Never repeat a topic in ALREADY SHOWN. Reply with JSON "
+        "only: {\"topics\": [{\"t\": \"the topic\", \"why\": \"the reason\"}]}.")
+    user = ("WHAT THEY STUDY, WORK ON OR CARE ABOUT: " + interest + ("\nABOUT THE PERSON: " + about if about else "")
+            + ("\nALREADY SHOWN:\n- " + "\n- ".join(avoid) if avoid else ""))
+    try:
+        obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=700, timeout=45, feature="brief-topics"))
+    except Exception as e:
+        logger.warning(f"Brief: topic ideas didn't run: {str(e)[:120]}")
+        return jsonify({"error": "RamzAI couldn’t suggest topics just now. Please try again, or type a topic of your own."}), 502
+    out, seen = [], {re.sub(r"\W+", "", a.lower()) for a in avoid}
+    for x in (obj.get("topics") or [])[:8]:
+        t = _brief_line(x.get("t"), 200) if isinstance(x, dict) else ""
+        k = re.sub(r"\W+", "", t.lower())
+        if t and k not in seen:
+            seen.add(k)
+            out.append({"t": _finish_text(t, "words"), "why": _finish_text(_brief_line(x.get("why"), 160), "words")})
+    if len(out) < 2:
+        return jsonify({"error": "RamzAI couldn’t suggest topics just now. Please try again, or type a topic of your own."}), 502
+    return jsonify({"topics": out[:5]})
+
+
+_BRIEF_VAGUE = re.compile(r"^(?:idk|i don'?t know|not sure|anything|something|any|whatever|help|n/?a|none|nothing|\?+|\.+|ok|okay|yes|no)$", re.I)
+
+
+@app.route("/api/brief/check", methods=["POST", "OPTIONS"])
+@limiter.limit(BRIEF_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def brief_check():
+    """Is what the person typed clear enough to start from? If not: one short question to ask them, with a wide range
+    of answers to tap (they can always answer in their own words instead). When the check itself can't run, the answer
+    is taken as it is (nobody is held up). other=true: the person asked for other answers to the same question."""
+    data = request.get_json(silent=True) or {}
+    text = _brief_line(data.get("text"), 600)
+    kind = data.get("kind") if data.get("kind") in BRIEF_KINDS else "auto"
+    told = _brief_list(data.get("told"), 4, 300)             # what they answered before
+    about = _brief_line(data.get("about"), 400)
+    avoid = _brief_list(data.get("avoid"), 18, 80)           # answers they have already been shown
+    asked = _brief_line(data.get("ask"), 220)                # other=true: the question those answers were for
+    other = bool(data.get("other")) and bool(asked)
+    if not text:
+        return jsonify({"clear": False, "ask": "What would you like this to be about?", "options": []})
+    if not other and (_BRIEF_VAGUE.match(text) or len(text) < 3):
+        return jsonify({"clear": False, "unsure": True,
+                        "ask": "Could you say a little more? A few words on the subject, the people or the place are enough.", "options": []})
+    if not other and len(told) >= 2:                          # asked twice already: their words are taken as they are
+        return jsonify({"clear": True})
+    range_rule = ("Give 4 to 6 short answers they could tap (each at most 9 words), as different from each other as you "
+                  "can, so that together they cover the wide range of what a person could mean: different groups of people, "
+                  "places, fields, levels or meanings, never several versions of one. Don't include 'other' or 'something "
+                  "else': the app always lets them answer in their own words.")
+    if other:
+        system = ("A person typed the TOPIC below to start " + BRIEF_KINDS[kind] + ", and was asked the QUESTION to make it "
+                  "clear. None of the answers shown fitted, and they asked to see others. " + BRIEF_ANYONE + " " + range_rule +
+                  " Never repeat an answer in ALREADY SHOWN. Reply with JSON only: {\"options\": [\"...\"]}.")
+        user = ("TOPIC: " + text + "\nQUESTION: " + asked + ("\nABOUT THE PERSON: " + about if about else "")
+                + ("\nALREADY SHOWN:\n- " + "\n- ".join(avoid) if avoid else ""))
+    else:
+        system = (
+            "A person typed the TOPIC below to start " + BRIEF_KINDS[kind] + ". " + BRIEF_ANYONE + " Decide whether it is "
+            "clear enough to begin: a reader can tell what subject it is about. Be generous: a broad topic, a title in "
+            "capitals, informal words, spelling mistakes or a topic that could be narrower are all CLEAR. It is NOT clear only "
+            "when the subject itself can't be told (a word with several unrelated meanings, an unfinished thought, a reference "
+            "to something you can't see like 'my assignment' or 'chapter 3', or words that don't say a subject at all), or when "
+            "it is one or two words that name only a very wide subject (stress, education, climate change, marketing): that is "
+            "too wide to research well, so ask which part of it, or which people or place. When it is not clear, write ONE "
+            "short, kind question (at most 22 words, plain English) that would settle it. "
+            + range_rule + " Never refuse, never lecture. Reply with JSON only: {\"clear\": true} or "
+            "{\"clear\": false, \"ask\": \"...\", \"options\": [\"...\"]}.")
+        user = ("TOPIC: " + text + ("\nABOUT THE PERSON: " + about if about else "")
+                + ("\nWHAT THEY SAID BEFORE: " + " | ".join(told) if told else ""))
+    try:
+        obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=320, timeout=12, feature="brief-check"))
+    except Exception as e:
+        logger.warning(f"Brief: the clarity check didn't run: {str(e)[:120]}")
+        if other:
+            return jsonify({"error": "RamzAI couldn’t think of other answers just now. You can say it in your own words."}), 502
+        return jsonify({"clear": True, "unchecked": True})
+    if other:
+        opts = _brief_options(obj.get("options"), avoid)
+        if not opts:
+            return jsonify({"error": "RamzAI has no other answers to suggest. You can say it in your own words."}), 404
+        return jsonify({"clear": False, "ask": asked, "options": opts})
+    if obj.get("clear") is not False:
+        return jsonify({"clear": True})
+    ask = _finish_text(_brief_line(obj.get("ask"), 220), "words")
+    if not ask:
+        return jsonify({"clear": True})
+    return jsonify({"clear": False, "ask": ask, "options": _brief_options(obj.get("options"))})
+
+
+BRIEF_REVIEW_MAX = 3            # questions at one time
+BRIEF_REVIEW_ROUNDS = 6         # answers already given in this brief: after that, RamzAI starts with what it has
+
+
+@app.route("/api/brief/review", methods=["POST", "OPTIONS"])
+@limiter.limit(BRIEF_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def brief_review():
+    """Before the person confirms: RamzAI reads the whole brief the way a careful supervisor or editor would, and asks
+    only for what is still vital (missing, unclear or at odds), each question with a wide range of answers to tap. Most
+    short pieces need nothing more. When this can't run, the brief goes ahead as it is."""
+    data = request.get_json(silent=True) or {}
+    kind = data.get("kind") if data.get("kind") in BRIEF_KINDS else "auto"
+    b = data.get("brief") if isinstance(data.get("brief"), dict) else {}
+    topic = _brief_line(b.get("topic"), 400)
+    if not topic:
+        return jsonify({"questions": []})
+    lines = [("TOPIC", topic), ("WHO IT IS FOR", _brief_line(b.get("for"), 200)), ("WHAT IT IS FOR", _brief_line(b.get("purpose"), 160)),
+             ("FOCUS (place or setting)", _brief_line(b.get("place"), 120)), ("WHAT IT IS", _brief_line(b.get("piece"), 120)),
+             ("LENGTH", _brief_line(b.get("length"), 60)), ("CITATIONS", _brief_line(b.get("style"), 60)),
+             ("PAPERS FROM", _brief_line(b.get("years"), 80)), ("KINDS OF SOURCES", _brief_line(b.get("kinds"), 160)),
+             ("READERS", _brief_line(b.get("readers"), 160)), ("IT MUST FOLLOW", _brief_line(b.get("more"), 800)),
+             ("TEMPLATE", _brief_line(b.get("template"), 160)), ("LANGUAGE", _brief_line(b.get("language"), 60)),
+             ("THE WORD FILE", _brief_line(b.get("look"), 160))]
+    heads = _brief_list(b.get("headings"), 30, 90)
+    answered = []
+    for x in (b.get("asked") if isinstance(b.get("asked"), list) else [])[:12]:
+        if isinstance(x, dict) and _brief_line(x.get("q"), 220):
+            answered.append((_brief_line(x.get("q"), 220), _brief_line(x.get("a"), 300) or "(skipped: don't ask again)"))
+    if len(answered) >= BRIEF_REVIEW_ROUNDS:
+        return jsonify({"questions": []})
+    most = 2 if kind == "question" else BRIEF_REVIEW_MAX
+    system = (
+        "You are RamzAI, the research helper in Academic-Home. A person is about to start " + BRIEF_KINDS[kind] + ". "
+        + BRIEF_ANYONE + " Read their BRIEF the way a careful supervisor, editor or client lead would before work begins. "
+        "Decide whether anything VITAL is still missing, unclear or at odds: something that would change what is written, "
+        "and that a careful human would ask before starting. Ask at most " + str(most) + " questions, the most important "
+        "first. Ask NONE when the brief is good enough to start well: most short pieces need none, and it is better to "
+        "start than to quiz people. The higher the stakes (a thesis or dissertation, a proposal, a journal article, a policy "
+        "brief, a report for an organisation or institution), the more it is worth asking.\n"
+        "What is worth asking, when the brief doesn't already say and it matters for this kind of work: which chapter or "
+        "part of a thesis or report this is; the research question, aim or objectives (a proposal, a thesis, an article); "
+        "the planned approach (reviewing what is published, numbers, interviews, both) when the piece must describe a "
+        "method; the theory, model or framework to use (postgraduate work); the group of people, the place or the period "
+        "when the topic is wide and the level calls for a focus; the argument or position (an essay that must argue); the "
+        "decision, problem or audience behind a report or briefing; anything in the brief that contradicts itself (a "
+        "500-word thesis chapter; a policy brief for children).\n"
+        "Never ask what the BRIEF or ALREADY ANSWERED covers. Never ask the same thing in other words. Never ask for "
+        "personal details, for their own data or results (the work is written from published papers), or for anything you "
+        "couldn't use. Never ask about length, citation style, years, kinds of sources, language, the Word file or "
+        "template when they are given.\n"
+        "Each question: plain, kind English, at most 24 words, one thing only. With each give 4 to 6 short answers to tap "
+        "(each at most 9 words), as different from each other as you can so that together they cover the wide range of "
+        "what a person could want; include 'I’m not sure, you choose' as the last answer when choosing for them would "
+        "be sensible. Don't include 'other' or 'something else': the app always lets them answer in their own words. Give "
+        "each a short reason (at most 14 words) why it helps, and a short id (one or two words, lower case). Reply with "
+        "JSON only: {\"questions\": [{\"id\": \"...\", \"ask\": \"...\", \"why\": \"...\", \"options\": [\"...\"]}]} "
+        "(an empty list when nothing is needed).")
+    user = ("BRIEF\n" + "\n".join(f"{k}: {v}" for k, v in lines if v)
+            + ("\nTEMPLATE HEADINGS:\n- " + "\n- ".join(heads) if heads else "")
+            + ("\n\nALREADY ANSWERED\n" + "\n".join(f"Q: {q}\nA: {a}" for q, a in answered) if answered else ""))
+    try:
+        obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=700, timeout=18, feature="brief-review"))
+    except Exception as e:
+        logger.warning(f"Brief: the review didn't run: {str(e)[:120]}")
+        return jsonify({"questions": [], "unchecked": True})
+    out, seen = [], {re.sub(r"\W+", "", q.lower()) for q, _ in answered}
+    for x in (obj.get("questions") if isinstance(obj.get("questions"), list) else [])[:most + 2]:
+        if not isinstance(x, dict):
+            continue
+        ask = _finish_text(_brief_line(x.get("ask"), 240), "words")
+        k = re.sub(r"\W+", "", ask.lower())
+        if not ask or k in seen:
+            continue
+        seen.add(k)
+        qid = re.sub(r"[^a-z0-9]+", "-", _brief_line(x.get("id"), 30).lower()).strip("-") or f"q{len(out) + 1}"
+        opts = []
+        for o in (x.get("options") if isinstance(x.get("options"), list) else [])[:8]:
+            t = _finish_text(_brief_line(o, 80), "words").strip(" .") if isinstance(o, str) else ""
+            if t and re.sub(r"\W+", "", t.lower()) not in ("other", "somethingelse") and t not in opts:
+                opts.append(t)
+        out.append({"id": qid, "ask": ask, "why": _finish_text(_brief_line(x.get("why"), 140), "words"), "options": opts[:6]})
+        if len(out) >= most or len(answered) + len(out) >= BRIEF_REVIEW_ROUNDS:
+            break
+    return jsonify({"questions": out})
+
+
+_BRIEF_HEAD = re.compile(r"^(?:(?:chapter|section|part)\s+\w+[:.\s-]*|\d+(?:\.\d+){0,3}[.)]?\s+|[IVXLC]{1,6}[.)]\s+|[A-Z][.)]\s+)?(.{2,90})$", re.I)
+
+
+def _brief_headings(text):
+    """The lines of a template that read as headings: numbered ("2.1 Methods", "Chapter One"), in capitals, or a short
+    line without a full stop standing on its own."""
+    out, seen = [], set()
+    lines = [re.sub(r"\s+", " ", l).strip() for l in str(text or "").splitlines()]
+    for i, l in enumerate(lines):
+        if not l or len(l) > 90 or len(l.split()) > 12:
+            continue
+        numbered = bool(re.match(r"^(?:(?:chapter|section|part)\s+\w+|\d+(?:\.\d+){0,3}[.)]?\s+\S|[IVXLC]{1,6}[.)]\s+\S)", l, re.I))
+        caps = l.upper() == l and sum(c.isalpha() for c in l) >= 4
+        alone = (l[-1] not in ".,;:?!" and len(l.split()) <= 7 and l[0].isupper()
+                 and (i == 0 or not lines[i - 1]) and (i + 1 >= len(lines) or not lines[i + 1] or len(lines[i + 1]) > 60))
+        if not (numbered or caps or alone):
+            continue
+        key = l.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(l)
+        if len(out) >= 40:
+            break
+    return out
+
+
+@app.route("/api/brief/template", methods=["POST", "OPTIONS"])
+@limiter.limit(HEAVY_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def brief_template():
+    """The person's own template or guide (a Word file, a PDF, slides, plain text, a photo of a page…): its headings and
+    its instructions, in words. The file is read and deleted at once; nothing of it is kept here."""
+    if "file" not in request.files or not request.files["file"].filename:
+        return jsonify({"error": "Choose the file that holds your template or guide."}), 400
+    file = request.files["file"]
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    work_dir = tempfile.mkdtemp(prefix=f"mc_tpl_{uuid.uuid4().hex[:8]}_")
+    try:
+        src_path = os.path.join(work_dir, safe_upload_filename(file.filename)[0])
+        file.save(src_path)
+        text = extract_text(src_path, ext)
+    except ConversionError as e:
+        return jsonify({"error": str(e)}), 422
+    except Exception as e:
+        logger.error(f"Brief: a template couldn't be read: {e}", exc_info=True)
+        return jsonify({"error": "Academic-Home couldn’t read that file. Try a Word file, a PDF or plain text."}), 422
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    text = re.sub(r"[ \t]+", " ", str(text or "")).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(re.sub(r"\W", "", text)) < 30:
+        return jsonify({"error": "That file doesn’t hold a guide in words Academic-Home can read. Try another file, or choose "
+                                 "one of the templates here."}), 422
+    heads = _brief_headings(text)
+    return jsonify({"name": safe_download_name(file.filename), "headings": heads, "guide": text[:3500],
+                    "cut": len(text) > 3500, "words": len(text.split())})
+
+
 _RS_DOWN = re.compile(r"HTTP (?:4(?:08|29)|5\d\d)|failed|timed? ?out|busy|Timeout|ConnectionError|rate", re.I)
 
 
@@ -9401,6 +10640,9 @@ def research_endpoint():
     started = time.time()
     data = request.get_json(silent=True) or {}
     question = re.sub(r"\s+", " ", str(data.get("question") or "")).strip()
+    # 5.0: who the report is for (a doctoral student in nursing, an organisation…), as the person said before starting
+    context = re.sub(r"\s+", " ", str(data.get("context") or "")).strip()[:700]
+    language = re.sub(r"[^\w\s\-’'()]", "", str(data.get("language") or "")).strip()[:40]      # 5.0: the language of the report
     if len(question) < 12 or len(question.split()) < 3:
         return jsonify({"error": "Say a little more: who, where and what you want to know."}), 400
     if len(question) > 400:
@@ -9409,7 +10651,13 @@ def research_endpoint():
         years = int(data.get("years") or 0)
     except (TypeError, ValueError):
         years = 0
-    years = years if years in RS_YEARS else 0
+    years = years if 1 <= years <= 100 else 0            # 5.0: any number of years (4.9: 5, 10 or 20 only)
+    # 5.0: or the years the person chose themselves ("from 2010 to 2018")
+    this_year = datetime.now(timezone.utc).year
+    year_from, year_to = _brief_year(data.get("year_from"), this_year), _brief_year(data.get("year_to"), this_year)
+    if year_from and year_to and year_from > year_to:
+        year_from, year_to = year_to, year_from
+    until = year_to if (year_to and year_to < this_year) else None
     kinds = [k for k in RS_KINDS if k in (data.get("kinds") or [])] or ["article", "review"]
     library = _rs_library(data.get("library"))
     user = request.current_user
@@ -9449,15 +10697,15 @@ def research_endpoint():
         try:
             yield line({"step": "search", "state": "now"})
             stats = {}
-            since = (datetime.now(timezone.utc).year - years + 1) if years else None
+            since = year_from or ((this_year - years + 1) if years else None)
             terms = _paper_terms(question)
             query = " ".join(terms[:8]) if len(terms) >= 2 else _search_topic(question)
-            fs = pool.submit(search_papers, query, 24, since, True, kinds, stats)
+            fs = pool.submit(search_papers, query, 24, since, True, kinds, stats, **({"until": until} if until else {}))
             yield from waiting({fs})
             found, diag = fs.result()
             yield line({"step": "search", "state": "done", "found": stats.get("found", len(found)), "from": stats.get("from", [])})
             yield line({"step": "keep", "state": "now"})
-            papers = _rs_pick(found, library, question, kinds, since)
+            papers = _rs_pick(found, library, question, kinds, since, until)
             if len(papers) < RS_MIN_PAPERS:
                 if not found and diag and _RS_DOWN.search(diag):
                     msg = "The paper search services aren’t answering right now. Please try again in a few minutes."
@@ -9473,7 +10721,7 @@ def research_endpoint():
             yield line({"step": "evidence", "state": "now"})
             by_n = {p["n"]: p for p in papers}
             all_text = " ".join(" ".join(p["sents"]) for p in papers)
-            fw = pool.submit(_rs_write, question, papers, deadline)
+            fw = pool.submit(_rs_write, question, papers, deadline, context, language)
             fe = pool.submit(_rs_evidence, question, papers, deadline)
             pending, evidence, flat, fc = {fw, fe}, None, [], None
             while pending:
@@ -9484,7 +10732,16 @@ def research_endpoint():
                         evidence = f.result()
                         yield line({"step": "evidence", "state": "done", "rows": len(papers)})
                     elif f is fw:
-                        parts = f.result()          # may raise: the research stops, and the point is given back
+                        try:
+                            parts = f.result()      # may raise: the research stops, and the point is given back
+                        except Exception as e:
+                            logger.warning(f"Research failed at the writing: {e.__class__.__name__}: {str(e)[:160]}")
+                            settle(False)
+                            # 4.9.1: say what happened when the AI itself said it (busy, slow, not available)
+                            why = str(e) if isinstance(e, ConversionError) and str(e) in (AI_MSG_BUSY, AI_MSG_SLOW, AI_MSG_UNAVAILABLE) \
+                                else "RamzAI couldn’t finish this research. Please try again."
+                            yield line({"step": "write", "error": why + " This didn’t use any points."})
+                            return
                         yield line({"step": "write", "state": "done"})
                         yield line({"step": "check", "state": "now"})
                         for head, sents in parts:
@@ -9514,6 +10771,15 @@ def research_endpoint():
             parts_out = [(head, [{"t": x["t"], "c": x["c"]} for x in flat if x["h"] == head and x.get("c")]) for _key, head in RS_SECTIONS]
             stats.update(checked=len(flat), removed=len(flat) - len(kept))
             result = _rs_result(question, years, kinds, papers, parts_out, evidence or {}, stats)
+            if year_from or until:           # 5.0: the years the person chose themselves
+                result["asked"].update({k: v for k, v in (("year_from", year_from), ("year_to", until)) if v})
+            if language and language.lower() not in ("english", "en"):      # 5.0: the language it is written in
+                result["asked"]["language"] = language
+                heads = RS_SECTIONS_LANG.get(language.lower())
+                if heads:
+                    names = {en: tr for (_k, en), tr in zip(RS_SECTIONS, heads)}
+                    for sec in result.get("sections") or []:
+                        sec["h"] = names.get(sec["h"], sec["h"])
             yield line({"done": True, "result": result})
             settle(True)
             logger.info(f"Research: {len(papers)} papers, {len(flat)} sentences, {len(kept)} kept, {time.time() - started:.0f}s")
@@ -9623,7 +10889,7 @@ def remy_plan():
                     "params": {str(k)[:30]: (clip(v, 400) if isinstance(v, str) else v) for k, v in params.items() if k},
                     "next": [clip(n, 90) for n in (obj.get("next") or []) if clip(n, 90)][:3],
                     "points": REMY_PLAN_POINTS.get(tool, 0)})
-        if tool in REMY_PLAN_SCHOLAR and not _is_pro(request.current_user) and _free_state(request.current_user)[1] <= 0:
+        if tool in REMY_PLAN_SCHOLAR and not _is_pro(request.current_user) and not _research_open(request.current_user):
             out["scholar"] = REMY_PLAN_SCHOLAR[tool]
     try:
         pts = _points_state(request.current_user)
@@ -9648,7 +10914,12 @@ def write_export_docx_endpoint():
     try:
         result_path = academic_essay_to_docx(
             {"title": title, "text": text, "sections": sections, "references": references, "references_title": str(data.get("references_title") or "References")[:40],
-             "numbered": data.get("numbered") is True},
+             "numbered": data.get("numbered") is True,
+             # 5.0: the numbers' look (Vancouver, IEEE, the person's own numbered style), the look the person chose for the
+             # file, and the citation style it follows (which says where the text is aligned when they didn't choose)
+             "marks": data.get("cite_marks") if data.get("cite_marks") in NUM_MARKS + ("ieee",) else None,
+             "look": data.get("look") if isinstance(data.get("look"), dict) else None, "style": str(data.get("style") or "apa")[:20],
+             "front": data.get("front") if isinstance(data.get("front"), dict) else None},     # 5.0: the title page
             work_dir,
         )
         return send_file(
