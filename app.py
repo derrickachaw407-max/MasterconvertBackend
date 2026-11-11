@@ -2357,6 +2357,8 @@ def _epmc_papers(query, n, since=None, kinds=None, until=None):
         if p:
             p["preprint"] = p["preprint"] or str(x.get("source") or "").upper() == "PPR"
             p["kind"] = "preprint" if p["preprint"] else _kind_epmc(((x.get("pubTypeList") or {}).get("pubType")) or [])
+            if re.fullmatch(r"PMC\d{3,10}", str(x.get("pmcid") or "")):
+                p["pmcid"] = x["pmcid"]          # 5.1: Research reads the paper itself there (its open-access full text)
             out.append(p)
     return out, None if out else "Europe PMC found no open papers with a PDF"
 
@@ -2485,6 +2487,8 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
                     twin["abstract_lent"] = not same_record
         if same_record and not twin.get("biblio") and p.get("biblio"):
             twin["biblio"] = p["biblio"]
+        if same_record and not twin.get("pmcid") and p.get("pmcid"):
+            twin["pmcid"] = p["pmcid"]
         twin["preprint"] = bool(twin.get("preprint") or (same_record and p.get("preprint")))
         if twin.get("doi"):
             twin["url"] = f"https://doi.org/{twin['doi']}"
@@ -7055,19 +7059,19 @@ def _parse_summary_json(raw_text):
     return slides
 
 
-SAGE_SYSTEM_PROMPT = (
+_SAGE_BASE = (
     "You are RamzAI (said 'Ram-zai'; 'Ramz' is Arabic for 'symbol'), Academic-Home's built-in AI assistant — not a narrow, single-purpose tool "
     "like the app's other AI features, but a genuine, open-ended assistant anyone can "
     "bring almost anything to: students and teachers, people at work, and anyone with an "
-    "everyday question. Academic-Home also has purpose-built AI tools that make things a "
-    "chat can't: Research (a short report that answers a question from real papers, with the sentence of the paper "
-    "behind every citation and an evidence table), Slides from a topic (a whole slide deck on a topic, from real research papers), "
-    "Smart Summarize (slides, a revision sheet or a mind map from a document or notes), "
-    "Practice Quiz (a quiz to test yourself), Automatic research writing (RamzAI drafts "
-    "academic writing from real papers, with citations and references) and Manual research writing "
-    "(the person writes in the Word editor while statements from real papers, each with its "
-    "citation and reference, wait beside the page). A request for one of those goes to that "
-    "tool (see the hand-over below); don't mention them as a reflexive sign-off.\n\n"
+    "everyday question. The person chooses how you work: Chat (this), Research (a short report that answers a question "
+    "from real papers, with the sentence of the paper behind every citation and an evidence table) or Study (you teach "
+    "step by step). You can also make things a chat can't, and the app makes them when the person asks you: a whole "
+    "slide deck on a topic from real research papers; slides, a revision sheet, a mind map, exam questions or key terms "
+    "from a document or notes; a practice quiz; Automatic research writing (you write the whole piece from real papers, "
+    "with citations and references, after the person confirms the details) and Manual research writing (you show "
+    "statements from real papers a few at a time, each with its citation and reference, and the person chooses which to "
+    "use in their own page). A request for one of those is handed over (see the hand-over below); don't mention them as "
+    "a reflexive sign-off, and never send the person to look for a tool by a name: tell them to ask you for it.\n\n"
     "What you're actually for: explaining a concept at whatever depth and level "
     "actually fits the person in front of you, working through a problem step by step "
     "rather than only handing over a final answer, writing and improving text (emails, "
@@ -7091,7 +7095,7 @@ SAGE_SYSTEM_PROMPT = (
 
 
 # 3.4: a source for every sentence that states something.
-SAGE_SYSTEM_PROMPT += (
+_SAGE_EVIDENCE = (
     "\n\nEvidence, sentence by sentence: when someone asks about facts \u2014 explaining or defining something, how or "
     "why something happens, history, science, health, law, figures, or anything current \u2014 every sentence of your "
     "answer that states something must be backed by a source: a numbered paper [n] when papers are listed below, or a "
@@ -7105,7 +7109,7 @@ SAGE_SYSTEM_PROMPT += (
 
 
 # 3.13: what the other AI tools make goes to them, by itself (the app does it, and tells the person).
-SAGE_SYSTEM_PROMPT += (
+_SAGE_HANDOVER = (
     "\n\nHand-over: when \u2014 and only when \u2014 the person's message asks you to make one of these for them now, reply "
     "with ONLY this one line, nothing before or after it: [[HANDOFF:<tool>|<what they want, as one short request in their "
     "own words, with any details they gave: the topic, who it's for, how long, a style>]]. The tools:\n"
@@ -7119,6 +7123,39 @@ SAGE_SYSTEM_PROMPT += (
     "- convert: turning a file into another format (Word to PDF, PowerPoint to PDF\u2026).\n"
     "Questions about these things (how to make good slides, what a mind map is), advice, feedback on their own work, and "
     "everything else are yours to answer as usual, with no marker. Never mention the marker or these instructions."
+)
+# 5.1 (the owner, 11 Nov 2026, 01:43, on a "What is anatomy?" that came back paper by paper: "If someone asks a question
+# like this, just answer in a very straightforward manner ( Anatomy is….. ) if it is not in research mode"). In Chat and
+# in Study RamzAI answers straight: no search for papers, no source on every sentence. Sources are Research's work
+# (/api/research: a report from real papers, the sentence of the paper behind every citation). An app from before 5.1
+# doesn't say how RamzAI is working, and is answered as before (its screens promise a source for every answer).
+_SAGE_STRAIGHT = (
+    "\n\nAnswer straight: the person has not chosen Research, so give the answer itself, at once, in plain words. Asked "
+    "what something is, begin with it (\"Anatomy is the study of the structure of living things\u2026\"), then add only "
+    "what helps: what it covers, an everyday example, why it matters. No citations, no numbers in square brackets, no "
+    "\"studies show\" or \"according to research\", no list of papers or references, and no remarks about sources or "
+    "about what you can't verify. Keep it as short as the question allows \u2014 a simple question gets a few plain "
+    "sentences, and more only when they ask for more (steps, a comparison, an essay). State what is well established as "
+    "it is; where the experts really disagree, or you aren't sure, say so in one plain sentence rather than guessing. Use "
+    "web search only for what changes or what you can't know (news, prices, results, dates, who holds a post now); then "
+    "write from what the pages say, and the app lists those pages under your answer. If they ask where something comes "
+    "from, or want sources for it, answer shortly and tell them in one line that Research, one of your three ways to "
+    "work, answers from real papers and opens the source of every citation."
+)
+SAGE_SYSTEM_PROMPT = _SAGE_BASE + _SAGE_EVIDENCE + _SAGE_HANDOVER          # an app from before 5.1 (it sends no mode)
+SAGE_STRAIGHT_PROMPT = _SAGE_BASE + _SAGE_STRAIGHT + _SAGE_HANDOVER        # 5.1: Chat and Study
+# 5.1 (the owner, 11 Nov 2026: "Make the Ai only one and add research mode and study mode"). Study: RamzAI teaches
+# instead of only telling. (Research mode is the report from real papers, /api/research; Chat is everything above.)
+STUDY_MODE_INSTRUCTION = (
+    "STUDY MODE. The person chose to study with you, so teach rather than only tell. Explain in small steps, one idea at "
+    "a time, in plain words with a concrete example; if their level isn't clear, pitch it for a first-year student and "
+    "adjust from how they answer. After you explain something, ask ONE short question whose answer shows whether they "
+    "understood it (never just 'Does that make sense?'), then stop and wait. When they answer, say plainly what was "
+    "right, correct what was wrong and say why, then go on to the next step. If they ask to be tested, ask one question "
+    "at a time and tell them how they are doing as you go. If they are stuck on a problem, give a hint first, and the "
+    "full working only when they ask or are still stuck. Keep each reply short enough to read on a phone. Teach what is "
+    "well established, plainly, as above: no citations. A request to MAKE a quiz, slides, a revision sheet, a mind map "
+    "or key terms still goes to its tool by the hand-over above."
 )
 _HANDOFF_RX = re.compile(r"\[\[\s*HANDOFF\s*:\s*(deck|summarize|quiz|write|convert|research)(?:\s*:\s*(slides|map|sheet|terms|questions))?"
                          r"\s*(?:\|([^\]]{0,800}))?\]\]", re.I)
@@ -7744,14 +7781,16 @@ def _c34_number(text, papers, pages):
     return out, used, web
 
 
-def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment, report=None):
+def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment, report=None, enforce=True):
     """RamzAI's answer with a source on every sentence that states something (see the top of this patch).
-    Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced)."""
+    Returns (text, papers cited, web pages: the cited ones numbered, then others the search found, unsourced).
+    enforce=False (5.1, a straight answer in Chat or Study): no sentence is checked, taken out or given a source; the
+    pages the web search itself grounded a passage in are still numbered and listed."""
     text = _C34_AFTER.sub(lambda m: (" " if m.group(2).strip().startswith("[") else "") + m.group(2).strip() + m.group(1), text)
     is_cited = _c34_remy_cited(papers)
     has_cite = bool(C34_WMARK.search(text)) or (bool(papers) and any(is_cited(m.group(0)) for m in _REMY_CITE.finditer(text)))
     unsourced = 0
-    if not attachment and (papers or pages) and (has_cite or topic_q):
+    if enforce and not attachment and (papers or pages) and (has_cite or topic_q):
         lines = []
         for i, p in enumerate(papers, 1):
             lines.append(f"[P{i}] {p.get('title', '')} ({p.get('year') or 'n.d.'})" + (f" \u2014 {str(p.get('abstract'))[:600]}" if p.get("abstract") else ""))
@@ -7784,7 +7823,7 @@ def _c34_remy(text, papers, pages, found, message, topic_q, started, attachment,
 
         text, unsourced = _c34_enforce("remy", text, message, is_cited, lines, mark, started + 50, allow_skip=not has_cite,
                                        cited_ids=own, unmark=bare, evidence_text=ev, abstract_text=abstracts, report=report)
-    elif topic_q and not has_cite:
+    elif enforce and topic_q and not has_cite:
         # a question about facts, and nothing found to back the answer: it stays, and says so
         need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
         unsourced = len(need) if len(need) >= 2 else 0
@@ -7928,7 +7967,11 @@ def sage_endpoint():
     # RamzAI's memory (when the person allows it): what RamzAI noted before, and
     # permission to note one new durable thing — taken out of the reply below.
     memory_on = _memory_on(request.current_user)
-    system_prompt = SAGE_SYSTEM_PROMPT
+    # 5.1: the app says how RamzAI is working. Chat and Study answer straight ("Anatomy is…"): no search for papers and
+    # no source on every sentence; an older app says nothing and is answered as before.
+    mode = str(data.get("mode") or "").strip().lower()
+    straight = mode in ("chat", "study")
+    system_prompt = SAGE_STRAIGHT_PROMPT if straight else SAGE_SYSTEM_PROMPT
     if memory_on:
         notes = get_user_memory(request.current_user["id"])
         if notes:
@@ -7936,11 +7979,16 @@ def sage_endpoint():
                 "\n\nWhat you remember about this person from earlier — use it naturally where it "
                 "genuinely helps; don't recite it back: " + "; ".join(notes))
         system_prompt += "\n\n" + MEMORY_INSTRUCTION
+    # 5.1: the person chose to study with RamzAI (the app sends mode "study"): it teaches, a step at a time
+    if mode == "study":
+        system_prompt += "\n\n" + STUDY_MODE_INSTRUCTION
     # 5.0.2: RamzAI is no longer asked to write out its thinking before the answer ("How I worked it out"): since
     # November 2026 the AI service declines every request that asks its strong model for that, with an empty answer.
     # Evidence first (3.0): a question about a topic gets real open papers to ground the answer.
     papers = []
-    topic_q = not attachment and _remy_wants_papers(message)
+    topic_q = not straight and not attachment and _remy_wants_papers(message)
+    # the news, a score, a price: its answer is written from pages found now, in every mode (never from memory alone)
+    live_q = not attachment and _remy_live_q(message)
     if topic_q:
         try:
             papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
@@ -7987,8 +8035,8 @@ def sage_endpoint():
         noted = note[:300]          # 4.5: the person sees what RamzAI noted, and can change it
     report = {}
     reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
-                                           message, topic_q or (not attachment and _remy_live_q(message)), started,
-                                           bool(attachment), report)
+                                           message, topic_q or live_q, started, bool(attachment), report,
+                                           enforce=not straight or live_q)
     reply = C34_WMARK.sub("", reply)
     return jsonify({"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
                     "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced,
@@ -9980,7 +10028,7 @@ def _rs_library(raw):
             out.append({"title": title, "authors": authors or None, "year": year, "venue": (str(it.get("venue") or "")[:200] or None),
                         "doi": _norm_doi(it.get("doi")), "pdf": pdf if pdf.startswith("http") else None, "url": url if url.startswith("http") else None,
                         "abstract": abstract, "abstract_full": abstract, "kind": was, "preprint": was == "preprint", "lib": "saved",
-                        "cites": 0, "biblio": _rs_biblio(it.get("biblio"))})
+                        "cites": 0, "biblio": _rs_biblio(it.get("biblio")), "own_link": True})
         elif kind == "mine":
             text = re.sub(r"[ \t]+", " ", str(it.get("text") or "")).strip()[:12000]
             if len(text) < 300:
@@ -10066,6 +10114,816 @@ def _rs_pick(found, library, question, kinds, since, until=None):
     return out
 
 
+# ======================= 5.1: Research reads the papers themselves =======================
+# The owner, 11 Nov 2026, 01:43: "In research mode, I prefer you read from the papers themselves other than the
+# abstracts." For each paper Research keeps, its own text is read where the paper is free to open: Europe PMC's full
+# text when the paper is in its open-access set, otherwise the free PDF the search found. What is taken from it:
+#   - only the paper's own parts (methods, results, discussion, conclusion; a paper with no such headings: its text up
+#     to the references), never its introduction or its review of other work;
+#   - only whole sentences, word for word, that cite no other work and don't speak of "previous studies" (so a quote is
+#     always what this paper itself says, never what it reports of another);
+#   - from a PDF, only sentences that two separate readings of the file give letter for letter (so a line from the
+#     margin, a note or the next column is never joined into a quote);
+#   - the sentences that bear on the question (and a few about how the study was done), not the whole text.
+# The file is checked to be that paper (its title and its abstract's own words on its first page). When a paper can't
+# be opened, isn't that paper, is a scan or is too large, its abstract is used as before, and the person is told how
+# many papers were read themselves. Safety: https only, public addresses only (checked again at every redirect), a
+# size and a time limit, the PDF read by a child process with limits, and the file deleted at once: nothing of a paper
+# is kept. A link the person's own app sent (a saved paper the search didn't also find) is never opened: only links
+# the indexes gave, and Europe PMC by the paper's own id or DOI.
+import bisect
+import ipaddress as _ipaddress
+import socket as _socket
+import subprocess as _subprocess
+from lxml import etree as _etree
+
+RS_READ_SECONDS = 25                  # for all the papers of one research together
+RS_READ_AT_ONCE = 5
+RS_FILE_MAX = 10 * 1024 * 1024        # a paper's file: at most 10 MB is taken
+RS_XML_MAX = 3 * 1024 * 1024
+RS_PAGES_MAX = 80                     # of a long work (a thesis, a book, a report) the first 80 pages are read
+RS_TEXT_MAX = 420000                  # the characters of a paper that are looked at
+RS_BODY_MAX = 22                      # sentences taken from a paper's own text (its abstract's come first)
+RS_BODY_CHARS = 5200
+RS_OWN_MIN = 6                        # fewer whole sentences than this, and the file wasn't really read
+_RS_PDF_SLOTS = _threading.BoundedSemaphore(2)        # this box is small: two files are parsed at a time
+# what a sentence's place in the paper is called, for the app: a(bstract), m(ethods), r(esults), d(iscussion),
+# c(onclusion), b (the paper's text, when it has no such headings)
+_RS_WHERE = {"methods": "m", "results": "r", "discussion": "d", "conclusion": "c", "body": "b"}
+
+
+class _RsNo(Exception):
+    """Why a paper's own text wasn't read, as a short code: no_file, not_public, refused, gone, unreachable, slow, big,
+    not_pdf, scan, other_paper, long, unclear."""
+
+
+def _rs_alnum(s):
+    return re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKC", str(s or "")).lower())
+
+
+# ---- a public address, and nothing else
+def _rs_public_ip(a):
+    try:
+        ip = _ipaddress.ip_address(str(a).split("%")[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return bool(ip.is_global) and not ip.is_multicast
+
+
+def _rs_public_url(url):
+    """The address, when Research may open it: https on its usual port, no name and password in it, a host with a
+    name (never a bare number) whose every address is a public one. None otherwise."""
+    try:
+        u = urlparse(str(url or "").strip())
+        if u.scheme != "https" or not u.hostname or u.username or u.password or u.port not in (None, 443):
+            return None
+        host = u.hostname.strip(".").lower()
+        if (not host or "." not in host or len(host) > 253 or host == "localhost"
+                or host.endswith((".local", ".localhost", ".internal", ".intranet", ".lan", ".home", ".corp", ".test", ".onion"))):
+            return None
+        try:
+            _ipaddress.ip_address(host)
+            return None                                    # a bare address is never a paper's home
+        except ValueError:
+            pass
+        addrs = _rs_addresses(host)
+        if not addrs or not all(_rs_public_ip(a) for a in addrs):
+            return None
+        return u.geturl()
+    except Exception:
+        return None
+
+
+def _rs_addresses(host):
+    """Every address a host name answers at."""
+    return {i[4][0] for i in _socket.getaddrinfo(host, 443, type=_socket.SOCK_STREAM)}
+
+
+def _rs_peer_public(resp):
+    """The address the answer really came from is a public one (when it can be seen; the check before stands anyway,
+    and so does the certificate: an inside address has none for the paper's host)."""
+    try:
+        conn = getattr(resp.raw, "_connection", None) or getattr(resp.raw, "connection", None)
+        sock = getattr(conn, "sock", None)
+        peer = sock.getpeername()[0] if sock else None
+        return True if not peer else _rs_public_ip(peer)
+    except Exception:
+        return True
+
+
+def _rs_session():
+    s = requests.Session()
+    s.trust_env = False               # no proxy from the surroundings: the address checked is the address asked
+    return s
+
+
+def _rs_download(url, path, until, max_bytes=RS_FILE_MAX):
+    """Saves what a public https address gives to path (redirects are followed by hand, each one checked).
+    Raises _RsNo."""
+    url = str(url or "").strip()
+    sess = _rs_session()
+    try:
+        for _hop in range(5):
+            if url[:7].lower() == "http://":
+                url = "https://" + url[7:]
+            ok = _rs_public_url(url)
+            if not ok:
+                raise _RsNo("not_public")
+            left = until - time.time()
+            if left < 1.5:
+                raise _RsNo("slow")
+            try:
+                r = sess.get(ok, headers=dict(_PAPER_UA, Accept="application/pdf,*/*;q=0.5"), stream=True, allow_redirects=False,
+                             timeout=(min(4, left), min(7, left)))
+            except requests.exceptions.Timeout:
+                raise _RsNo("slow")
+            except requests.exceptions.RequestException:
+                raise _RsNo("unreachable")
+            try:
+                if r.status_code in (301, 302, 303, 307, 308):
+                    url = requests.compat.urljoin(ok, str(r.headers.get("Location") or ""))
+                    continue
+                if r.status_code in (401, 402, 403, 407, 429, 451):
+                    raise _RsNo("refused")
+                if r.status_code in (404, 410):
+                    raise _RsNo("gone")
+                if r.status_code != 200:
+                    raise _RsNo("unreachable")
+                if not _rs_peer_public(r):
+                    raise _RsNo("not_public")
+                size = str(r.headers.get("Content-Length") or "")
+                if size.isdigit() and int(size) > max_bytes:
+                    raise _RsNo("big")
+                got = 0
+                try:
+                    with open(path, "wb") as f:
+                        for chunk in r.iter_content(65536):
+                            got += len(chunk)
+                            if got > max_bytes:
+                                raise _RsNo("big")
+                            if time.time() > until:
+                                raise _RsNo("slow")
+                            f.write(chunk)
+                except requests.exceptions.Timeout:
+                    raise _RsNo("slow")
+                except requests.exceptions.RequestException:
+                    raise _RsNo("unreachable")
+                return ok
+            finally:
+                r.close()
+        raise _RsNo("unreachable")                       # it only sends on, and on
+    finally:
+        sess.close()
+
+
+# ---- a paper's parts, by their headings
+_RS_SECS = (
+    ("refs", re.compile(r"^(?:references?(?: list| cited| and notes)?|notes and references|bibliography|selected bibliography|works (?:cited|consulted)|"
+                        r"literature(?: cited)?|cited literature|sources(?: cited)?|list of references|citations|références(?: bibliographiques)?|bibliographie|"
+                        r"referencias(?: bibliográficas)?|bibliografía|referências(?: bibliográficas)?|bibliografia|literatur|literaturverzeichnis|quellen)$")),
+    ("back", re.compile(r"^(?:acknowledge?ments?|funding(?: information| statement| sources?)?|financial (?:support|disclosure)|conflicts? of interests?|"
+                        r"competing interests?|declarations?(?: of .*)?|disclosures?(?: statement)?|authors?['’]?s? contributions?|"
+                        r"credit author(?:ship)? .*|data availability(?: statement)?|availability of data.*|supplementary (?:materials?|information|data)|"
+                        r"supporting information|appendi(?:x|ces)(?: [a-z0-9]+)?|abbreviations|ethic(?:s|al) (?:statement|approval|considerations?|declarations?).*|"
+                        r"consent .*|notes?|footnotes?|endnotes?|orcid(?: ids?)?|publisher['’]?s note|about the authors?|"
+                        r"author (?:information|biograph(?:y|ies)|details)|biographical notes?|additional information)$")),
+    ("intro", re.compile(r"^(?:introduction|general introduction|background(?: and .*| to the study| of the study)?|literature review|"
+                         r"review of (?:the )?(?:related |relevant )?literature|related (?:work|works|literature|studies|research)|"
+                         r"theoretical (?:framework|background|perspectives?)|conceptual framework|(?:empirical|theoretical) literature(?: review)?|"
+                         r"prior (?:work|research)|previous (?:work|research|studies)|context(?: of the study)?|overview|rationale|"
+                         r"statement of the problem|problem statement|introduction and (?:background|literature review))$")),
+    ("methods", re.compile(r"^(?:methods?|methodology|materials? and methods?|methods? and materials?|research (?:design|methods?|methodology|approach)|"
+                           r"study (?:design|area|setting|population|sample|site)(?: and .*)?|design(?: and .*)?|participants?(?: and .*)?|"
+                           r"subjects?(?: and methods?)?|patients? and methods?|samples?(?: and .*)?|sampling(?: .*)?|"
+                           r"data(?: collection| sources?| analysis| and methods?| and methodology)?(?: (?:procedures?|methods?|techniques?))?|procedures?|"
+                           r"measures?|instruments?|instrumentation|setting|statistical analys[ie]s|analys[ie]s|analytic(?:al)? (?:strategy|approach)|"
+                           r"experimental(?: (?:design|section|procedures?|setup))?|search strategy|eligibility criteria|"
+                           r"inclusion (?:and exclusion )?criteria|empirical strategy|model specification|the (?:present|current) study)$")),
+    ("results", re.compile(r"^(?:results?|findings?|results? and discussions?|findings? and discussions?|discussions? of (?:the )?(?:results?|findings?)|"
+                           r"(?:main|key|empirical|quantitative|qualitative|descriptive|experimental|study) (?:results?|findings?)|outcomes?|"
+                           r"analys[ie]s and (?:results?|findings?)|results? and analys[ie]s|presentation of (?:the )?(?:results?|findings?)|"
+                           r"data analysis and (?:results?|findings?|discussion))$")),
+    ("discussion", re.compile(r"^(?:discussions?|general discussion|discussion and (?:conclusions?|implications?|recommendations?)|implications?|"
+                              r"(?:practical|policy|clinical|theoretical) implications|implications for (?:practice|policy|research)|limitations?|"
+                              r"(?:study )?limitations|strengths? and limitations?(?: of (?:the|this) study)?|limitations of (?:the|this) study|interpretation)$")),
+    ("conclusion", re.compile(r"^(?:conclusions?|concluding (?:remarks?|comments?|thoughts)|summary(?: and conclusions?| of (?:the )?findings?)?|"
+                              r"conclusions? and (?:recommendations?|implications?|future (?:work|research|directions?)|policy implications)|"
+                              r"recommendations?|future (?:work|research|directions?)|closing remarks?|summary and recommendations?|final remarks?)$")),
+)
+_RS_HEAD_NUM = re.compile(r"^\s*(?:(?:chapter|section|part)\s+)?(?:(?:\d{1,2}(?:\.\d{1,2}){0,3}|[IVX]{1,5}|[A-H])\s*[.):]\s*|(?:\d{1,2}(?:\.\d{1,2}){0,3}|[IVX]{1,5})\s+)?")
+_RS_SECTYPE = {"intro": "intro", "introduction": "intro", "background": "intro", "methods": "methods", "materials": "methods", "subjects": "methods",
+               "results": "results", "findings": "results", "discussion": "discussion", "conclusions": "conclusion", "conclusion": "conclusion",
+               "supplementary-material": "back", "ack": "back", "coi-statement": "back", "data-availability": "back"}
+
+
+def _rs_sec_cat(title):
+    """The part of a paper a heading opens: "intro", "methods", "results", "discussion", "conclusion", "back" (what
+    follows the paper's own text: thanks, funding, appendices) or "refs". None for a heading of the paper's own."""
+    t = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not t or len(t) > 80:
+        return None
+    t = _RS_HEAD_NUM.sub("", t, count=1).strip(" :.–—-").lower()
+    if not t or len(t.split()) > 8:
+        return None
+    for cat, rx in _RS_SECS:
+        if rx.match(t):
+            return cat
+    return None
+
+
+# ---- a paper's own sentences
+_RS_NOT_NAME = ("In|On|At|By|Of|To|And|Or|For|From|Since|Until|Till|During|Between|After|Before|Around|About|Circa|Throughout|Through|"
+                "Early|Late|Mid|Year|Years|Vision|Agenda|Act|Version|Census|Survey|Report|January|February|March|April|May|June|July|"
+                "August|September|October|November|December|Spring|Summer|Autumn|Fall|Winter|Table|Figure|Wave|Round|Cohort|Class|Season|"
+                "Covid|COVID|Over|Under|Late|As|The|Both|Only|Edition")
+_RS_CITES = re.compile(
+    r"\[\s*\d{1,3}(?:\s*[,;–\-]\s*\d{1,3})*\s*\]"                                                   # [12], [3, 4], [5–7]
+    r"|\(\s*(?:[^()]{0,200}?[,\s])?(?:1[5-9]|20)\d{2}[a-z]?(?:\s*[,;:][^()]{0,200})?\s*\)"              # (Mensah, 2019), (2019), (see Adu 2020, p. 4)
+    r"|\bet\s+al\b\.?|\bibid\b|\bop\.\s?cit\b"
+    r"|\b(?!(?:" + _RS_NOT_NAME + r")\b)[A-Z][A-Za-z'’\-]+(?:\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]+)?(?:'s|’s)?\s+\(?(?:1[5-9]|20)\d{2}[a-z]?\b"   # Mensah (2019), Mensah and Adu 2019
+    r"|(?<=[a-z\)\]”\"])[.,]?\d{1,3}(?:[,–\-]\d{1,3})*(?=\s|$|[.,;:])")                       # infections12 / outcomes.3,4: a note set small
+# a sentence about what others found ("as reported by…", "it is well known that…"), or about what the authors set out or
+# expected to find, is not a finding of this paper
+_RS_OTHERS_SAY = re.compile(r"\b(?:and (?:colleagues|co-?workers|associates)|according to|as (?:reported|noted|shown|described|found|suggested|argued|proposed|observed) (?:by|in)|"
+                            r"(?:reported|noted|shown|described|found|suggested|argued|proposed|observed|documented|demonstrated) (?:by|in) (?:others|other|earlier|previous|prior|several|many)|"
+                            r"(?:in line|in keeping|in agreement|in accordance|consistent|at odds|in contrast|inconsistent) with (?:the )?(?:findings|results|work|studies|literature|reports?|evidence|"
+                            r"those|that|previous|earlier|prior|other|others)|(?:similar|comparable|contrary) to (?:the )?(?:findings|results|those|that|previous|earlier|prior|other|what)|"
+                            r"(?:has|have) (?:long |also |often |already |previously |repeatedly )?been (?:shown|reported|found|documented|demonstrated|suggested|argued|established|described|"
+                            r"observed|noted|proposed|recognized|recognised|studied|linked|associated)|it is (?:well[- ])?(?:known|established|documented|recognized|recognised|accepted)|"
+                            r"the (?:existing |available |published |wider |broader )?literature|(?:scholars|authors|researchers|investigators|others) (?:have|has|had)|"
+                            r"(?:studies|research|work|evidence|reports?) (?:from|in|on|by) (?:other|elsewhere)|elsewhere)\b", re.I)
+_RS_NOT_FOUND = re.compile(r"\b(?:hypothes[ie][sz]\w*|hypothes[ie]s|we (?:expect|predict|anticipat|assum|presum)\w*|it was (?:expected|predicted|anticipated|assumed)|"
+                           r"(?:aims?|objectives?|purposes?|goals?) (?:of|was|were|is|are)\b|(?:aim|aims|aimed|seek|seeks|sought|set out|intend|intends|intended) to\b|"
+                           r"research questions?|remains? (?:unclear|unknown|to be)|(?:is|are) (?:needed|required|warranted))\b", re.I)
+_RS_NOT_SENTENCE = re.compile(r"https?://|www\.|@|©|\bdoi\b|\bISSN\b|\bISBN\b|\bcopyright\b|all rights reserved|creative commons|\blicen[cs]e[sd]?\b|"
+                              r"open[- ]access|\bpeer[- ]review(?:ed)? under\b|\bcorresponding author\b|⟦", re.I)
+_RS_NOT_START = re.compile(r"^[\"“'(\[]?(?:Tables?|Figures?|Figs?\.?|Supplementary|Supplemental|Appendix|Notes?|Sources?|Keywords?|Key words|Received|Accepted|"
+                           r"Published|Correspondence|Citation|Cite this|Funding|Abbreviations?|Copyright|Available|Retrieved|Downloaded)\b", re.I)
+
+
+def _rs_clean_sentence(s):
+    """A sentence Research may quote from a paper's own text: whole, the paper's own (it cites no other work and doesn't
+    speak of earlier studies), about what was done or found (not a plan), and plain prose (not a row of a table, a
+    caption, a formula or the small print)."""
+    if not 60 <= len(s) <= 520 or not re.match(r"[\"“'(\[]?[A-Z]", s):
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z'’\-]*", s)
+    if len(words) < 9:
+        return False
+    plain = sum(1 for ch in s if ch.isalpha() or ch == " ") / len(s)
+    if plain < 0.5 or (plain < 0.62 and len(words) < 12):
+        return False
+    if s.count("(") != s.count(")") or s.count("[") != s.count("]") or s.count("“") != s.count("”"):
+        return False
+    if _RS_NOT_SENTENCE.search(s) or _RS_NOT_START.match(s):
+        return False
+    if _RS_CITES.search(s) or _RS_OTHER_CLAUSE.search(s) or _RS_PLAN.search(s) or _RS_OTHERS_SAY.search(s) or _RS_NOT_FOUND.search(s):
+        return False
+    if re.search(r"(?:\b[A-Z]{2,}\b[ ,:]+){6,}", s) or re.search(r"(?:\b\w\b\s+){5,}", s):
+        return False                                   # a line of capitals run into the text, or letters set apart
+    return True
+
+
+def _rs_own_sentences(blocks):
+    """[(sentence, part)] from [(part, paragraph, broken)]: the whole sentences of a paper's own parts."""
+    out = []
+    for cat, text, broken in blocks:
+        if cat not in _RS_WHERE:
+            continue
+        sents = _rs_split(text, limit=400)
+        if broken:
+            sents = sents[1:]                          # the paragraph began in the middle of a sentence
+        out.extend((s, cat) for s in sents if _rs_clean_sentence(s))
+    return out
+
+
+_RS_FINDING = re.compile(r"\b(?:found|findings?|show(?:s|ed|n)?|reveal(?:s|ed)?|indicat(?:e|es|ed)|suggest(?:s|ed)?|demonstrat(?:e|es|ed)|"
+                         r"report(?:s|ed)?|observ(?:e|ed)|result(?:s|ed)?|increas(?:e|es|ed)|decreas(?:e|es|ed)|improv(?:e|es|ed|ement)|"
+                         r"reduc(?:e|es|ed|tion)|declin(?:e|es|ed)|associat(?:ed|ion)|correlat(?:ed|ion)|significant(?:ly)?|higher|lower|greater|"
+                         r"fewer|more likely|less likely|effects?|effective|impact|differences?|predict(?:s|ed|ors?)?|conclude[sd]?|evidence|"
+                         r"compared|outcomes?|scored?|gains?)\b", re.I)
+
+
+def _rs_stems(terms):
+    """The question's words without their endings ("tutoring" → "tutor", "reading" → "read"), so that a paper's
+    "tutored pupils read…" counts as being about them."""
+    out = []
+    for t in terms:
+        st = re.sub(r"(?:ing|ed|es|s|ions?|ments?)$", "", t)
+        out.append(st if len(st) >= 4 else t)
+    return out
+
+
+def _rs_choose(own, terms, abstract_sents, limit=RS_BODY_MAX, chars=RS_BODY_CHARS):
+    """From a paper's own sentences [(sentence, part)], the ones Research reads closely: what it found (its results and
+    conclusions; from its discussion or a paper without such headings, the sentences that speak of the question), the
+    ones nearest the question first, and up to three on how the study was done. In the paper's order; none that the
+    abstract already says."""
+    abs_keys = {_rs_alnum(s) for s in abstract_sents}
+    abs_text = " ".join(abstract_sents)
+    stems = _rs_stems(terms)
+    seen, scored = set(), []
+    for i, (s, cat) in enumerate(own):
+        k = _rs_alnum(s)
+        if k in seen or k in abs_keys or _c45_copied(s, abs_text, run=12):
+            continue
+        seen.add(k)
+        low = s.lower()
+        hits = sum(1 for t in stems if t in low)
+        figure = bool(re.search(r"\d", s))
+        if cat == "methods":
+            score = (2.5 if _RS_SELF.search(s) and figure else 0) + (1.5 if any(rx.search(s) for rx, _ in _RS_DESIGNS) else 0) + hits * 0.5
+        else:
+            if not hits and cat not in ("results", "conclusion"):
+                continue
+            score = (hits * 3 + {"results": 2.0, "conclusion": 2.0, "discussion": 1.5}.get(cat, 1.0) + (1.2 if _RS_FINDING.search(s) else 0)
+                     + (0.8 if figure else 0) - (0.6 if len(s) > 380 else 0))
+        if score > 0:
+            scored.append((score, i))
+    how = sorted((x for x in scored if own[x[1]][1] == "methods"), key=lambda x: (-x[0], x[1]))[:3]
+    rest = sorted((x for x in scored if own[x[1]][1] != "methods"), key=lambda x: (-x[0], x[1]))
+    keep, used = [], 0
+    for _score, i in how + rest:
+        if len(keep) >= limit:
+            break
+        n = len(own[i][0])
+        if used + n > chars:
+            continue
+        keep.append(i)
+        used += n
+    return [own[i] for i in sorted(keep)]
+
+
+# ---- Europe PMC's full text (JATS)
+def _rs_jats_text(el):
+    """An element's words. A citation of other work, a note, a formula or a link leaves a mark (⟦…⟧), so
+    that the sentence it stands in is never quoted; a table or a figure inside the paragraph is left out."""
+    out = [el.text or ""]
+    for ch in el:
+        tag = _etree.QName(ch).localname if isinstance(ch.tag, str) else ""
+        if tag == "xref":
+            kind = (ch.get("ref-type") or "").lower()
+            out.append(_rs_jats_text(ch) if kind in ("fig", "table", "sec", "app", "supplementary-material", "disp-formula", "boxed-text", "scheme", "list") else "⟦r⟧")
+        elif tag in ("inline-formula", "disp-formula", "tex-math", "math", "ext-link", "uri", "email", "fn", "named-content-uri"):
+            out.append("⟦x⟧")
+        elif tag in ("table-wrap", "table", "fig", "fig-group", "graphic", "inline-graphic", "media", "supplementary-material", "alternatives",
+                     "disp-formula-group", "chem-struct-wrap", "table-wrap-foot", "caption", "label", "object-id"):
+            pass
+        elif tag:
+            out.append(_rs_jats_text(ch))
+        out.append(ch.tail or "")
+    return "".join(out)
+
+
+def _rs_jats_blocks(data):
+    """An article's own text from Europe PMC's XML: ([(part, paragraph, False)], {"doi", "title"}) — (None, {}) when it
+    can't be read."""
+    try:
+        parser = _etree.XMLParser(resolve_entities=False, no_network=True, load_dtd=False, dtd_validation=False, recover=True,
+                                  huge_tree=False, remove_comments=True, remove_pis=True)
+        root = _etree.fromstring(data, parser)
+    except Exception:
+        return None, {}
+    if root is None:
+        return None, {}
+    local = lambda e: _etree.QName(e).localname if isinstance(e.tag, str) else ""
+    body = next((e for e in root.iter() if local(e) == "body"), None)
+    doi = next(((e.text or "").strip() for e in root.iter() if local(e) == "article-id" and (e.get("pub-id-type") or "").lower() == "doi"), None)
+    title = next((" ".join(_rs_jats_text(e).split()) for e in root.iter() if local(e) == "article-title"), "")
+    blocks = []
+
+    def walk(node, cat):
+        for ch in node:
+            tag = local(ch)
+            if tag == "sec":
+                t = next((" ".join(_rs_jats_text(x).split()) for x in ch if local(x) == "title"), "")
+                kind = re.split(r"[|\s,]", (ch.get("sec-type") or "").lower())[0]
+                walk(ch, _rs_sec_cat(t) or _RS_SECTYPE.get(kind) or cat)
+            elif tag == "p":
+                text = " ".join(_rs_jats_text(ch).split())
+                if text:
+                    blocks.append((cat, text, False))
+            elif tag in ("list", "list-item", "boxed-text", "disp-quote", "def-list", "def-item", "def", "statement"):
+                walk(ch, cat)
+
+    if body is not None:
+        walk(body, "body")
+    return blocks, {"doi": doi, "title": title}
+
+
+def _rs_epmc_id(p, until):
+    """The paper's id in Europe PMC's open-access set ("PMC…"): from its record, or looked up by its DOI. None when it
+    isn't there."""
+    pm = str(p.get("pmcid") or "")
+    if re.fullmatch(r"PMC\d{3,10}", pm):
+        return pm
+    doi = str(p.get("doi") or "")
+    left = until - time.time()
+    if left < 3 or not re.fullmatch(r"10\.\d{4,9}/[^\s\"<>]{1,200}", doi):
+        return None
+    try:
+        r = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                         params={"query": f'DOI:"{doi}"', "format": "json", "resultType": "lite", "pageSize": 2}, headers=_PAPER_UA, timeout=min(5, left))
+        if r.status_code != 200:
+            return None
+        for x in ((r.json() or {}).get("resultList") or {}).get("result") or []:
+            if (isinstance(x, dict) and _norm_doi(x.get("doi")) == doi and str(x.get("isOpenAccess") or "").upper() == "Y"
+                    and re.fullmatch(r"PMC\d{3,10}", str(x.get("pmcid") or ""))):
+                return x["pmcid"]
+    except Exception:
+        pass
+    return None
+
+
+def _rs_from_epmc(pmcid, p, until):
+    """[(part, paragraph, False)] of the paper, from Europe PMC. Raises _RsNo."""
+    left = until - time.time()
+    if left < 2:
+        raise _RsNo("slow")
+    try:
+        r = requests.get(f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML", headers=_PAPER_UA, stream=True,
+                         timeout=(min(4, left), min(8, left)))
+    except requests.exceptions.Timeout:
+        raise _RsNo("slow")
+    except requests.exceptions.RequestException:
+        raise _RsNo("unreachable")
+    data = bytearray()
+    try:
+        if r.status_code != 200:
+            raise _RsNo("gone" if r.status_code in (404, 410) else "unreachable")
+        for chunk in r.iter_content(65536):
+            data += chunk
+            if len(data) > RS_XML_MAX:
+                raise _RsNo("big")
+            if time.time() > until:
+                raise _RsNo("slow")
+    except requests.exceptions.Timeout:
+        raise _RsNo("slow")
+    except requests.exceptions.RequestException:
+        raise _RsNo("unreachable")
+    finally:
+        r.close()
+    blocks, meta = _rs_jats_blocks(bytes(data))
+    if blocks is None:
+        raise _RsNo("unclear")
+    # the same paper: by its DOI, or (when one of the two has none) by its title
+    if p.get("doi") and _norm_doi(meta.get("doi")):
+        if _norm_doi(meta.get("doi")) != p["doi"]:
+            raise _RsNo("other_paper")
+    elif not _title_key(p.get("title")) or _title_key(meta.get("title"))[:70] != _title_key(p.get("title"))[:70]:
+        raise _RsNo("other_paper")
+    return blocks
+
+
+# ---- the free PDF
+def _rs_pdftotext(pdf, raw, until):
+    """A PDF's words, by poppler in a child process with limits: in reading order, or (raw) in the order the file itself
+    holds them. None when it can't be read in time."""
+    out = pdf + (".raw.txt" if raw else ".txt")
+    cmd = ["pdftotext", "-q", "-enc", "UTF-8", "-l", str(RS_PAGES_MAX + 1)] + (["-raw"] if raw else []) + [pdf, out]
+    lim = shutil.which("prlimit")
+    if lim:
+        cmd = [lim, "--as=" + str(400 * 1024 * 1024), "--cpu=12"] + cmd
+    left = until - time.time()
+    if left < 1:
+        return None
+    try:
+        _subprocess.run(cmd, stdin=_subprocess.DEVNULL, stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL, timeout=min(12, left), check=False)
+        with open(out, "rb") as f:
+            return f.read(RS_TEXT_MAX * 3).decode("utf-8", "replace")[:RS_TEXT_MAX]
+    except Exception:
+        return None
+
+
+_RS_RUNIN = re.compile(r"^(?:(?:\d{1,2}(?:\.\d{1,2})*\.?|[IVX]{1,4}\.)\s+)?(Background|Introduction|Objectives?|Aims?|Purpose|Methods?|Methodology|"
+                       r"Materials and Methods|Design|Setting|Participants|Results?|Findings|Discussion|Conclusions?|Interpretation|Limitations|"
+                       r"Implications|Recommendations)\s*(?:[:.]|—|–| - )\s*(?=[A-Z0-9\"“(])")
+_RS_RUNIN_CAPS = re.compile(r"^(?:(?:\d{1,2}(?:\.\d{1,2})*\.?|[IVX]{1,4}\.)\s+)?(BACKGROUND|INTRODUCTION|OBJECTIVES?|AIMS?|PURPOSE|METHODS?|METHODOLOGY|"
+                            r"MATERIALS AND METHODS|DESIGN|SETTING|PARTICIPANTS|RESULTS?|FINDINGS|DISCUSSION|CONCLUSIONS?|INTERPRETATION|"
+                            r"LIMITATIONS|IMPLICATIONS|RECOMMENDATIONS)\s*[:.]?\s+(?=[A-Z0-9\"“(])")
+_RS_RUNIN_CAT = {"background": "intro", "introduction": "intro", "objective": "intro", "objectives": "intro", "aim": "intro", "aims": "intro",
+                 "purpose": "intro", "method": "methods", "methods": "methods", "methodology": "methods", "materials and methods": "methods",
+                 "design": "methods", "setting": "methods", "participants": "methods", "result": "results", "results": "results",
+                 "findings": "results", "discussion": "discussion", "interpretation": "discussion", "limitations": "discussion",
+                 "implications": "discussion", "conclusion": "conclusion", "conclusions": "conclusion", "recommendations": "conclusion"}
+_RS_SENT_END = re.compile(r"[.!?][\"”’')\]]*$")
+# a line of a reference list: a year with a volume, an issue or pages beside it, "pp.", "Vol.", "et al.", "(Eds.)", a DOI…
+_RS_REF_LINE = re.compile(r"\b(?:19|20)\d{2}[a-z]?\s*[;:,.)]\s*\d|\b\d{1,4}\s*\(\d{1,3}(?:[–\-]\d{1,3})?\)\s*[:,]?\s*\d|\bpp?\.\s*\d|\bvol\.?\s*\d|\bdoi\b|doi\.org|"
+                          r"\bet al\b|\(eds?\.?\)|\bIn:\s|\bRetrieved from\b|\bAvailable (?:at|from)\b|https?://|^\s*\[\d{1,3}\]\s+[A-Z]|"
+                          r"^\s*\d{1,3}\.\s+[A-Z][A-Za-z'’\-]+,?\s+[A-Z]{1,3}\b|\(\s*(?:19|20)\d{2}[a-z]?\s*\)\.?\s+[A-Z]|\b\d{1,4}\s*[–\-]\s*\d{1,4}\.?\s*$", re.I)
+
+
+def _rs_refs_line(lines):
+    """Where a list of references begins when no heading this reader knows stands over it: the line from which, to the
+    end of the paper, the lines read like references (at least two in every five do). None when the paper doesn't
+    end in such a list."""
+    like = [1 if _RS_REF_LINE.search(l) else 0 for l in lines]
+    n, tail, at = len(lines), 0, None
+    for i in range(n - 1, n // 2, -1):
+        tail += like[i]
+        span = n - i
+        if span < 8:
+            continue
+        if tail / span < 0.25:
+            break
+        if like[i] and tail / span >= 0.4:
+            at = i
+    return at
+_RS_PAGE_NO = re.compile(r"^\s*(?:page\s+)?\d{1,4}(?:\s*(?:of|/)\s*\d{1,4})?\s*$", re.I)
+
+
+def _rs_join_lines(lines, vocab):
+    """The lines of a paragraph as running text. A word broken at the end of a line is put together again: with its
+    hyphen when the paper writes it with one elsewhere ("well-being"), without it otherwise ("inter-vention")."""
+    out = lines[0]
+    for nxt in lines[1:]:
+        a, b = re.search(r"([A-Za-z]{2,})-$", out), re.match(r"([a-z]{2,})", nxt)
+        if a and b:
+            whole, hyph = (a.group(1) + b.group(1)).lower(), (a.group(1) + "-" + b.group(1)).lower()
+            out = (out + nxt) if (hyph in vocab and whole not in vocab) else (out[:-1] + nxt)
+        elif re.search(r"[A-Za-z0-9]-$", out):
+            out = out + nxt                              # "COVID-" + "19"
+        else:
+            out = out + " " + nxt
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def _rs_pdf_start(pages, p):
+    """The page this paper begins on in the file: where its title stands and its abstract's own words follow (so the
+    file is this paper, and a paper bound before it in the same file isn't read as part of it). Raises _RsNo."""
+    keys = [_rs_alnum(pg) for pg in pages]
+    tkey = _rs_alnum(p.get("title"))[:48]
+    probes = []
+    for s in _rs_split(p.get("abstract_full") or p.get("abstract") or "")[:8]:
+        k = _rs_alnum(s)
+        if len(k) >= 60:
+            probes.append(k[len(k) // 2 - 20:len(k) // 2 + 20])
+    need = 2 if len(probes) >= 3 else 1
+
+    def abstract_at(i):
+        both = keys[i] + (keys[i + 1] if i + 1 < len(keys) else "")
+        return bool(probes) and sum(1 for x in probes if x in both) >= need
+
+    titled = [i for i, k in enumerate(keys) if len(tkey) >= 18 and tkey in k]
+    for i in titled:
+        if abstract_at(i):
+            return i
+    for i in range(len(keys)):
+        if abstract_at(i):
+            return i
+    if titled and titled[0] <= 2 and len(pages) <= 60:
+        return titled[0]                                  # its title opens the file; the index's abstract is worded differently
+    raise _RsNo("other_paper")
+
+
+def _rs_pdf_own(flow, raw, p):
+    """A PDF's own sentences, [(sentence, part)], and whether only its first RS_PAGES_MAX pages were read.
+    flow: the file read in reading order (its paragraphs stand apart, so a heading, a caption or a row of a table is
+    never run into a sentence); raw: the same file in the order it holds its words. A sentence is taken only when both
+    readings give it letter for letter; its words are then set down as the second reading prints them (a word broken
+    at the end of a line is put together by _rs_join_lines: the first reading drops every such hyphen), and its part
+    of the paper comes from the headings around it in that reading. Raises _RsNo."""
+    fix = lambda t: unicodedata.normalize("NFKC", t).replace("\u00ad", "").replace("\r", "")
+    pages, rpages = fix(flow).split("\f"), fix(raw).split("\f")
+    for x in (pages, rpages):
+        while x and not x[-1].strip():
+            x.pop()
+    cut = len(pages) > RS_PAGES_MAX
+    pages, rpages = pages[:RS_PAGES_MAX], rpages[:RS_PAGES_MAX]
+    if sum(len(pg) for pg in pages) < 2500:
+        raise _RsNo("scan")                               # pictures of pages: no words to read
+    start = _rs_pdf_start(pages, p)
+    if cut and p.get("kind") in ("article", "review", "conference", "preprint", None):
+        raise _RsNo("long")                               # an article isn't that long: a whole issue, or a book
+    pages, rpages = pages[start:], rpages[start:]
+    # the lines printed at the top and the foot of every page are not the paper's sentences
+    key = lambda line: re.sub(r"\d+", "#", re.sub(r"\s+", " ", line.strip().lower()))
+    edge = Counter()
+    for pg in pages:
+        lines = [l for l in pg.split("\n") if l.strip()]
+        for k in {key(x) for x in lines[:3] + lines[-3:]}:
+            if len(k) <= 100:
+                edge[k] += 1
+    heads = {k for k, n in edge.items() if n >= max(3, int(len(pages) * 0.3))}
+    is_head = lambda st: 3 <= len(st) <= 70 and st[-1] not in ".,;?!" and bool(re.match(r"[A-Z0-9]", st))
+    # ---- the second reading: its lines (without the page furniture and the headings this reader knows), its letters
+    # and digits as one run, where each run of them stands in the lines, and where each known heading falls
+    marks, kept, runs, parts, n, off = [], [], [], [], 0, 0
+    for pg in rpages:
+        for line in pg.split("\n"):
+            st = line.strip()
+            if not st or key(st) in heads or _RS_PAGE_NO.match(st):
+                continue
+            if is_head(st):
+                c = _rs_sec_cat(st)
+                if c == "conclusion" and not marks and re.fullmatch(r"\W*summary\W*", st, re.I):
+                    c = None                               # "Summary" before any other heading is the abstract's name
+                if c:
+                    marks.append((n, c))
+                    continue
+            for m in re.finditer(r"[A-Za-z0-9]+", st):
+                runs.append((n, off + m.start()))
+                parts.append(m.group().lower())
+                n += m.end() - m.start()
+            kept.append(st)
+            off += len(st) + 1
+    second, text2 = "".join(parts), "\n".join(kept)
+    run_at = [r[0] for r in runs]
+    vocab = set(re.findall(r"[a-z]+(?:-[a-z]+)+|[a-z]{4,}", text2.lower()))
+    refs_at = min((pos for pos, c in marks if c == "refs"), default=None)
+    if refs_at is None and len(kept) > 40:
+        at = _rs_refs_line(kept)          # the references, under a heading this reader doesn't know
+        if at is not None:
+            refs_at = sum(len(x) for l in kept[:at] for x in re.findall(r"[A-Za-z0-9]+", l))
+
+    def text_at(a):
+        i = bisect.bisect_right(run_at, a) - 1
+        return runs[i][1] + (a - runs[i][0])
+
+    def as_printed(a, b):
+        """The letters [a, b) of the second reading, with the marks around and between them, as the file prints them."""
+        t0, t1 = text_at(a), text_at(b - 1) + 1
+        while t0 > 0 and text2[t0 - 1] in "\"\u201c\u2018'([":
+            t0 -= 1
+        while t1 < len(text2) and text2[t1] in ".!?\"\u201d\u2019')]%":
+            t1 += 1
+        return _rs_join_lines(text2[t0:t1].split("\n"), vocab)
+
+    def part_at(pos):
+        if refs_at is not None and pos >= refs_at:
+            return "refs"
+        cat, at = ("front" if marks else "body"), 0
+        for mpos, c in marks:
+            if mpos > pos:
+                break
+            cat, at = c, mpos
+        return "body" if (cat == "intro" and pos - at > 14000) else cat      # an introduction isn't that long
+
+    # ---- the first reading: paragraphs that stand apart
+    all_lines = sorted(len(l.strip()) for pg in pages for l in pg.split("\n") if l.strip())
+    full_w = all_lines[int(len(all_lines) * 0.8)] if all_lines else 80
+    label = lambda st: len(st) <= min(80, 0.7 * full_w) and not re.search(r"[.!?:;,]$", st) and bool(re.match(r"[A-Z0-9]", st))
+    blocks = []
+    for pg in pages:
+        lines = pg.split("\n")
+        full = [i for i, l in enumerate(lines) if l.strip()]
+        drop = {i for i in full[:3] + full[-3:] if key(lines[i]) in heads or _RS_PAGE_NO.match(lines[i])}
+        cur = []
+        for i, l in enumerate(lines + [""]):
+            st = l.strip()
+            if st and i not in drop:
+                # a short line with no full stop, and a capital after it: a heading or a label inside the block
+                nxt = next((x.strip() for x in lines[i + 1:i + 2] if x.strip()), "")
+                if (is_head(st) and _rs_sec_cat(st)) or (label(st) and (not nxt or re.match(r"[A-Z0-9\"\u201c(]", nxt))):
+                    if cur:
+                        blocks.append(cur)
+                    blocks.append(None)                    # a break: what follows starts afresh
+                    cur = []
+                else:
+                    cur.append(st)
+            elif cur and not st:
+                blocks.append(cur)
+                cur = []
+    paras, open_prev = [], False                           # [text, broken]
+    for lines in blocks:
+        if lines is None:
+            open_prev = False
+            continue
+        para = " ".join(lines)
+        lower = bool(re.match(r"[a-z]", para))
+        if open_prev and lower and paras:
+            paras[-1][0] += " " + para                     # the sentence carries on (a new column, a new page)
+        else:
+            paras.append([para, open_prev or lower])
+        open_prev = not _RS_SENT_END.search(para)
+    own, seen = [], set()
+    for para, broken in paras:
+        scope = None
+        m = _RS_RUNIN.match(para) or _RS_RUNIN_CAPS.match(para)
+        if m:
+            scope = _RS_RUNIN_CAT.get(m.group(1).lower())
+            para = para[m.end():]
+        sents = _rs_split(para, limit=400)
+        for s in (sents[1:] if broken and not m else sents):
+            k = _rs_alnum(s)
+            if len(k) < 40 or k in seen:
+                continue
+            pos = second.find(k)
+            if pos < 0:
+                continue                                   # the two readings differ here: not quoted
+            seen.add(k)
+            cat = part_at(pos)
+            for _again in range(3):                        # said again later (in the conclusion, as in the abstract): that place counts
+                if scope or cat in _RS_WHERE:
+                    break
+                nxt_pos = second.find(k, pos + 1)
+                if nxt_pos < 0:
+                    break
+                pos, cat = nxt_pos, part_at(nxt_pos)
+            if cat in ("refs", "back"):
+                continue
+            if scope:
+                cat = scope                                # "Results: …" at the head of a paragraph says what it is
+            if cat not in _RS_WHERE:
+                continue                                   # what stands before the paper's text, and its introduction
+            printed = as_printed(pos, pos + len(k))
+            if _RS_SENT_END.search(printed) and _rs_clean_sentence(printed):
+                own.append((pos, printed, cat))
+    return [(t, c) for _pos, t, c in sorted(own)], cut      # in the paper's own order
+
+
+def _rs_from_pdf(p, until):
+    """([(sentence, part)], cut) from the paper's free PDF. Raises _RsNo."""
+    work = tempfile.mkdtemp(prefix="mc_rs_")
+    try:
+        pdf = os.path.join(work, "paper.pdf")
+        _rs_download(p["pdf"], pdf, until)
+        with open(pdf, "rb") as f:
+            if b"%PDF-" not in f.read(1024):
+                raise _RsNo("not_pdf")                    # a web page (a viewer, a sign-in), not the paper's file
+        if not _RS_PDF_SLOTS.acquire(timeout=max(0.1, until - time.time())):
+            raise _RsNo("slow")
+        try:
+            flow = _rs_pdftotext(pdf, False, until)
+            if flow is None:
+                raise _RsNo("slow")
+            if len(flow.strip()) < 2500:
+                raise _RsNo("scan")
+            raw = _rs_pdftotext(pdf, True, until)
+            if not raw:
+                raise _RsNo("slow")
+        finally:
+            _RS_PDF_SLOTS.release()
+        own, cut = _rs_pdf_own(flow, raw, p)
+        if len(own) < RS_OWN_MIN:
+            raise _RsNo("unclear")
+        return own, cut
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _rs_read_one(p, terms, until):
+    """One paper's own text: {"read": "paper" | "part", "via": …, "body": [(sentence, part)]}. Raises _RsNo."""
+    why = "no_file"
+    pm = _rs_epmc_id(p, until)
+    if pm:
+        try:
+            own = _rs_own_sentences(_rs_from_epmc(pm, p, until))
+            if len(own) >= RS_OWN_MIN:
+                return {"read": "paper", "via": "Europe PMC", "body": _rs_choose(own, terms, p["sents"])}
+            why = "unclear"
+        except _RsNo as e:
+            why = str(e)
+    if p.get("own_link") or not p.get("pdf"):
+        raise _RsNo(why)                                  # a link the person's app sent is never opened
+    own, cut = _rs_from_pdf(p, until)
+    return {"read": "part" if cut else "paper", "via": "PDF", "body": _rs_choose(own, terms, p["sents"])}
+
+
+def _rs_read_papers(papers, question, until):
+    """Reads each kept paper itself where it is free to open (see the top of this part) and puts the sentences that
+    bear on the question after its abstract's. Never raises; a paper that can't be read keeps its abstract.
+    Returns {"paper": n, "part": n, "abstract": n, "mine": n} — how each paper was read."""
+    t0 = time.time()
+    terms = _paper_terms(question)
+    for p in papers:
+        p["abs_n"] = len(p["sents"])
+        p["where"] = ["a"] * len(p["sents"])
+        p["read"] = "mine" if p.get("kind") == "mine" else "abstract"
+    todo = [p for p in papers if p.get("kind") != "mine"]
+    why, via = Counter(), Counter()
+    if todo:
+        pool = _futures.ThreadPoolExecutor(max_workers=RS_READ_AT_ONCE)
+        try:
+            jobs = {pool.submit(_rs_read_one, dict(p), terms, until): p for p in todo}
+            done, late = _futures.wait(jobs, timeout=max(0.5, until - time.time() + 1.5))
+            for job in done:
+                p = jobs[job]
+                try:
+                    got = job.result()
+                except _RsNo as e:
+                    why[str(e) or "error"] += 1
+                    continue
+                except Exception as e:
+                    logger.warning(f"Research: a paper couldn't be read ({e.__class__.__name__}: {str(e)[:120]})")
+                    why["error"] += 1
+                    continue
+                body = [(s, c) for s, c in got["body"] if c in _RS_WHERE]
+                p["sents"] = p["sents"] + [s for s, _c in body]
+                p["where"] = p["where"] + [_RS_WHERE[c] for _s, c in body]
+                p["read"] = got["read"]
+                via[got["via"]] += 1
+            why["slow"] += len(late)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    out = dict(Counter(p["read"] for p in papers))
+    logger.info(f"Research: {out.get('paper', 0) + out.get('part', 0)} of {len(todo)} papers read themselves ({dict(via) or 'none'}), "
+                f"{out.get('abstract', 0)} by their abstract ({dict(why) or 'none'}), {time.time() - t0:.1f}s")
+    return {k: out.get(k, 0) for k in ("paper", "part", "abstract", "mine")}
+
+
 def _rs_json(raw):
     a, b = str(raw or "").find("{"), str(raw or "").rfind("}")
     obj = json.loads(raw[a:b + 1]) if 0 <= a < b else None
@@ -10075,11 +10933,21 @@ def _rs_json(raw):
 
 
 def _rs_papers_text(papers, labelled=False, cap=2600):
+    """The papers as the AI is shown them. 5.1: after a paper's abstract come the sentences of the paper itself that
+    Research read (its methods, results, discussion and conclusion), under their own line."""
     out = []
     for p in papers:
         head = f"[{p['n']}] {p['title']} ({p.get('year') or 'no date'}; " + ("the person's own PDF" if p["kind"] == "mine" else RS_KIND_WORDS.get(p["kind"], ("paper",))[0]) + ")"
+        n_abs = p.get("abs_n", len(p["sents"]))
+        own = n_abs < len(p["sents"])
         if labelled:
-            body = "\n".join(f"  P{p['n']}-S{i}: {s}" for i, s in enumerate(p["sents"]))
+            lines = [f"  P{p['n']}-S{i}: {s}" for i, s in enumerate(p["sents"])]
+            if own:
+                lines = ["  Its abstract:"] + lines[:n_abs] + ["  The paper itself (its methods, results, discussion and conclusion):"] + lines[n_abs:]
+            body = "\n".join(lines)
+        elif own:
+            body = ("  Its abstract: " + " ".join(p["sents"][:n_abs])[:cap] + "\n  The paper itself (its methods, results, discussion and conclusion): "
+                    + " ".join(p["sents"][n_abs:])[:RS_BODY_CHARS + 400])
         else:
             body = "  " + " ".join(p["sents"])[:cap]
         out.append(head + "\n" + body)
@@ -10115,13 +10983,14 @@ def _rs_write(question, papers, deadline, context="", language=""):
     person chose (the quotations under each citation stay in the paper's own language)."""
     system = (
         "You are RamzAI, the research helper in Academic-Home, used by students and teachers. Answer the person's QUESTION "
-        "from the numbered PAPERS only (their abstracts, or the first pages of the person's own PDF). Rules:\n"
+        "from the numbered PAPERS only (each paper's abstract and, where the paper itself was read, sentences from its "
+        "methods, results, discussion and conclusion; or the first pages of the person's own PDF). Rules:\n"
         "- Say only what the papers state. No outside knowledge, no background of your own, no advice, no guesses.\n"
         "- Every sentence ends with the numbers of the papers that state what it says, in square brackets before the full "
         "stop, like [2] or [1, 4]. Cite a paper only for what its own text states. Give each figure exactly as the paper does. "
         "When you count the papers themselves, use words (\"two studies\").\n"
         "- Put it in your own words: never six or more words in a row from a paper. Don't name authors or years in the "
-        "sentences (the brackets are the citations), and don't mention 'the abstract'.\n"
+        "sentences (the brackets are the citations), and don't mention 'the abstract' or which part of a paper says it.\n"
         "- Formal, plain English a first-year student understands, unless WRITTEN FOR says who the reader is: then write "
         "for that reader (a doctoral researcher or an organisation reads fuller, more exact language; a school pupil simpler). "
         "One idea per sentence. WRITTEN FOR never changes the rules above.\n"
@@ -10297,7 +11166,7 @@ def _rs_evidence(question, papers, deadline):
     return out
 
 
-def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="apa"):
+def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="apa", full=True):
     """What the app shows: the report (sentences with their papers, quotes by number and verdicts), the papers (with their
     references, citations, quotes, design and who they studied) and what it rests on. The citations and the reference
     list are worked out from the cited papers alone (APA), so a paper that isn't cited never changes them."""
@@ -10309,7 +11178,23 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
             cited.update(c["p"] for c in s["c"])
         if keep:
             sections.append({"h": head, "s": keep})
-    strip = lambda p: {k: v for k, v in p.items() if k not in ("sents", "abstract_full")}
+    strip = lambda p: {k: v for k, v in p.items() if k not in ("sents", "abstract_full", "where", "abs_n", "read", "own_link", "pmcid")}
+    # 5.1: of the sentences read from a paper itself, the app is sent only those a citation or the evidence table
+    # quotes (after its abstract's, which all go as before); the numbers that point at them are moved to match
+    used = {}
+    for sec in sections:
+        for s_ in sec["s"]:
+            for c in s_["c"]:
+                used.setdefault(c["p"], set()).update(c["q"])
+    for pn, (nums, _a) in evidence.items():
+        used.setdefault(pn, set()).update(nums)
+    move = {}
+    for p in papers:
+        n_abs = min(p.get("abs_n", len(p["sents"])), len(p["sents"]))
+        kept = list(range(n_abs)) + sorted(k for k in used.get(p["n"], ()) if n_abs <= k < len(p["sents"]))
+        move[p["n"]] = {old: new for new, old in enumerate(kept)}
+    for sec in sections:
+        sec["s"] = [dict(s_, c=[dict(c, q=[move[c["p"]][k] for k in c["q"] if k in move.get(c["p"], {})]) for c in s_["c"]]) for s_ in sec["s"]]
     on_list = [p for p in papers if p["n"] in cited]
     keys = {p["n"]: e for p, e in zip(on_list, enrich_sources([strip(p) for p in on_list], style))}
     # a paper read but not cited: its reference and label are worked out alone (no a/b from the other papers), with the
@@ -10329,18 +11214,56 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
         if url:
             ref = ref.rstrip() + " " + url
         finding, answer = evidence.get(p["n"], ([], None))
+        mv = move[p["n"]]
+        order = sorted(mv, key=mv.get)
+        where_all = p.get("where") or ["a"] * len(p["sents"])
+        n_abs = min(p.get("abs_n", len(p["sents"])), len(p["sents"]))
+        finding = [mv[k] for k in finding if k in mv]
+        # design and who it studied: from the abstract's own words; when it doesn't say, from the paper's methods
+        own_how = [x for x, w in zip(p["sents"], where_all) if w == "m"]
         out_papers.append({
             "n": p["n"], "title": p["title"], "authors": p.get("authors") or [], "year": p.get("year"), "venue": p.get("venue"),
             "kind": p["kind"], "doi": p.get("doi"), "url": url, "pdf": p.get("pdf"), "biblio": p.get("biblio") or {},
-            "cite": cite, "ref": ref, "sents": p["sents"],
-            "design": _rs_design(p["sents"], p["kind"]), "people": _rs_people(p["sents"]),
+            "cite": cite, "ref": ref, "sents": [p["sents"][k] for k in order],
+            # 5.1: how many of the sentences are the abstract's, where each of the others stands in the paper (m: methods,
+            # r: results, d: discussion, c: conclusion, b: its text), and how the paper was read (itself, or its abstract)
+            "abs_n": n_abs, "where": [where_all[k] for k in order], "read": p.get("read") or ("mine" if p["kind"] == "mine" else "abstract"),
+            "design": _rs_design(p["sents"][:n_abs]) or _rs_design(own_how) or ("Review" if p["kind"] == "review" else None),
+            "people": _rs_people(p["sents"][:n_abs]) or _rs_people(own_how),
             "finding": finding, "answer": answer if finding else None, "cited": p["n"] in cited, "lib": p.get("lib")})
     yrs = [p["year"] for p in papers if p.get("year")]
     counts = Counter(p["kind"] for p in papers)
     kinds_words = ", ".join(f"{counts[k]} {RS_KIND_WORDS[k][0 if counts[k] == 1 else 1]}" for k in ("article", "review", "book", "conference", "thesis", "report", "preprint", "mine") if counts.get(k))
+    # 5.1: how the papers were read: themselves (where each was free to open), or by their abstract
+    n_self = sum(1 for p in papers if p.get("read") in ("paper", "part"))
+    n_abs = sum(1 for p in papers if p["kind"] != "mine" and p.get("read") not in ("paper", "part"))
+    n_mine = counts.get("mine", 0)
+    if n_self and not n_abs:
+        how = "RamzAI read the paper itself, not only its abstract." if n_self == 1 else "RamzAI read the papers themselves, not only their abstracts."
+    elif n_self:
+        how = (f"RamzAI read {n_self} of the papers {'itself' if n_self == 1 else 'themselves'} and, for the other {'one' if n_abs == 1 else n_abs}, "
+               + ("its abstract (that paper’s file couldn’t be opened)." if n_abs == 1 else "their abstracts (those papers’ files couldn’t be opened)."))
+    elif n_abs:
+        how = ("RamzAI read this paper’s abstract: the paper’s file couldn’t be opened this time." if n_abs == 1
+               else "RamzAI read these papers’ abstracts: the papers’ files couldn’t be opened this time.")
+    else:
+        how = ""
+    if n_mine:
+        how += (" " if how else "") + ("RamzAI read the first pages of your PDF." if n_mine == 1 else "RamzAI read the first pages of your PDFs.")
+    if any(p.get("read") == "part" for p in papers):
+        how += f" Of a long work it read the first {RS_PAGES_MAX} pages."
     limits = (f"{len(papers)} paper{'' if len(papers) == 1 else 's'}" + (f" from {min(yrs)} to {max(yrs)}" if yrs and min(yrs) != max(yrs) else f" from {yrs[0]}" if yrs else "")
-              + (f": {kinds_words}" if kinds_words else "") + ". RamzAI read their abstracts"
-              + (", and the first pages of your PDFs," if counts.get("mine") else "") + " not the whole papers, so read a paper before you rely on it.")
+              + (f": {kinds_words}" if kinds_words else "") + ". " + how
+              + " Every quote is a paper’s own sentence, word for word. Read a paper before you rely on it.")
+    if not full:
+        # an app from before 5.1 (the endpoint read abstracts alone for it): the words and the shape of 5.0, so that what
+        # it shows as "the abstract" is the abstract and nothing else
+        for op in out_papers:
+            for k in ("abs_n", "where", "read"):
+                op.pop(k, None)
+        limits = (f"{len(papers)} paper{'' if len(papers) == 1 else 's'}" + (f" from {min(yrs)} to {max(yrs)}" if yrs and min(yrs) != max(yrs) else f" from {yrs[0]}" if yrs else "")
+                  + (f": {kinds_words}" if kinds_words else "") + ". RamzAI read their abstracts"
+                  + (", and the first pages of your PDFs," if counts.get("mine") else "") + " not the whole papers, so read a paper before you rely on it.")
     if counts.get("preprint"):
         limits += " Preprints are not yet peer reviewed."
     return {"v": 1, "question": question, "asked": {"years": years, "kinds": kinds}, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -10706,6 +11629,10 @@ def research_endpoint():
     until = year_to if (year_to and year_to < this_year) else None
     kinds = [k for k in RS_KINDS if k in (data.get("kinds") or [])] or ["article", "review"]
     library = _rs_library(data.get("library"))
+    # 5.1: the papers themselves are read for an app that shows how each paper was read and where each quote stands
+    # in it (it sends papers: "full"). An app from before 5.1 calls every quote "the abstract's" and keeps a paper's
+    # sentences as its abstract: it is answered as before, from the abstracts alone, in the same words as before.
+    full = str(data.get("papers") or "").strip().lower() == "full"
     user = request.current_user
     gate = _scholar_gate(user, "Research", research=True)
     if gate:
@@ -10727,7 +11654,7 @@ def research_endpoint():
         return json.dumps(obj, ensure_ascii=False) + "\n"
 
     def run():
-        deadline = started + 200
+        deadline = started + 215          # 5.1: fifteen seconds more, for reading the papers themselves (the app waits 240)
         pool = _futures.ThreadPoolExecutor(max_workers=3)
 
         def waiting(futs):
@@ -10763,6 +11690,26 @@ def research_endpoint():
             yrs = [p["year"] for p in papers if p.get("year")]
             yield line({"step": "keep", "state": "done", "kept": len(papers), "years": [min(yrs), max(yrs)] if yrs else None,
                         "kinds": dict(Counter(p["kind"] for p in papers))})
+            # 5.1 (the owner: "read from the papers themselves other than the abstracts"): each kept paper is read itself
+            # where it is free to open; one that can't be keeps its abstract, and the person is told how many were read
+            if full:
+                yield line({"step": "read", "state": "now"})
+                fr = pool.submit(_rs_read_papers, papers, question, min(time.time() + RS_READ_SECONDS, deadline - 150))
+                yield from waiting({fr})
+                try:
+                    read = fr.result()
+                except Exception as e:           # reading is an extra: whatever happens to it, the research goes on from the abstracts
+                    logger.warning(f"Research: the papers couldn't be read ({e.__class__.__name__}: {str(e)[:120]})")
+                    for p in papers:
+                        p["sents"] = p["sents"][:p.get("abs_n", len(p["sents"]))]
+                        p["abs_n"], p["where"], p["read"] = len(p["sents"]), ["a"] * len(p["sents"]), ("mine" if p.get("kind") == "mine" else "abstract")
+                    read = {"paper": 0, "part": 0, "abstract": sum(1 for p in papers if p.get("kind") != "mine"), "mine": sum(1 for p in papers if p.get("kind") == "mine")}
+                yield line({"step": "read", "state": "done", "full": read["paper"] + read["part"], "abstract": read["abstract"], "mine": read["mine"]})
+                stats["read"] = read
+            else:
+                # an app from before 5.1: the abstracts alone, as before (no file of a paper is fetched)
+                for p in papers:
+                    p["abs_n"], p["where"], p["read"] = len(p["sents"]), ["a"] * len(p["sents"]), ("mine" if p.get("kind") == "mine" else "abstract")
             yield line({"step": "write", "state": "now"})
             yield line({"step": "evidence", "state": "now"})
             by_n = {p["n"]: p for p in papers}
@@ -10816,7 +11763,7 @@ def research_endpoint():
                 return
             parts_out = [(head, [{"t": x["t"], "c": x["c"]} for x in flat if x["h"] == head and x.get("c")]) for _key, head in RS_SECTIONS]
             stats.update(checked=len(flat), removed=len(flat) - len(kept))
-            result = _rs_result(question, years, kinds, papers, parts_out, evidence or {}, stats)
+            result = _rs_result(question, years, kinds, papers, parts_out, evidence or {}, stats, full=full)
             if year_from or until:           # 5.0: the years the person chose themselves
                 result["asked"].update({k: v for k, v in (("year_from", year_from), ("year_to", until)) if v})
             if language and language.lower() not in ("english", "en"):      # 5.0: the language it is written in
