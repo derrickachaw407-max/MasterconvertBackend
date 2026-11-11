@@ -1654,6 +1654,7 @@ AI_MSG_SLOW = "RamzAI took too long to answer. Please try again."
 AI_MSG_TOO_BIG = "That\u2019s more than RamzAI can read at once. Please try a shorter message or file."
 AI_MSG_FAILED = "RamzAI couldn\u2019t answer just now. Please try again."
 AI_MSG_NOT_COUNTED = " This didn\u2019t use any of your messages."
+AI_MSG_DECLINED = "RamzAI couldn\u2019t answer that one. Please try saying it another way."
 
 
 def _ai_failure(status, body, feature=None):
@@ -1695,6 +1696,48 @@ def _ai_failure(status, body, feature=None):
     return AI_MSG_FAILED
 
 
+def _ai_send(payload, timeout, feature=None):
+    """One request to the AI service. Its answer (a dict), or a ConversionError with the words the person sees."""
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+    except requests.exceptions.Timeout:
+        logger.warning(f"AI: no answer in time ({feature or '-'})")
+        raise ConversionError(AI_MSG_SLOW)
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {e}")
+        raise ConversionError(AI_MSG_FAILED)
+    if resp.status_code != 200:
+        raise ConversionError(_ai_failure(resp.status_code, resp.text, feature))
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        logger.warning(f"AI: the answer wasn't readable ({feature or '-'})")
+        raise ConversionError(AI_MSG_FAILED)
+    return data
+
+
+def _ai_declined(data):
+    """5.0.2: the newer models have safety checks that can decline a request. That comes back as an ordinary answer
+    (HTTP 200) with stop_reason "refusal" and no words, so it must be looked for: an answer with no words was once shown
+    to people as an empty reply. Returns the policy area the service names ("reasoning_extraction", "bio", "cyber"...),
+    "none" when it names none, or None when the request was not declined."""
+    if not isinstance(data, dict) or data.get("stop_reason") != "refusal":
+        return None
+    details = data.get("stop_details")
+    return str((details if isinstance(details, dict) else {}).get("category") or "none")[:40]
+
+
 def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None,
                 timeout=None, feature=None):
     """messages, when given, is sent to the API exactly as the native
@@ -1720,32 +1763,31 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     }
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
-    try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=timeout or (140 if use_search else 110),
-        )
-    except requests.exceptions.Timeout:
-        logger.warning(f"AI: no answer in time ({feature or '-'})")
-        raise ConversionError(AI_MSG_SLOW)
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {e}")
-        raise ConversionError(AI_MSG_FAILED)
-    if resp.status_code != 200:
-        raise ConversionError(_ai_failure(resp.status_code, resp.text, feature))
-    try:
-        data = resp.json()
-    except ValueError:
-        logger.warning(f"AI: the answer wasn't readable ({feature or '-'})")
-        raise ConversionError(AI_MSG_FAILED)
+    wait = timeout or (140 if use_search else 110)
+    data = _ai_send(payload, wait, feature)
+    # 5.0.2: the AI service can DECLINE a request with an ordinary answer (see _ai_declined). A request that asks for its
+    # reasoning in the answer is declined by the newer models: it is sent once more without that part. Anything else is
+    # sent once to the other model. The person never gets an empty answer.
+    for attempt in range(3):
+        why = _ai_declined(data)
+        if why is None:
+            break
+        _log_ai_use(payload["model"], data.get("usage"), feature)
+        logger.error(f"AI: the AI service declined a request (category {why}, {payload['model']}) ({feature or '-'})")
+        if attempt < 2 and THINKING_INSTRUCTION in (payload["system"] or ""):
+            payload["system"] = payload["system"].replace(THINKING_INSTRUCTION, "").strip()
+        elif attempt < 2 and payload["model"] != ANTHROPIC_MODEL:
+            payload["model"] = ANTHROPIC_MODEL
+        else:
+            logger.error(f"AI: nothing else to try: the person is asked to say it another way ({feature or '-'})")
+            raise ConversionError(AI_MSG_DECLINED)
+        data = _ai_send(payload, wait, feature)
     _log_ai_use(payload["model"], data.get("usage"), feature)
-    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    blocks = [b for b in (data.get("content") or []) if isinstance(b, dict)]
+    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+    if not text.strip():
+        kinds = ",".join(sorted({str(b.get("type")) for b in blocks})) or "none"
+        logger.warning(f"AI: an answer with no words (stop_reason {data.get('stop_reason')}, blocks {kinds}, {payload['model']}) ({feature or '-'})")
     if return_meta:
         sources, queries = _search_trail(data.get("content") or [])
         return {"text": text, "stop_reason": data.get("stop_reason"), "sources": sources, "queries": queries,
@@ -7894,7 +7936,8 @@ def sage_endpoint():
                 "\n\nWhat you remember about this person from earlier — use it naturally where it "
                 "genuinely helps; don't recite it back: " + "; ".join(notes))
         system_prompt += "\n\n" + MEMORY_INSTRUCTION
-    system_prompt += "\n\n" + THINKING_INSTRUCTION
+    # 5.0.2: RamzAI is no longer asked to write out its thinking before the answer ("How I worked it out"): since
+    # November 2026 the AI service declines every request that asks its strong model for that, with an empty answer.
     # Evidence first (3.0): a question about a topic gets real open papers to ground the answer.
     papers = []
     topic_q = not attachment and _remy_wants_papers(message)
@@ -7918,6 +7961,9 @@ def sage_endpoint():
         )
         marked, pages = _c34_marked_text(meta.get("content"))
         result = marked if marked.strip() else meta["text"]
+        if not (result or "").strip():
+            # 5.0.2: no words came back (the reason is in the log): say so and give the point back, never an empty reply
+            raise ConversionError(AI_MSG_FAILED)
     except Exception as e:
         # The message was counted above, before the AI call — but no reply
         # arrived, so give it back. Otherwise a timeout or AI outage quietly
