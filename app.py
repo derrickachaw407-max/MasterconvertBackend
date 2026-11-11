@@ -27,7 +27,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import jwt as pyjwt  # PyJWT — aliased since this file also uses "jwt" as a short variable name in a couple of places below
-from flask import Flask, request, send_file, jsonify, Response, stream_with_context, g
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context, g, copy_current_request_context
 from flask_compress import Compress
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -50,6 +50,7 @@ from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalo
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
 import threading as _threading
+import queue as _queue
 _threading.Thread(target=warm_up_libreoffice, daemon=True).start()
 
 app = Flask(__name__)
@@ -384,12 +385,146 @@ SAGE_WINDOW_DAYS = 30
 _serializer = URLSafeTimedSerializer(SECRET_KEY) if SECRET_KEY else None
 
 
+# 5.2 (the owner, 11 Nov 2026: "Upgrade the app's output, speed and performance one more time"): connections to the
+# database are kept and used again. Until now every request made its own (two for the plainest request, five for one
+# of RamzAI's answers: signing in to the database each time is most of the work of a small request, on a small server).
+# get_db() is called as before and conn.close() is called as before: close() now hands the connection back, cleaned
+# so that the next request finds it exactly as a new one (no open transaction, autocommit on, nothing left of the
+# last request's session: DISCARD ALL also lets go of any lock it held).
+# DB_POOL=0 on Render turns this off (every request then makes its own connection again, as before 5.2).
+DB_POOL_ON = os.environ.get("DB_POOL", "1").strip().lower() not in ("0", "off", "no", "false")
+DB_POOL_KEEP = 6                 # the most connections kept waiting in one server process (more are made when needed, and ended after)
+DB_POOL_IDLE_CHECK_S = 20        # one that waited longer is tried before it is lent (the database may have ended it)
+DB_POOL_IDLE_MAX_S = 240         # one that waited longer than this is ended, not lent (a quiet line can be cut without a word)
+DB_POOL_MAX_AGE_S = 600          # one older than this is ended and a new one made
+_DB_POOL = {"pid": 0, "free": [], "lock": _threading.Lock()}
+# A connection that is kept must notice when the other end is gone, instead of waiting on it: a new one is given up
+# after 15 seconds, a quiet one is probed, and data nobody acknowledges is given up after 20 seconds.
+_DB_LINE = {"connect_timeout": 15, "keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3,
+            "tcp_user_timeout": 20000}
+
+
+def _db_new():
+    if _DB_LINE:
+        try:
+            return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor, **_DB_LINE)
+        except psycopg2.ProgrammingError:
+            # the database library here doesn't know one of these settings: connect as before 5.2, from now on
+            _DB_LINE.clear()
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def _db_end(raw):
+    try:
+        raw.close()
+    except Exception:
+        pass
+
+
+class _PooledConn:
+    """A database connection on loan. It is the connection itself for everything the code does with it (cursor(),
+    commit(), rollback(), autocommit…), except that close() hands it back instead of ending it."""
+    __slots__ = ("_raw", "_born")
+
+    def __init__(self, raw, born):
+        object.__setattr__(self, "_raw", raw)
+        object.__setattr__(self, "_born", born)
+
+    def __getattr__(self, name):
+        raw = object.__getattribute__(self, "_raw")
+        if raw is None:
+            if name == "closed":
+                return 1
+            raise psycopg2.InterfaceError("connection already closed")
+        return getattr(raw, name)
+
+    def __setattr__(self, name, value):
+        raw = object.__getattribute__(self, "_raw")
+        if raw is None:
+            raise psycopg2.InterfaceError("connection already closed")
+        setattr(raw, name, value)
+
+    def __enter__(self):
+        self._raw.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._raw.__exit__(*exc)
+
+    def close(self):
+        raw = object.__getattribute__(self, "_raw")
+        if raw is None:
+            return                      # closed twice: nothing more to do
+        object.__setattr__(self, "_raw", None)
+        _db_give_back(raw, object.__getattribute__(self, "_born"))
+
+    # (One that is never closed by its user is not handed back: when nothing uses it any more it ends by itself, as
+    # every connection did before 5.2. It may have been in the middle of something.)
+
+
+def _db_pool_mine():
+    """The connections of THIS server process (a process started from another never uses, or ends, the other's)."""
+    pid = os.getpid()
+    if _DB_POOL["pid"] != pid:
+        _DB_POOL["pid"] = pid
+        _DB_POOL["free"] = []
+    return _DB_POOL["free"]
+
+
+def _db_take():
+    """A connection that waited, ready to use (raw, born), or None when a new one must be made."""
+    now = time.time()
+    while True:
+        with _DB_POOL["lock"]:
+            free = _db_pool_mine()
+            if not free:
+                return None
+            raw, born, since = free.pop()           # the one used last: it is the likeliest to be alive
+        if raw.closed or now - born > DB_POOL_MAX_AGE_S or now - since > DB_POOL_IDLE_MAX_S:
+            _db_end(raw)
+            continue
+        if now - since > DB_POOL_IDLE_CHECK_S:
+            try:
+                with raw.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            except Exception:
+                _db_end(raw)                        # the database ended it while it waited
+                continue
+        return raw, born
+
+
+def _db_give_back(raw, born):
+    try:
+        if raw.closed:
+            return
+        if raw.info.transaction_status != psycopg2.extensions.TRANSACTION_STATUS_IDLE:
+            raw.rollback()                          # what wasn't committed is undone, as ending the connection did
+        raw.autocommit = True
+        with raw.cursor() as cur:
+            cur.execute("DISCARD ALL")              # the session as new: no lock, no setting, nothing prepared left behind
+    except Exception:
+        _db_end(raw)
+        return
+    with _DB_POOL["lock"]:
+        free = _db_pool_mine()
+        if len(free) < DB_POOL_KEEP:
+            free.append((raw, born, time.time()))
+            return
+    _db_end(raw)
+
+
 def get_db():
     if not DATABASE_URL:
         raise ConversionError("Accounts need DATABASE_URL set on the server")
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    conn.autocommit = True
-    return conn
+    if not DB_POOL_ON:
+        conn = _db_new()
+        conn.autocommit = True
+        return conn
+    got = _db_take()
+    raw, born = got if got else (_db_new(), time.time())
+    raw.autocommit = True
+    return _PooledConn(raw, born)
 
 
 def init_db():
@@ -1547,6 +1682,25 @@ def _once_settle(uid, key, resp):
         logger.warning(f"once: couldn't keep an answer: {e}")
 
 
+def _once_settle_json(uid, key, body):
+    """5.2: the same for an answer that was sent while it was written: the whole answer is kept (or, with None, the
+    request is forgotten so it can run again)."""
+    try:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                if data is not None and len(data) <= ONCE_MAX_BODY:
+                    cur.execute("UPDATE request_once SET state = 'done', status = 200, body = %s, mimetype = 'application/json' "
+                                "WHERE user_id = %s AND key = %s", (psycopg2.Binary(data), uid, key))
+                else:
+                    cur.execute("DELETE FROM request_once WHERE user_id = %s AND key = %s", (uid, key))
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"once: couldn't keep an answer: {e}")
+
+
 @app.after_request
 def _once_keep(resp):
     """The answer is kept as it was sent. This hook is registered before the others, so it runs after them (the AI's
@@ -1727,6 +1881,121 @@ def _ai_send(payload, timeout, feature=None):
     return data
 
 
+class _AiStreamTrouble(Exception):
+    """5.2: the stream of an answer failed (the connection, or the service's own trouble while writing). The request is
+    then asked again the plain way (_ai_send), which is the path every other AI call takes."""
+
+
+def _ai_send_stream(payload, timeout, feature=None, on_text=None, on_search=None):
+    """5.2: one request to the AI service, read while it is written (server-sent events), so RamzAI's words can be
+    shown as they come. Returns the same answer (a dict) that _ai_send returns. on_text(words): each new piece of the
+    answer's text; on_search(query): each web search as it starts.
+    ConversionError: the service refused the request before writing (the words the person sees).
+    _AiStreamTrouble: the stream itself failed; the caller asks again the plain way."""
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=dict(payload, stream=True),
+            timeout=(15, 75),               # to connect; and between two pieces (the service sends a ping while it works)
+            stream=True,
+        )
+    except requests.exceptions.RequestException as e:
+        raise _AiStreamTrouble(f"couldn't reach the AI service: {e.__class__.__name__}")
+    try:
+        if resp.status_code != 200:
+            body = ""
+            try:
+                body = resp.text
+            except Exception:
+                pass
+            if resp.status_code >= 500 or resp.status_code == 429:
+                raise _AiStreamTrouble(f"HTTP {resp.status_code}")            # busy: the plain way has its own words for it
+            raise ConversionError(_ai_failure(resp.status_code, body, feature))
+        until = time.time() + timeout
+        msg, blocks, partial, done = {}, {}, {}, False
+        for raw in resp.iter_lines():
+            if time.time() > until:
+                raise _AiStreamTrouble("no end in time")
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            if not line.startswith("data:"):
+                continue                                   # "event: …" (the kind is in the data too), comments
+            try:
+                ev = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type")
+            if kind == "message_start":
+                msg = dict(ev.get("message") or {})
+            elif kind == "content_block_start":
+                b = ev.get("content_block")
+                if isinstance(b, dict):
+                    blocks[ev.get("index")] = dict(b)
+                    if b.get("type") in ("server_tool_use", "tool_use"):
+                        partial[ev.get("index")] = ""
+                    elif b.get("type") == "text" and b.get("text") and on_text:
+                        on_text(str(b["text"]))
+            elif kind == "content_block_delta":
+                i, d = ev.get("index"), ev.get("delta") or {}
+                b = blocks.get(i)
+                if b is None or not isinstance(d, dict):
+                    continue
+                dk = d.get("type")
+                if dk == "text_delta":
+                    piece = str(d.get("text") or "")
+                    b["text"] = str(b.get("text") or "") + piece
+                    if piece and on_text:
+                        on_text(piece)
+                elif dk == "input_json_delta":
+                    partial[i] = partial.get(i, "") + str(d.get("partial_json") or "")
+                elif dk == "citations_delta" and isinstance(d.get("citation"), dict):
+                    b.setdefault("citations", []).append(d["citation"])
+            elif kind == "content_block_stop":
+                i = ev.get("index")
+                b = blocks.get(i)
+                if b is not None and i in partial:
+                    try:
+                        b["input"] = json.loads(partial.pop(i) or "{}")
+                    except ValueError:
+                        b["input"] = {}
+                    q = str((b.get("input") or {}).get("query") or "").strip() if b.get("name") == "web_search" else ""
+                    if q and on_search:
+                        on_search(q[:200])
+            elif kind == "message_delta":
+                d = ev.get("delta") or {}
+                for k in ("stop_reason", "stop_sequence", "stop_details"):
+                    if isinstance(d, dict) and k in d:
+                        msg[k] = d[k]
+                if isinstance(ev.get("usage"), dict):          # the counts are running totals
+                    msg["usage"] = dict(msg.get("usage") or {}, **ev["usage"])
+            elif kind == "message_stop":
+                done = True
+                break
+            elif kind == "error":
+                err = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+                raise _AiStreamTrouble(f"the service's own error while writing ({str(err.get('type') or '')[:40]})")
+            # ping, and any kind added later: nothing to do
+        if not done:
+            raise _AiStreamTrouble("the stream ended early")
+        msg["content"] = [blocks[i] for i in sorted(blocks, key=lambda x: (not isinstance(x, int), x))]
+        return msg
+    except requests.exceptions.RequestException as e:
+        raise _AiStreamTrouble(f"the stream broke: {e.__class__.__name__}")
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 def _ai_declined(data):
     """5.0.2: the newer models have safety checks that can decline a request. That comes back as an ordinary answer
     (HTTP 200) with stop_reason "refusal" and no words, so it must be looked for: an answer with no words was once shown
@@ -1739,7 +2008,7 @@ def _ai_declined(data):
 
 
 def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None,
-                timeout=None, feature=None):
+                timeout=None, feature=None, on_text=None, on_search=None):
     """messages, when given, is sent to the API exactly as the native
     multi-turn conversation it already is (alternating user/assistant
     turns) — the correct way to give Claude real conversational
@@ -1764,7 +2033,17 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
     wait = timeout or (140 if use_search else 110)
-    data = _ai_send(payload, wait, feature)
+    # 5.2: with on_text the answer is read while it is written, so its words can be shown as they come. If the stream
+    # fails, the same request is asked once more the plain way (and what was shown is replaced by the whole answer).
+    data = None
+    if on_text:
+        try:
+            data = _ai_send_stream(payload, wait, feature, on_text, on_search)
+        except _AiStreamTrouble as e:
+            logger.warning(f"AI: an answer couldn't be read as it was written ({e}); asked again the plain way ({feature or '-'})")
+            data = None
+    if data is None:
+        data = _ai_send(payload, wait, feature)
     # 5.0.2: the AI service can DECLINE a request with an ordinary answer (see _ai_declined). A request that asks for its
     # reasoning in the answer is declined by the newer models: it is sent once more without that part. Anything else is
     # sent once to the other model. The person never gets an empty answer.
@@ -7144,6 +7423,20 @@ _SAGE_STRAIGHT = (
 )
 SAGE_SYSTEM_PROMPT = _SAGE_BASE + _SAGE_EVIDENCE + _SAGE_HANDOVER          # an app from before 5.1 (it sends no mode)
 SAGE_STRAIGHT_PROMPT = _SAGE_BASE + _SAGE_STRAIGHT + _SAGE_HANDOVER        # 5.1: Chat and Study
+# 5.2 (the owner, 11 Nov 2026, 20:04: "And make the chat Ai very straightforward"). Chat only: Study teaches in steps and
+# asks a question back, which this would forbid.
+CHAT_VERY_STRAIGHT = (
+    "VERY STRAIGHTFORWARD (Chat). The first words of your reply are the answer itself. A simple question (what something "
+    "is, who, when, where, how much, yes or no) gets one to three plain sentences and nothing else: no lead-in, no "
+    "repeating the question, no background they did not ask for, no list of related facts, no summary, and no offer or "
+    "question at the end. A yes-or-no question starts with Yes or No. A calculation gives the result first, then the "
+    "working in a few short steps. Give more only when the question itself needs it or they ask for it (how to do "
+    "something, a comparison, an explanation in depth, a piece of writing): then the answer still comes first and the "
+    "detail after it, in the order they will use it, with nothing they did not ask for. One idea to a sentence. Everyday "
+    "words; a term they may not know is explained in a few words the first time. If the question can be read two ways, "
+    "answer the likelier one and say in one short sentence which you took. If what they sent is too unclear to answer, "
+    "ask one short question instead of guessing."
+)
 # 5.1 (the owner, 11 Nov 2026: "Make the Ai only one and add research mode and study mode"). Study: RamzAI teaches
 # instead of only telling. (Research mode is the report from real papers, /api/research; Chat is everything above.)
 STUDY_MODE_INSTRUCTION = (
@@ -7959,21 +8252,22 @@ def sage_endpoint():
     # Checked and consumed before the expensive call below, not after —
     # the whole point is to never spend the API cost on a request that
     # was already over its limit.
+    user = request.current_user
     try:
-        charged_from = _log_sage_message_and_consume(request.current_user)
+        charged_from = _log_sage_message_and_consume(user)
     except ConversionError as e:
         return _points_reply(e)
 
     # RamzAI's memory (when the person allows it): what RamzAI noted before, and
     # permission to note one new durable thing — taken out of the reply below.
-    memory_on = _memory_on(request.current_user)
+    memory_on = _memory_on(user)
     # 5.1: the app says how RamzAI is working. Chat and Study answer straight ("Anatomy is…"): no search for papers and
     # no source on every sentence; an older app says nothing and is answered as before.
     mode = str(data.get("mode") or "").strip().lower()
     straight = mode in ("chat", "study")
     system_prompt = SAGE_STRAIGHT_PROMPT if straight else SAGE_SYSTEM_PROMPT
     if memory_on:
-        notes = get_user_memory(request.current_user["id"])
+        notes = get_user_memory(user["id"])
         if notes:
             system_prompt += (
                 "\n\nWhat you remember about this person from earlier — use it naturally where it "
@@ -7982,6 +8276,9 @@ def sage_endpoint():
     # 5.1: the person chose to study with RamzAI (the app sends mode "study"): it teaches, a step at a time
     if mode == "study":
         system_prompt += "\n\n" + STUDY_MODE_INSTRUCTION
+    # 5.2 (the owner: "make the chat Ai very straightforward"): in Chat the answer itself comes first, and little else
+    if mode == "chat":
+        system_prompt += "\n\n" + CHAT_VERY_STRAIGHT
     # 5.0.2: RamzAI is no longer asked to write out its thinking before the answer ("How I worked it out"): since
     # November 2026 the AI service declines every request that asks its strong model for that, with an empty answer.
     # Evidence first (3.0): a question about a topic gets real open papers to ground the answer.
@@ -7991,56 +8288,189 @@ def sage_endpoint():
     live_q = not attachment and _remy_live_q(message)
     if topic_q:
         try:
-            papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(request.current_user) else REMY_PAPERS_FREE)
+            papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(user) else REMY_PAPERS_FREE)
         except Exception as e:
             logger.warning(f"RamzAI's paper search failed: {e}")
             papers = []
     if papers:
         system_prompt += "\n\n" + _remy_papers_block(papers)
+
+    def answer(on_text=None, on_search=None, on_step=None):
+        """RamzAI's answer: (what the app is sent, the HTTP status). With on_text the words are passed on while they
+        are written (5.2); on_step says what is being done to an answer that is shown only when it is finished."""
+        try:
+            meta = call_claude(
+                system_prompt=system_prompt,
+                messages=turns,
+                max_tokens=4000,
+                use_search=True,
+                model=ANTHROPIC_MODEL_STRONG,
+                return_meta=True,
+                feature="remy",
+                **({"on_text": on_text, "on_search": on_search} if on_text else {}),
+            )
+            marked, pages = _c34_marked_text(meta.get("content"))
+            result = marked if marked.strip() else meta["text"]
+            if not (result or "").strip():
+                # 5.0.2: no words came back (the reason is in the log): say so and give the point back, never an empty reply
+                raise ConversionError(AI_MSG_FAILED)
+        except Exception as e:
+            # The message was counted above, before the AI call — but no reply
+            # arrived, so give it back. Otherwise a timeout or AI outage quietly
+            # spent one of a free user's 10 monthly messages, and tapping Retry
+            # spent another.
+            _refund_sage_message(user, charged_from)
+            if isinstance(e, ConversionError):
+                return {"error": str(e) + AI_MSG_NOT_COUNTED}, 502
+            raise
+        thinking, result = split_thinking_anywhere(result or "")
+        # 3.13: another tool makes this — the app passes it on; nothing was answered, so the message isn't counted
+        handoff = _remy_handoff(result)
+        if handoff:
+            _refund_sage_message(user, charged_from)
+            return {"handoff": handoff}, 200
+        thinking = C34_WMARK.sub("", thinking) if thinking else thinking
+        note, reply = split_memory_note(result or "")
+        note = C34_WMARK.sub("", note).strip() if note else note
+        noted = None
+        if note and memory_on and add_user_memory(user["id"], note):
+            noted = note[:300]          # 4.5: the person sees what RamzAI noted, and can change it
+        report = {}
+        enforce = not straight or live_q
+        if on_step and enforce and not attachment and (papers or pages):
+            on_step("check")            # its sentences are checked against their sources now
+        reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
+                                               message, topic_q or live_q, started, bool(attachment), report,
+                                               enforce=enforce)
+        reply = C34_WMARK.sub("", reply)
+        out = {"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
+               "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced,
+               "unchecked": int(report.get("unchecked") or 0), "noted": noted}
+        if meta.get("stop_reason") == "max_tokens":
+            out["cut"] = True           # 5.2: the answer reached its length limit: the app offers to carry on
+        return out, 200
+
+    # 5.2: an app that shows the words while they are written asks for the answer that way (stream: true). Only a
+    # straight answer is shown as it comes: one whose sentences are checked against their sources afterwards (the news,
+    # a price) is shown when it is finished, because a sentence may still be taken out of it.
+    if data.get("stream") is True and straight:
+        return _sage_as_written(answer, show_words=not live_q)
+    body, status = answer()
+    return jsonify(body), status
+
+
+_SAGE_HOLD = re.compile(r"\[[^\]\n]{0,24}$")
+SAGE_PACE = 0.06            # the least time between two lines of words (a few times a second is plenty for the eye, and light on a small server)
+SAGE_HB_SECONDS = 8         # a small line when nothing else went for this long (the connection stays open while the AI thinks or searches)
+
+
+def _sage_visible(raw):
+    """5.2: what may be shown of an answer that is still being written: never RamzAI's private marks (a hand-over
+    line, its note for the memory, a block of thinking), nor the beginning of one; tidied as the whole answer will be."""
+    t = str(raw or "")
+    if t.lstrip().startswith("[["):               # a hand-over is the whole reply
+        return ""
+    a = t.find(THINK_START)
+    while a != -1:
+        b = t.find(THINK_END, a)
+        if b == -1:
+            t = t[:a]
+            break
+        t = t[:a] + t[b + len(THINK_END):]
+        a = t.find(THINK_START)
+    for mark in (MEMORY_START, "[[HANDOFF"):
+        i = t.find(mark)
+        if i != -1:
+            t = t[:i]
+    t = _SAGE_HOLD.sub("", t)                     # a mark may be starting at the very end ("[", "[MEM")
+    if not t.strip():
+        return ""
     try:
-        meta = call_claude(
-            system_prompt=system_prompt,
-            messages=turns,
-            max_tokens=4000,
-            use_search=True,
-            model=ANTHROPIC_MODEL_STRONG,
-            return_meta=True,
-            feature="remy",
-        )
-        marked, pages = _c34_marked_text(meta.get("content"))
-        result = marked if marked.strip() else meta["text"]
-        if not (result or "").strip():
-            # 5.0.2: no words came back (the reason is in the log): say so and give the point back, never an empty reply
-            raise ConversionError(AI_MSG_FAILED)
-    except Exception as e:
-        # The message was counted above, before the AI call — but no reply
-        # arrived, so give it back. Otherwise a timeout or AI outage quietly
-        # spent one of a free user's 10 monthly messages, and tapping Retry
-        # spent another.
-        _refund_sage_message(request.current_user, charged_from)
-        if isinstance(e, ConversionError):
-            return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
-        raise
-    thinking, result = split_thinking_anywhere(result or "")
-    # 3.13: another tool makes this — the app passes it on; nothing was answered, so the message isn't counted
-    handoff = _remy_handoff(result)
-    if handoff:
-        _refund_sage_message(request.current_user, charged_from)
-        return jsonify({"handoff": handoff})
-    thinking = C34_WMARK.sub("", thinking) if thinking else thinking
-    note, reply = split_memory_note(result or "")
-    note = C34_WMARK.sub("", note).strip() if note else note
-    noted = None
-    if note and memory_on and add_user_memory(request.current_user["id"], note):
-        noted = note[:300]          # 4.5: the person sees what RamzAI noted, and can change it
-    report = {}
-    reply, used, web, unsourced = _c34_remy((reply or "").strip() or result, papers, pages, meta.get("sources") or [],
-                                           message, topic_q or live_q, started, bool(attachment), report,
-                                           enforce=not straight or live_q)
-    reply = C34_WMARK.sub("", reply)
-    return jsonify({"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
-                    "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced,
-                    "unchecked": int(report.get("unchecked") or 0), "noted": noted})
+        return _finish_text(t, "chat")
+    except Exception:
+        return t.strip()
+
+
+def _sage_as_written(answer, show_words=True):
+    """5.2: RamzAI's answer, sent while it is written, as lines of JSON (the way /api/research sends its steps):
+      {"t": words}                 the next words of the answer;
+      {"set": words}               the answer so far, when it changed by more than growing;
+      {"step": "search", "q": …}   a web search has started; {"step": "write"} / {"step": "check"}: an answer that is
+                                   shown only when finished is being written / checked against its sources;
+      {"hb": 1}                    nothing new for a few seconds (the connection stays open);
+      {"done": {…}}                the whole answer, exactly what /api/sage answers the plain way; or
+      {"error": words, "status": n}.
+    The answer is made in its own thread: a phone that loses its connection doesn't stop it, and the whole answer is
+    kept for the request's key like any other (see _once), so the app collects it instead of asking, and paying, again."""
+    lines = _queue.Queue()
+    once = g.pop("_once_pending", None)          # kept below, when the answer is whole (not by _once_keep: this is a stream)
+    seen = {"raw": "", "sent": "", "at": 0.0, "late": False, "wrote": False}
+
+    def flush():
+        vis = _sage_visible(seen["raw"])
+        seen["late"] = False
+        seen["at"] = time.time()
+        if vis == seen["sent"]:
+            return
+        lines.put({"t": vis[len(seen["sent"]):]} if vis.startswith(seen["sent"]) else {"set": vis})
+        seen["sent"] = vis
+
+    def on_text(piece):
+        if not show_words:
+            if not seen["wrote"] and piece.strip():
+                seen["wrote"] = True
+                lines.put({"step": "write"})
+            return
+        seen["raw"] += piece
+        if time.time() - seen["at"] >= SAGE_PACE:
+            flush()
+        else:
+            seen["late"] = True
+
+    def on_search(query):
+        if show_words and seen["late"]:
+            flush()
+        seen["wrote"] = False
+        lines.put({"step": "search", "q": query})
+
+    def on_step(what):
+        lines.put({"step": what})
+
+    @copy_current_request_context
+    def work():
+        body, status = None, 502
+        try:
+            body, status = answer(on_text, on_search, on_step)
+            if status == 200:
+                body = _fin_walk(body, "chat", False)
+        except Exception as e:
+            logger.error(f"RamzAI's answer failed while it was written: {e.__class__.__name__}: {str(e)[:200]}", exc_info=True)
+            body, status = {"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}, 502
+        finally:
+            good = status == 200 and isinstance(body, dict)
+            if once:
+                _once_settle_json(once[0], once[1], body if good else None)
+            if good:
+                lines.put({"done": body})
+            else:
+                lines.put({"error": str((body or {}).get("error") or AI_MSG_FAILED), "status": status})
+            lines.put(None)
+
+    _threading.Thread(target=work, name="ramzai-answer", daemon=True).start()
+
+    def run():
+        while True:
+            try:
+                item = lines.get(timeout=SAGE_HB_SECONDS)
+            except _queue.Empty:
+                yield '{"hb":1}\n'
+                continue
+            if item is None:
+                return
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
+    return Response(run(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
 
 
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
