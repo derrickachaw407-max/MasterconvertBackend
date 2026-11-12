@@ -1852,6 +1852,41 @@ def _ai_failure(status, body, feature=None):
     return AI_MSG_FAILED
 
 
+class _AiBadRequest(ConversionError):
+    """5.5: the AI service refused a request as badly made (HTTP 400). The person's words are the same as for any other
+    failure; call_claude looks for this kind so that an optional part of a request can never switch RamzAI off."""
+
+
+# 5.5 (12 Nov 2026): "RamzAI couldn't write the background just now", every time. The cause, read in the server's log:
+# Claude Sonnet 5 THINKS before it answers unless a request says not to, and that thinking is counted against
+# max_tokens. The proposal's first chapter had 3,300 tokens for its words; the thinking used all 3,300 and no word came
+# ("an answer with no words (stop_reason max_tokens, blocks thinking)"). The writing check and others lost answers the
+# same way. Every max_tokens and every time limit in this file was set for the WORDS of an answer, so:
+#   1. a plain request (no tools) to a model that can answer without thinking first says so: max_tokens is the room
+#      for the words again, and the answer comes sooner (_ai_tune);
+#   2. if the AI service does not accept that part (HTTP 400), the same request goes once more without it and it is
+#      left out for that model for a while: nothing sent to the AI service may be able to switch RamzAI off for
+#      everyone (5.0.2's lesson);
+#   3. an answer that still comes back with no words because its room ran out is asked for once more with more room.
+# RamzAI's chat (the stronger model, with web search) is sent as before: that model is not meant to answer with tools
+# without thinking; point 3 covers it.
+AI_THINK_OFF_MODELS = ("claude-sonnet-5",)      # these accept "thinking": {"type": "disabled"} (the AI service's own list)
+AI_THINK_OFF_AGAIN = 6 * 3600                   # after a refusal of that part: how long it is left out before one more try
+AI_ROOM_MAX = 16000                             # the most room a second try is given
+_AI_THINK_KEPT = {}                             # model -> the time until which that part is left out
+
+
+def _ai_tune(payload):
+    """5.5: says, in a request, that the model answers without thinking first, where that is right: a plain request (no
+    tools) to a model that accepts it. Anything else is sent without that part, as before."""
+    model = payload.get("model")
+    if model in AI_THINK_OFF_MODELS and not payload.get("tools") and _AI_THINK_KEPT.get(model, 0) <= time.time():
+        payload["thinking"] = {"type": "disabled"}
+    else:
+        payload.pop("thinking", None)
+    return payload
+
+
 def _ai_send(payload, timeout, feature=None):
     """One request to the AI service. Its answer (a dict), or a ConversionError with the words the person sees."""
     try:
@@ -1872,7 +1907,7 @@ def _ai_send(payload, timeout, feature=None):
         logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {e}")
         raise ConversionError(AI_MSG_FAILED)
     if resp.status_code != 200:
-        raise ConversionError(_ai_failure(resp.status_code, resp.text, feature))
+        raise (_AiBadRequest if resp.status_code == 400 else ConversionError)(_ai_failure(resp.status_code, resp.text, feature))
     try:
         data = resp.json()
     except ValueError:
@@ -1917,7 +1952,7 @@ def _ai_send_stream(payload, timeout, feature=None, on_text=None, on_search=None
                 pass
             if resp.status_code >= 500 or resp.status_code == 429:
                 raise _AiStreamTrouble(f"HTTP {resp.status_code}")            # busy: the plain way has its own words for it
-            raise ConversionError(_ai_failure(resp.status_code, body, feature))
+            raise (_AiBadRequest if resp.status_code == 400 else ConversionError)(_ai_failure(resp.status_code, body, feature))
         until = time.time() + timeout
         msg, blocks, partial, done = {}, {}, {}, False
         for raw in resp.iter_lines():
@@ -2034,18 +2069,40 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     }
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
+    _ai_tune(payload)                            # 5.5: max_tokens is the room for the words (see AI_THINK_OFF_MODELS)
     wait = timeout or (140 if use_search else 110)
-    # 5.2: with on_text the answer is read while it is written, so its words can be shown as they come. If the stream
-    # fails, the same request is asked once more the plain way (and what was shown is replaced by the whole answer).
-    data = None
-    if on_text:
+    began = time.time()
+
+    def once(stream, limit):
+        # 5.2: with on_text the answer is read while it is written, so its words can be shown as they come. If the
+        # stream fails, the same request is asked once more the plain way (and what was shown is replaced by the
+        # whole answer).
+        if stream:
+            try:
+                return _ai_send_stream(payload, limit, feature, on_text, on_search)
+            except _AiStreamTrouble as e:
+                logger.warning(f"AI: an answer couldn't be read as it was written ({e}); asked again the plain way ({feature or '-'})")
+        return _ai_send(payload, limit, feature)
+
+    def send(stream=False, limit=None):
+        """One request. 5.5: if the AI service refuses it as badly made while it carries the part that says "answer
+        without thinking first", it goes once more without that part. When that works, the part was the reason: it is
+        left out for this model for a while, and the log says so. When it doesn't, the request fails as it always did."""
+        limit = limit or wait
         try:
-            data = _ai_send_stream(payload, wait, feature, on_text, on_search)
-        except _AiStreamTrouble as e:
-            logger.warning(f"AI: an answer couldn't be read as it was written ({e}); asked again the plain way ({feature or '-'})")
-            data = None
-    if data is None:
-        data = _ai_send(payload, wait, feature)
+            return once(stream, limit)
+        except _AiBadRequest:
+            if "thinking" not in payload:
+                raise
+            payload.pop("thinking")
+            answer = once(False, limit)
+            _AI_THINK_KEPT[payload["model"]] = time.time() + AI_THINK_OFF_AGAIN
+            logger.error(f"AI: the AI service did not accept \"thinking\": disabled for {payload['model']} (HTTP 400). It is left out for "
+                         f"{AI_THINK_OFF_AGAIN // 3600} hours; until then an answer can lose its room to the model's own thinking and is asked "
+                         f"for twice. Check AI_THINK_OFF_MODELS against the AI service's list. ({feature or '-'})")
+            return answer
+
+    data = send(bool(on_text))
     # 5.0.2: the AI service can DECLINE a request with an ordinary answer (see _ai_declined). A request that asks for its
     # reasoning in the answer is declined by the newer models: it is sent once more without that part. Anything else is
     # sent once to the other model. The person never gets an empty answer.
@@ -2059,13 +2116,35 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
             payload["system"] = payload["system"].replace(THINKING_INSTRUCTION, "").strip()
         elif attempt < 2 and payload["model"] != ANTHROPIC_MODEL:
             payload["model"] = ANTHROPIC_MODEL
+            _ai_tune(payload)
         else:
             logger.error(f"AI: nothing else to try: the person is asked to say it another way ({feature or '-'})")
             raise ConversionError(AI_MSG_DECLINED)
-        data = _ai_send(payload, wait, feature)
+        data = send()
     _log_ai_use(payload["model"], data.get("usage"), feature)
-    blocks = [b for b in (data.get("content") or []) if isinstance(b, dict)]
-    text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+    def words(d):
+        bl = [b for b in (d.get("content") or []) if isinstance(b, dict)]
+        return bl, "".join(b.get("text", "") for b in bl if b.get("type") == "text")
+
+    blocks, text = words(data)
+    if not text.strip() and data.get("stop_reason") == "max_tokens":
+        # 5.5: the room ran out before the first word (the model's own thinking, or its searching, took it). Asked once
+        # more with more room, inside the time the caller allowed for this answer; a caller that set no time gets the
+        # usual time again. Never a third time.
+        kinds = ",".join(sorted({str(b.get("type")) for b in blocks})) or "none"
+        left = wait - (time.time() - began) if timeout else wait
+        more = min(AI_ROOM_MAX, max(payload["max_tokens"] * 3, payload["max_tokens"] + 4000))
+        if left >= 8 and more > payload["max_tokens"]:
+            logger.warning(f"AI: no words came, the room of {payload['max_tokens']} ran out (blocks {kinds}, {payload['model']}); "
+                           f"asked once more with room for {more} ({feature or '-'})")
+            payload["max_tokens"] = more
+            data = send(limit=left)
+            _log_ai_use(payload["model"], data.get("usage"), feature)
+            if _ai_declined(data) is not None:
+                logger.error(f"AI: the AI service declined the second try ({payload['model']}) ({feature or '-'})")
+                raise ConversionError(AI_MSG_DECLINED)
+            blocks, text = words(data)
     if not text.strip():
         kinds = ",".join(sorted({str(b.get("type")) for b in blocks})) or "none"
         logger.warning(f"AI: an answer with no words (stop_reason {data.get('stop_reason')}, blocks {kinds}, {payload['model']}) ({feature or '-'})")
@@ -9115,6 +9194,22 @@ def _fin_marks(t):
 _FIN_CODE = re.compile(r"(?ms)^[ \t]*```[^\n]*\n.*?^[ \t]*```[ \t]*$")
 _FIN_INLINE = re.compile(r"`[^`\n]+`")
 _FIN_URL = re.compile(r"\bhttps?://[^\s<>\])\"']+")
+_FIN_LIST_LINE = re.compile(r"(?:[-*+\u2022]|\d{1,3}[.)])[ \t]+\S")
+
+
+def _fin_spaces(t):
+    """5.5: runs of spaces become one, but a list line keeps the spaces it starts with: they say how deep the point is
+    (a mind map's branches, a list inside a list). Until 5.5 every run became one space, so every level below the
+    first arrived at the same depth and a Mind map was drawn flat."""
+    out = []
+    for line in t.split("\n"):
+        lead = ""
+        m = re.match(r"[ \t]+", line)
+        if m and _FIN_LIST_LINE.match(line, m.end()):
+            lead = m.group(0).replace("\t", "  ")[:24]
+            line = line[m.end():]
+        out.append(lead + re.sub(r"[ \t]{2,}", " ", line))
+    return "\n".join(out)
 
 
 def _finish_text(text, kind="chat"):
@@ -9139,7 +9234,9 @@ def _finish_text(text, kind="chat"):
         t = re.sub(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+(.+?)[ \t#]*$", r"\1", t)          # "## Heading" -> "Heading"
         t = re.sub(r"(?m)^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$", "", t)           # a ruled line
         t = re.sub(r"(?m)^([ \t]*)[-*+][ \t]+(?=\S)", r"\1• ", t)              # "- item" -> "• item"
-        t = re.sub(r"(?m)^([ \t]*)>[ \t]?", r"\1", t)                              # "> quote"
+        # "> quote" loses its sign. 5.5: only before words: "> 7: alkaline" (greater than) keeps it (it lost it, and
+        # read "7: alkaline" above "< 7: acidic")
+        t = re.sub(r"(?m)^([ \t]*)>[ \t]+(?=[\"\u201c'\u2018*_A-Za-z\u00C0-\u024F])", r"\1", t)
     t = _fin_marks(t)
     t = _fin_undash(t)
     t = _FIN_EMOJI.sub("", t)
@@ -9156,11 +9253,14 @@ def _finish_text(text, kind="chat"):
         t = "\n\n".join(paras)
     t = _FIN_HOLD.sub("", t)
     t = re.sub(r"(?<=\w)[ \t]+(?=[,;:.!?](?:\s|$))", "", t)            # "Dear , thank you" (a placeholder gone)
-    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = _fin_spaces(t)
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = re.sub("\x00(\\d+)\x00", lambda m: keep[int(m.group(1))], t)
-    return t.strip()
+    lead = re.match(r"\n*([ \t]*)", t).group(1)
+    t = t.strip()
+    # an answer that begins with a point set in from the margin keeps that too (its brothers are as deep)
+    return (lead + t) if lead and _FIN_LIST_LINE.match(t) else t
 
 
 # What each AI answer carries in words people read (references, sources and paper titles are quoted as published)
@@ -12879,7 +12979,10 @@ def write_export_docx_endpoint():
              # file, and the citation style it follows (which says where the text is aligned when they didn't choose)
              "marks": data.get("cite_marks") if data.get("cite_marks") in NUM_MARKS + ("ieee",) else None,
              "look": data.get("look") if isinstance(data.get("look"), dict) else None, "style": str(data.get("style") or "apa")[:20],
-             "front": data.get("front") if isinstance(data.get("front"), dict) else None},     # 5.0: the title page
+             "front": data.get("front") if isinstance(data.get("front"), dict) else None,      # 5.0: the title page
+             # 5.5: what the writing is ("answer" and "notes" are set out as notes; a "report" and "writing" as a paper;
+             # an app from before 5.5 doesn't say, and gets the paper's look as before)
+             "kind": data.get("kind") if data.get("kind") in ("answer", "notes", "report", "writing") else ""},
             work_dir,
         )
         return send_file(

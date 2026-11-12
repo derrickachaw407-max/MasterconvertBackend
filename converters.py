@@ -10497,6 +10497,14 @@ DOC_LOOKS = {
     "clean": {"font": "Calibri", "size": 11, "spacing": 1.15, "align": "left", "indent": False, "numbers": "bottom-right", "rule": False},
     "elegant": {"font": "Garamond", "size": 12, "spacing": 1.5, "align": "justify", "indent": True, "numbers": "bottom-center", "rule": True},
 }
+# 5.5: a chat answer or study notes saved as Word are NOTES, not a paper: the title at the left with a fine line under
+# it, headings at the left, closer lines with room between paragraphs, tables with every line drawn. (Until 5.5 they
+# were set out as an APA paper: double-spaced, first lines set in, "Table 1" over each table, a contents page.)
+# The app says what the writing is (kind: "answer", "notes"); an app that doesn't gets the look it had.
+NOTE_LOOK = {"font": "Times New Roman", "size": 12, "spacing": 1.3, "align": "left", "indent": False, "numbers": "bottom-center",
+             "rule": False, "note": True, "margin_left": 1.0}
+NOTE_KINDS = ("answer", "notes")
+TOC_MIN_PAGES = 4           # a contents list (and the lists of tables and figures) only where the writing runs to four pages
 _LOOK = threading.local()
 
 
@@ -10542,7 +10550,9 @@ _MD_CAPTION = re.compile(r"^\s*(?:\*\*|__)?\s*(table|figure)\s*(\d+)?\s*(?:\*\*|
 _MD_IMAGE = re.compile(r"^\s*!\[([^\]]*)\]\((data:image/(?:png|jpe?g);base64,[A-Za-z0-9+/=]+)\)\s*$")
 _MD_HEADING_LINE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 _MD_BOLD_HEADING = re.compile(r"^\*\*([^*].{0,110}?)\*\*:?\s*$")
-_MD_BULLET_LINE = re.compile(r"^\s*[-*•]\s+(.+)$")
+_MD_BULLET_LINE = re.compile(r"^\s*[-*+•]\s+(.+)$")
+_MD_QUOTE_LINE = re.compile(r"^\s*>\s+(?=[\"\u201c'\u2018*_A-Za-z\u00C0-\u024F])")      # "> words", never "> 7" (greater than)
+_MD_RULE_LINE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,}|(?:[-*_]\s+){2,}[-*_])$")
 _PLAIN_HEAD_END = set(".,;:!?)\"'”’")
 
 
@@ -10554,7 +10564,7 @@ def _plain_heading(line):
     if re.match(r"^[-*•]\s", t) or t.startswith("|"):
         return False
     return t[0].isupper() or t[0].isdigit()
-_MD_NUMBER_LINE = re.compile(r"^\s*\d{1,3}[.)]\s+(.+)$")
+_MD_NUMBER_LINE = re.compile(r"^\s*(\d{1,3})[.)]\s+(.+)$")
 
 
 def _emphasis_runs(text):
@@ -10578,15 +10588,16 @@ def _emphasis_runs(text):
     return [r for r in out if r[0]]
 
 
-def _xrun(text, bold=False, italic=False, color=None, underline=None, size=None, sup=False):
-    """One run of text, in the document's font (the look's); sup: raised (a citation number)."""
+def _xrun(text, bold=False, italic=False, color=None, underline=None, size=None, sup=False, font=None, sub=False):
+    """One run of text, in the document's font (the look's) or the one named; sup: raised (a citation number, x²);
+    sub: lowered (H₂O)."""
     lk = _look()
     size = size or lk["size"]
     r = OxmlElement("w:r")
     rpr = OxmlElement("w:rPr")
     fonts = OxmlElement("w:rFonts")
     for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
-        fonts.set(qn(a), lk["font"])
+        fonts.set(qn(a), font or lk["font"])
     rpr.append(fonts)
     if bold:
         rpr.append(OxmlElement("w:b"))
@@ -10602,9 +10613,9 @@ def _xrun(text, bold=False, italic=False, color=None, underline=None, size=None,
         u = OxmlElement("w:u")
         u.set(qn("w:val"), underline)
         rpr.append(u)
-    if sup:
+    if sup or sub:
         va = OxmlElement("w:vertAlign")
-        va.set(qn("w:val"), "superscript")
+        va.set(qn("w:val"), "superscript" if sup else "subscript")
         rpr.append(va)
     r.append(rpr)
     t = OxmlElement("w:t")
@@ -10715,11 +10726,69 @@ def _plain_or_raised(p, text, b, it):
         p._p.append(_xrun(text[pos:], b, it))
 
 
+# 5.5: what RamzAI writes inside a line besides bold and italics. Until 5.5 these reached the Word file as their signs
+# ("`2^n`", "[Khan Academy](https://…)", "H<sub>2</sub>O").
+_CODE_FONT = "Courier New"          # every phone and computer has it
+_INLINE_ATOM = re.compile(
+    r"`([^`\n]+)`"                                                                   # 1: `code`
+    r"|\[([^\[\]\n]{1,200})\]\((https?://[^\s()<>]+(?:\([^\s()<>]*\)[^\s()<>]*)*)\)"      # 2, 3: [words](address)
+    r"|<(sub|sup)>([^<>\n]{1,60})</\4>", re.I)                                        # 4, 5: <sub>2</sub>
+_ATOM_MARK = re.compile("\ue000(\\d+)\ue001")
+
+
+def _inline_spans(text):
+    """A line's words as runs: [(text, bold, italic, extra)]; extra is None, ("code",), ("link", address), ("sub",) or
+    ("sup",)."""
+    text = _sanitize_xml_text(str(text or "")).replace("\ue000", "").replace("\ue001", "")
+    atoms = []
+
+    def stash(m):
+        atoms.append(m)
+        return "\ue000%d\ue001" % (len(atoms) - 1)
+    out = []
+    for seg, b, it in _emphasis_runs(_INLINE_ATOM.sub(stash, text)):
+        pos = 0
+        for m in _ATOM_MARK.finditer(seg):
+            if m.start() > pos:
+                out.append((seg[pos:m.start()], b, it, None))
+            a = atoms[int(m.group(1))]
+            if a.group(1) is not None:
+                out.append((a.group(1), b, it, ("code",)))
+            elif a.group(2) is not None:
+                out.append((a.group(2), b, it, ("link", a.group(3))))
+            else:
+                out.append((a.group(5), b, it, (a.group(4).lower(),)))
+            pos = m.end()
+        if pos < len(seg):
+            out.append((seg[pos:], b, it, None))
+    return [r for r in out if r[0]]
+
+
+def _write_link(p, url, words, bold=False, italic=False):
+    """Words that open a web address: blue with a line under them, as Word shows a link."""
+    from docx.opc.constants import RELATIONSHIP_TYPE as _RT
+    rid = p.part.relate_to(url, _RT.HYPERLINK, is_external=True)
+    h = OxmlElement("w:hyperlink")
+    h.set(qn("r:id"), rid)
+    h.set(qn("w:history"), "1")
+    h.append(_xrun(words, bold, italic, color=_LINK_BLUE, underline="single"))
+    p._p.append(h)
+
+
 def _write_rich(p, text, links=None, bold=False, italic=False):
-    """Markdown emphasis as Word formatting; each in-text citation a link to its reference."""
+    """Markdown emphasis as Word formatting; each in-text citation a link to its reference; 5.5: code in its own
+    font, a link RamzAI wrote as a live link, lowered and raised letters as such."""
     raised = bool(links and getattr(links, "marks", None) == "raised")
-    for seg, b, it in _emphasis_runs(text):
+    for seg, b, it, extra in _inline_spans(text):
         b, it = b or bold, it or italic
+        if extra:
+            if extra[0] == "code":
+                p._p.append(_xrun(seg, b, it, font=_CODE_FONT, size=max(8, _look()["size"] - 1)))
+            elif extra[0] == "link":
+                _write_link(p, extra[1], seg, b, it)
+            else:
+                p._p.append(_xrun(seg, b, it, sup=extra[0] == "sup", sub=extra[0] == "sub"))
+            continue
         pos = 0
         for s, e, anchor in (links.spans(seg) if links else []):
             if s > pos:
@@ -10776,11 +10845,17 @@ def _apa_styles(doc):
         pf.space_after = DocxPt(0)
         pf.line_spacing = lk["spacing"]
     plain(doc.styles["Normal"])
+    note = bool(lk.get("note"))
     for lvl in (1, 2, 3):
         st = doc.styles[f"Heading {lvl}"]
         plain(st, bold=True, italic=(lvl == 3))
         st.paragraph_format.keep_with_next = True
-        st.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if lvl == 1 else WD_ALIGN_PARAGRAPH.LEFT
+        st.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if (lvl == 1 and not note) else WD_ALIGN_PARAGRAPH.LEFT
+        if note:                # notes: a heading a little larger than the words, with room above it
+            st.font.size = DocxPt((14, 12.5, 12)[lvl - 1])
+            st.paragraph_format.space_before = DocxPt((14, 10, 8)[lvl - 1])
+            st.paragraph_format.space_after = DocxPt(4)
+            st.paragraph_format.line_spacing = 1.15
     try:
         cap = doc.styles["Caption"]
         plain(cap)
@@ -10791,16 +10866,29 @@ def _apa_styles(doc):
 
 def _md_blocks(text, skip_heading=None):
     """The answer's markdown as blocks: ("h", level, text) headings, ("p", text) paragraphs,
-    ("li", text, numbered) list items, ("table", caption, rows), ("img", caption, bytes)."""
+    ("li", text, numbered, depth, number) list items (depth 0 to 3: a point under a point is one deeper; number: the
+    one it was written with), ("table", caption, rows), ("img", caption, bytes), and since 5.5 ("quote", text) a
+    quotation and ("code", text) a block of code with its lines."""
     lines = (text or "").splitlines()
     blocks, buf = [], []
     skip = (skip_heading or "").strip().lower()
     pending_caption = None
+    depths = []                 # where the open list's levels start (spaces from the margin)
 
     def flush():
         if buf:
             blocks.append(("p", " ".join(buf)))
             buf.clear()
+
+    def depth_of(raw):
+        if not blocks or blocks[-1][0] != "li":          # a list after anything else starts from the margin again
+            depths.clear()
+        indent = len(raw.expandtabs(4)) - len(raw.expandtabs(4).lstrip(" "))
+        while depths and indent < depths[-1]:
+            depths.pop()
+        if not depths or indent > depths[-1]:
+            depths.append(indent)
+        return min(len(depths) - 1, 3)
 
     i = 0
     while i < len(lines):
@@ -10809,6 +10897,37 @@ def _md_blocks(text, skip_heading=None):
         if not line:
             flush()
             i += 1
+            continue
+        # 5.5: a fenced block of code keeps its lines
+        if line.startswith("```"):
+            flush()
+            j, code = i + 1, []
+            while j < len(lines) and not re.match(r"^\s*```\s*$", lines[j]):
+                code.append(lines[j].rstrip())
+                j += 1
+            while code and not code[0].strip():
+                code.pop(0)
+            while code and not code[-1].strip():
+                code.pop()
+            if code:
+                blocks.append(("code", "\n".join(code)))
+            i = j + 1
+            continue
+        # 5.5: a ruled line between two parts says nothing
+        if _MD_RULE_LINE.match(line) and not (i + 1 < len(lines) and _MD_TABLE_ROW.match(lines[i + 1].strip()) and _MD_TABLE_ROW.match(line)):
+            flush()
+            i += 1
+            continue
+        # 5.5: a quotation ("> words"; lines that follow each other are one quotation)
+        if _MD_QUOTE_LINE.match(line):
+            flush()
+            said = []
+            while i < len(lines) and _MD_QUOTE_LINE.match(lines[i]):
+                said.append(re.sub(r"^\s*(?:>\s?)+", "", lines[i]).strip())
+                i += 1
+            said = " ".join(x for x in said if x)
+            if said:
+                blocks.append(("quote", said))
             continue
         # a table: | a | b | then |---|---|
         if _MD_TABLE_ROW.match(line) and i + 1 < len(lines) and _MD_TABLE_SEP.match(lines[i + 1].strip()):
@@ -10879,14 +10998,22 @@ def _md_blocks(text, skip_heading=None):
             continue
         m = _MD_BULLET_LINE.match(raw)
         if m:
-            flush()
-            blocks.append(("li", m.group(1).strip(), False))
+            if buf:
+                flush()
+            blocks.append(("li", m.group(1).strip(), False, depth_of(raw), None))
             i += 1
             continue
         m = _MD_NUMBER_LINE.match(raw)
         if m:
-            flush()
-            blocks.append(("li", m.group(1).strip(), True))
+            if buf:
+                flush()
+            blocks.append(("li", m.group(2).strip(), True, depth_of(raw), int(m.group(1))))
+            i += 1
+            continue
+        # 5.5: a point's words carried on to the next line, set in under it, are still that point
+        if not buf and blocks and blocks[-1][0] == "li" and i > 0 and lines[i - 1].strip() and re.match(r"^(?: {2,}|\t)", raw):
+            b = blocks[-1]
+            blocks[-1] = ("li", b[1] + " " + line) + b[2:]
             i += 1
             continue
         buf.append(line)
@@ -10946,13 +11073,153 @@ def _laid_out_pages(docx_path, work_dir, headings, captions):
                 if want and want in texts[i]:
                     pages[bm] = i + 1
                     break
+    pages["#pages"] = len(reader.pages)          # 5.5: how long the whole document is
     return pages
 
 
-def _build_word(payload, pages):
-    """The document itself; pages maps each heading/caption bookmark to its page number."""
+def _table_widths(rows, total, size):
+    """5.5: how wide each column of a table is (inches; together the width of the text): as wide as what it holds and
+    never narrower than its longest word, so a column of sentences gets the room a column of "Yes" doesn't need.
+    (Until 5.5 every column was as wide as the others: a quotation ran down seven lines beside an empty column.)"""
+    ncol = max(len(r) for r in rows)
+    per = float(size) / 72.0 * 0.5                 # about one letter
+    pad = 0.2
+    words = lambda c: re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", re.sub(r"[*_`]|</?su[bp]>", "", str(c or "")))
+    natural, least = [], []
+    for k in range(ncol):
+        cells = [words(r[k]) if k < len(r) else "" for r in rows]
+        natural.append(min(max([len(c) for c in cells] + [1]), 80) * per + pad)
+        longest = max([len(w) for c in cells for w in re.split(r"[\s\-/]+", c)] + [1])
+        least.append(max(0.55, min(longest, 22) * per * 1.08 + pad))
+    if sum(natural) <= total:                      # everything fits on one line: share out what is left
+        spare = total - sum(natural)
+        return [n + spare * n / sum(natural) for n in natural]
+    if sum(least) >= total:                        # too many columns for the page: each its share
+        return [total * m / sum(least) for m in least]
+    want = [max(n - m, 0.0) for n, m in zip(natural, least)]
+    spare = total - sum(least)
+    return [m + (spare * w / sum(want) if sum(want) else spare / ncol) for m, w in zip(least, want)]
+
+
+class _Lists:
+    """5.5: real Word lists that keep what was written: how deep a point is, and the number a numbered list starts at.
+    A second numbered list starts at its own number (until 5.5 it carried on from the list before: "5." where "1."
+    was written), and a point under a point is set further in (until 5.5 every point stood at the margin)."""
+    BULLETS = ("1", "2", "3", "4")          # the template's four bullet lists, each set further in than the one before
+    NUMBERS = ("5", "6", "7", "8")
+
+    def __init__(self, doc):
+        self.el = doc.part.numbering_part.element
+        self.next_id = max([int(n.get(qn("w:numId"))) for n in self.el.findall(qn("w:num"))] or [0]) + 1
+        self.open = {}              # depth -> [the list's id, the number last given]
+        self.before = None          # (depth, numbered) of the point before; None after anything that isn't a point
+        # a point under a point has its own sign, as Word's own lists do: a dot, then a small circle, then a dash
+        # (the template gives every depth the same dot). "o" in Courier New and a dash in the words' font are in
+        # every program; Word's third sign is a Wingdings square, which a phone may not have.
+        for num_id, sign, font in ((self.BULLETS[1], "o", _CODE_FONT), (self.BULLETS[2], "\u2013", _look()["font"])):
+            for a in self.el.findall(qn("w:abstractNum")):
+                if a.get(qn("w:abstractNumId")) != self._abstract(num_id):
+                    continue
+                lvl = a.find(qn("w:lvl"))
+                lvl.find(qn("w:lvlText")).set(qn("w:val"), sign)
+                rpr = lvl.find(qn("w:rPr"))
+                if rpr is None:
+                    rpr = OxmlElement("w:rPr")
+                    lvl.append(rpr)
+                for old in list(rpr):
+                    rpr.remove(old)
+                rf = OxmlElement("w:rFonts")
+                for k in ("w:ascii", "w:hAnsi", "w:cs"):
+                    rf.set(qn(k), font)
+                rf.set(qn("w:hint"), "default")
+                rpr.append(rf)
+
+    def _abstract(self, num_id):
+        for n in self.el.findall(qn("w:num")):
+            if n.get(qn("w:numId")) == num_id:
+                return n.find(qn("w:abstractNumId")).get(qn("w:val"))
+        return "0"
+
+    def _new(self, depth, start):
+        num = OxmlElement("w:num")
+        num.set(qn("w:numId"), str(self.next_id))
+        a = OxmlElement("w:abstractNumId")
+        a.set(qn("w:val"), self._abstract(self.NUMBERS[depth]))
+        num.append(a)
+        ov = OxmlElement("w:lvlOverride")
+        ov.set(qn("w:ilvl"), "0")
+        so = OxmlElement("w:startOverride")
+        so.set(qn("w:val"), str(start))
+        ov.append(so)
+        num.append(ov)
+        self.el.append(num)
+        self.next_id += 1
+        return str(self.next_id - 1)
+
+    def other(self):
+        """Something that isn't a point was written (a paragraph, a table…)."""
+        self.before = None
+
+    def give(self, p, numbered, depth, number):
+        """Makes paragraph p a point of the right list."""
+        depth = max(0, min(int(depth or 0), 3))
+        for d in [k for k in self.open if k > depth]:        # the lists under a point end when a point above them comes
+            del self.open[d]
+        if not numbered:
+            num_id = self.BULLETS[depth]
+        else:
+            n = number if isinstance(number, int) and 0 < number < 1000 else None
+            cur, prev = self.open.get(depth), self.before
+            straight = prev is not None and (prev[0] > depth or (prev[0] == depth and prev[1]))
+            if cur is not None and (straight or (n is not None and n == cur[1] + 1)):
+                cur[1] += 1                     # the same list carries on
+            else:
+                start = n or 1
+                cur = self.open[depth] = [self._new(depth, start), start]
+            num_id = cur[0]
+        self.before = (depth, bool(numbered))
+        ppr = p._p.get_or_add_pPr()
+        old = ppr.find(qn("w:numPr"))
+        if old is not None:
+            ppr.remove(old)
+        npr = OxmlElement("w:numPr")
+        il = OxmlElement("w:ilvl")
+        il.set(qn("w:val"), "0")
+        npr.append(il)
+        ni = OxmlElement("w:numId")
+        ni.set(qn("w:val"), num_id)
+        npr.append(ni)
+        _insert_pPr_child_in_order(ppr, npr)
+
+
+def _para_border(p, edge, sz, color, space):
+    """A line on one side of a paragraph (under a title, beside a quotation)."""
+    ppr = p._p.get_or_add_pPr()
+    bdr = ppr.find(qn("w:pBdr"))
+    if bdr is None:
+        bdr = OxmlElement("w:pBdr")
+        _insert_pPr_child_in_order(ppr, bdr)
+    e = OxmlElement(f"w:{edge}")
+    for k, v in (("w:val", "single"), ("w:sz", str(sz)), ("w:space", str(space)), ("w:color", color)):
+        e.set(qn(k), v)
+    bdr.append(e)
+
+
+def _para_shade(p, fill):
+    ppr = p._p.get_or_add_pPr()
+    shd = OxmlElement("w:shd")
+    for k, v in (("w:val", "clear"), ("w:color", "auto"), ("w:fill", fill)):
+        shd.set(qn(k), v)
+    _insert_pPr_child_in_order(ppr, shd)
+
+
+def _build_word(payload, pages, front_matter=True):
+    """The document itself; pages maps each heading/caption bookmark to its page number. front_matter: the contents
+    and the lists of tables and figures, when the writing has the headings and tables for them (5.5: left out of a
+    short piece, and of notes)."""
     doc = Document()
     lk = _look()
+    note = bool(lk.get("note"))
     sec = doc.sections[0]
     sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = DocxInches(1)
     sec.left_margin = DocxInches(lk.get("margin_left", 1.0))
@@ -10985,6 +11252,10 @@ def _build_word(payload, pages):
             body.extend(_md_blocks(s.get("text") or ""))
     else:
         body = _md_blocks(str(payload.get("text") or "").strip(), skip_heading=title)
+        # 5.5, notes: an outline whose one top point is the title again (a Mind map's centre) starts at its branches
+        if (note and len(body) > 1 and all(b[0] == "li" for b in body) and body[0][3] == 0 and all(b[3] >= 1 for b in body[1:])
+                and _norm_words(body[0][1]) == _norm_words(title)):
+            body = [("li", b[1], b[2], b[3] - 1, b[4]) for b in body[1:]]
 
     # numbers and bookmarks for headings, tables and figures
     heads, tables, figures = [], [], []
@@ -10996,6 +11267,12 @@ def _build_word(payload, pages):
             body[k] = ("h", b[1], b[2], bm)
             current_head = b[2]
         elif b[0] == "table":
+            # notes: a table has a title only when it was written with one. A research report's table stands under
+            # its own heading ("Evidence"), in whatever language the report is in: "Table 1" and the heading said
+            # again in italics over it said nothing more.
+            if (note or payload.get("kind") == "report") and not b[1]:
+                body[k] = ("table", None, b[2], None, None)
+                continue
             n = len(tables) + 1
             cap = b[1] or (current_head or "Summary")
             bm = f"_Tbl{n}"
@@ -11007,7 +11284,7 @@ def _build_word(payload, pages):
             bm = f"_Fig{n}"
             figures.append((bm, n, cap))
             body[k] = ("img", cap, b[2], n, bm)
-    want_toc = len(heads) >= 3
+    want_toc = len(heads) >= 3 and front_matter and not note
     bid = [1]
 
     def next_id():
@@ -11052,8 +11329,15 @@ def _build_word(payload, pages):
         doc.add_paragraph().add_run().add_break(_WDB.PAGE)
 
     # ---- the title
-    tp = para(WD_ALIGN_PARAGRAPH.CENTER)
-    _write_rich(tp, title, bold=True)
+    if note:                    # notes: the title at the left, larger, a fine line under it
+        tp = para(WD_ALIGN_PARAGRAPH.LEFT, spacing=1.1)
+        for seg, _b, it in _emphasis_runs(title):
+            tp._p.append(_xrun(seg, True, it, size=17))
+        tp.paragraph_format.space_after = DocxPt(12)
+        _para_border(tp, "bottom", 4, _PROP_LINE, 6)
+    else:
+        tp = para(WD_ALIGN_PARAGRAPH.CENTER)
+        _write_rich(tp, title, bold=True)
 
     # ---- contents, list of tables, list of figures: real Word fields, already filled in
     def contents(heading, entries, instr):
@@ -11093,10 +11377,10 @@ def _build_word(payload, pages):
     if want_toc:
         contents("Contents", [(bm, text, lvl) for bm, text, lvl in heads], 'TOC \\o "1-3" \\h \\z \\u')
         front = True
-    if tables:
+    if tables and front_matter and not note:
         contents("List of Tables", [(bm, f"Table {n} {cap}", 1) for bm, n, cap in tables], 'TOC \\h \\z \\c "Table"')
         front = True
-    if figures:
+    if figures and front_matter and not note:
         contents("List of Figures", [(bm, f"Figure {n} {cap}", 1) for bm, n, cap in figures], 'TOC \\h \\z \\c "Figure"')
         front = True
     if front:
@@ -11120,8 +11404,22 @@ def _build_word(payload, pages):
             p._p.append(_xrun(seg, b, True))
         _xbookmark(p._p, bm, next_id())
 
+    lists = _Lists(doc)
+    text_width = sec.page_width.inches - lk.get("margin_left", 1.0) - 1.0
+    was = None                  # the block before: (kind, its paragraph, numbered, depth)
     for b in body:
         kind = b[0]
+        if kind != "li":
+            lists.other()
+        if note and was is not None and was[1] is not None:
+            # notes: a list stands with the line that leads into it ("A good answer:"), and has room after its last
+            # point (before a paragraph, a heading's own room aside, or the next list)
+            if kind == "li" and was[0] == "p" and was[1].text.rstrip().endswith(":"):
+                was[1].paragraph_format.space_after = DocxPt(2)
+                was[1].paragraph_format.keep_with_next = True
+            elif was[0] == "li" and (kind != "li" or ((b[3] if len(b) > 3 else 0) == 0 and was[3] == 0 and bool(b[2]) != bool(was[2]))):
+                was[1].paragraph_format.space_after = DocxPt(9)
+        p = None
         if kind == "h":
             _, lvl, text, bm = b
             p = doc.add_paragraph(style=f"Heading {lvl}")
@@ -11133,34 +11431,67 @@ def _build_word(payload, pages):
                 p.paragraph_format.space_after = DocxPt(round(lk["size"] * 0.8))
             _write_rich(p, b[1], links)
         elif kind == "li":
+            # 5.5: a real list that keeps how deep the point is and the number its list starts at
             p = doc.add_paragraph(style="List Number" if b[2] else "List Bullet")
             p.paragraph_format.line_spacing = lk["spacing"]
+            if note:
+                p.paragraph_format.space_after = DocxPt(3)
+            lists.give(p, b[2], b[3] if len(b) > 3 else 0, b[4] if len(b) > 4 else None)
             _write_rich(p, b[1], links)
+            was = ("li", p, bool(b[2]), b[3] if len(b) > 3 else 0)
+            continue
+        elif kind == "quote":
+            # 5.5: a quotation: set in from the margin (APA's block quotation); in notes with a line beside it
+            p = para(WD_ALIGN_PARAGRAPH.LEFT)
+            p.paragraph_format.left_indent = DocxInches(0.5)
+            if note:
+                p.paragraph_format.left_indent = DocxInches(0.3)
+                p.paragraph_format.space_before = DocxPt(4)
+                p.paragraph_format.space_after = DocxPt(10)
+                _para_border(p, "left", 12, "8C8C8C", 10)
+            elif not lk["indent"]:
+                p.paragraph_format.space_after = DocxPt(round(lk["size"] * 0.8))
+            _write_rich(p, b[1], links)
+        elif kind == "code":
+            # 5.5: code keeps its lines and its spaces, in a font whose letters are all as wide as each other
+            p = para(WD_ALIGN_PARAGRAPH.LEFT, spacing=1.0)
+            p.paragraph_format.space_before = DocxPt(4)
+            p.paragraph_format.space_after = DocxPt(10)
+            _para_shade(p, _PROP_HEAD_FILL)
+            for k, ln in enumerate(b[1].split("\n")[:400]):
+                if k:
+                    br = OxmlElement("w:r")
+                    br.append(OxmlElement("w:br"))
+                    p._p.append(br)
+                p._p.append(_xrun(_sanitize_xml_text(ln.expandtabs(4)), font=_CODE_FONT, size=max(8, lk["size"] - 2)))
         elif kind == "table":
             _, cap, rows, n, bm = b
-            caption("Table", n, cap, bm)
-            t = doc.add_table(rows=len(rows), cols=len(rows[0]))
-            borders = OxmlElement("w:tblBorders")
-            for edge, val in (("top", "single"), ("left", "nil"), ("bottom", "single"), ("right", "nil"), ("insideH", "nil"), ("insideV", "nil")):
-                e = OxmlElement(f"w:{edge}")
-                e.set(qn("w:val"), val)
-                if val == "single":
+            if n:
+                caption("Table", n, cap, bm)
+            # 5.5: as wide as the text, each column as wide as what it holds; in the middle of the page (set at the
+            # left, Word stands a table a cell's padding outside the margin)
+            widths = _table_widths(rows, text_width, lk["size"])
+            t = _prop_table(doc, widths, len(rows), grid=note, header=True, centre=True)
+            if not note:        # APA's table: a line above, a line below, one under the column headings
+                tb = t._tbl.tblPr.find(qn("w:tblBorders"))
+                for edge in ("top", "bottom"):
+                    e = tb.find(qn(f"w:{edge}"))
+                    e.set(qn("w:val"), "single")
                     e.set(qn("w:sz"), "8")
+                    e.set(qn("w:space"), "0")
                     e.set(qn("w:color"), "000000")
-                borders.append(e)
-            t._tbl.tblPr.append(borders)
             for ri, row in enumerate(rows):
-                trpr = t.rows[ri]._tr.get_or_add_trPr()      # a row never breaks across pages
-                trpr.append(OxmlElement("w:cantSplit"))
                 for ci, cell_text in enumerate(row):
                     cell = t.cell(ri, ci)
+                    cell.width = DocxInches(widths[ci])
                     cp = cell.paragraphs[0]
                     cp.paragraph_format.line_spacing = 1.0
                     cp.paragraph_format.space_before = DocxPt(3)
                     cp.paragraph_format.space_after = DocxPt(3)
-                    cp.paragraph_format.keep_with_next = ri < len(rows) - 1   # the table stays together
                     _write_rich(cp, cell_text, links, bold=(ri == 0))
-                    if ri == 0:      # a line under the column headings, as APA tables have
+                    if ri == 0 and note:
+                        _set_docx_cell_shading(cell, _PROP_HEAD_FILL)
+                    elif ri == 0:      # a line under the column headings, as APA tables have
                         tcpr = cell._tc.get_or_add_tcPr()
                         tb = OxmlElement("w:tcBorders")
                         bt = OxmlElement("w:bottom")
@@ -11169,7 +11500,9 @@ def _build_word(payload, pages):
                         bt.set(qn("w:color"), "000000")
                         tb.append(bt)
                         tcpr.append(tb)
+            _prop_keep(t)          # a short table stays whole on one page; a long one keeps its first rows together
             para(spacing=1.0)      # a little room after the table
+            p = None
         elif kind == "img":
             _, cap, data, n, bm = b
             caption("Figure", n, cap, bm)
@@ -11177,16 +11510,24 @@ def _build_word(payload, pages):
                 doc.add_paragraph().add_run().add_picture(io.BytesIO(data), width=DocxInches(6.0))
             except Exception:
                 pass
+            p = None
+        was = (kind, p if kind == "p" else None, False, 0)
 
     # ---- the references: each one a place the citations link to, with its live link
     if references:
-        doc.add_paragraph()
-        rh = para(WD_ALIGN_PARAGRAPH.CENTER)
-        rh._p.append(_xrun(str(payload.get("references_title") or "References")[:40], bold=True))
+        if note:                # notes: a heading like the others
+            rh = doc.add_paragraph(style="Heading 1")
+            rh._p.append(_xrun(str(payload.get("references_title") or "References")[:40], bold=True, size=14))
+        else:
+            doc.add_paragraph()
+            rh = para(WD_ALIGN_PARAGRAPH.CENTER)
+            rh._p.append(_xrun(str(payload.get("references_title") or "References")[:40], bold=True))
+            rh.paragraph_format.keep_with_next = True       # 5.5: never alone at the foot of a page, its list over the leaf
         for i, ref in enumerate(references):
             p = para()
             p.paragraph_format.left_indent = DocxInches(0.5)
             p.paragraph_format.first_line_indent = DocxInches(-0.5)
+            p.paragraph_format.keep_together = True         # 5.5: a reference is never cut in two by a page
             text = str(ref.get("text") or "").strip()
             if numbered:     # IEEE (and RamzAI's own notes) number in brackets; Vancouver and the others "1."
                 p._p.append(_xrun(f"[{i + 1}] " if marks in (None, "ieee") else f"{i + 1}. "))
@@ -11218,10 +11559,20 @@ def academic_essay_to_docx(payload, out_dir):
     1-inch margins, justified paragraphs with a first-line indent, page numbers), real
     headings; a real clickable Table of Contents / List of Tables / List of Figures when the
     piece has them (page numbers worked out from the laid-out document); tables with
-    captions; in-text citations linked to their references; live reference links."""
+    captions; in-text citations linked to their references; live reference links.
+
+    5.5 (the owner, 12 Nov 2026: "make every research product and results, and other products … very high quality"):
+    payload["kind"] says what the writing is. "answer" and "notes" are set out as notes (NOTE_LOOK); "report" and
+    "writing", and a payload that doesn't say (an app before 5.5), as a paper. Whatever the kind: the contents and the
+    lists of tables and figures only where the writing runs to TOC_MIN_PAGES pages; lists that keep their depth and
+    their numbers; quotations, code, links and small letters drawn as what they are; a table's columns as wide as what
+    they hold; a file that says the right things about itself (_finish_docx)."""
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "Academic_Response.docx")
-    _LOOK.v = doc_look(payload.get("look"), payload.get("style"))
+    if str(payload.get("kind") or "") in NOTE_KINDS and not isinstance(payload.get("look"), dict):
+        _LOOK.v = dict(NOTE_LOOK)          # 5.5: a chat answer, study notes: set out as notes
+    else:
+        _LOOK.v = doc_look(payload.get("look"), payload.get("style"))
     try:
         return _essay_docx(payload, out_dir, out_path)
     finally:
@@ -11325,9 +11676,50 @@ def _rtl_pass(doc):
     return True
 
 
+def _finish_docx(doc, title="", subject="", author=""):
+    """5.5: what a Word file says about itself, and nothing left over from the empty file it grew from. Until 5.5 every
+    file but the proposal said its author was "python-docx", its comment "generated by python-docx" and its date 23
+    December 2013, carried a picture of a blank page as its preview (some phones show that picture as the file), and
+    a zoom setting that Word's own format calls incomplete."""
+    import datetime as _dt
+    zoom = doc.settings.element.find(qn("w:zoom"))
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+    try:
+        pkg = doc.part.package
+        for rid, rel in list(pkg.rels.items()):
+            if str(rel.reltype).endswith("/metadata/thumbnail"):
+                del pkg.rels[rid]
+    except Exception:
+        pass
+    cp = doc.core_properties
+    cp.title = re.sub(r"[*_`]+", "", re.sub(r"\s+", " ", str(title or "")).strip())[:250]
+    cp.subject, cp.keywords, cp.comments, cp.category = str(subject or "")[:80], "", "", ""
+    cp.author = re.sub(r"\s+", " ", str(author or "")).strip()[:250]
+    cp.last_modified_by = ""
+    cp.created = cp.modified = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0, tzinfo=None)
+    cp.revision = 1
+
+
+_DOC_SUBJECTS = {"answer": "Notes", "notes": "Study notes", "report": "Research report"}
+
+
+def _rough_pages(payload):
+    """About how many pages the writing fills, from its words (used only when the layout couldn't be worked out)."""
+    lk = _look()
+    parts = [str(payload.get("text") or "")]
+    for sct in payload.get("sections") or []:
+        if isinstance(sct, dict):
+            parts.append(str(sct.get("heading") or "") + " " + str(sct.get("text") or ""))
+    words = len(re.findall(r"\S+", " ".join(parts)))
+    per_page = 550.0 / max(1.0, float(lk.get("spacing") or 2.0)) * (12.0 / float(lk.get("size") or 12)) ** 2
+    return words / per_page + 0.5
+
+
 def _essay_docx(payload, out_dir, out_path):
-    doc, heads, caps = _build_word(payload, {})
-    fronted = len(heads) >= 3 or bool(caps)
+    note = bool(_look().get("note"))
+    doc, heads, caps = _build_word(payload, {}, front_matter=not note)
+    fronted = (not note) and (len(heads) >= 3 or bool(caps))
     if fronted:
         pages = {}
         try:
@@ -11340,12 +11732,23 @@ def _essay_docx(payload, out_dir, out_path):
         except Exception as e:
             import logging as _logging
             _logging.getLogger("academic-home").warning(f"Contents page numbers not worked out: {e}")
-        doc, heads, caps = _build_word(payload, pages)
-        wanted = [bm for bm, _ in heads] if len(heads) >= 3 else []
-        wanted += [bm for bm, _, _, _ in caps]
-        if any(bm not in pages for bm in wanted):
-            _ask_word_to_update(doc)
+        # 5.5: a contents page only where the writing is long. (Until 5.5 any piece with three headings or one table
+        # opened on a page that held its title, "Contents" and "List of Tables" and nothing else: a one-page answer
+        # became two pages, the first almost empty.)
+        total = pages.pop("#pages", None)
+        begins = min(pages.values()) if pages else None
+        long_enough = ((total - begins + 1) if (total and begins) else _rough_pages(payload)) >= TOC_MIN_PAGES
+        if not long_enough:
+            doc, heads, caps = _build_word(payload, {}, front_matter=False)
+        else:
+            doc, heads, caps = _build_word(payload, pages)
+            wanted = [bm for bm, _ in heads] if len(heads) >= 3 else []
+            wanted += [bm for bm, _, _, _ in caps]
+            if any(bm not in pages for bm in wanted):
+                _ask_word_to_update(doc)
     _rtl_pass(doc)
+    front = payload.get("front") if isinstance(payload.get("front"), dict) else {}
+    _finish_docx(doc, payload.get("title") or "", _DOC_SUBJECTS.get(str(payload.get("kind") or ""), ""), front.get("author") or "")
     doc.save(out_path)
     return out_path
 
@@ -11999,138 +12402,204 @@ def _build_proposal(payload, pages):
     cp.title, cp.subject, cp.keywords, cp.comments, cp.category = title[:250], "Research proposal", "", "", ""
     cp.author = ", ".join(str(a["name"]) for a in authors)[:250]
     cp.last_modified_by = ""
+    import datetime as _dt          # 5.5: the day it was made (it said 23 December 2013, the empty file's own date)
+    cp.created = cp.modified = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0, tzinfo=None)
     return doc, heads
 
 
-def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
-    """Builds a polished, printable practice quiz from AI-generated
-    question data — deliberately styled differently from
-    academic_essay_to_docx (Calibri, single-spaced, generous blank space
-    for handwritten answers) since a worksheet a student writes on and
-    a formal essay serve completely different purposes. No AI involved
-    here — pure deterministic formatting of content the caller already
-    generated and validated.
+_QUIZ_FONT = "Times New Roman"      # every phone and computer has it (until 5.5 the file asked for Calibri, which an iPhone has not)
+_QUIZ_INK = DocxRGBColor(0x00, 0x00, 0x00)
+_QUIZ_SOFT = DocxRGBColor(0x40, 0x40, 0x40)       # explanations: dark enough to read in print (they were a pale grey)
+_QUIZ_RIGHT = DocxRGBColor(0x1A, 0x6B, 0x43)      # the right answer: a calm green
+_QUIZ_LINE = DocxRGBColor(0x80, 0x80, 0x80)       # lines to write on
 
-    questions is a list of dicts, each with:
-      "type": "multiple_choice" or "short_answer"
-      "question": the question text
-      "options": list of answer choices (multiple_choice only)
-      "correct_answer": the correct option text, or a model short answer
-      "explanation": a brief note on why, shown only in the answer key
+
+def _quiz_letter(q):
+    """The right option of a multiple-choice question as (its letter, its words): ("C", "Anaphase"), whether the answer
+    was given as the option's words, as its letter ("C") or as both ("C. Anaphase"); None when it is none of the options."""
+    opts = [str(o) for o in (q.get("options") or [])][:8] if isinstance(q.get("options"), list) else []
+    ans = str(q.get("correct_answer") or "").strip()
+    if not opts or not ans:
+        return None
+    bare = lambda t: re.sub(r"^[a-hA-H][).:]\s+", "", str(t).strip())
+    norm = lambda t: re.sub(r"\s+", " ", bare(t)).lower()
+    for k, o in enumerate(opts):
+        if norm(o) == norm(ans):
+            return "ABCDEFGH"[k], bare(o)
+    m = re.match(r"^([A-Ha-h])(?:[).:]|$)", ans)
+    if m and "ABCDEFGH".index(m.group(1).upper()) < len(opts):
+        k = "ABCDEFGH".index(m.group(1).upper())
+        return "ABCDEFGH"[k], bare(opts[k])
+    return None
+
+
+def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
+    """A practice quiz to print and write on, and its answer key on a page of its own. No AI here: the questions are
+    set out as they were made.
+
+    5.5 (the owner, 12 Nov 2026: "make every research product and results, and other products … very high
+    quality"): the file is finished like the app's other files. Times New Roman 12 (it named Calibri 11, which an
+    iPhone has not), a title with a fine line under it, a line for the name, the date and the score, every question
+    kept whole on one page with its options, wrapped lines standing under their words (not under the number or the
+    letter), real lines to write on, and an answer key that says the letter and explains in letters dark enough to read.
+
+    questions: dicts with "type" ("multiple_choice" or "short_answer"), "question", "options" (multiple choice),
+    "correct_answer", "explanation" (shown only in the key), and for a case study "case_study" and "case".
     """
+    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
     if not questions:
+        raise ConversionError("No questions were generated.")
+    asked = [q for q in questions if isinstance(q, dict) and str(q.get("question") or "").strip()]
+    if not asked:
         raise ConversionError("No questions were generated.")
 
     doc = Document()
     section = doc.sections[0]
-    section.left_margin = DocxInches(1)
-    section.right_margin = DocxInches(1)
-    section.top_margin = DocxInches(1)
-    section.bottom_margin = DocxInches(1)
-    _add_page_number_footer(doc)
+    section.left_margin = section.right_margin = section.top_margin = section.bottom_margin = DocxInches(1)
+    width = section.page_width.inches - 2.0
+    _add_page_number_footer(doc, "bottom-center", _QUIZ_FONT, 10)
 
     normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = DocxPt(11)
-    normal.font.color.rgb = DocxRGBColor(0x22, 0x22, 0x22)
+    normal.font.name = _QUIZ_FONT
+    normal.font.size = DocxPt(12)
+    normal.font.color.rgb = _QUIZ_INK
+    rpr = normal.element.get_or_add_rPr()
+    rf = rpr.find(qn("w:rFonts"))
+    if rf is None:
+        rf = OxmlElement("w:rFonts")
+        rpr.insert(0, rf)
+    for a in list(rf.attrib):
+        if a.lower().endswith("theme"):
+            del rf.attrib[a]
+    for a in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rf.set(qn(a), _QUIZ_FONT)
     normal.paragraph_format.line_spacing = 1.15
+    normal.paragraph_format.space_before = DocxPt(0)
+    normal.paragraph_format.space_after = DocxPt(0)
 
-    def set_run(run, size=11, bold=False, italic=False, color=None):
-        run.font.name = "Calibri"
-        run.font.size = DocxPt(size)
-        run.font.color.rgb = color or DocxRGBColor(0x22, 0x22, 0x22)
-        run.bold = bold
-        run.italic = italic
-        return run
+    def run(p, text, size=12, bold=False, italic=False, color=None):
+        r = p.add_run(_sanitize_xml_text(str(text)))
+        r.font.name = _QUIZ_FONT
+        r.font.size = DocxPt(size)
+        r.font.color.rgb = color or _QUIZ_INK
+        r.bold = bold
+        r.italic = italic
+        rp = r._r.get_or_add_rPr()
+        f = rp.find(qn("w:rFonts"))
+        if f is not None:
+            for a in ("w:cs", "w:eastAsia"):
+                f.set(qn(a), _QUIZ_FONT)
+        return r
 
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    set_run(title_p.add_run(_sanitize_xml_text(str(title)[:200])), size=20, bold=True)
+    def hang(p, left, by):
+        """A numbered or lettered line: its other lines stand under its words."""
+        pf = p.paragraph_format
+        pf.left_indent = DocxInches(left + by)
+        pf.first_line_indent = DocxInches(-by)
+        pf.tab_stops.add_tab_stop(DocxInches(left + by))
 
-    # A real, printable worksheet has somewhere to write a name and
-    # date — a small, deliberate touch that a plain AI-generated
-    # question list wouldn't include on its own.
+    def heading(text):
+        hp = doc.add_paragraph()
+        hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        hp.paragraph_format.space_after = DocxPt(14)
+        hp.paragraph_format.keep_with_next = True
+        run(hp, text, size=18, bold=True)
+        _para_border(hp, "bottom", 4, _PROP_LINE, 8)
+        return hp
+
+    heading(str(title or "Practice quiz")[:200])
+
+    # where to write the name, the date and the score: three lines drawn to their places
     name_p = doc.add_paragraph()
-    name_p.paragraph_format.space_before = DocxPt(18)
-    name_p.paragraph_format.space_after = DocxPt(18)
-    set_run(name_p.add_run("Name: " + "_" * 28 + "        Date: " + "_" * 14), size=11)
+    name_p.paragraph_format.space_after = DocxPt(10)
+    stops = name_p.paragraph_format.tab_stops
+    stops.add_tab_stop(DocxInches(width * 0.50), WD_TAB_ALIGNMENT.LEFT, WD_TAB_LEADER.LINES)
+    stops.add_tab_stop(DocxInches(width * 0.53), WD_TAB_ALIGNMENT.LEFT)
+    stops.add_tab_stop(DocxInches(width * 0.78), WD_TAB_ALIGNMENT.LEFT, WD_TAB_LEADER.LINES)
+    stops.add_tab_stop(DocxInches(width * 0.81), WD_TAB_ALIGNMENT.LEFT)
+    stops.add_tab_stop(DocxInches(width * 0.94), WD_TAB_ALIGNMENT.LEFT, WD_TAB_LEADER.LINES)
+    run(name_p, "Name: ")
+    run(name_p, "\t", color=_QUIZ_LINE)
+    run(name_p, "\tDate: ")
+    run(name_p, "\t", color=_QUIZ_LINE)
+    run(name_p, "\tScore: ")
+    run(name_p, "\t", color=_QUIZ_LINE)
+    run(name_p, f" / {len(asked)}")
 
-    for i, q in enumerate(questions, 1):
+    for i, q in enumerate(asked, 1):
         q_type = q.get("type") or "short_answer"
         q_text = str(q.get("question") or "").strip()
-        if not q_text:
-            continue
-
+        options = [str(o) for o in q["options"][:8]] if q_type == "multiple_choice" and isinstance(q.get("options"), list) and q["options"] else []
         case = str(q.get("case") or "").strip() if q.get("case_study") else ""
         if case:
-            # A case study: its label, the scenario in plain text, then the question.
+            # a case study: its label, the case set in with a line beside it, then the question under it
             lab = doc.add_paragraph()
             lab.paragraph_format.space_before = DocxPt(16)
-            lab.paragraph_format.space_after = DocxPt(3)
-            set_run(lab.add_run(f"{i}. Case study"), size=10.5, bold=True, color=DocxRGBColor(0x1F, 0x5F, 0x8B))
+            lab.paragraph_format.space_after = DocxPt(4)
+            lab.paragraph_format.keep_with_next = True
+            hang(lab, 0, 0.35)
+            run(lab, f"{i}.\t", bold=True)
+            run(lab, "Case study", bold=True)
             case_p = doc.add_paragraph()
-            case_p.paragraph_format.left_indent = DocxInches(0.3)
+            case_p.paragraph_format.left_indent = DocxInches(0.5)
             case_p.paragraph_format.space_after = DocxPt(6)
-            set_run(case_p.add_run(_sanitize_xml_text(case)), size=11)
+            _para_border(case_p, "left", 12, "8C8C8C", 8)
+            run(case_p, case)
         q_p = doc.add_paragraph()
-        q_p.paragraph_format.space_before = DocxPt(4 if case else 14)
-        q_p.paragraph_format.space_after = DocxPt(4)
+        q_p.paragraph_format.space_before = DocxPt(4 if case else 16)
+        q_p.paragraph_format.space_after = DocxPt(5)
+        q_p.paragraph_format.keep_with_next = True
+        q_p.paragraph_format.keep_together = True
         if case:
-            q_p.paragraph_format.left_indent = DocxInches(0.3)
+            q_p.paragraph_format.left_indent = DocxInches(0.35)
         else:
-            set_run(q_p.add_run(f"{i}. "), bold=True)
-        set_run(q_p.add_run(_sanitize_xml_text(q_text)), bold=True)
+            hang(q_p, 0, 0.35)
+            run(q_p, f"{i}.\t", bold=True)
+        run(q_p, q_text, bold=True)
 
-        if q_type == "multiple_choice" and isinstance(q.get("options"), list) and q["options"]:
-            letters = "ABCDEFGH"
-            for j, opt in enumerate(q["options"][:8]):
+        if options:
+            for j, opt in enumerate(options):
                 opt_p = doc.add_paragraph()
-                opt_p.paragraph_format.left_indent = DocxInches(0.4)
-                opt_p.paragraph_format.space_after = DocxPt(2)
-                set_run(opt_p.add_run(f"{letters[j]}. "), bold=False)
-                set_run(opt_p.add_run(_sanitize_xml_text(str(opt))))
+                hang(opt_p, 0.35, 0.3)
+                opt_p.paragraph_format.space_after = DocxPt(3)
+                opt_p.paragraph_format.keep_together = True
+                opt_p.paragraph_format.keep_with_next = j < len(options) - 1      # a question is never cut from its options
+                run(opt_p, "ABCDEFGH"[j] + ".\t")
+                run(opt_p, re.sub(r"^[A-Ha-h][).:]\s+", "", opt.strip()))
         else:
-            # Short answer: three ruled writing lines made of literal
-            # underscore text, not paragraph borders — confirmed
-            # directly that consecutive paragraph borders here get
-            # merged by Word/LibreOffice's rendering into a single
-            # line (a real, known OOXML behavior for adjacent
-            # identical borders), which silently produced only one
-            # visible line no matter how the spacing was adjusted.
-            # Underscores as actual run content sidestep that
-            # entirely and render exactly as three separate lines.
-            for _ in range(3):
+            # lines to write on: each drawn from the question's words to the right margin
+            for k in range(3):
                 line_p = doc.add_paragraph()
-                line_p.paragraph_format.left_indent = DocxInches(0.4)
-                line_p.paragraph_format.space_before = DocxPt(16)
-                set_run(line_p.add_run("_" * 70), color=DocxRGBColor(0x99, 0x99, 0x99))
+                line_p.paragraph_format.left_indent = DocxInches(0.35)
+                line_p.paragraph_format.space_before = DocxPt(13)
+                line_p.paragraph_format.keep_with_next = k < 2
+                line_p.paragraph_format.tab_stops.add_tab_stop(DocxInches(width), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.LINES)
+                run(line_p, "\t", color=_QUIZ_LINE)
 
-    # Answer key on its own page — a tutor handing this to a student
-    # hands over the first page only, or the whole thing to grade it
-    # themselves; either way the two need to be cleanly separable.
+    # the answer key on a page of its own: a tutor hands over the questions, or the whole file
     doc.add_page_break()
-    key_title = doc.add_paragraph()
-    key_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    set_run(key_title.add_run("Answer Key"), size=18, bold=True)
-
-    for i, q in enumerate(questions, 1):
-        q_text = str(q.get("question") or "").strip()
-        if not q_text:
-            continue
+    heading("Answer key")
+    for i, q in enumerate(asked, 1):
         ans = str(q.get("correct_answer") or "").strip()
         expl = str(q.get("explanation") or "").strip()
-
+        right = _quiz_letter(q) if (q.get("type") or "") == "multiple_choice" else None
         ans_p = doc.add_paragraph()
         ans_p.paragraph_format.space_before = DocxPt(10)
-        ans_p.paragraph_format.space_after = DocxPt(1)
-        set_run(ans_p.add_run(f"{i}. "), bold=True)
-        set_run(ans_p.add_run(_sanitize_xml_text(ans)), bold=True, color=DocxRGBColor(0x1a, 0x7a, 0x4a))
-
+        ans_p.paragraph_format.space_after = DocxPt(2)
+        ans_p.paragraph_format.keep_with_next = bool(expl)
+        hang(ans_p, 0, 0.35)
+        run(ans_p, f"{i}.\t", bold=True)
+        if right:              # the letter a person circled, then the option's own words
+            run(ans_p, right[0] + ". ", bold=True, color=_QUIZ_RIGHT)
+            ans = right[1]
+        run(ans_p, ans or "See the explanation.", bold=True, color=_QUIZ_RIGHT)
         if expl:
             expl_p = doc.add_paragraph()
-            expl_p.paragraph_format.left_indent = DocxInches(0.3)
-            set_run(expl_p.add_run(_sanitize_xml_text(expl)), size=10, italic=True, color=DocxRGBColor(0x66, 0x66, 0x66))
+            expl_p.paragraph_format.left_indent = DocxInches(0.35)
+            expl_p.paragraph_format.keep_together = True
+            run(expl_p, expl, size=11.5, color=_QUIZ_SOFT)
 
+    _finish_docx(doc, str(title or "Practice quiz"), "Practice quiz")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)
     doc.save(out_path)
