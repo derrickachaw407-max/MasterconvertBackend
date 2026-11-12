@@ -16,6 +16,7 @@ import threading
 import tempfile
 import shutil
 import statistics
+import unicodedata
 from collections import Counter
 from docx import Document
 from docx.shared import Inches as DocxInches, Pt as DocxPt, RGBColor as DocxRGBColor
@@ -33,12 +34,12 @@ from docx.table import Table as DocxTable
 from docx.text.paragraph import Paragraph as DocxParagraph
 from docx.text.run import Run as DocxRun
 from pptx import Presentation
-from pptx.util import Inches as PptxInches, Pt, Length
+from pptx.util import Inches as PptxInches, Pt, Length, Emu
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.dml.color import RGBColor as PptxRGBColor
 from pptx.enum.dml import MSO_FILL_TYPE, MSO_COLOR_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE, PP_PLACEHOLDER
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_LABEL_POSITION, XL_MARKER_STYLE
 from pptx.chart.data import CategoryChartData
 from pptx.text.text import _Run
 from pptx.opc.constants import RELATIONSHIP_TYPE as _PPTX_RT
@@ -9272,216 +9273,862 @@ _SUMMARY_CHART_TYPES = {
 }
 
 
-_SUMMARY_STYLES = {
-    "visual": {
-        "show_icon": True,
-        "cta_accent": True,
-        "bullet_prefix": "",  # relies on spacing/bold alone for hierarchy, not a bullet glyph
-    },
-    "plain": {
-        # "Plain" means undecorated styling, not lower-quality content —
-        # the 6x6 condensation, bold key-term spans, real charts, and
-        # generous whitespace are genuinely good regardless of visual
-        # theme, so none of that changes here. What's actually stripped
-        # is decoration: no emoji icon, no color accent distinguishing
-        # the CTA slide, and traditional bullet glyphs instead of relying
-        # on spacing alone — closer to a plain, formal outline a reader
-        # who wants the AI's text without a designed look would expect.
-        "show_icon": False,
-        "cta_accent": False,
-        "bullet_prefix": "\u2022  ",
-    },
+# 5.3: the Summary deck, finished. The owner, 11 Nov 2026: "I want the slides to be a perfectly completed, matured, and
+# well line spaced with perfect fonts PowerPoint" and "And remove the emojis".
+#
+# The file is a real PowerPoint deck now, not text boxes on blank slides: a theme with its two fonts, a master, named
+# layouts, and every slide's heading and words in the layout's own placeholders (so PowerPoint's outline, "Reset", a
+# change of font or layout, and a screen reader all work). It stays plain: white, black words, nothing drawn (R4);
+# a chart is the one thing in colour (the owner, 12 Nov 2026: "Keep the charts colored.").
+#   - Fonts every phone and computer has, so the deck looks the same wherever it is opened: Times New Roman for
+#     headings, Arial for the words. (The old deck named no font and got Calibri, which an iPhone doesn't have: it
+#     showed another font there, with other line breaks.) Liberation Serif and Sans, on the server, have their widths.
+#   - Line spacing is set, not left to chance: headings close-set, 1.1 lines inside a point, a clear gap between
+#     points, a wider one above a sub-heading. (All of it is space ABOVE a line: Slide Studio draws that, and a
+#     slide's first line is told to take none, since PowerPoint would add it and LibreOffice would not.)
+#   - Complete: a cover with a line under the title, the fixed order of slides, the deck's title and the slide's number
+#     at the foot of every slide, "(continued)" beside a heading that carries on.
+#   - Nothing is shrunk to fit (R7). Words are measured with the fonts' own widths; a slide takes what it holds and
+#     the rest carries on, shared evenly: a sub-heading stays with its points, and no slide is left with a stray line.
+#   - No emoji anywhere, whatever the plan holds.
+_SD_HEAD_FONT = "Times New Roman"
+_SD_TEXT_FONT = "Arial"
+_SD_IN = 914400
+_SD_SLIDE_W, _SD_SLIDE_H = 12192000, 6858000          # PowerPoint's own widescreen: 13.333 in x 7.5 in
+_SD_LEFT = 0.95                                        # inches: the left and right margins
+_SD_WIDTH = _SD_SLIDE_W / _SD_IN - 2 * _SD_LEFT        # 11.43 in of words
+_SD_TITLE_TOP, _SD_TITLE_STEP = 0.62, 0.6              # a heading's top; what a second line of heading takes
+_SD_BODY_TOP, _SD_BODY_BOTTOM = 1.8, 6.75              # the words, under a one-line heading
+_SD_FOOT_TOP, _SD_FOOT_H = 6.93, 0.3
+_SD_COVER_LEFT, _SD_COVER_TOP, _SD_COVER_H, _SD_COVER_GAP = 1.4, 1.3, 2.45, 0.32
+_SD_TITLE_PT, _SD_COVER_PT, _SD_FOOT_PT, _SD_CHART_PT = 40, 54, 12, 16
+_SD_LINE = 1.2                                         # one line at 100%, in ems (PowerPoint's rule, and LibreOffice's)
+_SD_INK, _SD_INK_2, _SD_INK_3, _SD_LINK = "000000", "404040", "595959", "1F3A5F"
+# A chart keeps its colours (the owner, 12 Nov 2026, on 5.3's first pictures, where the chart was drawn in greys: "Keep
+# the charts colored."). Eight hues in a fixed order, checked for people who see colours differently (neighbours stay
+# apart for protanopia and deuteranopia) and for ordinary sight; three of them are light on white, so every mark also
+# carries its value in black and a pie has its legend. The words stay black: colour is for the marks only.
+_SD_CHART_COLOURS = ("2A78D6", "EB6834", "1BAF7A", "EDA100", "E87BA4", "008300", "6250D6", "E34948")
+_SD_PIE_MAX = len(_SD_CHART_COLOURS)       # a pie with more slices than colours is drawn as bars: one hue, every slice named
+# a line's kind: font (h heading, t text), size, line spacing, space above it (none on a slide's first line), where its
+# words start (inches)
+_SD_STYLE = {
+    "sub": ("h", 28, 1.0, 24, 0.0),            # a sub-heading
+    "pt": ("t", 22, 1.1, 10, 0.34),            # a point under it
+    "bul": ("t", 22, 1.1, 10, 0.34),           # a point on a slide without sub-headings
+    "num": ("t", 22, 1.1, 10, 0.5),            # a numbered line (the outline, questions)
+    "line": ("t", 24, 1.1, 12, 0.0),           # a plain line (a presenter's name)
+    "ref": ("t", 20, 1.1, 11, 0.45),           # a reference, its second line set in
 }
+_SD_STYLE["subc"] = _SD_STYLE["sub"]           # a sub-heading again, on the slide its section carries on to
+# Character widths, " " to "~", in thousandths of an em (Arial's and Times New Roman's own tables)
+_SD_W_TEXT = (278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,
+              556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,
+              1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+              667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,
+              333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,
+              556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584)
+_SD_W_HEAD = (250, 333, 408, 500, 500, 833, 778, 180, 333, 333, 500, 564, 250, 333, 250, 278,
+              500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 278, 278, 564, 564, 564, 444,
+              921, 722, 667, 667, 722, 611, 556, 722, 722, 333, 389, 722, 611, 889, 722, 722,
+              556, 722, 667, 556, 611, 722, 722, 944, 722, 722, 611, 333, 278, 333, 469, 500,
+              333, 444, 500, 444, 500, 444, 333, 500, 500, 278, 278, 500, 278, 778, 500, 500,
+              500, 500, 333, 389, 278, 500, 500, 722, 500, 500, 444, 480, 200, 480, 541)
+_SD_W_MORE = {"t": {"‘": 222, "’": 222, "‚": 222, "“": 333, "”": 333, "„": 333, "—": 1000, "–": 556, "•": 350, "…": 1000,
+                    "·": 333, "°": 400, "±": 549, "×": 584, "÷": 549, "€": 556, "£": 556, "™": 1000, "−": 584, "\u00a0": 278},
+              "h": {"‘": 333, "’": 333, "‚": 333, "“": 444, "”": 444, "„": 444, "—": 1000, "–": 500, "•": 350, "…": 1000,
+                    "·": 333, "°": 400, "±": 549, "×": 564, "÷": 549, "€": 500, "£": 500, "™": 980, "−": 564, "\u00a0": 250}}
+# Emoji: every pictograph of the emoji planes; the older symbols that phones draw as emoji by themselves; any symbol
+# asked to be drawn as one (followed by U+FE0F); and what joins or colours them. Signs that mean something in study
+# notes are NOT emoji and stay: ♀ ♂ ♯ ♭ ♠ ♥ ✓ ✗ ✔ ✖ ★ ● □ △ ⌊ ⌋ → ➡ © ™ and the like.
+_SD_EMOJI = re.compile(
+    "[\U0001F000-\U0001FAFF\U000E0020-\U000E007F]"
+    "|[\u203C-\u2121\u2123-\u3299]\uFE0F"
+    "|[\u231A\u231B\u23E9-\u23EC\u23F0\u23F3\u25FD\u25FE\u2614\u2615\u2648-\u2653\u267F\u2693\u26A1\u26AA\u26AB\u26BD\u26BE\u26C4\u26C5\u26CE"
+    "\u26D4\u26EA\u26F2\u26F3\u26F5\u26FA\u26FD\u2705\u270A\u270B\u2728\u274C\u274E\u2753-\u2755\u2757\u2795-\u2797\u27B0\u27BF\u2B1B\u2B1C\u2B50\u2B55]"
+    "|[\u2600-\u2604\u260E\u2618\u261D\u2620\u2639\u263A\u2668\u267B\u2692-\u2694\u2696\u2697\u2699\u26A0\u26B0\u26B1\u26C8\u26CF\u26D1\u26D3\u26E9"
+    "\u26F0\u26F1\u26F4\u26F7-\u26F9\u2702\u2708\u2709\u270C\u270D\u270F\u2712\u2733\u2734\u2744\u2747\u2763\u2764\u2328\u23CF\u23ED-\u23EF\u23F1\u23F2"
+    "\u23F8-\u23FA]"
+    "|[\uFE00-\uFE0F\u200D\u20E3]")
+_SD_CONT = " (continued)"
 
 
-def summary_slides_to_pptx(slides, out_dir, style="plain", filename="Summary.pptx"):
-    """Builds the deck from Smart Summarize's slide plan. Plain White by default (white, black
-    words, no icons or accents); "visual" keeps the icon-and-colour look. Sizes are fixed and big
-    — headings 34 pt, sub-headings 28 pt, points 24 pt — and text is never shrunk to fit: what
-    doesn't fit continues on the next slide under the same heading (its sub-heading repeated)."""
+def _sd_clean(text, cap=600):
+    """Words as they go on a slide: no emoji or pictographs, no Markdown marks, single spaces."""
+    raw = str(text or "")
+    t = _SD_EMOJI.sub("", raw)
+    if t != raw:
+        t = re.sub(r"\s+([.,;:!?])", r"\1", t)             # no space left before the full stop where one stood
+    t = re.sub(r"\*{1,3}(?=\S)(.+?)(?<=\S)\*{1,3}", r"\1", t)
+    t = re.sub(r"(?<![\w/])_{1,2}(?=\S)(.+?)(?<=\S)_{1,2}(?![\w/])", r"\1", t)
+    t = re.sub(r"`([^`\n]+)`", r"\1", t)
+    t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", t)
+    t = re.sub(r"^\s*(?:[•▪●◦‣⁃∙·]+\s*|[-–—*]\s+)", "", t)                                   # a bullet typed into the words
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:cap].rstrip()
+
+
+def _sd_pt(text, size, face):
+    """How wide `text` is, in points, in the heading font ("h") or the text font ("t") at `size`."""
+    table, more = (_SD_W_HEAD, _SD_W_MORE["h"]) if face == "h" else (_SD_W_TEXT, _SD_W_MORE["t"])
+    total = 0
+    for ch in text:
+        o = ord(ch)
+        if 32 <= o <= 126:
+            total += table[o - 32]
+            continue
+        w = more.get(ch)
+        if w is None:
+            base = unicodedata.normalize("NFD", ch)[:1]
+            bo = ord(base) if base else 0
+            if 32 <= bo <= 126:
+                w = table[bo - 32]                       # é is as wide as e
+            elif unicodedata.combining(ch):
+                w = 0
+            elif 0x2E80 <= o <= 0x9FFF or 0xAC00 <= o <= 0xD7AF or 0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFF60:
+                w = 1000
+            else:
+                w = 620
+        total += w
+    return total * size / 1000.0
+
+
+def _sd_wrap(text, size, width_pt, face, slack=0.98):
+    """(lines, width of the last one) for `text` in `width_pt`, broken at spaces as a slide breaks it (a word longer
+    than a line breaks where it must). The width is taken a little short: a line that only just fits may not."""
+    width_pt = max(width_pt * slack, size)
+    space = _sd_pt(" ", size, face)
+    lines, cur, started = 1, 0.0, False
+    for word in str(text).replace("\u00a0", " ").split():
+        w = _sd_pt(word, size, face)
+        if started and cur + space + w <= width_pt:
+            cur += space + w
+            continue
+        if started:
+            lines += 1
+        started = True
+        while w > width_pt:
+            lines += 1
+            w -= width_pt
+        cur = w
+    return lines, cur
+
+
+def _sd_height(line, width_in):
+    """(points of height, space above) for one line of a slide's words: (kind, words)."""
+    face, size, spacing, above, indent = _SD_STYLE[line[0]]
+    words = line[1] + (_SD_CONT if line[0] == "subc" else "")
+    n = _sd_wrap(words, size, (width_in - indent) * 72.0, face)[0]
+    return n * size * _SD_LINE * spacing, above
+
+
+def _sd_used(lines, width_in):
+    """What these lines take on a slide, top to bottom (no space above the first)."""
+    used = 0.0
+    for i, line in enumerate(lines):
+        h, above = _sd_height(line, width_in)
+        used += h + (above if i else 0)
+    return used
+
+
+def _sd_split(block, room, width_in):
+    """A section too tall for one slide, in parts that fit: its sub-heading again on each, marked."""
+    parts, cur = [], [block[0]]
+    for p in block[1:]:
+        if len(cur) > 1 and _sd_used(cur + [p], width_in) > room:
+            parts.append(cur)
+            cur = [("subc", block[0][1])]
+        cur.append(p)
+    parts.append(cur)
+    return parts
+
+
+def _sd_pages(blocks, room_of, width_in):
+    """Blocks of lines (a sub-heading with its points; or one line of a list) into slides: as few as hold them, and
+    then shared evenly, so that no slide is left with a stray line or two. room_of(n) is the room on the n-th slide,
+    in points. A sub-heading stays with its points; only a section too tall for a slide is carried over."""
+    tight = min(room_of(0), room_of(1))
+    parts = []                                           # (lines, must it start a slide?)
+    for block in blocks:
+        if not block:
+            continue
+        if block[0][0] == "sub" and len(block) > 2 and _sd_used(block, width_in) > tight:
+            parts.extend((piece, n > 0) for n, piece in enumerate(_sd_split(block, tight, width_in)))
+        else:
+            parts.append((list(block), False))
+    if not parts:
+        return [[]]
+    n = len(parts)
+    used = {}
+
+    def take(i, j):                                      # what parts i..j-1 need together
+        if (i, j) not in used:
+            used[(i, j)] = _sd_used([line for part, _ in parts[i:j] for line in part], width_in)
+        return used[(i, j)]
+
+    def fits(i, j, page):
+        if any(forced for _, forced in parts[i + 1:j]):
+            return False
+        return j - i == 1 or take(i, j) <= room_of(page)
+
+    # the fewest slides, filling each in turn
+    count, i = 0, 0
+    while i < n:
+        j = i + 1
+        while j < n and fits(i, j + 1, count):
+            j += 1
+        i, count = j, count + 1
+    if count == 1:
+        return [[line for part, _ in parts for line in part]]
+    # the same number of slides, the emptiest of them as full as can be (then the fullest as light as can be)
+    best = [[None] * (count + 1) for _ in range(n + 1)]
+    best[0][0] = (1e9, 0.0, None)
+    for j in range(1, n + 1):
+        for page in range(1, min(j, count) + 1):
+            for i in range(page - 1, j):
+                prev = best[i][page - 1]
+                if prev is None or not fits(i, j, page - 1):
+                    continue
+                h = take(i, j)
+                cand = (min(prev[0], h), max(prev[1], h), i)
+                cur = best[j][page]
+                if cur is None or (cand[0], -cand[1]) > (cur[0], -cur[1]):
+                    best[j][page] = cand
+    pages, j, page = [], n, count
+    while page > 0:
+        i = best[j][page][2]
+        pages.append([line for part, _ in parts[i:j] for line in part])
+        j, page = i, page - 1
+    return pages[::-1]
+
+
+def _sd_heading_fit(text, continued=False):
+    """(size, lines) of a slide's heading: 40 pt on one line or two; a longer one is set a little smaller."""
+    width = _SD_WIDTH * 72.0
+    for size in (_SD_TITLE_PT, 34, 30):
+        n, last = _sd_wrap(text, size, width, "h", 0.99)
+        if continued and last + _sd_pt(_SD_CONT, size * 0.6, "h") > width * 0.99:
+            n += 1
+        if n <= 2:
+            break
+    return size, min(n, 3)
+
+
+def _sd_body_top(text, continued=False):
+    size, n = _sd_heading_fit(text, continued)
+    return _SD_BODY_TOP + (n - 1) * _SD_TITLE_STEP * size / _SD_TITLE_PT
+
+
+# ---------------------------------------------------------------- the deck's own theme, master and layouts
+def _sd_el(tag, parent=None, **attrs):
+    el = etree.SubElement(parent, pptx_qn(tag)) if parent is not None else etree.Element(pptx_qn(tag))
+    for k, v in attrs.items():
+        el.set(k, str(v))
+    return el
+
+
+def _sd_emu(inches):
+    return int(round(inches * _SD_IN))
+
+
+def _sd_fill(parent, colour):
+    fill = _sd_el("a:solidFill", parent)
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", colour):
+        _sd_el("a:srgbClr", fill, val=colour.upper())
+    else:
+        _sd_el("a:schemeClr", fill, val=colour)
+    return fill
+
+
+def _sd_level(parent, n, size, font="+mn-lt", colour="tx1", mar=0.0, hang=0.0, bullet=None, spacing=None, above=0, algn="l"):
+    """<a:lvlNpPr>: how level n of a text looks."""
+    lv = _sd_el("a:lvl%dpPr" % n, parent, marL=_sd_emu(mar), indent=-_sd_emu(hang), algn=algn, defTabSz=914400, rtl=0, eaLnBrk=1, latinLnBrk=0, hangingPunct=1)
+    if spacing:
+        _sd_el("a:spcPct", _sd_el("a:lnSpc", lv), val=int(round(spacing * 100000)))
+    _sd_el("a:spcPts", _sd_el("a:spcBef", lv), val=int(above * 100))
+    _sd_el("a:spcPts", _sd_el("a:spcAft", lv), val=0)
+    if bullet:
+        _sd_el("a:buFont", lv, typeface="Arial")
+        _sd_el("a:buChar", lv, char=bullet)
+    else:
+        _sd_el("a:buNone", lv)
+    rpr = _sd_el("a:defRPr", lv, sz=int(size * 100), b=0, i=0, kern=1200)
+    _sd_fill(rpr, colour)
+    _sd_el("a:latin", rpr, typeface=font)
+    _sd_el("a:ea", rpr, typeface=font.replace("-lt", "-ea"))
+    _sd_el("a:cs", rpr, typeface=font.replace("-lt", "-cs"))
+    return lv
+
+
+def _sd_body_levels(parent, sections=False):
+    """The levels of a slide's words: points (or, on a slide in sections, a sub-heading and then its points)."""
+    n = 1
+    if sections:
+        face, size, spacing, above, _ = _SD_STYLE["sub"]
+        _sd_level(parent, 1, size, font="+mj-lt", spacing=spacing, above=above)
+        n = 2
+    face, size, spacing, above, indent = _SD_STYLE["pt"]
+    _sd_level(parent, n, size, mar=indent, hang=indent, bullet="•", spacing=spacing, above=above)
+    _sd_level(parent, n + 1, 20, mar=indent + 0.36, hang=0.3, bullet="–", spacing=1.1, above=8)
+    _sd_level(parent, n + 2, 18, mar=indent + 0.7, hang=0.28, bullet="•", spacing=1.1, above=6)
+    for k in range(n + 3, 10):
+        _sd_level(parent, k, 16, mar=indent + 0.7 + 0.32 * (k - n - 2), hang=0.26, bullet="–" if (k - n) % 2 else "•", spacing=1.1, above=6)
+
+
+def _sd_place(sp, x, y, w, h, anchor=None):
+    """Puts a placeholder where it belongs, with no inner margins (its words start exactly at the margin) and no
+    shrinking to fit."""
+    sppr = sp.find(pptx_qn("p:spPr"))
+    for old in sppr.findall(pptx_qn("a:xfrm")):
+        sppr.remove(old)
+    xfrm = _sd_el("a:xfrm")
+    _sd_el("a:off", xfrm, x=_sd_emu(x), y=_sd_emu(y))
+    _sd_el("a:ext", xfrm, cx=_sd_emu(w), cy=_sd_emu(h))
+    sppr.insert(0, xfrm)
+    bp = sp.find(pptx_qn("p:txBody")).find(pptx_qn("a:bodyPr"))
+    for k in ("lIns", "tIns", "rIns", "bIns"):
+        bp.set(k, "0")
+    if anchor:
+        bp.set("anchor", anchor)
+    bp.set("wrap", "square")
+    for child in list(bp):
+        bp.remove(child)
+    _sd_el("a:noAutofit", bp)
+
+
+def _sd_ph(tree, ph_type=None, idx=None):
+    """The placeholder of this type (or this idx) in a master, a layout or a slide."""
+    for sp in tree.iter(pptx_qn("p:sp")):
+        ph = sp.find(".//" + pptx_qn("p:ph"))
+        if ph is None:
+            continue
+        if (ph_type is None or ph.get("type") == ph_type) and (idx is None or ph.get("idx") == str(idx)):
+            return sp
+    return None
+
+
+def _sd_list_style(sp):
+    """The placeholder's own list style, emptied (to be written)."""
+    tx = sp.find(pptx_qn("p:txBody"))
+    ls = tx.find(pptx_qn("a:lstStyle"))
+    if ls is None:
+        ls = _sd_el("a:lstStyle")
+        tx.find(pptx_qn("a:bodyPr")).addnext(ls)
+    for child in list(ls):
+        ls.remove(child)
+    return ls
+
+
+def _sd_prompt(sp, lines):
+    """The words a layout shows in PowerPoint's "Slide Master" view and in an empty placeholder (never printed)."""
+    tx = sp.find(pptx_qn("p:txBody"))
+    for p in tx.findall(pptx_qn("a:p")):
+        tx.remove(p)
+    for lvl, words in lines:
+        p = _sd_el("a:p", tx)
+        if lvl:
+            _sd_el("a:pPr", p, lvl=lvl)
+        r = _sd_el("a:r", p)
+        _sd_el("a:rPr", r, lang="en-US")
+        _sd_el("a:t", r).text = words
+
+
+def _sd_presentation(head_font=None, text_font=None):
+    """A new presentation with the deck's theme, master and layouts. Returns (prs, layouts by name)."""
+    head_font, text_font = head_font or _SD_HEAD_FONT, text_font or _SD_TEXT_FONT
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(_SD_SLIDE_W), Emu(_SD_SLIDE_H)
+    master = prs.slide_master
+    # ---- the theme: two fonts, black on white, the chart's colours for anything drawn (a chart, a shape someone adds)
+    part = master.part.part_related_by(_PPTX_RT.THEME)
+    theme = etree.fromstring(part.blob)
+    ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    theme.set("name", "Academic-Home Plain")
+    scheme = theme.find(".//" + ns + "clrScheme")
+    scheme.set("name", "Academic-Home Plain")
+    colours = {"dk1": _SD_INK, "lt1": "FFFFFF", "dk2": _SD_INK_2, "lt2": "F2F2F2", "accent1": _SD_CHART_COLOURS[0], "accent2": _SD_CHART_COLOURS[1],
+               "accent3": _SD_CHART_COLOURS[2], "accent4": _SD_CHART_COLOURS[3], "accent5": _SD_CHART_COLOURS[4], "accent6": _SD_CHART_COLOURS[5],
+               "hlink": _SD_LINK, "folHlink": _SD_INK_2}
+    for el in scheme:
+        name = etree.QName(el).localname
+        if name in colours:
+            for child in list(el):
+                el.remove(child)
+            etree.SubElement(el, ns + "srgbClr", val=colours[name])
+    fonts = theme.find(".//" + ns + "fontScheme")
+    fonts.set("name", "Academic-Home Plain")
+    for tag, face in (("majorFont", head_font), ("minorFont", text_font)):
+        f = fonts.find(ns + tag)
+        for child in list(f):
+            f.remove(child)
+        etree.SubElement(f, ns + "latin", typeface=face)
+        etree.SubElement(f, ns + "ea", typeface="")
+        etree.SubElement(f, ns + "cs", typeface="")
+    part._blob = etree.tostring(theme, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    # ---- the master: where the heading, the words and the foot of a slide sit, and how each level of text looks
+    m = master._element
+    _sd_place(_sd_ph(m, "title"), _SD_LEFT, _SD_TITLE_TOP, _SD_WIDTH, _SD_BODY_TOP - _SD_TITLE_TOP - 0.1, anchor="t")
+    _sd_place(_sd_ph(m, "body"), _SD_LEFT, _SD_BODY_TOP, _SD_WIDTH, _SD_BODY_BOTTOM - _SD_BODY_TOP, anchor="t")
+    for kind, x, w, algn in (("ftr", _SD_LEFT, 8.4, "l"), ("dt", _SD_LEFT + 8.5, 1.8, "r"), ("sldNum", _SD_LEFT + _SD_WIDTH - 1.0, 1.0, "r")):
+        sp = _sd_ph(m, kind)
+        _sd_place(sp, x, _SD_FOOT_TOP, w, _SD_FOOT_H, anchor="ctr")
+        _sd_level(_sd_list_style(sp), 1, _SD_FOOT_PT, colour=_SD_INK_3, algn=algn)
+    styles = m.find(pptx_qn("p:txStyles"))
+    for child in list(styles):
+        styles.remove(child)
+    _sd_level(_sd_el("p:titleStyle", styles), 1, _SD_TITLE_PT, font="+mj-lt", spacing=0.9)
+    _sd_body_levels(_sd_el("p:bodyStyle", styles))
+    other = _sd_el("p:otherStyle", styles)
+    for k in range(1, 10):
+        _sd_level(other, k, 18, mar=0.5 * (k - 1))
+
+    # ---- the layouts (python-pptx's own eleven, re-set; three are made into this deck's, three go)
+    lay = list(prs.slide_layouts)
+    names = {}
+
+    def name_it(layout, name, kind=None):
+        el = layout._element
+        el.find(pptx_qn("p:cSld")).set("name", name)
+        if kind is None:
+            el.attrib.pop("type", None)
+            el.set("userDrawn", "1")
+        el.set("preserve", "1")
+        names[name] = layout
+
+    def like_content(layout):
+        """Gives a layout its own copy of what "Title and Content" holds."""
+        src = lay[1]._element.find(pptx_qn("p:cSld")).find(pptx_qn("p:spTree"))
+        cs = layout._element.find(pptx_qn("p:cSld"))
+        cs.remove(cs.find(pptx_qn("p:spTree")))
+        cs.insert(0, copy.deepcopy(src))
+        return layout._element
+
+    cover_w = _SD_SLIDE_W / _SD_IN - 2 * _SD_COVER_LEFT
+
+    def big_title(sp):
+        _sd_place(sp, _SD_COVER_LEFT, _SD_COVER_TOP, cover_w, _SD_COVER_H, anchor="b")
+        _sd_level(_sd_list_style(sp), 1, _SD_COVER_PT, font="+mj-lt", spacing=0.9, algn="ctr")
+
+    # Title Slide: the title large and centred, a line or two of words under it, nothing at the foot
+    cover = lay[0]._element
+    big_title(_sd_ph(cover, "ctrTitle"))
+    sub = _sd_ph(cover, "subTitle")
+    _sd_place(sub, _SD_COVER_LEFT, _SD_COVER_TOP + _SD_COVER_H + _SD_COVER_GAP, cover_w, 1.7, anchor="t")
+    ls = _sd_list_style(sub)
+    _sd_level(ls, 1, 24, colour="tx2", spacing=1.1, algn="ctr")
+    for k in range(2, 10):
+        _sd_level(ls, k, 20, colour="tx2", spacing=1.1, above=8, algn="ctr")
+    name_it(lay[0], "Title Slide", "title")
+    name_it(lay[1], "Title and Content", "obj")
+    # Sub-headings and Points: level 1 is a sub-heading in the heading font, level 2 its points
+    b = _sd_ph(like_content(lay[2]), idx=1)
+    _sd_body_levels(_sd_list_style(b), sections=True)
+    _sd_prompt(b, [(0, "Sub-heading"), (1, "A point about it"), (1, "Another point"), (2, "A detail")])
+    name_it(lay[2], "Sub-headings and Points")
+    # Two Content: two columns of points
+    half = (_SD_WIDTH - 0.5) / 2
+    for idx, x in ((1, _SD_LEFT), (2, _SD_LEFT + half + 0.5)):
+        sp = _sd_ph(lay[3]._element, idx=idx)
+        _sd_place(sp, x, _SD_BODY_TOP, half, _SD_BODY_BOTTOM - _SD_BODY_TOP, anchor="t")
+        _sd_body_levels(_sd_list_style(sp))
+    name_it(lay[3], "Two Content", "twoObj")
+    # References: each one a paragraph, its second line set in
+    b = _sd_ph(like_content(lay[4]), idx=1)
+    ls = _sd_list_style(b)
+    face, size, spacing, above, indent = _SD_STYLE["ref"]
+    for k in range(1, 10):
+        _sd_level(ls, k, size, mar=indent + 0.3 * (k - 1), hang=indent, spacing=spacing, above=above)
+    _sd_prompt(b, [(0, "Author, A. (Year). Title of the work. Publisher or journal.")])
+    name_it(lay[4], "References")
+    name_it(lay[5], "Title Only", "titleOnly")
+    name_it(lay[6], "Blank", "blank")
+    # Closing: one large line, where the cover's title sits
+    end = lay[7]._element
+    tree = end.find(pptx_qn("p:cSld")).find(pptx_qn("p:spTree"))
+    for sp in list(tree.findall(pptx_qn("p:sp"))):
+        if sp.find(".//" + pptx_qn("p:ph")).get("type") not in ("title", "dt", "ftr", "sldNum"):
+            tree.remove(sp)
+    big_title(_sd_ph(end, "title"))
+    name_it(lay[7], "Closing")
+    for extra in lay[8:]:
+        prs.slide_layouts.remove(extra)
+    # no layout shrinks its heading or its words to fit
+    for layout in prs.slide_layouts:
+        for bp in layout._element.iter(pptx_qn("a:bodyPr")):
+            for child in list(bp):
+                if etree.QName(child).localname in ("normAutofit", "spAutoFit"):
+                    bp.remove(child)
+    return prs, names
+
+
+def _sd_run(p, words, size=None, colour=None):
+    r = p.add_run()
+    r.text = words
+    if size:
+        r.font.size = Pt(size)
+    if colour:
+        r.font.color.rgb = PptxRGBColor.from_string(colour)
+    return r
+
+
+def _sd_text(shape, lines):
+    """Writes a slide's lines into a placeholder: [(kind, words[, number])]. A paragraph carries only what it needs
+    beyond its layout's level: a number, "no bullet", and, on the first line, "no space above"."""
+    tf = shape.text_frame
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    tf.word_wrap = True
+    body = tf._txBody
+    for p in body.findall(pptx_qn("a:p"))[1:]:
+        body.remove(p)
+    for i, line in enumerate(lines):
+        kind, words = line[0], line[1]
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        if kind == "pt":
+            p.level = 1
+        if i == 0:
+            # (as a percentage: Slide Studio reads a level's space above in points, from the layout, for the lines
+            # after this one; and when it writes the slide again it keeps this mark on the first line only)
+            _sd_el("a:spcPct", _sd_el("a:spcBef", p._p.get_or_add_pPr()), val=0)
+        if kind in ("num", "line"):
+            indent = _SD_STYLE[kind][4]
+            ppr = p._p.get_or_add_pPr()
+            ppr.set("marL", str(_sd_emu(indent)))
+            ppr.set("indent", str(-_sd_emu(indent)))
+            if kind == "num":
+                auto = _sd_el("a:buAutoNum", ppr, type="arabicPeriod")
+                if len(line) > 2 and line[2] > 1:
+                    auto.set("startAt", str(line[2]))
+            else:
+                _sd_el("a:buNone", ppr)
+        _sd_run(p, words, size=_SD_STYLE[kind][1] if kind == "line" else None)
+        if kind == "subc":
+            _sd_run(p, _SD_CONT, size=round(_SD_STYLE[kind][1] * 0.7), colour=_SD_INK_3)
+        if kind == "ref":
+            _link_urls_in_runs(p)
+    return tf
+
+
+def _sd_foot(slide, layout, title, number):
+    """The deck's title and the slide's number at the foot, in the layout's own places for them. Their look is
+    written on them as well: LibreOffice (the app's preview) doesn't take a footer's from the master."""
+    tree = slide.shapes._spTree
+    ids = [int(x) for x in tree.xpath(".//p:cNvPr/@id") if str(x).isdigit()]
+    nxt = max(ids + [1]) + 1
+    for kind, algn in (("ftr", "l"), ("sldNum", "r")):
+        src = _sd_ph(layout._element, kind)
+        if src is None or (kind == "ftr" and not title):
+            continue
+        el = copy.deepcopy(src)
+        el.find(".//" + pptx_qn("p:cNvPr")).set("id", str(nxt))
+        nxt += 1
+        sppr = el.find(pptx_qn("p:spPr"))
+        for child in list(sppr):
+            sppr.remove(child)                           # its place comes from the layout
+        tx = el.find(pptx_qn("p:txBody"))
+        for p in tx.findall(pptx_qn("a:p")):
+            tx.remove(p)
+        p = _sd_el("a:p", tx)
+        _sd_el("a:pPr", p, algn=algn)
+        holder = _sd_el("a:r", p) if kind == "ftr" else _sd_el("a:fld", p, id="{B6F15528-21DE-4FAA-801E-634DDDAF4B2B}", type="slidenum")
+        rpr = _sd_el("a:rPr", holder, lang="en-US", sz=_SD_FOOT_PT * 100, b=0, dirty=0)
+        _sd_fill(rpr, _SD_INK_3)
+        _sd_el("a:latin", rpr, typeface="+mn-lt")
+        _sd_el("a:t", holder).text = title if kind == "ftr" else str(number)
+        tree.append(el)
+
+
+def _sd_heading(slide, text, continued=False, body=None):
+    """The slide's heading in its place; "(continued)" beside it, small and grey, when the slide carries on from the
+    one before. A heading too long for one line takes a second, and the words under it start a line lower. Returns
+    where the words start (inches from the top)."""
+    t = slide.shapes.title
+    size, n = _sd_heading_fit(text, continued)
+    tf = t.text_frame
+    tf.auto_size = MSO_AUTO_SIZE.NONE
+    p = tf.paragraphs[0]
+    _sd_run(p, text, size=size if size != _SD_TITLE_PT else None)
+    if continued:
+        _sd_run(p, _SD_CONT, size=round(size * 0.6), colour=_SD_INK_3)
+    top = _SD_BODY_TOP + (n - 1) * _SD_TITLE_STEP * size / _SD_TITLE_PT
+    if n > 1:
+        t.left, t.top, t.width, t.height = (Emu(_sd_emu(v)) for v in (_SD_LEFT, _SD_TITLE_TOP, _SD_WIDTH, top - _SD_TITLE_TOP - 0.1))
+        if body is not None:
+            body.left, body.top, body.width, body.height = (Emu(_sd_emu(v)) for v in (_SD_LEFT, top, _SD_WIDTH, _SD_BODY_BOTTOM - top))
+    return top
+
+
+def _sd_list_kind(sd):
+    """What a slide of plain lines is: the presenters' names, the outline, references, questions, or points."""
+    kind = str(sd.get("list") or "").lower()
+    if kind in ("names", "outline", "refs", "numbered", "points"):
+        return kind
+    h = re.sub(r"\s+", " ", str(sd.get("header") or "")).strip().lower()
+    if h == "presented by":
+        return "names"
+    if h in ("presentation outline", "outline"):
+        return "outline"
+    if h.startswith("references"):
+        return "refs"
+    if h == "discussion":
+        return "numbered"
+    return "points"
+
+
+def _sd_chart_plan(chart):
+    """A slide's chart as it can be drawn (its kind, names and numbers), or None."""
+    if not isinstance(chart, dict) or chart.get("type") not in _SUMMARY_CHART_TYPES:
+        return None
+    cats, vals = chart.get("categories"), chart.get("values")
+    if not isinstance(cats, list) or not isinstance(vals, list) or not cats or len(cats) != len(vals) or len(cats) > 24:
+        return None
+    try:
+        vals = [float(v) for v in vals]
+    except (TypeError, ValueError):
+        return None
+    if any(v != v or v in (float("inf"), float("-inf")) for v in vals) or (chart["type"] == "pie" and (min(vals) < 0 or sum(vals) <= 0)):
+        return None
+    return {"type": chart["type"], "categories": [str(c) for c in cats], "values": vals, "series_name": str(chart.get("series_name") or "")}
+
+
+def _sd_chart(slide, chart, top, text_font):
+    """The chart: coloured marks on white (_SD_CHART_COLOURS), the value on each in black, the words' own font.
+    One series is one colour (the bars of a chart name things, they aren't different series); a pie's slices take the
+    colours in their fixed order."""
+    ink = [PptxRGBColor.from_string(c) for c in _SD_CHART_COLOURS]
+    data = CategoryChartData()
+    cats = [_sd_clean(c, 60) or "-" for c in chart["categories"]]
+    data.categories = cats
+    name = _sd_clean(chart.get("series_name") or "", 90) or "Value"
+    data.add_series(name, chart["values"])
+    kind = chart["type"]
+    if kind == "pie" and len(cats) > _SD_PIE_MAX:
+        kind = "bar"
+    gf = slide.shapes.add_chart(_SUMMARY_CHART_TYPES[kind], _sd_emu(_SD_LEFT), _sd_emu(top), _sd_emu(_SD_WIDTH), _sd_emu(_SD_BODY_BOTTOM - top), data)
+    gf.name = "Chart: " + name
+    said = ", ".join("%s %s" % (cat, ("%d" % v) if float(v).is_integer() else ("%.1f" % v)) for cat, v in zip(cats, chart["values"]))
+    gf._element.find(".//" + pptx_qn("p:cNvPr")).set("descr", ("%s chart. %s: %s" % ({"bar": "Bar", "line": "Line", "pie": "Pie"}[kind], name, said))[:900])
+    c = gf.chart
+    c.font.size = Pt(_SD_CHART_PT)
+    c.font.name = text_font
+    c.font.color.rgb = PptxRGBColor.from_string(_SD_INK)
+    c.has_title = True
+    c.chart_title.include_in_layout = False
+    tf = c.chart_title.text_frame
+    tf.text = name
+    for r in tf.paragraphs[0].runs:
+        r.font.size, r.font.bold, r.font.name = Pt(20), False, text_font
+    plot = c.plots[0]
+    whole = all(float(v).is_integer() for v in chart["values"])
+    plot.has_data_labels = True
+    labels = plot.data_labels
+    labels.font.size = Pt(_SD_CHART_PT)
+    labels.font.name = text_font
+    labels.number_format_is_linked = False
+    labels.number_format = "#,##0" if whole else "#,##0.0"
+    ser = plot.series[0]
+    if kind == "pie":
+        plot.vary_by_categories = True
+        labels.number_format = "0%"
+        labels.show_percentage, labels.show_value = True, False
+        labels.position = XL_LABEL_POSITION.OUTSIDE_END
+        for i in range(len(chart["values"])):
+            point = ser.points[i]
+            point.format.fill.solid()
+            point.format.fill.fore_color.rgb = ink[i]
+            point.format.line.color.rgb = PptxRGBColor(0xFF, 0xFF, 0xFF)
+            point.format.line.width = Pt(2)
+        c.has_legend = True
+        c.legend.position = XL_LEGEND_POSITION.RIGHT
+        c.legend.include_in_layout = False
+        c.legend.font.size = Pt(_SD_CHART_PT + 2)
+        c.legend.font.name = text_font
+        return gf
+    c.has_legend = False
+    if kind == "bar":
+        plot.gap_width = 80
+        plot.vary_by_categories = False
+        ser.format.fill.solid()
+        ser.format.fill.fore_color.rgb = ink[0]
+        labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    else:
+        ser.smooth = False
+        ser.format.line.color.rgb = ink[0]
+        ser.format.line.width = Pt(2.5)
+        ser.marker.style = XL_MARKER_STYLE.CIRCLE
+        ser.marker.size = 8
+        ser.marker.format.fill.solid()
+        ser.marker.format.fill.fore_color.rgb = ink[0]
+        ser.marker.format.line.color.rgb = ink[0]
+        labels.position = XL_LABEL_POSITION.ABOVE
+    va, ca = c.value_axis, c.category_axis
+    va.has_major_gridlines = True
+    va.major_gridlines.format.line.color.rgb = PptxRGBColor(0xD9, 0xD9, 0xD9)
+    va.major_gridlines.format.line.width = Pt(0.75)
+    va.format.line.fill.background()
+    va.tick_labels.font.size = Pt(_SD_CHART_PT)
+    va.tick_labels.font.name = text_font
+    ca.format.line.color.rgb = PptxRGBColor(0x8C, 0x8C, 0x8C)
+    ca.format.line.width = Pt(1)
+    ca.tick_labels.font.size = Pt(_SD_CHART_PT)
+    ca.tick_labels.font.name = text_font
+    ca.has_major_gridlines = False
+    return gf
+
+
+def _sd_file_details(prs, title, slides):
+    """What the file says about itself: its title, widescreen, how many slides; and nothing left over from the blank
+    file it grew from (another program's name, an old printer's settings, a picture of an empty slide)."""
+    cp = prs.core_properties
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
+    cp.title, cp.subject, cp.author, cp.last_modified_by, cp.keywords, cp.comments, cp.category = title[:250], "", "", "", "", "", ""
+    cp.created, cp.modified, cp.revision = now, now, 1
+    size = prs.part._element.find(pptx_qn("p:sldSz"))
+    if size is not None:
+        size.attrib.pop("type", None)                    # it said "4:3 screen"
+    try:
+        pkg = prs.part.package
+        for rel in list(pkg._rels.values()):
+            if rel.reltype == _PPTX_RT.THUMBNAIL:
+                pkg._rels.pop(rel.rId)
+            elif rel.reltype == _PPTX_RT.EXTENDED_PROPERTIES:
+                rel.target_part._blob = (
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                    '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">'
+                    "<Application>Academic-Home</Application><PresentationFormat>Widescreen</PresentationFormat>"
+                    "<Slides>%d</Slides><Notes>0</Notes><HiddenSlides>0</HiddenSlides></Properties>" % slides).encode("utf-8")
+        for rel in list(prs.part.rels.values()):
+            if rel.reltype == _PPTX_RT.PRINTER_SETTINGS:
+                prs.part.rels.pop(rel.rId)
+            elif rel.reltype == _PPTX_RT.VIEW_PROPS:
+                part = rel.target_part                   # its guides marked the middle of a 4:3 slide
+                part._blob = part.blob.replace(b'<p:guide pos="2880"/>', b'<p:guide pos="3840"/>')
+    except Exception:
+        pass                                             # details only: the deck itself is whole without them
+
+
+def summary_slides_to_pptx(slides, out_dir, style="plain", filename="Summary.pptx", head_font=None, text_font=None):
+    """Builds the deck from Smart Summarize's slide plan: a finished PowerPoint, plain white with black words (see
+    the note above). `style` is kept for older callers; there is one look."""
     if not slides:
         raise ConversionError("No slides to build a presentation from.")
-    style_conf = _SUMMARY_STYLES.get(style, _SUMMARY_STYLES["plain"])
-    visual = bool(style_conf["show_icon"])
-
-    prs = Presentation()
-    prs.slide_width = PptxInches(13.333)
-    prs.slide_height = PptxInches(7.5)
-    _fit_layouts_to_widescreen(prs)
-    blank_layout = prs.slide_layouts[6]
-
-    margin_x = PptxInches(0.9)
-    content_width = prs.slide_width - (2 * margin_x)
-    width_in = content_width / 914400.0
-    head_top, head_h = PptxInches(0.6), PptxInches(1.25)
-    content_top = PptxInches(2.0)
-    content_height = prs.slide_height - content_top - PptxInches(0.6)
-    budget = content_height / 12700.0          # points of height
-    INK = PptxRGBColor(0, 0, 0)
-    HEADER_COLOR = PptxRGBColor(0x1A, 0x1A, 0x1A) if visual else INK
-    BODY_COLOR = PptxRGBColor(0x26, 0x26, 0x26) if visual else INK
-    SUB_COLOR = PptxRGBColor(0x1F, 0x4E, 0x79) if visual else INK
-    CTA_ACCENT = PptxRGBColor(0x1F, 0x6F, 0x4B)
-    CTA_BG = PptxRGBColor(0xF2, 0xF9, 0xF5)
-    SUB_PT, POINT_PT, PLAIN_PT = 28, 24, 24
-
-    def lines(text, size):
-        per = max(10, int(width_in * 72 / (size * 0.5)))
-        plain = re.sub(r"\*+", "", str(text or ""))
-        return max(1, -(-len(plain) // per))
-
-    def item_h(kind, text):
-        if kind == "sub":
-            return lines(text, SUB_PT) * SUB_PT * 1.15 + 14 + 6
-        return lines(text, POINT_PT) * POINT_PT * 1.15 + 8
-
-    def pages_of(items):
-        """Items packed into slides by the room they need; a sub-heading never ends a slide, and a
-        section continued on the next slide gets its sub-heading again."""
-        pages, cur, used, current_sub = [], [], 0.0, None
-        for i, (kind, text) in enumerate(items):
-            h = item_h(kind, text)
-            if kind == "sub":
-                current_sub = text
-                nxt = items[i + 1] if i + 1 < len(items) and items[i + 1][0] == "pt" else None
-                need = h + (item_h(*nxt) if nxt else 0)
-                if cur and used + need > budget:
-                    pages.append(cur)
-                    cur, used = [], 0.0
-                cur.append((kind, text))
-                used += h
-                continue
-            if cur and used + h > budget:
-                pages.append(cur)
-                cur, used = [], 0.0
-                if current_sub:
-                    cur.append(("sub", current_sub))
-                    used += item_h("sub", current_sub)
-            cur.append((kind, text))
-            used += h
-        if cur:
-            pages.append(cur)
-        return pages or [[]]
-
-    def header(slide, text, is_cta, icon):
-        left = margin_x
-        if icon:
-            ib = slide.shapes.add_textbox(margin_x, head_top, PptxInches(1.1), PptxInches(1.1))
-            ib.text_frame.word_wrap = False
-            ir = ib.text_frame.paragraphs[0].add_run()
-            ir.text = icon
-            ir.font.size = Pt(44)
-            left = margin_x + PptxInches(1.15)
-        hb = slide.shapes.add_textbox(left, head_top, content_width - (left - margin_x), head_h)
-        tf = hb.text_frame
-        tf.word_wrap = True
-        tf.auto_size = MSO_AUTO_SIZE.NONE
-        _add_markdown_aware_pptx_text(tf.paragraphs[0], text)
-        for r in tf.paragraphs[0].runs:
-            r.font.size = Pt(34 if len(text) <= 48 else 30)
-            r.font.bold = True
-            r.font.color.rgb = CTA_ACCENT if is_cta else HEADER_COLOR
-
-    def body(slide, page, plain_bullets):
-        bb = slide.shapes.add_textbox(margin_x, content_top, content_width, content_height)
-        tf = bb.text_frame
-        tf.word_wrap = True
-        tf.auto_size = MSO_AUTO_SIZE.NONE        # never shrunk: what doesn't fit went to the next slide
-        first = True
-        for kind, text in page:
-            p = tf.paragraphs[0] if first else tf.add_paragraph()
-            if kind == "sub":
-                p.space_before = Pt(0 if first else 14)
-                p.space_after = Pt(6)
-                _add_markdown_aware_pptx_text(p, text)
-                for run in p.runs:
-                    run.font.size = Pt(SUB_PT)
-                    run.font.bold = True
-                    if run.font.color.type is None:
-                        run.font.color.rgb = SUB_COLOR
-            else:
-                p.space_after = Pt(8)
-                pPr = p._p.get_or_add_pPr()
-                indent = not plain_bullets
-                pPr.set("marL", str(int(PptxInches(0.55 if indent else 0.4))))
-                pPr.set("indent", str(-int(PptxInches(0.32))))
-                mark = p.add_run()
-                mark.text = "• "
-                mark.font.size = Pt(POINT_PT)
-                mark.font.color.rgb = SUB_COLOR
-                _add_markdown_aware_pptx_text(p, text)
-                for run in p.runs:
-                    if run.font.size is None:
-                        run.font.size = Pt(POINT_PT)
-                    if run.font.color.type is None:
-                        run.font.color.rgb = BODY_COLOR
-            first = False
-
-    for slide_data in slides:
-        if slide_data.get("kind") in ("cover", "thanks"):
-            slide = prs.slides.add_slide(blank_layout)
-            slide.background.fill.solid()
-            slide.background.fill.fore_color.rgb = PptxRGBColor(0x14, 0x2B, 0x4A) if visual else PptxRGBColor(0xFF, 0xFF, 0xFF)
-            ink = PptxRGBColor(0xFF, 0xFF, 0xFF) if visual else INK
-            head = re.sub(r"\*\*", "", str(slide_data.get("header") or "")).strip()
-            sub_lines = [re.sub(r"\*\*", "", str(b)).strip() for b in (slide_data.get("bullets") or []) if str(b).strip()][:4]
-            box = slide.shapes.add_textbox(margin_x, PptxInches(2.2 if sub_lines else 2.8), content_width, PptxInches(3.2))
-            tf = box.text_frame
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.alignment = PP_ALIGN.CENTER
-            r = p.add_run()
-            r.text = head
-            r.font.size = Pt(48 if len(head) <= 34 else 40 if len(head) <= 60 else 32)
-            r.font.color.rgb = ink
-            for line in sub_lines:
-                q = tf.add_paragraph()
-                q.alignment = PP_ALIGN.CENTER
-                q.space_before = Pt(12)
-                rr = q.add_run()
-                rr.text = line
-                rr.font.size = Pt(24)
-                rr.font.color.rgb = PptxRGBColor(0xC9, 0xD6, 0xEA) if visual else PptxRGBColor(0x26, 0x26, 0x26)
+    # ---- the plan, tidied: words cleaned, and a list that was cut into slides of six made whole again
+    plan = []
+    for sd in slides:
+        if not isinstance(sd, dict):
             continue
-
-        is_cta = bool(slide_data.get("is_cta")) and style_conf["cta_accent"]
-        icon = (slide_data.get("icon") or "").strip() if visual else ""
-        chart = slide_data.get("chart")
+        header = _sd_clean(sd.get("header"), 140)
+        kind = sd.get("kind") if sd.get("kind") in ("cover", "thanks") else None
+        if kind:
+            plan.append({"kind": kind, "header": header or ("Thank you" if kind == "thanks" else "Presentation"),
+                         "lines": [x for x in (_sd_clean(b, 200) for b in (sd.get("bullets") or [])) if x][:3]})
+            continue
+        if not header:
+            continue
+        chart = _sd_chart_plan(sd.get("chart"))
         if chart:
-            slide = prs.slides.add_slide(blank_layout)
-            header(slide, slide_data["header"], is_cta, icon)
-            chart_data = CategoryChartData()
-            chart_data.categories = chart["categories"]
-            chart_data.add_series(chart["series_name"], chart["values"])
-            try:
-                gc = slide.shapes.add_chart(_SUMMARY_CHART_TYPES[chart["type"]], margin_x, content_top, content_width, content_height, chart_data).chart
-                gc.has_legend = chart["type"] == "pie"
-                if gc.has_legend:
-                    gc.legend.position = XL_LEGEND_POSITION.BOTTOM
-                    gc.legend.include_in_layout = False
-                gc.font.size = Pt(16)
-            except Exception:
-                _add_chart_as_table_fallback(slide, chart["categories"], [(chart["series_name"], chart["values"])], prs.slide_width, prs.slide_height)
+            plan.append({"kind": "chart", "header": header, "chart": chart})
             continue
-        if slide_data.get("sections"):
-            items = []
-            for sec in slide_data["sections"]:
-                if sec.get("subheading"):
-                    items.append(("sub", sec["subheading"]))
-                items.extend(("pt", t) for t in (sec.get("points") or []))
-            plain_bullets = False
-        else:
-            items = [("pt", b) for b in (slide_data.get("bullets") or [])]
-            plain_bullets = True
-        for page in pages_of(items):
-            slide = prs.slides.add_slide(blank_layout)
-            if is_cta:
-                slide.background.fill.solid()
-                slide.background.fill.fore_color.rgb = CTA_BG
-            header(slide, slide_data["header"], is_cta, icon)
-            if page:
-                body(slide, page, plain_bullets)
+        blocks = []
+        for sec in (sd.get("sections") or []):
+            if not isinstance(sec, dict):
+                continue
+            sh = _sd_clean(sec.get("subheading"), 140)
+            pts = [("pt", x) for x in (_sd_clean(p, 400) for p in (sec.get("points") or [])) if x]
+            if sh:
+                blocks.append([("sub", sh)] + pts)
+            else:
+                blocks.extend([p] for p in pts)
+        if blocks:
+            if not any(b[0][0] == "sub" for b in blocks):
+                blocks = [[("bul", b[0][1])] for b in blocks]
+            plan.append({"kind": "words", "header": header, "blocks": blocks})
+            continue
+        items = [x for x in (_sd_clean(b, 700) for b in (sd.get("bullets") or [])) if x]
+        lk = _sd_list_kind(sd)
+        if plan and plan[-1]["kind"] == "list" and plan[-1]["list"] == lk and plan[-1]["header"].lower() == header.lower():
+            plan[-1]["items"].extend(items)
+        elif items:
+            plan.append({"kind": "list", "list": lk, "header": header, "items": items})
+    if not plan:
+        raise ConversionError("No slides to build a presentation from.")
 
+    prs, layouts = _sd_presentation(head_font, text_font)
+    text_font = text_font or _SD_TEXT_FONT
+    deck_title = next((p["header"] for p in plan if p["kind"] == "cover"), "")
+    foot = deck_title if len(deck_title) <= 90 else deck_title[:88].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    count = [0]
+
+    def new_slide(layout_name):
+        count[0] += 1
+        return prs.slides.add_slide(layouts[layout_name])
+
+    def words_slide(layout_name, header, continued, lines):
+        slide = new_slide(layout_name)
+        body = slide.placeholders[1]
+        _sd_heading(slide, header, continued, body)
+        _sd_text(body, lines)
+        _sd_foot(slide, layouts[layout_name], foot, count[0])
+
+    last_header = None
+    for item in plan:
+        kind, header = item["kind"], item["header"]
+        if kind in ("cover", "thanks"):
+            slide = new_slide("Title Slide" if kind == "cover" else "Closing")
+            size = _SD_COVER_PT
+            for smaller in (46, 40, 34):
+                if _sd_wrap(header, size, (_SD_SLIDE_W / _SD_IN - 2 * _SD_COVER_LEFT) * 72, "h")[0] > 3:
+                    size = smaller
+            t = slide.shapes.title
+            t.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+            _sd_run(t.text_frame.paragraphs[0], header, size=size if size != _SD_COVER_PT else None)
+            under = slide.placeholders[1] if kind == "cover" else None
+            if under is not None and item["lines"]:
+                tf = under.text_frame
+                tf.auto_size = MSO_AUTO_SIZE.NONE
+                for i, words in enumerate(item["lines"]):
+                    p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+                    if i:
+                        p.level = 1
+                    _sd_run(p, words)
+            else:
+                # nothing under the title: it stands in the middle of the slide
+                if under is not None:
+                    under._element.getparent().remove(under._element)
+                t.left, t.top, t.width, t.height = (Emu(_sd_emu(v)) for v in (_SD_COVER_LEFT, 2.0, _SD_SLIDE_W / _SD_IN - 2 * _SD_COVER_LEFT, 3.1))
+                t.text_frame._txBody.find(pptx_qn("a:bodyPr")).set("anchor", "ctr")
+            last_header = None
+            continue
+        same = last_header is not None and header.lower() == last_header.lower()
+        last_header = header
+        room_of = lambda n: (_SD_BODY_BOTTOM - _sd_body_top(header, same or n > 0)) * 72.0 * 0.97
+        if kind == "chart":
+            slide = new_slide("Title Only")
+            top = _sd_heading(slide, header, same)
+            try:
+                _sd_chart(slide, item["chart"], top, text_font)
+            except Exception:
+                for sh in [x for x in slide.shapes if getattr(x, "has_chart", False) and x.has_chart]:
+                    sh._element.getparent().remove(sh._element)
+                _add_chart_as_table_fallback(slide, item["chart"]["categories"], [(item["chart"].get("series_name") or "Value", item["chart"]["values"])],
+                                             prs.slide_width, prs.slide_height)
+            _sd_foot(slide, layouts["Title Only"], foot, count[0])
+            continue
+        if kind == "words":
+            sectioned = any(b[0][0] == "sub" for b in item["blocks"])
+            layout_name = "Sub-headings and Points" if sectioned else "Title and Content"
+            for n, page in enumerate(_sd_pages(item["blocks"], room_of, _SD_WIDTH)):
+                words_slide(layout_name, header, same or n > 0, page)
+            continue
+        lk = item["list"]
+        line_kind = {"names": "line", "outline": "num", "numbered": "num", "refs": "ref", "points": "bul"}[lk]
+        layout_name = "References" if lk == "refs" else "Title and Content"
+        done = 0
+        for n, page in enumerate(_sd_pages([[(line_kind, x)] for x in item["items"]], room_of, _SD_WIDTH)):
+            words_slide(layout_name, header, same or n > 0, [(k, w, done + i + 1) for i, (k, w) in enumerate(page)])
+            done += len(page)
+
+    _sd_file_details(prs, deck_title, count[0])
     result_path = os.path.join(out_dir, filename)
     prs.save(result_path)
     return result_path
@@ -10087,14 +10734,15 @@ def _write_rich(p, text, links=None, bold=False, italic=False):
             (_plain_or_raised(p, seg[pos:], b, it) if raised else p._p.append(_xrun(seg[pos:], b, it)))
 
 
-def _write_url(p, url):
-    """A live link (a reference's DOI or PDF), blue and underlined as Word shows links."""
+def _write_url(p, url, plain=False):
+    """A live link (a reference's DOI or PDF), blue and underlined as Word shows links; plain: in the words' own colour
+    with no line under it (APA 7 allows either), as a proposal handed in on paper reads best."""
     from docx.opc.constants import RELATIONSHIP_TYPE as _RT
     rid = p.part.relate_to(url, _RT.HYPERLINK, is_external=True)
     h = OxmlElement("w:hyperlink")
     h.set(qn("r:id"), rid)
     h.set(qn("w:history"), "1")
-    h.append(_xrun(url, color=_LINK_BLUE, underline="single"))
+    h.append(_xrun(url) if plain else _xrun(url, color=_LINK_BLUE, underline="single"))
     p._p.append(h)
 
 
@@ -10700,6 +11348,658 @@ def _essay_docx(payload, out_dir, out_path):
     _rtl_pass(doc)
     doc.save(out_path)
     return out_path
+
+
+# ------------------------------------------------ 5.4: a research proposal's Word file
+# The owner, 12 Nov 2026, with a nursing school's proposal as the model: "Make everything beautifully and high quality
+# like or than it." The file follows that document: a cover, a contents list with real page numbers, a structured
+# abstract, each chapter on a new page under its title in capitals, numbered headings, the sample size set out as a
+# worked formula, references with hanging indents, and the appendices (the instrument as real tables, the consent
+# form with its signature lines, the budget, the work plan as a Gantt chart). Where it could be better than the model
+# it is: one contents line for each chapter, no number on the cover, tables that never break a row across pages, a
+# formula that every program draws (the model's equations are objects that some programs leave blank), a Gantt chart
+# with its bars in colour, and every in-text citation a link to its reference.
+PROPOSAL_LOOK = {"font": "Times New Roman", "size": 12, "spacing": 2.0, "align": "justify", "indent": False, "numbers": "bottom-right", "rule": False}
+_PROP_ROMAN = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII")
+_PROP_BAR = "3F5E8C"          # the work plan's bars: a calm navy (coloured, as the owner asked; it prints as a clear dark grey)
+_PROP_HEAD_FILL = "F2F2F2"    # a table's heading row
+_PROP_LINE = "595959"         # a table's lines: fine and dark grey (a heavy black grid reads as a cage round the words)
+_PROP_SCALES = {"agreement": (("SD", "Strongly disagree"), ("D", "Disagree"), ("A", "Agree"), ("SA", "Strongly agree")),
+                "frequency": (("N", "Never"), ("R", "Rarely"), ("S", "Sometimes"), ("O", "Often"), ("A", "Always"))}
+
+
+def proposal_to_docx(payload, out_dir):
+    """The Word file of a research proposal: payload = {title, plan, sections, references, references_title, extras,
+    date, marks, look, style}. sections are those the app was given, part by part (kind: chapter, cited, plan, sample);
+    extras holds the abstract and the appendices once the last part is written. A proposal still being written gives
+    a file of what there is so far."""
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "Research_Proposal.docx")
+    raw = payload.get("look") if isinstance(payload.get("look"), dict) else {}
+    if str(raw.get("preset") or "style") == "style":
+        look = dict(PROPOSAL_LOOK)
+        look["margin_left"] = 1.5 if raw.get("binding") is True else 1.0
+    else:
+        look = doc_look(raw, payload.get("style"))
+    _LOOK.v = look
+    try:
+        doc, heads = _build_proposal(payload, {})
+        pages = {}
+        try:
+            probe = os.path.join(out_dir, "layout")
+            os.makedirs(probe, exist_ok=True)
+            first = os.path.join(probe, "probe.docx")
+            doc.save(first)
+            pages = _laid_out_pages(first, probe, heads, [])
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger("academic-home").warning(f"Proposal: the contents' page numbers were not worked out: {e}")
+        doc, heads = _build_proposal(payload, pages)
+        if any(bm not in pages for bm, _ in heads):
+            _ask_word_to_update(doc)
+        doc.save(out_path)
+        return out_path
+    finally:
+        _LOOK.v = None
+
+
+def _prop_cell(cell, text="", bold=False, italic=False, align=None, size=None, fill=None, width=None, valign=None, runs=None):
+    """One cell of a proposal's table: its words (or runs: [(text, bold, italic)]), single-spaced, with a little room."""
+    p = cell.paragraphs[0]
+    pf = p.paragraph_format
+    pf.line_spacing, pf.space_before, pf.space_after = 1.0, DocxPt(3), DocxPt(3)
+    if align is not None:
+        p.alignment = align
+    for t, b, i in (runs if runs is not None else [(text, bold, italic)]):
+        if t:
+            p._p.append(_xrun(_sanitize_xml_text(str(t)), b, i, size=size))
+    tcpr = cell._tc.get_or_add_tcPr()
+    if width is not None:
+        w = tcpr.find(qn("w:tcW"))
+        if w is None:
+            w = OxmlElement("w:tcW")
+            tcpr.insert(0, w)
+        w.set(qn("w:w"), str(int(round(width * 1440))))
+        w.set(qn("w:type"), "dxa")
+    if fill:
+        sh = OxmlElement("w:shd")
+        for k, v in (("w:val", "clear"), ("w:color", "auto"), ("w:fill", fill)):
+            sh.set(qn(k), v)
+        tcpr.append(sh)
+    if valign:
+        va = OxmlElement("w:vAlign")
+        va.set(qn("w:val"), valign)
+        tcpr.append(va)
+    return p
+
+
+def _prop_table(doc, widths, n_rows, grid=True, header=True, centre=False):
+    """A table of fixed column widths (inches): the same in Word, Google Docs and LibreOffice. grid: every line drawn."""
+    t = doc.add_table(rows=n_rows, cols=len(widths))
+    pr = t._tbl.tblPr
+    look = pr.find(qn("w:tblLook"))
+    for el in list(pr):                                          # written again below, in the order Word's format asks
+        pr.remove(el)
+    tw = OxmlElement("w:tblW")
+    tw.set(qn("w:w"), str(int(round(sum(widths) * 1440))))
+    tw.set(qn("w:type"), "dxa")
+    pr.append(tw)
+    if centre:
+        jc = OxmlElement("w:jc")
+        jc.set(qn("w:val"), "center")
+        pr.append(jc)
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        e = OxmlElement(f"w:{edge}")
+        e.set(qn("w:val"), "single" if grid else "nil")
+        if grid:
+            e.set(qn("w:sz"), "4")
+            e.set(qn("w:space"), "0")
+            e.set(qn("w:color"), _PROP_LINE)
+        borders.append(e)
+    pr.append(borders)
+    lay = OxmlElement("w:tblLayout")
+    lay.set(qn("w:type"), "fixed")
+    pr.append(lay)
+    if look is not None:
+        pr.append(look)
+    grid_el = t._tbl.find(qn("w:tblGrid"))
+    if grid_el is not None:
+        for col, w in zip(grid_el.findall(qn("w:gridCol")), widths):
+            col.set(qn("w:w"), str(int(round(w * 1440))))
+    for ri, row in enumerate(t.rows):
+        trpr = row._tr.get_or_add_trPr()
+        trpr.append(OxmlElement("w:cantSplit"))                 # a row never breaks across two pages
+        if header and ri == 0:
+            trpr.append(OxmlElement("w:tblHeader"))             # the heading row comes again on a new page
+    return t
+
+
+def _prop_keep(t, whole_up_to=16, first=3):
+    """Call when a table is filled: a short table stays whole on one page (it moves to the next page rather than break);
+    a long one keeps at least its heading and first rows together."""
+    n = len(t.rows)
+    upto = n - 1 if n <= whole_up_to else min(first, n - 1)
+    for ri, row in enumerate(t.rows):
+        if ri >= upto:
+            break
+        for c in row.cells:
+            for pp in c.paragraphs:
+                pp.paragraph_format.keep_with_next = True
+
+
+def _prop_merge(a, b):
+    """Two cells made one, with one paragraph left in it (merging keeps each cell's empty paragraph)."""
+    c = a.merge(b)
+    for extra in c.paragraphs[1:]:
+        extra._p.getparent().remove(extra._p)
+    return c
+
+
+def _prop_cell_border(cell, edge, val="single", sz="6"):
+    tcpr = cell._tc.get_or_add_tcPr()
+    tb = tcpr.find(qn("w:tcBorders"))
+    if tb is None:
+        tb = OxmlElement("w:tcBorders")
+        tcpr.append(tb)
+    e = OxmlElement(f"w:{edge}")
+    e.set(qn("w:val"), val)
+    if val != "nil":
+        e.set(qn("w:sz"), sz)
+        e.set(qn("w:space"), "0")
+        e.set(qn("w:color"), "000000")
+    tb.append(e)
+
+
+def _prop_formula(doc, line):
+    """One line of a formula. "n = A / B" is set out as a fraction, A over B with a bar between (a small table without
+    lines, so that every program draws it); a line without a division is centred as it is. Letters that stand for
+    quantities are in italics, as mathematics is written."""
+    def runs(expr):
+        out = []
+        for tok in re.findall(r"[A-Za-z]+|[^A-Za-z]+", expr):
+            out.append((tok, False, bool(re.fullmatch(r"[A-Za-z]", tok))))     # a single letter is a quantity (n, N, e, Z, p)
+        return out
+    m = re.match(r"^\s*(.+?[=≈])\s*(.+?)\s+/\s+(.+?)\s*$", line)
+    if not m:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.line_spacing = 1.0
+        p.paragraph_format.space_before, p.paragraph_format.space_after = DocxPt(6), DocxPt(14)
+        for t, b, i in runs(line.strip()):
+            p._p.append(_xrun(t, b, i))
+        return
+    left, num, den = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+    size = _look()["size"]
+    per = size * 0.5 / 72.0                                       # about one character's width, in inches
+    wl = max(0.5, len(left) * per + 0.2)
+    wr = max(0.8, max(len(num), len(den)) * per + 0.35)
+    t = _prop_table(doc, [wl, wr], 2, grid=False, header=False, centre=True)
+    a = _prop_merge(t.cell(0, 0), t.cell(1, 0))
+    _prop_cell(a, align=WD_ALIGN_PARAGRAPH.RIGHT, valign="center", width=wl, runs=runs(left + " "))
+    _prop_cell(t.cell(0, 1), align=WD_ALIGN_PARAGRAPH.CENTER, width=wr, runs=runs(num))
+    _prop_cell(t.cell(1, 1), align=WD_ALIGN_PARAGRAPH.CENTER, width=wr, runs=runs(den))
+    _prop_cell_border(t.cell(0, 1), "bottom")
+    for c in (a, t.cell(0, 1), t.cell(1, 1)):
+        for pp in c.paragraphs:
+            pp.paragraph_format.space_before, pp.paragraph_format.space_after = DocxPt(1), DocxPt(1)
+            pp.paragraph_format.keep_with_next = True
+    gap = doc.add_paragraph()
+    gap.paragraph_format.line_spacing = 1.0
+    gap.paragraph_format.space_after = DocxPt(0)
+    for r_ in gap.runs:
+        r_.font.size = DocxPt(4)
+
+
+def _prop_math_runs(text):
+    """Words in which a letter standing alone for a quantity (n, N, e, Z, p) is set in italics: [(text, bold, italic)]."""
+    out = []
+    for tok in re.split(r"(?<![A-Za-z’'])([nNeZp])(?![A-Za-z’'])", text):
+        if tok:
+            out.append((tok, False, tok in ("n", "N", "e", "Z", "p")))
+    return out
+
+
+def _build_proposal(payload, pages):
+    """The proposal itself; pages maps each heading's bookmark to its page. Returns (doc, [(bookmark, heading text)])."""
+    doc = Document()
+    lk = _look()
+    sec = doc.sections[0]
+    sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = DocxInches(1)
+    sec.left_margin = DocxInches(lk.get("margin_left", 1.0))
+    text_w = 8.5 - lk.get("margin_left", 1.0) - 1.0               # the width of the words, in inches
+    sec.different_first_page_header_footer = True                  # the cover carries no page number
+    _add_page_number_footer(doc, lk["numbers"], lk["font"], lk["size"])
+    _apa_styles(doc)
+    doc.styles["Heading 3"].font.italic = False                    # bold, as the model has its third level
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    extras = payload.get("extras") if isinstance(payload.get("extras"), dict) else {}
+    marks = payload.get("marks") if payload.get("marks") in ("ieee", "brackets", "parens", "raised") else None
+    numbered = bool(marks)
+    references = [r for r in (payload.get("references") or []) if isinstance(r, dict) and (r.get("text") or r.get("url"))]
+    links = _CiteLinks(references, numbered, marks) if references else None
+    title = re.sub(r"\s+", " ", str(payload.get("title") or plan.get("title") or "Research Proposal")).strip()[:300]
+    just = WD_ALIGN_PARAGRAPH.JUSTIFY if lk["align"] == "justify" else WD_ALIGN_PARAGRAPH.LEFT
+    after = DocxPt(0 if lk["indent"] else round(lk["size"] * 0.67))
+    bid, heads, toc = [1], [], []
+
+    def next_id():
+        bid[0] += 1
+        return bid[0]
+
+    def para(align=None, spacing=None, before=0, after_pt=0, keep=False):
+        p = doc.add_paragraph()
+        pf = p.paragraph_format
+        pf.line_spacing = spacing or lk["spacing"]
+        pf.space_before, pf.space_after = DocxPt(before), DocxPt(after_pt)
+        if align is not None:
+            p.alignment = align
+        if keep:
+            pf.keep_with_next = True
+        return p
+
+    def body(text, cited=False):
+        p = para(just)
+        if lk["indent"]:
+            p.paragraph_format.first_line_indent = DocxInches(0.5)
+        p.paragraph_format.space_after = after
+        _write_rich(p, text, links if cited else None)
+        return p
+
+    def heading(text, level, toc_text=None, new_page=False, match=None, after_pt=0):
+        """A real heading (Word's own Heading 1-3: the navigation pane, the contents, a screen reader), in the contents.
+        after_pt: the room under a title that stands alone at the top of its page (a chapter's has its name under it)."""
+        p = doc.add_paragraph(style=f"Heading {level}")
+        pf = p.paragraph_format
+        pf.line_spacing = lk["spacing"] if level > 1 else 1.5
+        pf.space_before, pf.space_after = DocxPt(0 if new_page else (12 if level == 2 else 6)), DocxPt(after_pt)
+        pf.page_break_before = bool(new_page)
+        _write_rich(p, text, None, bold=True)
+        bm = f"_Toc{200000 + len(heads)}"
+        _xbookmark(p._p, bm, next_id())
+        heads.append((bm, match or text))
+        toc.append((bm, toc_text or text, level))
+        return p
+
+    def items(text, cited=False):
+        """A plan's words: paragraphs, numbered lines ("1. To…"), bullet lines, and a short line standing alone as a label."""
+        blocks = [b for b in re.split(r"\n\s*\n", str(text or "").strip()) if b.strip()]
+        for b in blocks:
+            lines = [l.strip() for l in b.split("\n") if l.strip()]
+            buf = []
+            for l in lines:
+                m = re.match(r"^(\d{1,2})[.)]\s+(.+)$", l)
+                u = re.match(r"^[-•*]\s+(.+)$", l)
+                if m or u:
+                    if buf:
+                        body(" ".join(buf), cited)
+                        buf = []
+                    p = para(WD_ALIGN_PARAGRAPH.LEFT)
+                    p.paragraph_format.left_indent = DocxInches(0.5)
+                    p.paragraph_format.first_line_indent = DocxInches(-0.25)
+                    p.paragraph_format.tab_stops.add_tab_stop(DocxInches(0.5))
+                    p._p.append(_xrun((m.group(1) + "." if m else "•")))
+                    tab = OxmlElement("w:r")
+                    tab.append(OxmlElement("w:tab"))
+                    p._p.append(tab)
+                    _write_rich(p, m.group(2) if m else u.group(1), links if cited else None)
+                elif re.match(r"^(?:inclusion|exclusion) criteria:?$", l, re.I) or (len(l) <= 40 and not re.search(r"[.!?:;,]$", l) and len(l.split()) <= 4 and len(lines) > 1):
+                    if buf:
+                        body(" ".join(buf), cited)
+                        buf = []
+                    lp = para(WD_ALIGN_PARAGRAPH.LEFT, keep=True)       # "Inclusion criteria", "Exclusion criteria"
+                    lp._p.append(_xrun(l.rstrip(":"), bold=True))
+                else:
+                    buf.append(l)
+            if buf:
+                body(" ".join(buf), cited)
+
+    # ---------------------------------------------------------------- the cover
+    # The institution at the top, the title in the upper middle, who it is by under it, the date at the foot. Every
+    # line's height is counted, so that the date can be set at the bottom of the page whatever the cover holds.
+    used = [0.0]
+    PAGE_PT = 9 * 72.0                                                 # the height of the words on a page
+
+    def cover_line(text, size=None, before=0, after_pt=0, bold=True, spacing=1.5):
+        p = para(WD_ALIGN_PARAGRAPH.CENTER, spacing=spacing, before=before, after_pt=after_pt)
+        p._p.append(_xrun(_sanitize_xml_text(text), bold, size=size))
+        sz = size or lk["size"]
+        lines = max(1, -(-int(len(text) * sz * 0.66) // int(text_w * 72)))      # capitals in bold are wide
+        used[0] += before + after_pt + lines * sz * 1.15 * spacing
+        return p
+
+    inst = [str(x).strip() for x in (plan.get("institution") or []) if str(x).strip()][:4]
+    authors = [a for a in (plan.get("authors") or []) if isinstance(a, dict) and a.get("name")][:12]
+    for i, line in enumerate(inst):
+        cover_line(line.upper(), size=13 if i == 0 else 12, spacing=1.3)
+    lines_below = (len(authors) + 2 if authors else 0) + (2 if plan.get("programme") else 0) + (2 if plan.get("supervisor") else 0)
+    # the institution's logo, if the person gave one: under the institution's name, as on a school's own documents
+    has_logo = False
+    logo = payload.get("logo") if isinstance(payload.get("logo"), (bytes, bytearray)) else None
+    if logo:
+        try:
+            from PIL import Image as _Im
+            lw, lh = _Im.open(io.BytesIO(logo)).size
+            k = min(1.25 / lh, 2.6 / lw)                           # no taller than 1.25 inches, no wider than 2.6
+            lp = para(WD_ALIGN_PARAGRAPH.CENTER, spacing=1.0, before=22 if inst else 0, after_pt=0)
+            shape = lp.add_run().add_picture(io.BytesIO(bytes(logo)), width=DocxInches(lw * k), height=DocxInches(lh * k))
+            try:
+                shape._inline.docPr.set("descr", "The logo of the institution")
+            except Exception:
+                pass
+            used[0] += (22 if inst else 0) + lh * k * 72.0 + 4
+            has_logo = True
+        except Exception:
+            has_logo = False
+    gap_above = ((40 if lines_below > 8 else 54) if has_logo else (96 if lines_below > 8 else 120)) if (inst or has_logo) else 170
+    cover_line("RESEARCH PROPOSAL", size=14, before=gap_above, after_pt=18)
+    cover_line(title.upper(), size=14)
+    if authors:
+        cover_line("BY", before=56 if lines_below <= 8 else 40, after_pt=10)
+        if any(a.get("id") for a in authors):
+            t = _prop_table(doc, [3.2, 1.7], len(authors), grid=False, header=False, centre=True)
+            for i, a in enumerate(authors):
+                _prop_cell(t.cell(i, 0), str(a["name"]).upper(), bold=True, width=3.2)
+                _prop_cell(t.cell(i, 1), str(a.get("id") or "").upper(), bold=True, width=1.7, align=WD_ALIGN_PARAGRAPH.RIGHT)
+            used[0] += len(authors) * (lk["size"] * 1.15 + 6)
+        else:
+            for a in authors:
+                cover_line(str(a["name"]).upper(), spacing=1.15, after_pt=4)
+    if plan.get("programme"):
+        cover_line(str(plan["programme"]).upper(), before=44)
+    if plan.get("supervisor"):
+        cover_line("SUPERVISOR: " + str(plan["supervisor"]).upper(), before=22 if plan.get("programme") else 44)
+    date = re.sub(r"\s+", " ", str(plan.get("date") or payload.get("date") or "")).strip()[:40]
+    if date:
+        last = lk["size"] * 1.15 * 1.5
+        cover_line(date.upper(), before=max(28, int(PAGE_PT - used[0] - last - 30)))
+
+    # ---------------------------------------------------------------- the contents (filled in below, once every heading is known)
+    toc_title = para(WD_ALIGN_PARAGRAPH.CENTER, spacing=1.5, after_pt=6)
+    toc_title.paragraph_format.page_break_before = True
+    toc_title._p.append(_xrun("TABLE OF CONTENTS", bold=True))
+    toc_anchor = toc_title
+
+    # ---------------------------------------------------------------- the abstract
+    ab = extras.get("abstract") if isinstance(extras.get("abstract"), dict) else None
+    if ab and any(ab.get(k) for k in ("introduction", "aim", "methodology", "analysis")):
+        heading("ABSTRACT", 1, new_page=True, after_pt=10)
+        for key, label in (("introduction", "Introduction"), ("aim", "Aim"), ("methodology", "Methodology"), ("analysis", "Analysis")):
+            t = re.sub(r"\s+", " ", str(ab.get(key) or "")).strip()
+            if not t:
+                continue
+            p = para(just, after_pt=after.pt if after else 0)
+            p._p.append(_xrun(label + ": ", bold=True))
+            _write_rich(p, t)
+        kw = re.sub(r"\s+", " ", str(ab.get("keywords") or "")).strip().strip(".")
+        if kw:
+            p = para(WD_ALIGN_PARAGRAPH.LEFT)
+            p._p.append(_xrun("Keywords: ", bold=True))
+            p._p.append(_xrun(kw, italic=True))
+
+    # ---------------------------------------------------------------- the chapters
+    sample = extras.get("sample") if isinstance(extras.get("sample"), dict) else None
+    for s in payload.get("sections") or []:
+        if not isinstance(s, dict):
+            continue
+        kind, head, num, text = s.get("kind"), str(s.get("heading") or "").strip(), str(s.get("number") or "").strip(), str(s.get("text") or "")
+        if kind == "chapter":
+            a, _, b = head.partition(":")
+            heading(a.strip().upper(), 1, toc_text=head.upper(), new_page=True)
+            if b.strip():
+                sub = para(WD_ALIGN_PARAGRAPH.CENTER, spacing=1.5, after_pt=10, keep=True)
+                sub._p.append(_xrun(b.strip().upper(), bold=True))
+            continue
+        try:
+            lvl = max(2, min(int(s.get("level") or 2), 3))
+        except (TypeError, ValueError):
+            lvl = 2
+        heading((num + " " + head).strip(), lvl)
+        if kind == "sample" and sample and sample.get("steps") and sample.get("formula") and len(sample.get("text") or []) >= 4:
+            t = sample["text"]
+            body(t[0]).paragraph_format.keep_with_next = True
+            _prop_formula(doc, sample["formula"])
+            for line in (t[1], t[2]):
+                mp = para(just, after_pt=after.pt if after else 0)
+                for seg, b, it in _prop_math_runs(line):
+                    mp._p.append(_xrun(seg, b, it))
+            mp.paragraph_format.keep_with_next = True
+            for step in sample["steps"]:
+                _prop_formula(doc, step)
+            body(t[3])
+        else:
+            items(text, cited=(kind == "cited"))
+
+    # ---------------------------------------------------------------- the references
+    if references:
+        heading(str(payload.get("references_title") or "References").upper()[:40], 1, new_page=True, after_pt=10)
+        for i, ref in enumerate(references):
+            p = para(WD_ALIGN_PARAGRAPH.LEFT)
+            p.paragraph_format.left_indent = DocxInches(0.5)
+            p.paragraph_format.first_line_indent = DocxInches(-0.5)
+            text = str(ref.get("text") or "").strip()
+            if numbered:
+                p._p.append(_xrun(f"[{i + 1}] " if marks in (None, "ieee") else f"{i + 1}. "))
+            if text:
+                _write_rich(p, text + " ")
+            url = str(ref.get("url") or "").strip()
+            if url.startswith("http"):
+                _write_url(p, url, plain=True)
+            tail = str(ref.get("after") or "").strip()[:80]
+            if tail:
+                p._p.append(_xrun(" " + tail))
+            _xbookmark(p._p, f"ref_{i + 1}", next_id())
+
+    # ---------------------------------------------------------------- the appendices
+    app_n = [0]
+
+    def appendix(name):
+        app_n[0] += 1
+        heading(f"APPENDIX {_PROP_ROMAN[app_n[0] - 1]}: {name}", 1, new_page=True, after_pt=10)
+
+    def small(text, bold=False, italic=False, align=WD_ALIGN_PARAGRAPH.LEFT, before=0, after_pt=6, keep=False, size=None):
+        p = para(align, spacing=1.15, before=before, after_pt=after_pt, keep=keep)
+        if text:
+            p._p.append(_xrun(_sanitize_xml_text(text), bold, italic, size=size))
+        return p
+
+    tool = extras.get("instrument") if isinstance(extras.get("instrument"), dict) else None
+    if tool and tool.get("sections"):
+        guide = tool.get("kind") == "guide"
+        appendix("INTERVIEW GUIDE" if guide else "QUESTIONNAIRE")
+        small(title.upper(), bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, after_pt=10)
+        if tool.get("intro"):
+            small(str(tool["intro"]), align=just, after_pt=8)
+        if guide:
+            for sct in tool["sections"]:
+                small(str(sct.get("title") or ""), bold=True, before=8, keep=True)
+                for qi, q in enumerate(sct.get("questions") or []):
+                    p = small("", after_pt=5)
+                    p.paragraph_format.left_indent = DocxInches(0.4)
+                    p.paragraph_format.first_line_indent = DocxInches(-0.3)
+                    p._p.append(_xrun(f"{qi + 1}.  " + _sanitize_xml_text(str(q))))
+        else:
+            ip = small("", after_pt=8, align=just)
+            ip._p.append(_xrun("Instructions: ", bold=True))
+            ip._p.append(_xrun("Please tick (✓) the answer that fits you best. There are no right or wrong answers, and no name is needed."))
+            bg = tool.get("background") or []
+            if bg:
+                small("Section A: Background", bold=True, before=6, keep=True)
+                for qi, q in enumerate(bg):
+                    qp = small(f"{qi + 1}.  {q.get('q')}", after_pt=2, keep=bool(q.get("options")))
+                    qp.paragraph_format.left_indent = DocxInches(0.3)
+                    qp.paragraph_format.first_line_indent = DocxInches(-0.3)
+                    if q.get("options"):
+                        op = small("     ".join("☐ " + str(o) for o in q["options"]), after_pt=7)
+                        op.paragraph_format.left_indent = DocxInches(0.3)
+                    else:
+                        lp = small("______________________________", after_pt=7)
+                        lp.paragraph_format.left_indent = DocxInches(0.3)
+            for sct in tool["sections"]:
+                scale = _PROP_SCALES["frequency" if sct.get("scale") == "frequency" else "agreement"]
+                small(str(sct.get("title") or ""), bold=True, before=10, after_pt=3, keep=True)
+                small("Tick one box for each statement: " + ", ".join(f"{i + 1} = {name}" for i, (_, name) in enumerate(scale)) + ".", italic=True, after_pt=5, keep=True)
+                ws = 0.52
+                wq = text_w - 0.42 - ws * len(scale)
+                rows = sct.get("items") or []
+                t = _prop_table(doc, [0.42, wq] + [ws] * len(scale), len(rows) + 1, centre=True)
+                _prop_cell(t.cell(0, 0), "No.", bold=True, fill=_PROP_HEAD_FILL, width=0.42, align=WD_ALIGN_PARAGRAPH.CENTER, size=10.5, valign="center")
+                _prop_cell(t.cell(0, 1), "Statement", bold=True, fill=_PROP_HEAD_FILL, width=wq, size=10.5, valign="center")
+                for ci, (abbr, _) in enumerate(scale):
+                    _prop_cell(t.cell(0, 2 + ci), abbr, bold=True, fill=_PROP_HEAD_FILL, width=ws, align=WD_ALIGN_PARAGRAPH.CENTER, size=10.5, valign="center")
+                for ri, it in enumerate(rows):
+                    _prop_cell(t.cell(ri + 1, 0), str(ri + 1), width=0.42, align=WD_ALIGN_PARAGRAPH.CENTER, size=10.5, valign="center")
+                    _prop_cell(t.cell(ri + 1, 1), str(it), width=wq, size=10.5, valign="center")
+                    for ci in range(len(scale)):
+                        _prop_cell(t.cell(ri + 1, 2 + ci), str(ci + 1), width=ws, align=WD_ALIGN_PARAGRAPH.CENTER, size=10.5, valign="center")
+                _prop_keep(t)
+                small("", after_pt=2)
+            small("Thank you for taking part.", italic=True, align=WD_ALIGN_PARAGRAPH.CENTER, before=8)
+
+    consent = [c for c in (extras.get("consent") or []) if isinstance(c, dict) and c.get("p")]
+    if consent:
+        appendix("INFORMED CONSENT FORM")
+        small(title.upper(), bold=True, align=WD_ALIGN_PARAGRAPH.CENTER, after_pt=8)
+        for c in consent:
+            if c.get("h"):
+                small(str(c["h"]), bold=True, before=3, after_pt=1, keep=True)
+            small(str(c["p"]), align=just, after_pt=5)
+        # the two signature lines, kept on one page with the words of consent above them
+        doc.paragraphs[-1].paragraph_format.keep_with_next = True
+        cw = [text_w * 0.42, text_w * 0.33, text_w * 0.25]
+        t = _prop_table(doc, cw, 4, grid=False, header=False, centre=True)
+        for k, who in enumerate(("participant", "researcher")):
+            for ci, label in enumerate((f"Name of {who}", "Signature", "Date")):
+                top = _prop_cell(t.cell(2 * k, ci), "", width=cw[ci])
+                top.paragraph_format.space_before = DocxPt(18)
+                _prop_cell(t.cell(2 * k + 1, ci), label, width=cw[ci], size=10.5)
+                _prop_cell_border(t.cell(2 * k + 1, ci), "top")
+        _prop_keep(t)
+
+    budget = extras.get("budget") if isinstance(extras.get("budget"), dict) else None
+    if budget and budget.get("rows"):
+        appendix("BUDGET")
+        cur = str(budget.get("currency") or "").strip()
+        unit = f" ({cur})" if cur else ""
+        cw = [text_w - 3.3, 0.85, 1.3, 1.15]                       # "Unit cost (GH₵)" stays on one line, and so does a usual item
+        rows = [r for r in budget["rows"] if isinstance(r, dict)]
+        t = _prop_table(doc, cw, len(rows) + 2, centre=True)
+        for ci, h in enumerate(("Item", "Quantity", "Unit cost" + unit, "Total" + unit)):
+            _prop_cell(t.cell(0, ci), h, bold=True, fill=_PROP_HEAD_FILL, width=cw[ci], size=11, valign="center",
+                       align=WD_ALIGN_PARAGRAPH.LEFT if ci == 0 else WD_ALIGN_PARAGRAPH.CENTER)
+        money = lambda v: "" if v is None else "{:,.2f}".format(float(v))
+        for ri, r in enumerate(rows):
+            if r.get("head"):
+                c = _prop_merge(t.cell(ri + 1, 0), t.cell(ri + 1, 3))
+                _prop_cell(c, str(r["head"]), bold=True, size=11)
+            else:
+                _prop_cell(t.cell(ri + 1, 0), str(r.get("item") or ""), width=cw[0], size=11)
+                _prop_cell(t.cell(ri + 1, 1), str(r.get("qty") or ""), width=cw[1], size=11, align=WD_ALIGN_PARAGRAPH.CENTER)
+                _prop_cell(t.cell(ri + 1, 2), str(r.get("unit") or ""), width=cw[2], size=11, align=WD_ALIGN_PARAGRAPH.RIGHT)
+                _prop_cell(t.cell(ri + 1, 3), money(r.get("total")), width=cw[3], size=11, align=WD_ALIGN_PARAGRAPH.RIGHT)
+        last = len(rows) + 1
+        c = _prop_merge(t.cell(last, 0), t.cell(last, 2))
+        _prop_cell(c, "Total", bold=True, size=11, fill=_PROP_HEAD_FILL)
+        _prop_cell(t.cell(last, 3), money(budget.get("total")), bold=True, width=cw[3], size=11, align=WD_ALIGN_PARAGRAPH.RIGHT, fill=_PROP_HEAD_FILL)
+        _prop_keep(t, whole_up_to=24)
+        if not budget.get("filled"):
+            small("The amounts are left for the researcher to fill in.", italic=True, before=8, size=10.5)
+
+    gantt = extras.get("gantt") if isinstance(extras.get("gantt"), dict) else None
+    if gantt and gantt.get("rows") and gantt.get("months"):
+        appendix("WORK PLAN")
+        months = [str(m) for m in gantt["months"]][:36]
+        step = max(1, -(-len(months) // 12))                       # more than twelve months: two or three to a column
+        cols = [months[i:i + step] for i in range(0, len(months), step)]
+        wa = 2.05
+        wm = (text_w - wa) / len(cols)
+        rows = [r for r in gantt["rows"] if isinstance(r, dict)]
+        t = _prop_table(doc, [wa] + [wm] * len(cols), len(rows) + 1, centre=True)
+        _prop_cell(t.cell(0, 0), "Activity", bold=True, fill=_PROP_HEAD_FILL, width=wa, size=10, valign="center")
+        for ci, grp in enumerate(cols):
+            a, b = grp[0].split(" "), grp[-1].split(" ")
+            label = (a[0] + ("–" + b[0] if len(grp) > 1 else "")) if len(a) > 1 and not a[0].startswith("Month") else ("M" + a[-1] + ("–" + b[-1] if len(grp) > 1 else ""))
+            year = a[1] if len(a) > 1 and not a[0].startswith("Month") else ""
+            cell = t.cell(0, 1 + ci)
+            p = _prop_cell(cell, label, bold=True, fill=_PROP_HEAD_FILL, width=wm, size=8.5 if len(cols) > 9 else 9.5, align=WD_ALIGN_PARAGRAPH.CENTER, valign="center")
+            if year:
+                br = OxmlElement("w:r")
+                br.append(OxmlElement("w:br"))
+                p._p.append(br)
+                p._p.append(_xrun(year, bold=True, size=8.5 if len(cols) > 9 else 9.5))
+        for ri, r in enumerate(rows):
+            _prop_cell(t.cell(ri + 1, 0), str(r.get("activity") or ""), width=wa, size=10, valign="center")
+            try:
+                f, to = int(r.get("from")), int(r.get("to"))
+            except (TypeError, ValueError):
+                f, to = -1, -1
+            for ci in range(len(cols)):
+                on = f <= ci * step + step - 1 and to >= ci * step
+                _prop_cell(t.cell(ri + 1, 1 + ci), "", width=wm, fill=_PROP_BAR if on else None)
+        _prop_keep(t)
+        small("A shaded box is a month in which the activity is planned." + ("" if gantt.get("dated") else " M1 is the first month of the study."),
+              italic=True, before=8, size=10.5)
+
+    # ---------------------------------------------------------------- the contents, now that every heading is known
+    def toc_para(prev):
+        p = doc.add_paragraph()
+        prev._p.addnext(p._p)
+        return p
+
+    cur = toc_anchor
+    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    for n, (bm, text, level) in enumerate(toc):
+        p = toc_para(cur)
+        pf = p.paragraph_format
+        pf.line_spacing, pf.space_before, pf.space_after = 1.5, DocxPt(0), DocxPt(0)
+        pf.left_indent = DocxInches(0.25 * (level - 1))
+        pf.tab_stops.add_tab_stop(DocxInches(text_w), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+        if n == 0:
+            p._p.append(_xfield("begin"))
+            p._p.append(_xinstr('TOC \\o "1-3" \\h \\z \\u'))
+            p._p.append(_xfield("separate"))
+        h = OxmlElement("w:hyperlink")
+        h.set(qn("w:anchor"), bm)
+        h.set(qn("w:history"), "1")
+        h.append(_xrun(_sanitize_xml_text(text), bold=(level == 1)))
+        tab = OxmlElement("w:r")
+        tab.append(OxmlElement("w:tab"))
+        h.append(tab)
+        h.append(_xfield("begin"))
+        h.append(_xinstr(f"PAGEREF {bm} \\h"))
+        h.append(_xfield("separate"))
+        h.append(_xrun(str(pages.get(bm, "")), bold=(level == 1)))
+        h.append(_xfield("end"))
+        p._p.append(h)
+        cur = p
+    if toc:
+        endp = toc_para(cur)
+        endp.paragraph_format.line_spacing = 1.0
+        endp._p.append(_xfield("end"))
+
+    # a citation is a link to its reference, and reads as plain words on paper (no line under it)
+    for h in doc.element.body.iter(qn("w:hyperlink")):
+        if str(h.get(qn("w:anchor")) or "").startswith("ref_"):
+            for u in list(h.iter(qn("w:u"))):
+                u.getparent().remove(u)
+
+    # what the file says about itself (and nothing left over from the empty file it grew from: its picture of a blank
+    # page, a zoom setting that Word's own format calls incomplete)
+    zoom = doc.settings.element.find(qn("w:zoom"))
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+    try:
+        pkg = doc.part.package
+        for rid, rel in list(pkg.rels.items()):
+            if str(rel.reltype).endswith("/metadata/thumbnail"):
+                del pkg.rels[rid]
+    except Exception:
+        pass
+    cp = doc.core_properties
+    cp.title, cp.subject, cp.keywords, cp.comments, cp.category = title[:250], "Research proposal", "", "", ""
+    cp.author = ", ".join(str(a["name"]) for a in authors)[:250]
+    cp.last_modified_by = ""
+    return doc, heads
 
 
 def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):

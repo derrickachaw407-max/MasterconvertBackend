@@ -4954,9 +4954,17 @@ def _o_set_points(sh, bullets, fallback=None):
     if not tpl and ps:
         ppr = ps[0].find(qn("a:pPr"))
         tpl[0] = (ppr, ps[0].find(qn("a:endParaRPr")))
+    # 5.3: a deck's first line may say "no space above me" (a zero, as a percentage: PowerPoint would add its level's
+    # space above the first line of a box, LibreOffice would not). That belongs to the first line, whatever it now is,
+    # and to no other: copied with its level's look it would close every gap above that level's lines.
+    def no_gap(pp):
+        if pp is None:
+            return None
+        return next((sb for sb in pp.findall(qn("a:spcBef")) if sb.find(qn("a:spcPct")) is not None and sb.find(qn("a:spcPct")).get("val") == "0"), None)
+    first_has = (bool(ps) and no_gap(ps[0].find(qn("a:pPr"))) is not None) or any(no_gap(t[0]) is not None for t in tpl.values() if t and t[0] is not None)
     for p in ps:
         tb.remove(p)
-    for b in bullets or [{"text": "", "level": 0}]:
+    for k, b in enumerate(bullets or [{"text": "", "level": 0}]):
         lv = max(0, min(int(b.get("level", 0) or 0), 4))
         base = tpl.get(lv) or tpl.get(min(tpl, key=lambda k: abs(k - lv))) if tpl else (None, None)
         ppr, rpr = base if base else (None, None)
@@ -4966,6 +4974,17 @@ def _o_set_points(sh, bullets, fallback=None):
             pp.set("lvl", str(lv))
         elif "lvl" in pp.attrib:
             del pp.attrib["lvl"]
+        mark = no_gap(pp)
+        if k and mark is not None:
+            pp.remove(mark)
+        elif not k and first_has and mark is None:
+            sb = etree.Element(qn("a:spcBef"))
+            etree.SubElement(sb, qn("a:spcPct"), val="0")
+            line = pp.find(qn("a:lnSpc"))
+            if line is not None:
+                line.addnext(sb)
+            else:
+                pp.insert(0, sb)
         p.append(pp)
         for words, flags in _fmt_segments(str(b.get("text") or ""), b.get("fmt")):
             r = etree.SubElement(p, qn("a:r"))

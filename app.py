@@ -41,11 +41,13 @@ from converters import (
     warm_up_libreoffice,
 )
 from converters import _soffice_convert   # the server's own LibreOffice runner
+from converters import proposal_to_docx   # 5.4: a research proposal's Word file
 from converters import pdf_apply_plan, pdf_plan_needs_pro, pdf_to_images   # 3.1: the PDF editor
 from converters import word_open, word_save   # 3.1: the Word editor
 from converters import CONVERTERS as _OLD_PAIRS   # 3.15: the pairs Convert always had (kept as they were)
 import convert315 as _any                          # 3.15: every other kind of file
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
+import proposal as _prop                           # 5.4: a research proposal (the approach, and what needs no AI)
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -3817,9 +3819,13 @@ def numbered_refs(sources, nums, style, marks):
     out = []
     for i, n in sorted(nums.items(), key=lambda x: x[1]):
         s = sources[i]
-        out.append({"text": numbered_ref(s, style), "url": s.get("url"), "pdf": s.get("pdf") or None, "doi": s.get("doi") or None,
+        # 5.4: a reference an earlier part of the piece already lists stays word for word as it was. (Before: it was laid
+        # out again from what the app sent back, which holds no authors, volume or pages: the earlier references of a long
+        # piece in Vancouver or IEEE lost their authors, or gained "[date unknown]".)
+        kept = bool(s.get("_kept") and s.get("ref_text"))
+        out.append({"text": s["ref_text"] if kept else numbered_ref(s, style), "url": s.get("url"), "pdf": s.get("pdf") or None, "doi": s.get("doi") or None,
                     "key": _mark([n], marks), "n": n, "akey": s.get("citation_key") or "", "group": s.get("group") or _key_group(s.get("citation_key")),
-                    "sort": None, "after": ""})
+                    "sort": None, "after": (s.get("ref_after") or "") if kept else ""})
     return out
 
 
@@ -3942,7 +3948,8 @@ def restyle_result(result, sources, cited, plan, given=None, language=None):
     result["style"] = plan["style"]
     result["style_name"] = plan["name"]
     if plan["style"] == "other" and plan.get("example") and refs:
-        by_key = {str(s.get("citation_key") or ""): s for s in sources}
+        # (5.4: not the references an earlier part already laid out: they stay as they are)
+        by_key = {str(s.get("citation_key") or ""): s for s in sources if not s.get("_kept")}
         entries = [(by_key.get(r.get("akey") or r.get("key"), {}), r["text"]) for r in refs]
         laid = refs_like_example([(src, t) for src, t in entries if src] , plan["example"], plan["name"]) if any(src for src, _ in entries) else []
         k = 0
@@ -7150,16 +7157,13 @@ SUMMARIZE_SYSTEM_PROMPT = (
     "before or after it, nothing but the array itself, starting with [ and ending with ].\n\n"
     "Each element is one slide, an object with exactly these keys:\n"
     '  "header": the HEADING of this slide — the topic it is about, as a lecturer would title it '
-    '(e.g. "Areas of Biomechanics", "Causes of Academic Stress"). Consecutive slides on the same '
+    '(e.g. "Areas of Biomechanics", "Causes of Academic Stress"), at most 7 words. Consecutive slides on the same '
     'topic may share a heading.\n'
-    '  "sections": the body of this slide, in the lecture pattern — an array of 1 to 3 objects, each '
+    '  "sections": the body of this slide, in the lecture pattern — an array of 1 or 2 objects, each '
     '{"subheading": a SUB-HEADING naming the specific aspect discussed (at most 7 words, e.g. '
-    '"Developmental biomechanics"), "points": an array of 1 to 4 short points about it (each at '
-    'most 16 words)} — empty when this slide instead uses "chart" below\n'
+    '"Developmental biomechanics"), "points": an array of 2 to 4 short points about it (each at '
+    'most 14 words)} — empty when this slide instead uses "chart" below\n'
     '  "bullets": leave this an empty array — "sections" replaces it\n'
-    '  "icon": one single emoji that visually represents this slide\'s content (e.g. '
-    '\U0001F4C8 for growth, \U0001F4A1 for an idea, \u2705 for a takeaway/action) — pick '
-    "one that actually fits the specific content, not the same one repeatedly\n"
     '  "chart": either null, or an object {"type": "bar"|"line"|"pie", "categories": '
     '[...], "series_name": "...", "values": [...]} when — and only when — the source '
     "material contains real numeric/comparative data suited to a chart\n"
@@ -7168,13 +7172,13 @@ SUMMARIZE_SYSTEM_PROMPT = (
     "goal:\n\n"
     "1. HEADING, SUB-HEADING, THEN THE POINTS. Every content slide reads like a well-made "
     "lecture slide: the heading says the topic we are on, each sub-heading says what we are "
-    "about to talk about, and its points say it. At most 3 sub-headings and 8 points on a "
-    "slide — split a big topic across several slides that share the heading rather than "
-    "crowding one. Points are short and specific, never full paragraphs.\n"
-    "2. VISUAL HIERARCHY THROUGH BOLDING. Wrap key metrics, dates, names, and other "
-    "load-bearing terms in **double asterisks** so a reader can scan the slide in under "
-    "three seconds and immediately see what matters — but don't bold everything; bolding "
-    "every word bolds nothing.\n"
+    "about to talk about, and its points say it. A slide holds 3 to 5 points under at most 2 "
+    "sub-headings: full, never crowded — split a big topic across several slides that share the "
+    "heading rather than crowding one. Points are short and specific, never full paragraphs.\n"
+    "2. PLAIN WORDS ONLY. No emoji and no symbol used as decoration anywhere, and no bold or italic "
+    "marks (no asterisks, no underscores): the slides are set in type that needs none. A reader "
+    "scans a slide in a few seconds, so put the load-bearing term (the metric, the date, the name) "
+    "early in its point.\n"
     "3. DATA BECOMES CHARTS, NOT PROSE. When the source material contains real comparative "
     'or numeric data (figures across categories, a trend over time, a breakdown of parts), '
     'represent it with the "chart" field instead of describing it in bullets — a table or '
@@ -7212,10 +7216,14 @@ def _summary_structure_prompt(audience):
     return (SUMMARIZE_SYSTEM_PROMPT + "\n\nTHIS TIME, RETURN ONE JSON OBJECT INSTEAD OF A BARE ARRAY — nothing before or after it, "
             "starting with { and ending with } — with these keys:\n"
             '  "title": the presentation\'s title, taken from the material (its title or main topic), at most 12 words\n'
+            '  "subtitle": one line for the cover, under the title, that says what the presentation covers, in words '
+            'taken from the material: at most 14 words, no full stop at its end\n'
             '  "slides": the slide array exactly as described above, where the FIRST slide is an introduction / overview '
             'of the topic (its header begins "Introduction" or "Overview"), then the content in the order the material '
-            'presents it. Do NOT include a cover, outline, references, objectives, discussion or thank-you slide — those '
-            'are added separately — and no slide has is_cta true.\n'
+            'presents it, and the LAST slide is the conclusion (its header is "Conclusion" or "Summary"): the three to '
+            'five points most worth remembering, every one from the material. Do NOT include a cover, outline, '
+            'references, objectives, discussion or thank-you slide — those are added separately — and no slide has '
+            'is_cta true.\n'
             '  "references": every reference or citation that appears in the material, copied exactly as written there '
             "(with its web address \u2014 DOI or link \u2014 when the material gives one). Never invent, complete or add a reference; "
             "if the material cites nothing, return [].\n"
@@ -7239,26 +7247,32 @@ def _structure_summary(audience, obj, slides, presenters):
     """Lays the deck out in the fixed order for a student or a tutor."""
     clean = lambda xs, n, cap=300: [str(x).strip()[:cap] for x in (xs or []) if str(x).strip()][:n]
     title = str(obj.get("title") or (slides[0]["header"] if slides else "") or "Presentation").strip()[:120]
+    # 5.3: the line under the title on the cover (what the presentation covers, from the material)
+    subtitle = re.sub(r"\s+", " ", str(obj.get("subtitle") or "")).strip().rstrip(".").strip()[:160]
+    if subtitle.lower() == title.lower():
+        subtitle = ""
     refs = clean(obj.get("references"), 30)
     for s in slides:
         s["is_cta"] = False
-    plain = lambda header, items, icon: [{"header": header, "bullets": items[i:i + 6], "icon": icon, "chart": None, "is_cta": False}
+    # 5.3: no emoji on any slide ("icon" stays, empty, for an app from before 5.3); "list" says what a slide of plain
+    # lines is, so the PowerPoint sets names, a numbered outline, references and questions each in its own way
+    plain = lambda header, items, kind: [{"header": header, "bullets": items[i:i + 6], "icon": "", "chart": None, "is_cta": False, "list": kind}
                                          for i in range(0, len(items), 6)]
     outline = list(dict.fromkeys(re.sub(r"\*\*", "", s["header"]).strip() for s in slides))
-    out = [{"kind": "cover", "header": title, "bullets": [], "icon": "", "chart": None, "is_cta": False}]
+    out = [{"kind": "cover", "header": title, "bullets": [subtitle] if subtitle else [], "icon": "", "chart": None, "is_cta": False}]
     if audience == "student":
-        out += plain("Presented by", presenters or ["Your name and index number"], "\U0001F465")
-        out += plain("Presentation Outline", outline, "\U0001F5C2\ufe0f")
+        out += plain("Presented by", presenters or ["Your name and index number"], "names")
+        out += plain("Presentation Outline", outline, "outline")
         out += slides
-        out += plain("References", refs or [f"Source material: {title}"], "\U0001F4DA")
+        out += plain("References", refs or [f"Source material: {title}"], "refs")
     else:
         objectives = clean(obj.get("objectives"), 6, 160) or [f"Describe the key ideas in: {h}" for h in outline[:4]]
         questions = clean(obj.get("discussion"), 4, 200) or ["What stood out to you most in this session, and why?"]
-        out += plain("References & Recommended Books", refs or [f"Main source: {title}"], "\U0001F4DA")
-        out += plain("Learning Objectives", objectives, "\U0001F3AF")
-        out += plain("Presentation Outline", outline, "\U0001F5C2\ufe0f")
+        out += plain("References & Recommended Books", refs or [f"Main source: {title}"], "refs")
+        out += plain("Learning Objectives", objectives, "points")
+        out += plain("Presentation Outline", outline, "outline")
         out += slides
-        out += plain("Discussion", questions, "\U0001F4AC")
+        out += plain("Discussion", questions, "numbered")
         out.append({"kind": "thanks", "header": "Thank you", "bullets": [], "icon": "", "chart": None, "is_cta": False})
     return title, out
 
@@ -7284,7 +7298,8 @@ def _parse_summary_json(raw_text):
     for item in data:
         if not isinstance(item, dict):
             continue
-        header = str(item.get("header") or "").strip()
+        # 5.3: a heading and a sub-heading are finished as the points are (no emoji, no marks); they were let through
+        header = str(_finish_text(str(item.get("header") or ""), "words") or "").strip()[:140]
         if not header:
             continue
         bullets = [str(b).strip() for b in (item.get("bullets") or []) if str(b).strip()][:6]
@@ -7292,14 +7307,14 @@ def _parse_summary_json(raw_text):
         for sec in (item.get("sections") or [])[:3]:
             if not isinstance(sec, dict):
                 continue
-            sh = str(sec.get("subheading") or "").strip()[:120]
-            pts = [str(p).strip()[:240] for p in (sec.get("points") or []) if str(p).strip()][:4]
+            sh = str(_finish_text(str(sec.get("subheading") or ""), "words") or "").strip()[:120]
+            pts = [str(p).strip()[:240] for p in (sec.get("points") or []) if str(p).strip()][:6]
             if sh or pts:
                 sections.append({"subheading": sh, "points": pts})
         if sections and not bullets:
             # Older readers of a slide (and the outline) still see sensible bullets.
             bullets = [x for sec in sections for x in ([sec["subheading"]] if sec["subheading"] else []) + sec["points"]][:10]
-        icon = str(item.get("icon") or "").strip()
+        icon = ""                 # 5.3: no emoji on a slide (the key stays for an app from before 5.3)
         chart = item.get("chart")
         if isinstance(chart, dict):
             chart_type = chart.get("type") if chart.get("type") in ("bar", "line", "pie") else None
@@ -8631,6 +8646,9 @@ def summary_to_pptx_endpoint():
     slides = data.get("slides")
     if not isinstance(slides, list) or not slides:
         return jsonify({"error": "No slide plan provided."}), 400
+    if len(slides) > 150:
+        return jsonify({"error": "That is more slides than one presentation can hold here (150)."}), 400
+    # 5.3: one look, the finished Plain White deck (converters.summary_slides_to_pptx); "style" is read for older apps
     style = data.get("style") if data.get("style") in ("visual", "plain") else "plain"   # 3.0: Plain White
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_sum_{uuid.uuid4().hex[:8]}_")
@@ -9330,6 +9348,363 @@ def _write_more(text):
     return _WRITE_MORE.sub("\n\n", text).strip(), True
 
 
+# ---------- 5.4 a research proposal, written whole (the owner, 12 Nov 2026; the approach and everything that needs no
+# AI are in server/proposal.py) ----------
+# One request writes one part: Chapter One; Chapter Two in one, two or three parts; then Chapter Three with the
+# abstract and the appendices. What is said about the world (the background, the problem, the literature) is written
+# only from papers found now, every sentence cited and checked like every piece of writing here. The person's own plan
+# (objectives, questions, significance, scope, limits, method, ethics, appendices) is written only from what they gave
+# or agreed to: no citation, no figure that isn't theirs or worked out from theirs (proposal.guard_plan_text).
+PROPOSAL_REFS_MAX = 200
+PROPOSAL_POOL = {"short": 16, "standard": 20, "full": 24}       # papers one part may draw on
+PROPOSAL_CITED_RULES = (
+    # 5.4 (the owner, 12 Nov 2026: the research product must "be very healthy", not "scrambled"): one argument, built
+    # paragraph by paragraph, never a list of study after study. Every sentence still carries its citation.
+    "Write formal academic English that reads as one argument, not as a list of studies. Build each paragraph round ONE "
+    "point: its first sentence states that point, the next sentences give the evidence for it (what was studied, where, "
+    "among whom, and the result), and its last sentence draws the evidence together; then the next paragraph takes the "
+    "argument one step further. Set studies that agree side by side in ONE sentence with their citations together, and set "
+    "those that differ against each other. Join sentences with the words careful writers use (similarly, in contrast, "
+    "however, taken together) where they are true of the studies. Never begin two sentences in a row the same way, never "
+    "state a finding twice, and never fill a paragraph with one study after another. Use the past tense for what a study "
+    "found and the present tense for what is established. "
+    "Ground EVERY sentence in the listed sources, the first and the last sentence of a paragraph too: each sentence carries "
+    "at least one citation, using the EXACT citation key next to its source, copied exactly (never alter an author name or a "
+    "year, never invent a citation). Report what a study found the way careful writers do, with its figures exactly as its "
+    "abstract gives them and the place or people it studied; sometimes the finding comes first, sometimes the authors (as in "
+    "'Mensah et al. (2021) found…', using the same key's names and year). Write no sentence you can't cite: leave it out "
+    "instead, and keep each paragraph only as long as the sources support. Never copy a run of words from an abstract. Never "
+    "write a placeholder in place of a citation. No bullet points, no bold or italic marks, no heading other than the markers "
+    "asked for, no reference list (it is made separately).")
+
+
+def _prop_prev(previous_refs, cite_plan):
+    """The papers the earlier parts cite, as sources whose keys are fixed (so every citation already written stays
+    right), and for a numbered style the numbers already given. Returns (prev, given)."""
+    prev, given = [], {}
+    for r in (previous_refs if isinstance(previous_refs, list) else [])[:PROPOSAL_REFS_MAX]:
+        if not isinstance(r, dict):
+            continue
+        rkey = str(r.get("akey") or r.get("key") or "")
+        if not rkey.startswith("(") or not r.get("text"):
+            continue
+        key = rkey[:200]
+        try:
+            if cite_plan and cite_plan["marks"] and int(r.get("n") or 0) > 0:
+                given[len(prev)] = int(r["n"])
+        except (TypeError, ValueError):
+            pass
+        prev.append({"citation_key": key, "ref_text": str(r["text"])[:1200], "url": str(r.get("url") or "")[:600], "pdf": r.get("pdf") or None,
+                     "doi": _norm_doi(r.get("doi")), "title": re.sub(r"[*_]", "", str(r["text"]))[:300], "abstract": None,
+                     "group": re.sub(r"[^a-z0-9:]", "", str(r.get("group") or "").lower())[:120] or _key_group(key),
+                     "ref_after": str(r.get("after") or "")[:80], "_sort": _sort_back(r.get("sort"), r["text"]), "_kept": True})
+    return prev, given
+
+
+def _prop_sources(prev, found, style, cap):
+    """One list for a part: the earlier parts' papers first (their keys kept), then the papers found now that are new and
+    can't be mistaken for an earlier one (a new paper by the same first author in the same year would need the earlier
+    citations changed, so it is left out). Returns (sources, how many of them the part may write from)."""
+    groups = {p["group"] for p in prev if p["group"]}
+    fresh, seen, live = [], set(), 0
+    for c in found or []:
+        ident = _norm_doi(c.get("doi")) or str(c.get("url") or "")
+        if not ident or ident in seen:
+            continue
+        seen.add(ident)
+        twin = next((p for p in prev if (c.get("doi") and _norm_doi(c.get("doi")) == p.get("doi")) or (c.get("url") and c.get("url") == p.get("url"))), None)
+        if twin is not None:
+            if not twin.get("abstract") and c.get("abstract"):
+                twin["abstract"] = c.get("abstract")       # the same paper found again: its key stays, its abstract backs the check
+                twin["title"] = c.get("title") or twin["title"]
+                twin["venue"], twin["year"] = c.get("venue"), c.get("year")
+                live += 1
+            continue
+        if _paper_group(c) in groups:
+            continue
+        fresh.append(c)
+    fresh = enrich_sources(fresh[:max(0, cap - live)], style)
+    return prev + fresh, live + len(fresh)
+
+
+def _prop_block(sources):
+    """The sources a part may write from: those whose abstracts are in hand."""
+    return build_sources_block([s for s in sources if s.get("abstract")])
+
+
+def _prop_find(find_raw, queries, n_each):
+    """Several searches side by side, their papers in turn (the first of each, then the second…), so that every search
+    is represented when the list is cut. queries: [(text, is_a_topic)]. Returns (papers, the first search's diagnosis)."""
+    results = [None] * len(queries)
+
+    def run(i):
+        try:
+            return find_raw(queries[i][0], n_each, queries[i][1])
+        except Exception as e:
+            logger.warning(f"Proposal: a paper search didn't run ({str(e)[:120]})")
+            return [], "failed"
+    if len(queries) == 1:
+        results[0] = run(0)
+    else:
+        with _futures.ThreadPoolExecutor(max_workers=min(4, len(queries))) as pool:
+            jobs = {pool.submit(run, i): i for i in range(len(queries))}
+            for job, i in jobs.items():
+                try:
+                    results[i] = job.result(timeout=70)
+                except Exception:
+                    results[i] = ([], "failed")
+    out, k = [], 0
+    while any(r and k < len(r[0]) for r in results):
+        for r in results:
+            if r and k < len(r[0]):
+                out.append(r[0][k])
+        k += 1
+    return out, (results[0][1] if results and results[0] else None)
+
+
+def _prop_purpose(plan):
+    """The last words of the problem statement and of the literature's summary: the gap as the researcher states it, and
+    what the study will therefore do (their general objective). The researcher's own words: no citation."""
+    g = (plan.get("general") or "").strip()
+    will = ("The present study will therefore seek " + g[0].lower() + g[1:]) if g.lower().startswith("to ") else ""
+    return " ".join(x for x in ((plan.get("gap") or "").strip(), will) if x)
+
+
+def _prop_plan_text(raw, plan, sample, keys, extra_text=""):
+    """A plan part as the AI wrote it: split at its markers, citations and foreign figures out. {key: text}."""
+    allowed = _prop.allowed_numbers(plan, sample, extra_text)
+    out = {}
+    for k, t in _prop.split_marked(raw, set(keys)).items():
+        t = _write_more(t)[0]
+        t, gone = _prop.guard_plan_text(t, allowed)
+        if gone:
+            logger.info(f"Proposal: {gone} sentence(s) of the plan's '{k}' held a citation or a figure that isn't the person's, and went")
+        out[k] = t
+    return out
+
+
+def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
+    """One part of a research proposal (see proposal.parts). Returns the reply as a dict, restyled; raises
+    ConversionError when the part can't be written honestly (no paper found for a cited chapter)."""
+    all_parts = _prop.parts(plan)
+    keys = [p["key"] for p in all_parts]
+    spec = data.get("proposal") if isinstance(data.get("proposal"), dict) else {}
+    key = str(spec.get("part") or "ch1")
+    if key not in keys:
+        raise ConversionError("That part of the proposal isn’t one RamzAI knows. Please start the proposal again.")
+    idx = keys.index(key)
+    depth = plan.get("depth") or "standard"
+    D = _prop.DEPTHS[depth]
+    prev, given = _prop_prev(data.get("previous_refs"), cite_plan)
+    sample = _prop.sample_size(plan)
+    house = _house_style()                 # asked here: the calls below run side by side, outside the request
+    pool_n = PROPOSAL_POOL[depth]
+    sections, extras, cited_secs, sources = [], {}, [], list(prev)
+    outline2 = _prop.clean_outline(spec.get("outline2"), plan) if key != "ch1" else None
+    title = plan.get("title") or ""
+
+    def ask(system, user, max_tokens, feature, timeout=100):
+        return _write_more(str(call_claude(system_prompt=system + house, user_message=user, max_tokens=max_tokens, use_search=False,
+                                           timeout=timeout, feature=feature) or "").strip())[0]
+
+    def plan_part(raw, system, wanted, feature, extra_text=""):
+        """A plan part's sections; any that didn't come are asked for once more, alone, while there is time."""
+        got = _prop_plan_text(raw or "", plan, sample, wanted, extra_text)
+        lack = [k for k in wanted if not got.get(k)]
+        if lack and time.time() - started < 105:
+            try:
+                more = ask(system, "Write ONLY these sections, each after its marker: " + " ".join("⟦%s⟧" % k for k in lack), 1800, feature + "-again", 60)
+                for k, t in _prop_plan_text(more, plan, sample, lack, extra_text).items():
+                    got.setdefault(k, t)
+            except Exception as e:
+                logger.warning(f"Proposal: the missing sections of {feature} didn't come ({str(e)[:120]})")
+        return got
+
+    if key == "ch1":
+        # three searches side by side, so the background can go from the world to the place: the subject anywhere (the
+        # title without its place), the subject in the region or continent, and the title itself (the country, the place)
+        wide = _search_topic(_prop.wide_topic(plan)) or title
+        queries = [(title, True)]
+        if wide.lower() != (_search_topic(title) or title).lower():
+            queries.insert(0, (wide, False))
+        for place in (plan.get("country"), plan.get("region") or plan.get("continent")):
+            if place and not any(place.lower() in q.lower() for q, _ in queries):
+                queries.append((f"{wide} {place}", False))
+        found, diag = _prop_find(find_raw, queries, 10 if depth == "short" else 12)
+        sources, usable = _prop_sources(prev, found, style, pool_n)
+        if not usable:
+            raise ConversionError("RamzAI found no papers it can open for this topic, so it can’t write the background honestly. "
+                                  "Try wording the topic a little differently, or allow older papers. Nothing was taken.")
+        where = [x for x in ("the world", plan.get("continent"), plan.get("region"), plan.get("country"), "the study’s own setting") if x]
+        cited_system = (
+            "You are writing the opening of CHAPTER ONE of a research proposal titled \"" + title + "\". Below is a list of real "
+            f"sources, each labelled with its exact {CS['name']} in-text citation, e.g. {CS['example']}. " + PROPOSAL_CITED_RULES +
+            "\n\nWrite two sections, each after its marker on a line of its own:\n"
+            f"⟦background⟧ Background of the Study: {D['bg']} paragraphs of five or six sentences each, as a funnel from the widest "
+            "view to the narrowest: " + ", then ".join(where) + ". Use each source for the level its own study was done at "
+            "(its title or abstract says where); when no source speaks to a level, leave that level out. Start with what the "
+            "subject is and how common or serious it is; end with what the sources show closest to the study's setting.\n"
+            f"⟦problem⟧ Problem Statement: {D['problem']} paragraph{'s' if D['problem'] > 1 else ''} of five or six sentences each: how large and "
+            "how serious the problem is for the people in the study, with the sources' own figures, and what has and has not been "
+            "examined in the listed studies. Do not state the aim of the study and do not claim a gap in general: that sentence is "
+            "added separately.\n\nTHE STUDY\n" + _prop.plan_block(plan) + "\n\nSOURCES:\n" + _prop_block(sources))
+        jobs = {}
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs["cited"] = pool.submit(ask, cited_system, "Write the Background of the Study and the Problem Statement.", 3300, "proposal-ch1")
+            jobs["plan"] = pool.submit(ask, _prop.ch1_plan_prompt(plan), "Write the four sections.", 1500, "proposal-ch1-plan", 70)
+            jobs["outline"] = pool.submit(lambda: _brief_json(call_claude(system_prompt=_prop.outline_prompt(plan), user_message="Give the themes.",
+                                                                           max_tokens=700, timeout=40, feature="proposal-outline")))
+            got = {}
+            for name, job in jobs.items():
+                try:
+                    got[name] = job.result(timeout=130)
+                except Exception as e:
+                    logger.warning(f"Proposal: '{name}' of Chapter One didn't come ({str(e)[:140]})")
+                    got[name] = None
+        if not got.get("cited"):
+            raise ConversionError("RamzAI couldn’t write the background just now. Please try again; nothing was taken.")
+        cs = _prop.split_marked(got["cited"], {"background", "problem"})
+        if not cs.get("background"):
+            cs = {"background": got["cited"], "problem": cs.get("problem", "")}
+        bg = {"number": "1.0", "heading": "Background of the Study", "level": 2, "text": cs.get("background", ""), "kind": "cited"}
+        pr = {"number": "1.1", "heading": "Problem Statement", "level": 2, "text": cs.get("problem", ""), "kind": "cited"}
+        cited_secs = [bg, pr]
+        ps = plan_part(got.get("plan"), _prop.ch1_plan_prompt(plan), ("significance", "scope", "limitations", "organisation"), "proposal-ch1-plan")
+        if not all(ps.get(k) for k in ("significance", "scope", "limitations", "organisation")):
+            raise ConversionError("RamzAI couldn’t finish Chapter One just now. Please try again; nothing was taken.")
+        sections = [{"number": "", "heading": "CHAPTER ONE: INTRODUCTION", "level": 1, "text": "", "kind": "chapter"}, bg, pr]
+        sections += _prop.objectives_sections(plan)
+        for k, num, head in (("significance", "1.3", "Significance of the Study"), ("scope", "1.4", "Scope of the Study"),
+                             ("limitations", "1.5", "Limitations of the Study"), ("organisation", "1.6", "Organisation of the Study")):
+            sections.append({"number": num, "heading": head, "level": 2, "text": ps.get(k, ""), "kind": "plan"})
+        raw_outline = (got.get("outline") or {}).get("themes") if isinstance(got.get("outline"), dict) else None
+        outline2 = _prop.clean_outline(raw_outline, plan)
+        if len(outline2) < 2:
+            outline2 = _prop.fallback_outline(plan)
+
+    elif key.startswith("ch2"):
+        if not outline2 or len(outline2) < 2:
+            outline2 = _prop.fallback_outline(plan)
+        mine = _prop.share_themes(outline2, plan, key)
+        first, last = key == "ch2-1", key == "ch2-%d" % D["ch2_parts"]
+        found, diag = _prop_find(find_raw, [(t["q"], False) for t in mine] or [(title, True)], 6 if len(mine) > 3 else 8)
+        sources, usable = _prop_sources(prev, found, style, pool_n)
+        if not usable and not any(s.get("abstract") for s in sources):
+            raise ConversionError("RamzAI found no papers it can open for this part of the literature. Try again in a moment, "
+                                  "or allow older papers. Nothing was taken.")
+        P = D["theme_paras"]
+        marks = "\n".join(f"⟦t{i + 1}⟧ {t['n']} {t['h']}" for i, t in enumerate(mine))
+        system = (
+            "You are writing part of CHAPTER TWO (LITERATURE REVIEW) of a research proposal titled \"" + title + "\". Below is a list "
+            f"of real sources, each labelled with its exact {CS['name']} in-text citation, e.g. {CS['example']}. " + PROPOSAL_CITED_RULES +
+            "\n\nWrite these sections, each after its marker on a line of its own (write the marker only, never the heading):\n"
+            + (("⟦intro⟧ one paragraph of three or four sentences that says what this chapter reviews and names its themes in "
+                "order (" + "; ".join(t["h"] for t in outline2) + "). This one paragraph states nothing about the subject itself, "
+                "so it carries no citation.\n") if first else "")
+            + marks + f"\nEach numbered section: {P} paragraph{'s' if P > 1 else ''} of five or six sentences, reviewing what the "
+            "listed studies found on that theme: what was studied, where, among whom, and the result, comparing studies that "
+            "agree and those that differ. Keep to the theme; a study belongs where its findings fit."
+            + ("\n⟦summary⟧ Summary of the Literature: one paragraph of five or six sentences that draws together what the "
+               "reviewed studies show, each sentence citing the sources it draws on. Do not claim a gap and do not state the "
+               "study's aim: that is added separately." if last else "")
+            + "\n\nTHE STUDY\n" + _prop.plan_block(plan) + "\n\nSOURCES:\n" + _prop_block(sources))
+        raw = ask(system, "Write the sections.", 3600, "proposal-" + key)
+        want = {"intro", "summary"} | {f"t{i + 1}" for i in range(len(mine))}
+        got = _prop.split_marked(raw, want)
+        if not any(got.get(f"t{i + 1}") for i in range(len(mine))):
+            raise ConversionError("RamzAI couldn’t write this part of the literature review just now. Please try again; nothing was taken.")
+        if first:
+            sections.append({"number": "", "heading": "CHAPTER TWO: LITERATURE REVIEW", "level": 1, "text": "", "kind": "chapter"})
+            intro, _ = _prop.guard_plan_text(keep_known_citations(got.get("intro", ""), [], style)[0], set())
+            sections.append({"number": "2.0", "heading": "Introduction", "level": 2, "text": intro, "kind": "plan"})
+        for i, t in enumerate(mine):
+            sec = {"number": t["n"], "heading": t["h"], "level": 2, "text": got.get(f"t{i + 1}", ""), "kind": "cited"}
+            sections.append(sec)
+            cited_secs.append(sec)
+        if last:
+            sm = {"number": "2.%d" % (len(outline2) + 1), "heading": "Summary of the Literature", "level": 2, "text": got.get("summary", ""), "kind": "cited"}
+            sections.append(sm)
+            cited_secs.append(sm)
+
+    else:   # ch3: the method, the abstract, the appendices
+        digest = re.sub(r"\s+", " ", str(spec.get("digest") or ""))[:6000]
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = {"ch3": pool.submit(ask, _prop.ch3_prompt(plan, sample), "Write the sections of Chapter Three.", 3400, "proposal-ch3"),
+                    "abstract": pool.submit(ask, _prop.abstract_prompt(plan, sample) + "\n\nCHAPTER ONE (already written and checked)\n" + (digest or "(not available: write the introduction part from THE PLAN's title and gap only)"),
+                                            "Write the abstract.", 700, "proposal-abstract", 60),
+                    "tool": pool.submit(lambda: _brief_json(call_claude(system_prompt=_prop.instrument_prompt(plan), user_message="Draft it.",
+                                                                        max_tokens=1700, timeout=70, feature="proposal-instrument")))}
+            got = {}
+            for name, job in jobs.items():
+                try:
+                    got[name] = job.result(timeout=130)
+                except Exception as e:
+                    logger.warning(f"Proposal: '{name}' of the last part didn't come ({str(e)[:140]})")
+                    got[name] = None
+        if not got.get("ch3"):
+            raise ConversionError("RamzAI couldn’t write the methodology just now. Please try again; nothing was taken.")
+        want3 = [k for k, _, _ in _prop.CH3_HEADS if k != "sample"]
+        ms = plan_part(got["ch3"], _prop.ch3_prompt(plan, sample), want3, "proposal-ch3")
+        if not all(ms.get(k) for k in want3):
+            raise ConversionError("RamzAI couldn’t finish the methodology just now. Please try again; nothing was taken.")
+        sections.append({"number": "", "heading": "CHAPTER THREE: METHODOLOGY", "level": 1, "text": "", "kind": "chapter"})
+        for k, num, head in _prop.CH3_HEADS:
+            if k == "sample":
+                sections.append({"number": num, "heading": head, "level": 2, "text": _prop.sample_text(sample), "kind": "sample"})
+            else:
+                sections.append({"number": num, "heading": head, "level": 2, "text": ms.get(k, ""), "kind": "plan"})
+        ab = _prop_plan_text(got.get("abstract") or "", plan, sample, ("introduction", "aim", "methodology", "analysis", "keywords"), extra_text=digest)
+        if ab.get("introduction") or ab.get("aim"):
+            ab["introduction"] = keep_known_citations(ab.get("introduction", ""), [], style)[0]
+            extras["abstract"] = {k: ab.get(k, "") for k in ("introduction", "aim", "methodology", "analysis", "keywords")}
+        tool = _prop.clean_instrument(got.get("tool"), plan)
+        if tool:
+            extras["instrument"] = tool
+        extras["sample"] = {k: sample.get(k) for k in ("method", "N", "e", "n", "z", "p", "exact", "formula", "steps", "text") if sample.get(k) is not None}
+        # (the consent form names the researchers and gives their contact: it is made with the Word file, from what is
+        # sent then, so no name travels with the writing or is kept with its answer)
+        b = _prop.budget(plan)
+        if b:
+            extras["budget"] = {"currency": b["currency"], "total": b["total"], "filled": b["filled"],
+                                "rows": [{"head": r[1]} if r[0] == "head" else {"item": r[1], "qty": r[2], "unit": r[3], "total": r[4]} for r in b["rows"]]}
+        g = _prop.gantt(plan)
+        extras["gantt"] = {"months": g["months"], "dated": g["dated"], "rows": [{"activity": r[0], "from": r[1], "to": r[2]} for r in g["rows"]]}
+
+    # ---- every sentence of the cited sections: a real key, and a source that supports it
+    cited = set()
+    if cited_secs:
+        for sec in cited_secs:
+            sec["text"], c = keep_known_citations(sec["text"], sources, style)
+            cited |= c
+        cited = _c34_write_sections(cited_secs, sources, style, title, note, started)
+        tail = _prop_purpose(plan)
+        for s in cited_secs:
+            closes = s["number"] == "1.1" or s["heading"] == "Summary of the Literature"      # these end with the researcher's own words
+            if not s["text"] or s["text"].startswith("(No sentence here"):
+                if s["number"] == "1.0":
+                    raise ConversionError("The papers RamzAI found don’t support a background for this topic yet. Try wording the topic a "
+                                          "little differently, or allow older papers. Nothing was taken.")
+                s["text"] = ""
+                if not (closes and tail):
+                    sections.remove(s)
+                note["text"] = (note["text"] + " " if note["text"] else "") + (
+                    f"No paper found here supports “{s['heading']}”, so " + ("it holds only your own statement of the gap." if closes and tail else "that section was left out."))
+            if closes and tail:
+                s["text"] = (s["text"].rstrip() + "\n\n" + tail).strip()
+        if cite_plan and cite_plan["marks"]:
+            for s in cited_secs:
+                s["text"] = _strip_invented(s["text"])
+    cited |= set(range(len(prev)))                         # the earlier parts still cite their papers
+    nxt = all_parts[idx + 1] if idx + 1 < len(all_parts) else None
+    result = {"type": "result", "sections": [{"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"], "kind": s["kind"]}
+                                             for s in sections if s["kind"] == "chapter" or s["text"] or s["number"] == "1.2"],
+              "references": build_references_list(sources, cited), "references_all": True, "references_title": CS["heading"],
+              "source_note": note["text"], "style": style, "title": title, "truncated": bool(nxt),
+              "proposal": {"part": key, "index": idx, "of": len(all_parts), "label": all_parts[idx]["label"], "next": nxt,
+                           "outline2": outline2, "extras": extras or None, "parts": all_parts}}
+    return restyle_result(result, sources, cited, cite_plan, given, language=None)
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -9362,6 +9737,16 @@ def write_endpoint():
             content = (turn.get("content") or "").strip()[:2000]
             if role in ("user", "assistant") and content:
                 history.append({"role": role, "content": content})
+
+    # 5.4: a research proposal (one part to a request): what it must hold is checked before anything is taken
+    proposal_plan = None
+    if isinstance(data.get("proposal"), dict):
+        proposal_plan = _prop.clean_plan(data["proposal"].get("plan"))
+        need = _prop.missing(proposal_plan)
+        if need:
+            return jsonify({"error": "RamzAI still needs something before it can write the proposal: " + need[0][1], "need": [k for k, _ in need]}), 400
+        if str(data.get("language") or "English").strip().lower() not in ("", "english"):
+            return jsonify({"error": "The full proposal layout is written in English for now. Choose English, or another template."}), 400
 
     # 4.0: Evidence-Based Writing is Scholar's, and a draft costs POINTS_WRITE — taken before any call, given back on failure
     gate = _scholar_gate(request.current_user, "Automatic research writing", research=True)
@@ -9407,6 +9792,11 @@ def write_endpoint():
     def _find(text, n=None, topic=True):
         """Real, downloadable papers for this request, cited in the chosen style — from the years the person asked
         for, others added (with a note) when too few came up."""
+        papers, diag = _find_raw(text, n, topic)
+        return enrich_sources(papers, style), diag
+
+    def _find_raw(text, n=None, topic=True):
+        """The same papers before they are given their citations (5.4: a proposal joins several searches into one list)."""
         n = n or n_sources
         look = paper_topic_search if topic else search_papers
         papers, diag = look(text, max_results=n, since=since, kinds=kinds, **({"until": until} if until else {}))
@@ -9422,7 +9812,7 @@ def write_endpoint():
                                 f"so {'others' if until else 'older ones'} were added to support the writing properly.")
             if papers:
                 diag = None
-        return enrich_sources(papers, style), diag
+        return papers, diag
 
     # The student's own brief (word count, sections, focus…) and a target
     # length, added to EVERY writing call below — including continuations —
@@ -9461,6 +9851,20 @@ def write_endpoint():
                   "sensibly, and write only as much as the listed real sources support \u2014 never pad. If the piece is NOT "
                   f"finished at the end of this answer, write the single line {WRITE_MORE_MARK} after your last paragraph. When "
                   "the piece is complete (its last section written), don't write that line.")
+    # 5.4: a research proposal: one part (its own rules for what is cited and what is the person's plan)
+    if proposal_plan is not None:
+        try:
+            return jsonify(_proposal_write(data, proposal_plan, style, cite_plan, CS, _find_raw, note, started))
+        except ConversionError as e:
+            _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
+            why = str(e).strip()
+            if "nothing was taken" not in why.lower():
+                why = (why if why.endswith((".", "!", "?")) else why + ".") + " Nothing was taken for this part."
+            return jsonify({"error": why}), 502
+        except Exception as e:
+            logger.error(f"Proposal: a part failed unexpectedly: {e}", exc_info=True)
+            _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
+            return jsonify({"error": "RamzAI couldn’t write this part just now. Please try again; nothing was taken."}), 502
     _call_claude = globals()["call_claude"]
 
     def call_claude(*args, **kw):
@@ -9507,7 +9911,7 @@ def write_endpoint():
                     prev.append({"citation_key": key, "ref_text": str(r["text"])[:1200], "url": str(r.get("url") or "")[:600],
                                  "pdf": r.get("pdf") or None, "doi": _norm_doi(r.get("doi")), "title": plain_ref[:300],
                                  "abstract": None, "group": re.sub(r"[^a-z0-9:]", "", str(r.get("group") or "").lower())[:120] or _key_group(key),
-                                 "ref_after": str(r.get("after") or "")[:80], "_sort": _sort_back(r.get("sort"), r["text"])})
+                                 "ref_after": str(r.get("after") or "")[:80], "_sort": _sort_back(r.get("sort"), r["text"]), "_kept": True})
             if prev:
                 groups = {p["group"] for p in prev if p["group"]}
                 fresh = []
@@ -11970,6 +12374,119 @@ def brief_review():
     return jsonify({"questions": out})
 
 
+# 5.4 (the owner, 12 Nov 2026): "Ask about their Research topic (can suggest some for them immediately if they don't have;
+# about five to chose from), main objectives, specific objectives (how many objectives, they may state them or ai choose
+# for them using their information provided." What the person states is kept in their own words; RamzAI fills in the
+# rest from what they gave, and they change anything before it is used. Free, like the rest of the brief.
+PLAN_VERBS = ("determine", "assess", "examine", "identify", "describe", "compare", "explore", "establish", "evaluate", "investigate")
+
+
+def _plan_pick(v, table):
+    k = re.sub(r"[^a-z_]", "", str(v or "").lower())
+    return k if k in table else ""
+
+
+@app.route("/api/brief/plan", methods=["POST", "OPTIONS"])
+@limiter.limit(BRIEF_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+def brief_plan():
+    """A research proposal's study plan, from the topic and what the person has said so far: a formal title, the main
+    objective, the specific objectives (as many as they asked for) with a research question for each, the gap the study
+    fills, and the design, sampling, instrument and analysis that fit those objectives. Whatever the person stated is
+    returned as they stated it. other=true: they asked for other objectives than those shown."""
+    data = request.get_json(silent=True) or {}
+    topic = _brief_line(data.get("topic"), 400)
+    if len(topic) < 3:
+        return jsonify({"error": "Type the topic first. A few words are enough."}), 400
+    about = _brief_line(data.get("about"), 400)
+    given = data.get("given") if isinstance(data.get("given"), dict) else {}
+    stated = _prop.clean_plan(given)
+    try:
+        n = int(given.get("n") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    n = n if _prop.MIN_OBJECTIVES <= n <= _prop.MAX_OBJECTIVES else 0
+    if stated["specific"]:
+        n = len(stated["specific"])
+    avoid = _brief_list(data.get("avoid"), 12, 300)
+    place = stated["setting"] or _brief_line(data.get("place"), 200)
+    said = [("TITLE", stated["title"]), ("MAIN OBJECTIVE", stated["general"]),
+            ("SPECIFIC OBJECTIVES", "\n".join(f"  {i + 1}. {o}" for i, o in enumerate(stated["specific"]))),
+            ("WHERE THE STUDY WILL BE DONE", place), ("WHO WILL BE STUDIED", stated["population"]),
+            ("DESIGN", _prop.DESIGNS[stated["design"]][0] if stated["design"] else stated["design_other"])]
+    system = (
+        "You help a person plan a research proposal. " + BRIEF_ANYONE + " From the TOPIC and what they have already STATED, "
+        "give the study's plan. Keep everything they STATED exactly as they worded it (only correct plain spelling), and build "
+        "the rest around it. Fit the plan to who they are (ABOUT THE PERSON): an undergraduate project is simpler than a "
+        "doctoral study. Never invent a fact about their place, their people or their numbers.\n"
+        "- title: the proposal's formal title in Title Case (at most 22 words), from the topic, the people and the place when "
+        "they are given. A topic that is already a formal title stays as it is.\n"
+        "- general: the main objective, one sentence that starts with 'To' and covers the whole study.\n"
+        + (f"- specific: exactly {n} specific objectives. " if n else "- specific: three to five specific objectives, as many as the study truly needs. ")
+        + "Each starts with 'To' and ONE measurable verb (" + ", ".join(PLAN_VERBS) + "), is about one thing, and can be answered "
+        "with one design; together they cover the main objective and nothing beyond it; in a sensible order (what is described "
+        "first, then relationships or differences).\n"
+        "- questions: one research question for each specific objective, in the same order, each a real question.\n"
+        "- gap: one sentence saying what is not yet known that this study will find out, worded as the researcher's own view "
+        "('Little is known about…', 'Few studies have examined…'), about this topic, these people and this place only.\n"
+        "- design: the one that fits the objectives, as one of: " + ", ".join(_prop.DESIGNS) + " (relationships, differences, "
+        "levels and prevalence call for a quantitative design; experiences and meanings for a qualitative one).\n"
+        "- sampling: one of: " + ", ".join(_prop.SAMPLING) + ". instrument: one of: " + ", ".join(_prop.INSTRUMENTS) +
+        ". analysis: one of: " + ", ".join(_prop.ANALYSES) + ". Each must fit the design.\n"
+        "- why: one plain sentence (at most 22 words) on why this design, sampling and instrument fit these objectives.\n"
+        "- keywords: four to six keywords.\n"
+        "- country, region (the part of the continent, such as West Africa), continent: only when the topic or the place names "
+        "or plainly implies them; otherwise empty strings.\n"
+        + ("Give objectives that differ from those in ALREADY SHOWN: another angle on the same topic.\n" if avoid else "")
+        + "Plain English, no bold or italic marks. Reply with JSON only: {\"title\": \"\", \"general\": \"\", \"specific\": [\"\"], "
+        "\"questions\": [\"\"], \"gap\": \"\", \"design\": \"\", \"sampling\": \"\", \"instrument\": \"\", \"analysis\": \"\", \"why\": \"\", "
+        "\"keywords\": [\"\"], \"country\": \"\", \"region\": \"\", \"continent\": \"\"}.")
+    user = ("TOPIC: " + topic + ("\nABOUT THE PERSON: " + about if about else "")
+            + ("\n\nSTATED BY THE PERSON (keep exactly)\n" + "\n".join(f"{k}: {v}" for k, v in said if v) if any(v for _, v in said) else "")
+            + ("\n\nALREADY SHOWN:\n- " + "\n- ".join(avoid) if avoid else ""))
+    try:
+        obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=1100, timeout=40, feature="brief-plan"))
+    except Exception as e:
+        logger.warning(f"Brief: the study plan didn't come: {str(e)[:120]}")
+        return jsonify({"error": "RamzAI couldn’t suggest a plan just now. Please try again, or type your objectives yourself."}), 502
+    got = _prop.clean_plan({"title": obj.get("title"), "general": obj.get("general"), "specific": obj.get("specific"),
+                            "questions": obj.get("questions"), "gap": obj.get("gap"), "design": _plan_pick(obj.get("design"), _prop.DESIGNS),
+                            "sampling": _plan_pick(obj.get("sampling"), _prop.SAMPLING), "instrument": _plan_pick(obj.get("instrument"), _prop.INSTRUMENTS),
+                            "analysis": _plan_pick(obj.get("analysis"), _prop.ANALYSES), "keywords": obj.get("keywords"),
+                            "country": obj.get("country"), "region": obj.get("region"), "continent": obj.get("continent")})
+    fin = lambda t: _finish_text(t, "words") if t else t
+    # what the person stated stands; RamzAI's suggestion fills only what they left open
+    out = {"title": stated["title"] or fin(got["title"]) or topic,
+           "general": stated["general"] or fin(got["general"]),
+           "specific": stated["specific"] or [fin(o) for o in got["specific"]],
+           "gap": stated["gap"] or fin(got["gap"]),
+           "design": stated["design"] or got["design"], "sampling": stated["sampling"] or got["sampling"],
+           "instrument": stated["instrument"] or got["instrument"], "analysis": stated["analysis"] or got["analysis"],
+           "why": fin(_brief_line(obj.get("why"), 220)), "keywords": got["keywords"],
+           "country": stated["country"] or got["country"], "region": stated["region"] or got["region"], "continent": stated["continent"] or got["continent"]}
+    if n and not stated["specific"]:
+        out["specific"] = out["specific"][:n]
+    if len(out["specific"]) < _prop.MIN_OBJECTIVES or not out["general"]:
+        return jsonify({"error": "RamzAI couldn’t suggest a plan just now. Please try again, or type your objectives yourself."}), 502
+    # a question for each objective: RamzAI's when they came one for one, else a plain rewording of the objective
+    qs = [fin(q) for q in got["questions"]] if (not stated["specific"] or len(got["questions"]) == len(out["specific"])) else []
+    out["questions"] = qs if len(qs) == len(out["specific"]) and all(q.endswith("?") for q in qs) else [_prop.question_for(o) for o in out["specific"]]
+    # a design must have its own kind of sampling, instrument and analysis (a qualitative study has no statistics)
+    if out["design"] in _prop.QUALITATIVE:
+        out["sampling"] = out["sampling"] if out["sampling"] in ("purposive", "snowball", "convenience") else "purposive"
+        out["instrument"] = out["instrument"] if out["instrument"] in ("interview", "focus_group", "observation") else "interview"
+        out["analysis"] = "thematic"
+    elif out["design"] == "mixed":
+        out["instrument"] = out["instrument"] or "questionnaire_interview"
+        out["analysis"] = "both"
+    elif out["design"]:
+        out["sampling"] = out["sampling"] or "simple_random"
+        out["instrument"] = out["instrument"] or "questionnaire"
+        out["analysis"] = "statistics"
+    out["stated"] = {k: bool(stated[k]) for k in ("title", "general", "specific", "gap", "design")}
+    return jsonify(out)
+
+
 _BRIEF_HEAD = re.compile(r"^(?:(?:chapter|section|part)\s+\w+[:.\s-]*|\d+(?:\.\d+){0,3}[.)]?\s+|[IVXLC]{1,6}[.)]\s+|[A-Z][.)]\s+)?(.{2,90})$", re.I)
 
 
@@ -12335,6 +12852,26 @@ def write_export_docx_endpoint():
 
     work_dir = tempfile.mkdtemp(prefix=f"mc_docx_{uuid.uuid4().hex[:8]}_")
     try:
+        if isinstance(data.get("proposal"), dict):
+            # 5.4: a research proposal: its own Word file (cover, contents, abstract, chapters, references, appendices)
+            spec = data["proposal"]
+            plan = _prop.clean_plan(spec.get("plan"))
+            extras = dict(spec.get("extras")) if isinstance(spec.get("extras"), dict) else {}
+            extras.pop("consent", None)
+            if spec.get("complete"):
+                # the consent form is made here, from the names and the contact sent for this file alone
+                extras["consent"] = [{"h": h, "p": p} for h, p in _prop.consent(plan)]
+            result_path = proposal_to_docx(
+                {"title": plan.get("title") or title, "plan": plan, "sections": sections or [], "references": references,
+                 "references_title": str(data.get("references_title") or "References")[:40],
+                 "extras": extras,
+                 # the institution's logo for the cover: sent with this request alone, made safe, printed, not kept
+                 "logo": _prop.clean_logo(spec.get("logo")),
+                 "complete": bool(spec.get("complete")), "date": _prop.today_words(),
+                 "marks": data.get("cite_marks") if data.get("cite_marks") in NUM_MARKS + ("ieee",) else None,
+                 "look": data.get("look") if isinstance(data.get("look"), dict) else None, "style": str(data.get("style") or "apa")[:20]},
+                work_dir)
+            return send_file(result_path, mimetype=MIME_TYPES["docx"], as_attachment=True, download_name="Research_Proposal.docx")
         result_path = academic_essay_to_docx(
             {"title": title, "text": text, "sections": sections, "references": references, "references_title": str(data.get("references_title") or "References")[:40],
              "numbered": data.get("numbered") is True,
