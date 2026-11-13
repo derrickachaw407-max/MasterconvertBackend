@@ -48,6 +48,7 @@ from converters import CONVERTERS as _OLD_PAIRS   # 3.15: the pairs Convert alwa
 import convert315 as _any                          # 3.15: every other kind of file
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
 import proposal as _prop                           # 5.4: a research proposal (the approach, and what needs no AI)
+import defence as _defence                         # 5.7: slides from research work are a research defence
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -753,6 +754,43 @@ def add_user_memory(user_id, note):
 MEMORY_LIMIT = 50
 
 
+def _memory_is_full(user_id):
+    """Whether this person's memory holds all the notes it can (then a new note is not kept, and the app says so)."""
+    if not (DATABASE_URL and user_id):
+        return False
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM user_memory WHERE user_id = %s", (user_id,))
+                return int((cur.fetchone() or {}).get("n") or 0) >= MEMORY_LIMIT
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _research_note(user, plan, out):
+    """5.7 (the owner, 13 Nov 2026: "work on the memories and storages after research … well"): when the first part of
+    a research proposal is written, RamzAI's memory notes what the person is working on, so its chat knows without
+    being told again. Only with memory on, only the title the person confirmed, and the app shows the note with
+    "Change" as it does every note. Never lets a failure here touch the writing."""
+    try:
+        if (out.get("proposal") or {}).get("index") != 0 or not _memory_on(user):
+            return
+        title = re.sub(r"\s+", " ", str((plan or {}).get("title") or "")).strip()[:200]
+        if not title:
+            return
+        # (single quotes inside: the app shows a note between double ones, “…”)
+        note = "Working on a research proposal: \u2018" + title + "\u2019"
+        if add_user_memory(user["id"], note):
+            out["noted"] = note
+        elif _memory_is_full(user["id"]):
+            out["memory_full"] = True
+    except Exception as e:
+        logger.warning(f"Research note not kept: {e}")
+
+
 def _memory_on(user_row):
     """Whether this person lets RamzAI remember (Profile -> RamzAI's memory)."""
     try:
@@ -785,9 +823,10 @@ def _unpaid_plan(row):
     return not _owns_store_plan(row["id"])
 
 
-def get_user_memory(user_id, limit=12):
-    """Returns this student's most recent accumulated notes, oldest first, so
-    later context reads as a running history rather than a jumbled list."""
+def get_user_memory(user_id, limit=MEMORY_LIMIT):
+    """Returns this student's accumulated notes, oldest first, so later context reads as a running history rather
+    than a jumbled list. 5.7: ALL of them (the limit a person may keep), not the newest 12: the app lists every note as
+    something RamzAI remembers, so every one is read (the owner, 13 Nov 2026: "work on the memories … well")."""
     if not (DATABASE_URL and user_id):
         return []
     try:
@@ -7155,7 +7194,7 @@ def word_save_endpoint():
             a.save(p)
             assets[a.filename] = p
         try:
-            result = word_save(src, plan, os.path.join(work_dir, "out"), assets)
+            result = word_save(src, plan, os.path.join(work_dir, "out"), assets, name="" if has_file else str(request.form.get("name") or "")[:80])
         except ConversionError as e:
             return jsonify({"error": str(e)}), 422
         if has_file:
@@ -7216,6 +7255,10 @@ def extract_text_endpoint():
         file.save(src_path)
         text = extract_text(src_path, ext)
         cap = REMY_ATTACH_PRO if (request.form.get("limit") == str(REMY_ATTACH_PRO) and _is_pro(request.current_user)) else REMY_ATTACH_FREE
+        if request.form.get("limit") == str(_defence.TEXT_MAX):
+            # 5.7: research work is read whole, so its defence can follow every choice in it (the app cuts it for
+            # anything else, as before; an app from before 5.7 never asks for this)
+            cap = _defence.TEXT_MAX
         cut = len(text) > cap
         if cut:
             text = text[:cap]
@@ -8426,9 +8469,12 @@ def sage_endpoint():
         thinking = C34_WMARK.sub("", thinking) if thinking else thinking
         note, reply = split_memory_note(result or "")
         note = C34_WMARK.sub("", note).strip() if note else note
-        noted = None
-        if note and memory_on and add_user_memory(user["id"], note):
-            noted = note[:300]          # 4.5: the person sees what RamzAI noted, and can change it
+        noted, memory_full = None, False
+        if note and memory_on:
+            if add_user_memory(user["id"], note):
+                noted = note[:300]      # 4.5: the person sees what RamzAI noted, and can change it
+            else:
+                memory_full = _memory_is_full(user["id"])       # 5.7: said, not silent
         report = {}
         enforce = not straight or live_q
         if on_step and enforce and not attachment and (papers or pages):
@@ -8440,6 +8486,8 @@ def sage_endpoint():
         out = {"reply": reply, "thinking": thinking, "papers": used, "title": _topic_title(message) if papers else None,
                "sources": web, "searched": (meta.get("queries") or [])[:5], "unsourced": unsourced,
                "unchecked": int(report.get("unchecked") or 0), "noted": noted}
+        if memory_full:
+            out["memory_full"] = True
         if meta.get("stop_reason") == "max_tokens":
             out["cut"] = True           # 5.2: the answer reached its length limit: the app offers to carry on
         return out, 200
@@ -8576,6 +8624,8 @@ def summarize_endpoint():
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"error": "No text provided"}), 400
+    if data.get("audience") == "defence":
+        return _defence_reply(data, text)       # 5.7: slides from research work are a research defence
     if len(text) > 20000:
         return jsonify({"error": "Text too long (20,000 character limit)"}), 400
 
@@ -8649,6 +8699,60 @@ def summarize_endpoint():
 
 
 # 3.7: study notes from the same material as Smart Summarize — four kinds, each a plain Markdown page.
+DEFENCE_NOT_RESEARCH = ("RamzAI could not find a problem statement, objectives or a methodology in this, so it cannot make a research "
+                        "defence from it. For ordinary slides, choose Student or Tutor.")
+
+
+def _defence_reply(data, text):
+    """5.7 (the owner, 13 Nov 2026): slides made from research work are a research DEFENCE: choice by choice in the order
+    of the work, each with what was chosen and why, what to say, and the questions a panel may ask (server/defence.py
+    has the rules that keep it to the work). Two requests to the AI at once (the study and why it is needed; how it is
+    done and what it found), each checked against the work before a word of it reaches a slide. A whole deck: POINTS_DECK,
+    given back when no deck comes."""
+    cut = len(text) > _defence.TEXT_MAX
+    text = text[:_defence.TEXT_MAX]
+    presenters = [str(x).strip()[:80] for x in (data.get("presenters") or []) if str(x).strip()][:10]
+    reqs = str(data.get("requirements") or "").strip()[:1200]
+    reqs_block = ("\n\nTHE PRESENTER'S REQUIREMENTS \u2014 follow them where they do not conflict with the rules above (the rules "
+                  "about the work always win):\n<<<\n" + reqs + "\n>>>") if reqs else ""
+    try:
+        charged_from = _log_sage_message_and_consume(request.current_user, POINTS_DECK)
+    except ConversionError as e:
+        return _points_reply(e)
+    user = request.current_user
+    work = _defence.Work(text)
+    pa, pb = _defence.prompts("group" if len(presenters) > 1 else "one" if presenters else "")
+    message = "THE WORK:\n<<<\n" + text + "\n>>>"
+    clean = lambda t: _finish_text(t, "words")
+
+    def ask(system, room, feature):
+        return _defence.parse(call_claude(system + reqs_block, message, max_tokens=room, timeout=125, feature=feature))
+    try:
+        with _futures.ThreadPoolExecutor(max_workers=2) as pool:
+            ja, jb = pool.submit(ask, pa, _defence.ROOM_A, "defence-a"), pool.submit(ask, pb, _defence.ROOM_B, "defence-b")
+            a, b = ja.result(timeout=150), jb.result(timeout=150)
+        if a is None or b is None:
+            raise ConversionError("RamzAI's reading of the work came back in a form it could not use. Please try again.")
+        title, kind, deck, gaps, asked, suggested = _defence.build(a, b, work, clean, presenters)
+    except ValueError:
+        _refund_sage_message(user, charged_from, POINTS_DECK)
+        return jsonify({"error": DEFENCE_NOT_RESEARCH + AI_MSG_NOT_COUNTED, "not_research": True}), 422
+    except _futures.TimeoutError:
+        _refund_sage_message(user, charged_from, POINTS_DECK)
+        return jsonify({"error": AI_MSG_SLOW + AI_MSG_NOT_COUNTED}), 502
+    except ConversionError as e:
+        _refund_sage_message(user, charged_from, POINTS_DECK)
+        return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
+    except Exception as e:
+        _refund_sage_message(user, charged_from, POINTS_DECK)
+        logger.error(f"Defence slides failed unexpectedly: {e}", exc_info=True)
+        return jsonify({"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}), 502
+    logger.info(f"Defence: {kind}, {len(deck)} slides, {suggested} suggested reason(s), {len(gaps)} thing(s) the work does not say, "
+                f"{len(asked)} question(s); {len(text)} characters read" + (" (cut)" if cut else ""))
+    return jsonify({"slides": deck, "title": title, "audience": "defence", "kind": kind, "gaps": gaps, "questions": asked,
+                    "suggested": suggested, "read": len(text), "cut": cut})
+
+
 NOTES_COMMON = (
     "You turn a student's study material into study notes for a revision app. Use ONLY what is in the material: "
     "never add facts, figures, names or sources it doesn't contain. Keep its exact terms, names, numbers and dates. "
@@ -9954,7 +10058,9 @@ def write_endpoint():
     # 5.4: a research proposal: one part (its own rules for what is cited and what is the person's plan)
     if proposal_plan is not None:
         try:
-            return jsonify(_proposal_write(data, proposal_plan, style, cite_plan, CS, _find_raw, note, started))
+            out = _proposal_write(data, proposal_plan, style, cite_plan, CS, _find_raw, note, started)
+            _research_note(request.current_user, proposal_plan, out)        # 5.7: RamzAI remembers the research
+            return jsonify(out)
         except ConversionError as e:
             _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
             why = str(e).strip()
@@ -10258,9 +10364,12 @@ def write_endpoint():
         thinking, after_thinking = split_thinking(raw_text)
         is_clarify, text = split_clarify(after_thinking)
         memory_note, text = split_memory_note(text)
-        noted = None
-        if memory_note and memory_on and add_user_memory(user_id, memory_note):
-            noted = memory_note[:300]
+        noted, memory_full = None, False
+        if memory_note and memory_on:
+            if add_user_memory(user_id, memory_note):
+                noted = memory_note[:300]
+            else:
+                memory_full = _memory_is_full(user_id)          # 5.7: said, not silent
 
         if not text:
             raise ConversionError("Couldn't generate a reply — try rephrasing")
@@ -10268,7 +10377,7 @@ def write_endpoint():
             raise ConversionError("Couldn't generate a reply — try rephrasing")
 
         if is_clarify:
-            return jsonify({"type": "clarify", "text": text, "thinking": thinking, "noted": noted})
+            return jsonify({"type": "clarify", "text": text, "thinking": thinking, "noted": noted, **({"memory_full": True} if memory_full else {})})
 
         text, cited = keep_known_citations(text, sources, style)
         text, cited = _c34_write(text, sources, style, topic, note, started)
@@ -10280,7 +10389,7 @@ def write_endpoint():
             "thinking": thinking,
             "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             "title": _topic_title(topic) if not attachment else None,
-            "truncated": truncated, "noted": noted,
+            "truncated": truncated, "noted": noted, **({"memory_full": True} if memory_full else {}),
         }, sources, cited, cite_plan, language=data.get("language")))
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
@@ -12848,7 +12957,10 @@ quiz: a practice quiz from a topic, pasted notes or an attached file. params: to
   medium, hard; default mixed), audience (student or tutor; default student).
 deck: a whole slide deck drafted from a topic, from real research papers; no file needed. params: topic, group (student or tutor).
 summarize: notes or an attached file turned into slides, a one-page revision sheet, a mind map, likely exam questions or
-  key terms. Needs text or an attached file. params: kind (slides, sheet, map, questions or terms), audience (student or tutor).
+  key terms. Needs text or an attached file. params: kind (slides, sheet, map, questions or terms), audience (student, tutor
+  or defence). audience is defence when the notes or the file are the person's OWN RESEARCH WORK (a proposal, a project
+  work, a thesis or a dissertation) or they ask for defence slides: the slides then follow the choices of the work and
+  why each was made, with what to say and the questions a panel may ask.
 write: automatic research writing: RamzAI drafts an essay, report or section from real papers, with citations and
   references. params: topic, style (apa, harvard, mla or chicago; default apa), length_words (300 to 3000; default 800).
 cite: manual research writing in the Word editor: the person writes; real papers wait beside the page, one statement at a
@@ -13957,10 +14069,12 @@ def slides_draft_endpoint():
         deck["filename"] = (re.sub(r"[^\w \-]+", "", name).strip()[:60] or ("Lecture" if group == "tutor" else "Presentation"))
         return jsonify({"deck": deck, "references": refs})
     except ConversionError as e:
-        _refund_sage_message(request.current_user, charged_from)
+        # 5.7: all three points come back. (Since 4.0 only one of the deck's three did, while the words beside the
+        # error said that nothing was used: found while writing the defence slides, 13 Nov 2026.)
+        _refund_sage_message(request.current_user, charged_from, POINTS_DECK)
         return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
     except Exception as e:
-        _refund_sage_message(request.current_user, charged_from)
+        _refund_sage_message(request.current_user, charged_from, POINTS_DECK)
         logger.error(f"Slide draft failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}), 502
 

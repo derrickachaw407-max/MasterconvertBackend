@@ -8967,6 +8967,83 @@ _WD_HIGHLIGHTS = ("yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue
 _WD_SIZES = {"a4": (595.3, 841.9), "letter": (612.0, 792.0), "legal": (612.0, 1008.0), "a5": (419.5, 595.3)}
 
 
+# ---------------------------------------------------------------- 5.7: a document's design, chosen in the editor
+_WD_FONT_OK = re.compile(r"^[A-Za-z][A-Za-z0-9 .\-]{1,39}$")
+_WD_ALIGNS = {"left": "left", "center": "center", "centre": "center", "right": "right", "both": "both", "justify": "both"}
+
+
+def _wd_restyle(doc, restyle):
+    """5.7 (the owner, 13 Nov 2026: "Upgrade the word features and make them look good as well"): the design the editor
+    showed, written into the file's own styles, so the Word file opens the way the page looked.
+    restyle: {style id: {f, sz, b, i, u, caps, c, align, before, after, line}} (the editor's own names: font, size in
+    points, bold, italic, underline, capitals, colour as RRGGBB or None for automatic, alignment, points before and
+    after, line spacing as a multiple). Only paragraph styles the file already has are touched; every value is checked
+    and anything else is ignored. A restyled style lets go of its theme font and theme colour (they would win over what
+    was chosen) and of the line Word 2007 drew under a title (the editor never showed it). Returns how many styles."""
+    if not isinstance(restyle, dict) or not restyle:
+        return 0
+    from docx.shared import Pt, RGBColor
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    aligns = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "both": WD_ALIGN_PARAGRAPH.JUSTIFY}
+    by_id = {s.style_id: s for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH}
+    done = 0
+    for sid, v in list(restyle.items())[:40]:
+        st = by_id.get(str(sid))
+        if st is None or not isinstance(v, dict):
+            continue
+        font, pf = st.font, st.paragraph_format
+        f = v.get("f")
+        if isinstance(f, str) and _WD_FONT_OK.match(f.strip()):
+            f = f.strip()
+            font.name = f
+            rf = st.element.rPr.find(_wd_qn("w:rFonts"))
+            if rf is not None:
+                for a in ("w:cs", "w:eastAsia"):
+                    rf.set(_wd_qn(a), f)
+                for a in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+                    rf.attrib.pop(_wd_qn(a), None)
+        sz = _wd_num(v.get("sz"))
+        if sz is not None and 6 <= sz <= 96:
+            half = int(round(sz * 2))
+            font.size = Pt(half / 2.0)
+            cs = st.element.rPr.find(_wd_qn("w:szCs"))
+            if cs is not None:
+                cs.set(_wd_qn("w:val"), str(half))
+        for k, attr, twin in (("b", "bold", "w:bCs"), ("i", "italic", "w:iCs"), ("u", "underline", None), ("caps", "all_caps", None)):
+            if isinstance(v.get(k), bool):
+                setattr(font, attr, v[k])
+                if twin and st.element.rPr is not None:
+                    for x in st.element.rPr.findall(_wd_qn(twin)):
+                        st.element.rPr.remove(x)
+        if "c" in v:
+            c = v.get("c")
+            if c is None or (isinstance(c, str) and re.fullmatch(r"[0-9A-Fa-f]{6}", c)):
+                font.color.rgb = RGBColor.from_string((c or "000000").upper())
+                col = st.element.rPr.find(_wd_qn("w:color"))
+                if col is not None:
+                    for a in ("w:themeColor", "w:themeTint", "w:themeShade"):
+                        col.attrib.pop(_wd_qn(a), None)
+                    if c is None:
+                        col.set(_wd_qn("w:val"), "auto")
+        al = aligns.get(_WD_ALIGNS.get(str(v.get("align") or "").lower(), ""))
+        if al is not None:
+            pf.alignment = al
+        for k, attr in (("before", "space_before"), ("after", "space_after")):
+            n = _wd_num(v.get(k))
+            if n is not None and 0 <= n <= 96:
+                setattr(pf, attr, Pt(round(n * 2) / 2.0))
+        ln = _wd_num(v.get("line"))
+        if ln is not None and 0.8 <= ln <= 3:
+            pf.line_spacing = round(float(ln), 2)
+        ppr = st.element.find(_wd_qn("w:pPr"))
+        if ppr is not None:
+            for x in ppr.findall(_wd_qn("w:pBdr")):
+                ppr.remove(x)
+        done += 1
+    return done
+
+
 def _wd_page_setup(doc, page):
     """3.14: the page the editor chose — its size, way round and margins — for every section."""
     if not isinstance(page, dict):
@@ -9169,8 +9246,11 @@ def _wd_hf_write(doc, ctx, edits):
                 write(hf, e.get(key), style)
 
 
-def word_save(src_path, plan, out_dir, assets=None):
-    """The Word editor's Save: the original .docx (or none, for a new document) plus the plan → the new .docx."""
+def word_save(src_path, plan, out_dir, assets=None, name=""):
+    """The Word editor's Save: the original .docx (or none, for a new document) plus the plan → the new .docx.
+    5.7: a new document says its own name and today's date about itself (Word's File > Info showed "python-docx" and
+    23 December 2013, from the empty file it grew from); a file that was opened keeps what it says, with today as the
+    day it was last changed."""
     from docx import Document
     if not isinstance(plan, dict) or not isinstance(plan.get("body"), list):
         raise WordEditError(_WD_BAD)
@@ -9180,6 +9260,7 @@ def word_save(src_path, plan, out_dir, assets=None):
             raise WordEditError("This isn't the file that was opened — please open it again.")
     else:
         doc = Document()
+    _wd_restyle(doc, plan.get("restyle"))            # 5.7: the design chosen in the editor (before anything reads the styles)
     ctx = _WdCtx(doc, view=False, assets=assets)
     body = doc.element.body
     original = [c for c in body]
@@ -9219,6 +9300,14 @@ def word_save(src_path, plan, out_dir, assets=None):
     _wd_page_numbers(doc, plan.get("numbers"), plan.get("numfmt"))       # 3.14: page numbers (3.15: how they read)
     if getattr(ctx, "fields_dirty", False) or plan.get("fields"):     # 3.15: Word fills in new tables of contents, captions
         _wd_update_fields(doc)
+    if src_path:
+        try:
+            import datetime as _dt
+            doc.core_properties.modified = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0, tzinfo=None)
+        except Exception:
+            pass
+    else:
+        _finish_docx(doc, title=str(name or "")[:120])
     os.makedirs(out_dir, exist_ok=True)
     out = os.path.join(out_dir, "edited.docx")
     doc.save(out)
@@ -9762,6 +9851,23 @@ def _sd_presentation(head_font=None, text_font=None):
     return prs, names
 
 
+def _sd_notes(sd):
+    """5.7: a defence slide's presenter's notes as the words of the file's notes pane (server/defence.py writes them)."""
+    notes = sd.get("notes") if isinstance(sd, dict) else None
+    if not isinstance(notes, dict):
+        return ""
+    try:
+        from defence import notes_text
+        return _sd_clean_notes(notes_text(notes, len(sd.get("marks") or [])))
+    except Exception:
+        return ""
+
+
+def _sd_clean_notes(text):
+    # (what XML cannot hold is taken out; the lines stay)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(text or ""))[:3000]
+
+
 def _sd_run(p, words, size=None, colour=None):
     r = p.add_run()
     r.text = words
@@ -10042,7 +10148,7 @@ def summary_slides_to_pptx(slides, out_dir, style="plain", filename="Summary.ppt
         if blocks:
             if not any(b[0][0] == "sub" for b in blocks):
                 blocks = [[("bul", b[0][1])] for b in blocks]
-            plan.append({"kind": "words", "header": header, "blocks": blocks})
+            plan.append({"kind": "words", "header": header, "blocks": blocks, "notes": _sd_notes(sd)})
             continue
         items = [x for x in (_sd_clean(b, 700) for b in (sd.get("bullets") or [])) if x]
         lk = _sd_list_kind(sd)
@@ -10063,12 +10169,19 @@ def summary_slides_to_pptx(slides, out_dir, style="plain", filename="Summary.ppt
         count[0] += 1
         return prs.slides.add_slide(layouts[layout_name])
 
-    def words_slide(layout_name, header, continued, lines):
+    def words_slide(layout_name, header, continued, lines, notes=""):
         slide = new_slide(layout_name)
         body = slide.placeholders[1]
         _sd_heading(slide, header, continued, body)
         _sd_text(body, lines)
         _sd_foot(slide, layouts[layout_name], foot, count[0])
+        if notes:
+            # 5.7: the presenter's notes of a defence slide (what to say, the questions a panel may ask): in the file's
+            # notes pane, where only the presenter sees them
+            try:
+                slide.notes_slide.notes_text_frame.text = notes
+            except Exception:
+                pass
 
     last_header = None
     for item in plan:
@@ -10118,7 +10231,7 @@ def summary_slides_to_pptx(slides, out_dir, style="plain", filename="Summary.ppt
             sectioned = any(b[0][0] == "sub" for b in item["blocks"])
             layout_name = "Sub-headings and Points" if sectioned else "Title and Content"
             for n, page in enumerate(_sd_pages(item["blocks"], room_of, _SD_WIDTH)):
-                words_slide(layout_name, header, same or n > 0, page)
+                words_slide(layout_name, header, same or n > 0, page, item.get("notes") if n == 0 else "")
             continue
         lk = item["list"]
         line_kind = {"names": "line", "outline": "num", "numbered": "num", "refs": "ref", "points": "bul"}[lk]
