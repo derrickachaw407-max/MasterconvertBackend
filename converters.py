@@ -7364,7 +7364,8 @@ _WD_MATH = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 _WD_MAX_BLOCKS = 8000
 _WD_MAX_PICS = 80
 _WD_PIC_BUDGET = 9 * 1024 * 1024
-_WD_OFFER = ["Title", "Subtitle", "Heading1", "Heading2", "Heading3", "Caption", "TOCHeading"]   # 3.15: captions, a contents title
+_WD_OFFER = ["Title", "Subtitle", "Heading1", "Heading2", "Heading3", "Caption", "TOCHeading",   # 3.15: captions, a contents title
+             "NoSpacing", "Heading4", "Quote", "IntenseQuote", "ListParagraph"]                  # 5.8: Word's other everyday styles
 _WD_BAD = "The changes don't match this file — please open it again."
 _WD_RPR_ORDER = ["rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow",
                  "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
@@ -7375,6 +7376,14 @@ _WD_PPR_ORDER = ["pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr"
                  "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd", "snapToGrid",
                  "spacing", "ind", "contextualSpacing", "mirrorIndents", "suppressOverlap", "jc", "textDirection",
                  "textAlignment", "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange"]
+_WD_TBLPR_ORDER = ["tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize", "tblStyleColBandSize", "tblW", "jc",
+                   "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption",
+                   "tblDescription", "tblPrChange"]
+_WD_TCPR_ORDER = ["cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd", "noWrap", "tcMar", "textDirection",
+                  "tcFitText", "vAlign", "hideMark", "headers", "cellIns", "cellDel", "cellMerge", "tcPrChange"]
+# 5.8: the looks a table can be given in the editor: which lines it has (t l b r: its edges; h, v: between rows, columns)
+_WD_TBL_LOOKS = {"grid": "t l b r h v", "lines": "t b h", "academic": "t b", "banded": "t b h", "none": ""}
+_WD_TSIDES = (("t", ("top",)), ("l", ("left", "start")), ("b", ("bottom",)), ("r", ("right", "end")), ("h", ("insideH",)), ("v", ("insideV",)))
 _WD_ALIGN = {"center": "center", "right": "right", "end": "right", "both": "justify", "distribute": "justify",
              "lowKashida": "justify", "mediumKashida": "justify", "highKashida": "justify", "thaiDistribute": "justify"}
 
@@ -7572,11 +7581,17 @@ class _WdStyles:
         col = first("color", lambda e: "" if (e.get(_wd_qn("w:val")) or "auto").lower() == "auto" else e.get(_wd_qn("w:val")).upper())
         hl = first("highlight", lambda e: "" if (e.get(_wd_qn("w:val")) or "none") == "none" else e.get(_wd_qn("w:val")))
         va = first("vertAlign", lambda e: {"superscript": "sup", "subscript": "sub"}.get(e.get(_wd_qn("w:val")) or "", ""))
+        uk = first("u", lambda e: e.get(_wd_qn("w:val")) or "single")
+        sp = first("spacing", lambda e: _wd_num(e.get(_wd_qn("w:val"))))
         return {"b": bool(first("b", _wd_toggle)), "i": bool(first("i", _wd_toggle)),
-                "u": bool(first("u", lambda e: (e.get(_wd_qn("w:val")) or "single") != "none")),
+                "u": bool(uk and uk != "none"),
                 "s": bool(first("strike", _wd_toggle) or first("dstrike", _wd_toggle)),
                 "sz": round(sz / 2.0, 2) if sz else 10.0, "f": first("rFonts", self.font),
-                "c": col or None, "hl": hl or None, "va": va or None, "caps": bool(first("caps", _wd_toggle))}
+                "c": col or None, "hl": hl or None, "va": va or None, "caps": bool(first("caps", _wd_toggle)),
+                # 5.8: small capitals, a double strike-out, the kind of underline (double, thick, dotted…), the space
+                # between letters in points
+                "sc": bool(first("smallCaps", _wd_toggle)), "ds": bool(first("dstrike", _wd_toggle)),
+                "uk": uk if uk in _WD_UNDERLINES and uk != "single" else None, "sp": round(sp / 20.0, 2) if sp else None}
 
     def plook(self, layers):
         def attr(tag, a):
@@ -7600,7 +7615,10 @@ class _WdStyles:
                 "before": _wd_num(attr("spacing", "before"), 0.0) / 20.0, "after": _wd_num(attr("spacing", "after"), 0.0) / 20.0,
                 "line": (round(line / 240.0, 3) if rule == "auto" else -round(line / 20.0, 2)) if line else None,
                 "left": _wd_num(attr("ind", "left") or attr("ind", "start"), 0.0) / 20.0, "first": (first_line or 0.0) / 20.0,
-                "num": child("numPr", "numId"), "ilvl": int(_wd_num(child("numPr", "ilvl"), 0) or 0)}
+                "num": child("numPr", "numId"), "ilvl": int(_wd_num(child("numPr", "ilvl"), 0) or 0),
+                # 5.8: the right indent, and whether the line spacing is exact or at least (the line is negative then)
+                "right": _wd_num(attr("ind", "right") or attr("ind", "end"), 0.0) / 20.0,
+                "rule": "atLeast" if (line and rule == "atLeast") else ("exact" if line and rule != "auto" else None)}
 
     def list_of(self, pstyle):
         """The list a paragraph style makes its paragraphs part of: (numId, level), or None."""
@@ -7714,6 +7732,389 @@ class _WdNumbering:
         return nid
 
 
+_WD_NOTE_RT = {"foot": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes",
+               "end": "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes"}
+_WD_NOTE_CT = {"foot": "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml",
+               "end": "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml"}
+_WD_NOTE_STYLES = {
+    "FootnoteText": '<w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/>'
+                    '<w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style>',
+    "FootnoteReference": '<w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/>'
+                         '<w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>',
+    "EndnoteText": '<w:style w:type="paragraph" w:styleId="EndnoteText"><w:name w:val="endnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:unhideWhenUsed/>'
+                   '<w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style>',
+    "EndnoteReference": '<w:style w:type="character" w:styleId="EndnoteReference"><w:name w:val="endnote reference"/><w:basedOn w:val="DefaultParagraphFont"/>'
+                        '<w:uiPriority w:val="99"/><w:unhideWhenUsed/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>'}
+
+
+# ---------------------------------------------------------------- 5.8: the person's sources, as Word keeps them
+# Word keeps a document's sources in a part of its own (customXml, the "bibliography" namespace): its References >
+# Manage Sources lists them. Write keeps the person's sources there too, so Word shows them, and so they come back when
+# the file is opened in Write again. Each field is one Word knows; a source Write did not change keeps its own element
+# (with every field Word gave it).
+_WD_BIB = "http://schemas.openxmlformats.org/officeDocument/2006/bibliography"
+_WD_BIB_TYPES = {"book": "Book", "chapter": "BookSection", "article": "JournalArticle", "web": "InternetSite",
+                 "report": "Report", "thesis": "Report"}
+_WD_BIB_FROM = {"Book": "book", "ElectronicSource": "book", "BookSection": "chapter", "JournalArticle": "article",
+                "ArticleInAPeriodical": "article", "ConferenceProceedings": "article", "InternetSite": "web",
+                "DocumentFromInternetSite": "web", "Report": "report"}
+_WD_DEG_WORDS = {"phd": "Doctoral dissertation", "masters": "Master’s thesis", "bachelors": "Bachelor’s thesis"}
+_WD_BIB_STYLES = {"apa": "APA 7", "harvard": "Harvard", "mla": "MLA 9", "chicago": "Chicago (author-date)",
+                  "ieee": "IEEE", "vancouver": "Vancouver"}
+_WD_MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+              "November", "December"]
+
+
+def _wd_bq(local):
+    return "{%s}%s" % (_WD_BIB, local)
+
+
+def _wd_sources_part(doc):
+    """(part, root) of the document's sources, or (None, None)."""
+    from lxml import etree
+    for rel in list(doc.part.rels.values()):
+        if rel.is_external or not str(rel.reltype).endswith("/customXml"):
+            continue
+        part = rel.target_part
+        try:
+            root = etree.fromstring(part.blob, parser=etree.XMLParser(resolve_entities=False, no_network=True, huge_tree=False))
+        except Exception:
+            continue
+        if root.tag == _wd_bq("Sources"):
+            return part, root
+    return None, None
+
+
+def _wd_bib_text(el, local):
+    x = el.find(_wd_bq(local))
+    return re.sub(r"\s+", " ", x.text or "").strip()[:400] if x is not None and x.text else ""
+
+
+def _wd_bib_names(el, role):
+    """The people (or the organisation) of one role ("Author", "Editor") of a source."""
+    holder = el.find(_wd_bq("Author"))
+    r = holder.find(_wd_bq(role)) if holder is not None else None
+    if r is None:
+        return []
+    corp = r.find(_wd_bq("Corporate"))
+    if corp is not None and (corp.text or "").strip():
+        return [{"o": re.sub(r"\s+", " ", corp.text).strip()[:200]}]
+    out = []
+    for per in r.iter(_wd_bq("Person")):
+        f = _wd_bib_text(per, "Last")
+        g = " ".join(x for x in (_wd_bib_text(per, "First"), _wd_bib_text(per, "Middle")) if x)
+        if f or g:
+            out.append({"f": f[:120], "g": g[:120]})
+        if len(out) >= 60:
+            break
+    return out
+
+
+def _wd_sources_view(doc):
+    """{"style": one of Write's styles or "", "list": [source]} from the file, or None."""
+    part, root = _wd_sources_part(doc)
+    if root is None:
+        return None
+    name = (root.get("StyleName") or "").lower()
+    style = next((k for k, v in (("apa", "apa"), ("harvard", "harvard"), ("mla", "mla"), ("chicago", "chicago"),
+                                 ("ieee", "ieee"), ("vancouver", "vancouver")) if name.startswith(k)), "")
+    out = []
+    for el in root.findall(_wd_bq("Source"))[:500]:
+        tag = re.sub(r"[^A-Za-z0-9_]", "", _wd_bib_text(el, "Tag"))[:40]
+        if not tag or any(x["id"] == tag for x in out):
+            continue
+        st = _wd_bib_text(el, "SourceType")
+        kind = _WD_BIB_FROM.get(st, "report")
+        if kind == "report" and _wd_bib_text(el, "ThesisType"):
+            kind = "thesis"
+        v = {"id": tag, "type": kind, "au": _wd_bib_names(el, "Author"), "title": _wd_bib_text(el, "Title"),
+             "year": _wd_bib_text(el, "Year")[:12]}
+        if st not in _WD_BIB_FROM:
+            v["wtype"] = st[:40]
+        for key, local in (("vol", "Volume"), ("iss", "Issue"), ("pages", "Pages"), ("edn", "Edition"), ("pub", "Publisher"),
+                           ("place", "City"), ("url", "URL"), ("doi", "DOI"), ("rno", "StandardNumber"), ("inst", "Institution"),
+                           ("deg", "ThesisType")):
+            t = _wd_bib_text(el, local)
+            if t:
+                v[key] = t
+        cont = {"article": ("JournalName", "PeriodicalTitle", "ConferenceName"), "chapter": ("BookTitle",),
+                "web": ("InternetSiteTitle", "ProductionCompany")}.get(kind, ())
+        for local in cont:
+            t = _wd_bib_text(el, local)
+            if t:
+                v["cont"] = t
+                break
+        if v.get("deg"):                         # Word's words for the degree back to Write's codes (its styles word them)
+            low = v["deg"].lower()
+            v["deg"] = ("phd" if re.search(r"doctor|ph\.?\s?d|dissertation", low) else "masters" if low.startswith("master")
+                        else "bachelors" if low.startswith("bachelor") else v["deg"])
+        if kind == "chapter":
+            ed = _wd_bib_names(el, "Editor")
+            if ed:
+                v["ed"] = ed
+        y, m, d = _wd_bib_text(el, "YearAccessed"), _wd_bib_text(el, "MonthAccessed"), _wd_bib_text(el, "DayAccessed")
+        if re.fullmatch(r"\d{4}", y):
+            mi = next((i + 1 for i, n in enumerate(_WD_MONTHS) if m and n.lower().startswith(m.lower()[:3])), None)
+            if mi is None and re.fullmatch(r"\d{1,2}", m or ""):
+                mi = int(m)
+            if mi and 1 <= mi <= 12 and re.fullmatch(r"\d{1,2}", d or "") and 1 <= int(d) <= 31:
+                v["acc"] = "%s-%02d-%02d" % (y, mi, int(d))
+        ro = _wd_bib_text(el, "RefOrder")
+        if ro.isdigit():
+            v["n"] = int(ro)
+        out.append(v)
+    return {"style": style, "list": out}
+
+
+def _wd_sources_el(v, n):
+    """One source as Word's bibliography writes it."""
+    from lxml import etree
+    import uuid
+    S = lambda local, parent=None, text=None: (etree.SubElement(parent, _wd_bq(local)) if parent is not None
+                                                else etree.Element(_wd_bq(local)))
+    el = S("Source")
+
+    def put(local, text):
+        text = re.sub(r"\s+", " ", str(text or "")).strip()[:400]
+        if text:
+            S(local, el).text = text
+
+    kind = v.get("type") if v.get("type") in _WD_BIB_TYPES else "book"
+    put("Tag", v["id"])
+    put("SourceType", _WD_BIB_TYPES[kind])
+    put("Guid", "{%s}" % str(uuid.uuid4()).upper())
+
+    def names(role, lst):
+        lst = [a for a in (lst or []) if isinstance(a, dict)][:60]
+        if not lst:
+            return
+        holder = el.find(_wd_bq("Author"))
+        if holder is None:
+            holder = S("Author", el)
+        r = S(role, holder)
+        if lst[0].get("o"):
+            S("Corporate", r).text = re.sub(r"\s+", " ", str(lst[0]["o"]))[:200]
+            return
+        nl = S("NameList", r)
+        for a in lst:
+            per = S("Person", nl)
+            if str(a.get("f") or "").strip():
+                S("Last", per).text = re.sub(r"\s+", " ", str(a["f"])).strip()[:120]
+            if str(a.get("g") or "").strip():
+                S("First", per).text = re.sub(r"\s+", " ", str(a["g"])).strip()[:120]
+
+    names("Author", v.get("au"))
+    if kind == "chapter":
+        names("Editor", v.get("ed"))
+    put("Title", v.get("title"))
+    put("Year", v.get("year"))
+    cont = {"article": "JournalName", "chapter": "BookTitle", "web": "InternetSiteTitle"}.get(kind)
+    if cont:
+        put(cont, v.get("cont"))
+    for key, local in (("vol", "Volume"), ("iss", "Issue"), ("pages", "Pages"), ("edn", "Edition"), ("pub", "Publisher"),
+                       ("place", "City"), ("url", "URL"), ("doi", "DOI"), ("rno", "StandardNumber")):
+        put(local, v.get(key))
+    if kind == "thesis":
+        put("Institution", v.get("inst"))
+        # the words Word's own styles print ("Master’s thesis"), not Write's short code for them
+        put("ThesisType", _WD_DEG_WORDS.get(v.get("deg"), v.get("deg")) or "Thesis")
+    m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(v.get("acc") or ""))
+    if m and 1 <= int(m.group(2)) <= 12:
+        put("YearAccessed", m.group(1))
+        put("MonthAccessed", _WD_MONTHS[int(m.group(2)) - 1])
+        put("DayAccessed", str(int(m.group(3))))
+    if n:
+        put("RefOrder", n)
+    return el
+
+
+def _wd_sources_save(doc, data):
+    """The person's sources into the file (or out of it, when there are none left). data: {"style", "list"}; a source
+    with "keep" (not changed in Write) keeps the file's own element when it has one."""
+    from lxml import etree
+    import copy as _cp
+    from docx.opc.part import Part
+    from docx.opc.packuri import PackURI
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+        return
+    part, root = _wd_sources_part(doc)
+    old = {}
+    if root is not None:
+        for el in root.findall(_wd_bq("Source")):
+            old.setdefault(re.sub(r"[^A-Za-z0-9_]", "", _wd_bib_text(el, "Tag")), el)
+    new = etree.Element(_wd_bq("Sources"), nsmap={"b": _WD_BIB, None: _WD_BIB})
+    style = _WD_BIB_STYLES.get(str(data.get("style") or ""))
+    if style:
+        new.set("StyleName", style)
+    elif root is not None and root.get("StyleName"):
+        new.set("StyleName", root.get("StyleName"))
+    if root is not None:
+        for a in ("SelectedStyle", "Version", "URI"):
+            if root.get(a) and not style:
+                new.set(a, root.get(a))
+    seen = set()
+    for v in data["list"][:500]:
+        if not isinstance(v, dict):
+            continue
+        tag = re.sub(r"[^A-Za-z0-9_]", "", str(v.get("id") or ""))[:40]
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        v = dict(v, id=tag)
+        n = v.get("n") if isinstance(v.get("n"), int) and 0 < v.get("n") < 10000 else None
+        if v.get("keep") and tag in old:
+            el = _cp.deepcopy(old[tag])
+            ro = el.find(_wd_bq("RefOrder"))
+            if n and ro is not None:
+                ro.text = str(n)
+            new.append(el)
+        else:
+            new.append(_wd_sources_el(v, n))
+    blob = etree.tostring(new, xml_declaration=True, encoding="UTF-8", standalone=True)
+    if part is not None:
+        part._blob = blob
+        return
+    if not len(new):
+        return
+    pkg = doc.part.package
+    names = {str(p.partname) for p in pkg.iter_parts()}
+    i = 1
+    while "/customXml/item%d.xml" % i in names or "/customXml/itemProps%d.xml" % i in names:
+        i += 1
+    import uuid
+    item = Part(PackURI("/customXml/item%d.xml" % i), "application/xml", blob, pkg)
+    props = Part(PackURI("/customXml/itemProps%d.xml" % i), "application/vnd.openxmlformats-officedocument.customXmlProperties+xml",
+                 ('<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n<ds:datastoreItem ds:itemID="{%s}" '
+                  'xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml"><ds:schemaRefs>'
+                  '<ds:schemaRef ds:uri="%s"/></ds:schemaRefs></ds:datastoreItem>' % (str(uuid.uuid4()).upper(), _WD_BIB)).encode("utf-8"), pkg)
+    item.relate_to(props, RT.CUSTOM_XML_PROPS)
+    doc.part.relate_to(item, RT.CUSTOM_XML)
+
+
+class _WdNotes:
+    """5.8: a document's footnotes (kind "foot") or endnotes ("end"): their words by id; a new note added at the end with
+    Word's own look (the note's number in its reference style, a space, the words); a note's words rewritten; notes no
+    longer referred to anywhere taken away. The part (and its separator line) is made when a document has none yet."""
+
+    def __init__(self, doc, kind):
+        self.doc, self.kind = doc, kind
+        self.tag = "footnote" if kind == "foot" else "endnote"
+        self.part, self.root = None, None
+        for rel in doc.part.rels.values():
+            if rel.reltype == _WD_NOTE_RT[kind] and not rel.is_external:
+                self.part = rel.target_part
+                break
+        if self.part is not None:
+            el = getattr(self.part, "_element", None)
+            self.root = el if el is not None else etree.fromstring(self.part.blob)
+
+    def notes(self):
+        if self.root is None:
+            return []
+        return [n for n in self.root.findall(_wd_qn("w:" + self.tag)) if n.get(_wd_qn("w:type")) not in ("separator", "continuationSeparator", "continuationNotice")]
+
+    def texts(self):
+        out = {}
+        for n in self.notes():
+            out[str(n.get(_wd_qn("w:id")))] = "\n".join(_wd_ptext(p).strip() for p in n.findall(_wd_qn("w:p"))).strip()[:4000]
+        return out
+
+    def ensure(self):
+        if self.root is not None:
+            return
+        from docx.opc.part import Part
+        from docx.opc.packuri import PackURI
+        w = _WD_W
+        sep = ('<w:%s w:type="separator" w:id="-1"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:separator/></w:r></w:p></w:%s>'
+               '<w:%s w:type="continuationSeparator" w:id="0"><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/></w:pPr><w:r><w:continuationSeparator/></w:r></w:p></w:%s>'
+               % (self.tag, self.tag, self.tag, self.tag))
+        xml = '<w:%ss xmlns:w="%s" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">%s</w:%ss>' % (self.tag, w, sep, self.tag)
+        name = "/word/%ss.xml" % self.tag
+        self.part = Part(PackURI(name), _WD_NOTE_CT[self.kind], xml.encode("utf-8"), self.doc.part.package)
+        self.doc.part.relate_to(self.part, _WD_NOTE_RT[self.kind])
+        self.root = etree.fromstring(self.part.blob)
+        # Word's settings name the two separator notes
+        try:
+            st = self.doc.settings.element
+            tag = self.tag + "Pr"
+            if st.find(_wd_qn("w:" + tag)) is None:
+                pr = _wd_new("w:" + tag)
+                for i in ("-1", "0"):
+                    pr.append(_wd_new("w:" + self.tag, id=i))
+                later = _WD_SETTINGS_AFTER[_WD_SETTINGS_AFTER.index(tag) + 1:] if tag in _WD_SETTINGS_AFTER else _WD_SETTINGS_AFTER
+                after = [st.find(_wd_qn("w:" + t)) for t in later if st.find(_wd_qn("w:" + t)) is not None]
+                if after:
+                    after[0].addprevious(pr)
+                else:
+                    st.append(pr)
+        except Exception:
+            pass
+
+    def styles(self):
+        root = self.doc.styles.element
+        have = {x.get(_wd_qn("w:styleId")) for x in root.findall(_wd_qn("w:style"))}
+        for sid in (("FootnoteText", "FootnoteReference") if self.kind == "foot" else ("EndnoteText", "EndnoteReference")):
+            if sid not in have:
+                root.append(etree.fromstring('<w:styles xmlns:w="%s">%s</w:styles>' % (_WD_W, _WD_NOTE_STYLES[sid]))[0])
+
+    def _content(self, note, text):
+        ref = "FootnoteReference" if self.kind == "foot" else "EndnoteReference"
+        ptxt = "FootnoteText" if self.kind == "foot" else "EndnoteText"
+        for c in list(note):
+            note.remove(c)
+        for i, line in enumerate((_wd_clean(text)[:4000].split("\n") or [""])[:40]):
+            p = _wd_new("w:p")
+            ppr = _wd_new("w:pPr")
+            ppr.append(_wd_new("w:pStyle", val=ptxt))
+            p.append(ppr)
+            if i == 0:
+                r = _wd_new("w:r")
+                rpr = _wd_new("w:rPr")
+                rpr.append(_wd_new("w:rStyle", val=ref))
+                r.append(rpr)
+                r.append(_wd_new("w:" + self.tag + "Ref"))
+                p.append(r)
+                line = " " + line
+            r = _wd_new("w:r")
+            t = _wd_new("w:t")
+            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            t.text = line
+            r.append(t)
+            p.append(r)
+            note.append(p)
+
+    def add(self, text):
+        self.ensure()
+        self.styles()
+        ids = [int(_wd_num(n.get(_wd_qn("w:id")), 0) or 0) for n in self.root.findall(_wd_qn("w:" + self.tag))]
+        nid = str(max(ids + [0]) + 1)
+        note = _wd_new("w:" + self.tag, id=nid)
+        self._content(note, text)
+        self.root.append(note)
+        return nid
+
+    def rewrite(self, nid, text):
+        for n in self.notes():
+            if str(n.get(_wd_qn("w:id"))) == str(nid):
+                self._content(n, text)
+                return True
+        return False
+
+    def tidy(self, body_root):
+        """Notes no longer referred to from the document are taken away, as Word takes them away."""
+        if self.root is None:
+            return
+        used = {str(r.get(_wd_qn("w:id"))) for r in body_root.iter(_wd_qn("w:" + self.tag + "Reference"))}
+        for n in self.notes():
+            if str(n.get(_wd_qn("w:id"))) not in used:
+                self.root.remove(n)
+
+    def save(self):
+        if self.part is not None and getattr(self.part, "_element", None) is None:
+            self.part._blob = etree.tostring(self.root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+
 class _WdCtx:
     """What a Word file has, by id: blocks, paragraphs, the runs words come from, atoms, bookmarks."""
 
@@ -7729,6 +8130,26 @@ class _WdCtx:
         if self._num is None or (create and self._num.root is None):
             self._num = _WdNumbering(self.doc, create=create)
         return self._num
+
+    def notes_of(self, kind):
+        """5.8: the footnotes or endnotes part (made on first use)."""
+        if not hasattr(self, "_notes"):
+            self._notes = {}
+        if kind not in self._notes:
+            self._notes[kind] = _WdNotes(self.doc, kind)
+        return self._notes[kind]
+
+    def note_view(self, kind, x, label):
+        """5.8: a note's mark: its number, which note it is, and its words (Write lists them under the document)."""
+        nid = str(x.get(_wd_qn("w:id")) or "")
+        v = {"k": "note", "label": label, "nt": kind, "fn": nid}
+        try:
+            words = self.notes_of(kind).texts().get(nid)
+            if words is not None:
+                v["text"] = words
+        except Exception:
+            pass
+        return v
 
     # ---------------------------------------------------------------- reading
     def link_target(self, h):
@@ -7785,6 +8206,9 @@ class _WdCtx:
                 out["h"] = round(_wd_num(ext.get("cy"), 0) / 12700.0, 1)
             if x.find(".//" + _wd_qn("wp:anchor")) is not None:
                 out["float"] = True
+            dp = x.find(".//" + _wd_qn("wp:docPr"))     # 5.8: the picture's words for people who can't see it
+            if dp is not None and (dp.get("descr") or "").strip():
+                out["alt"] = _wd_alt_clean(dp.get("descr"))
             if rid is None:
                 gd = x.find(".//" + _wd_qn("a:graphicData"))
                 uri2 = (gd.get("uri") or "") if gd is not None else ""
@@ -7798,16 +8222,26 @@ class _WdCtx:
             return out
         if (uri, t) == (_WD_W, "footnoteReference"):
             self.notes += 1
-            return {"k": "note", "label": str(self.notes)}
+            return self.note_view("foot", x, str(self.notes))
         if (uri, t) == (_WD_W, "endnoteReference"):
             self.endnotes += 1
-            return {"k": "note", "label": "i ii iii iv v vi vii viii ix x".split()[(self.endnotes - 1) % 10]}
+            return self.note_view("end", x, "i ii iii iv v vi vii viii ix x".split()[(self.endnotes - 1) % 10])
         if (uri, t) == (_WD_W, "br"):
             return {"k": "break", "label": "Page break" if x.get(_wd_qn("w:type")) == "page" else "Column break"}
         if (uri, t) in ((_WD_MATH, "oMath"), (_WD_MATH, "oMathPara")):
             return {"k": "math", "label": _wd_text(x)[:200] or "Equation"}
         if (uri, t) == (_WD_W, "fldSimple"):
             return {"k": "field", "label": _wd_text(x)[:200] or _wd_field_word(x.get(_wd_qn("w:instr")))}
+        if (uri, t) == (_WD_W, "sdt"):              # 5.8: a citation made in Write, or one of Word's own
+            spr = x.find(_wd_qn("w:sdtPr"))
+            tag = (_wd_val(spr.find(_wd_qn("w:tag"))) or "") if spr is not None else ""
+            if tag.startswith("ah58c|"):
+                return {"k": "cite", "c": tag[:400], "label": _wd_text(x)[:400] or "Citation"}
+            if spr is not None and spr.find(_wd_qn("w:citation")) is not None:
+                instr = " ".join([i.text or "" for i in x.iter(_wd_qn("w:instrText"))] +
+                                 [f.get(_wd_qn("w:instr")) or "" for f in x.iter(_wd_qn("w:fldSimple"))])
+                tags = [a or b for a, b in re.findall(r"CITATION\s+([^\s\\]+)|\\m\s+([^\s\\]+)", instr)]
+                return {"k": "cite-w", "tags": [t2[:60] for t2 in tags[:20]], "label": _wd_text(x)[:400] or "Citation"}
         if (uri, t) == (_WD_W, "sym"):
             return {"k": "chip", "label": "◆"}
         if (uri, t) == (_WD_W, "ptab"):
@@ -7965,6 +8399,12 @@ class _WdCtx:
                         piece["dc"] = dc.get(_wd_qn("w:val")).upper()
                     if look["caps"]:
                         piece["caps"] = True
+                    for key in ("sc", "ds"):              # 5.8
+                        if look[key] != base[key]:
+                            piece[key] = look[key]
+                    for key in ("uk", "sp"):
+                        if look[key] != base[key] and look[key] is not None:
+                            piece[key] = look[key]
                     pieces.append(piece)
                 k += 1
                 i = j
@@ -8023,6 +8463,23 @@ class _WdCtx:
         for key, tag in (("kn", "keepNext"), ("kl", "keepLines"), ("pbb", "pageBreakBefore")):   # 3.15
             if _wd_first_on(lay, tag):
                 blk[key] = True
+        # 5.8: what the Paragraph window shows and the page draws
+        if ppr is not None:
+            d5 = self.styles.plook([ppr])
+            if d5["right"]:
+                blk["ri"] = d5["right"]
+            if "sp" in blk and blk["sp"][2] and blk["sp"][2] < 0:
+                blk["lr"] = self.styles.plook(lay)["rule"] or "exact"
+        bd = _wd_borders(lay)
+        if bd:
+            blk["bdr"] = bd
+        shd = _wd_shading(lay)
+        if shd:
+            blk["shd"] = shd
+        if not _wd_widow(lay):
+            blk["wc"] = False
+        if _wd_first_on(lay, "contextualSpacing"):
+            blk["cs"] = True
         pl = self.styles.plook(self.styles.players(pstyle, ppr))
         if pl["num"] and pl["num"] != "0":
             lv = self.numbering().level(pl["num"], pl["ilvl"])
@@ -8065,6 +8522,20 @@ class _WdCtx:
                 shd = tcpr.find(_wd_qn("w:shd")) if tcpr is not None else None
                 if shd is not None and (shd.get(_wd_qn("w:fill")) or "auto").lower() not in ("auto", "ffffff"):
                     cell["fill"] = shd.get(_wd_qn("w:fill")).upper()
+                tcb = tcpr.find(_wd_qn("w:tcBorders")) if tcpr is not None else None
+                if tcb is not None:                # 5.8: a cell's own lines (on, or taken off)
+                    on, off = [], []
+                    for k, sides in _WD_TSIDES[:4]:
+                        e = next((tcb.find(_wd_qn("w:" + x)) for x in sides if tcb.find(_wd_qn("w:" + x)) is not None), None)
+                        if e is not None:
+                            (off if (e.get(_wd_qn("w:val")) or "nil") in ("nil", "none") else on).append(k)
+                    if on:
+                        cell["bd"] = " ".join(on)
+                    if off:
+                        cell["bn"] = " ".join(off)
+                va = _wd_val(tcpr.find(_wd_qn("w:vAlign")) if tcpr is not None else None)
+                if va in ("center", "bottom"):
+                    cell["va"] = va
                 cells.append(cell)
                 col += span
             rows.append(cells)
@@ -8084,6 +8555,11 @@ class _WdCtx:
                             break
                     cell["rows"] = n
         blk = {"id": tid, "t": "table", "rows": rows}
+        # 5.8: the table's own lines (Word's "Normal Table" has none: then the editor draws faint guides, as Word does)
+        layers = [tpr] + [st.find(_wd_qn("w:tblPr")) for st in self.styles.chain(tsid)]
+        blk["tb"] = _wd_tbl_lines(layers)
+        if trs and trs[0].find(_wd_qn("w:trPr") + "/" + _wd_qn("w:tblHeader")) is not None:
+            blk["hdr"] = True
         if why:
             blk["locked"] = why
         return blk
@@ -8148,6 +8624,21 @@ class _WdCtx:
     def ensure_style(self, sid):
         if sid in self.styles.el:
             return
+        if sid == "Bibliography":                 # 5.8: a list of references (Word's own style name; a hanging indent)
+            st = _wd_new("w:style", type="paragraph", styleId="Bibliography")
+            st.append(_wd_new("w:name", val="Bibliography"))
+            base = self.styles.default_p
+            if base:
+                st.append(_wd_new("w:basedOn", val=base))
+                st.append(_wd_new("w:next", val=base))
+            st.append(_wd_new("w:uiPriority", val="37"))
+            st.append(_wd_new("w:unhideWhenUsed"))
+            ppr = _wd_new("w:pPr")
+            ppr.append(_wd_new("w:ind", left="720", hanging="720"))
+            st.append(ppr)
+            self.styles.root.append(st)
+            self.styles.el[sid] = st
+            return
         tpl = _wd_template().styles.element
         todo, have = [sid], dict((s.get(_wd_qn("w:styleId")), s) for s in tpl.findall(_wd_qn("w:style")))
         if sid not in have:
@@ -8183,10 +8674,16 @@ class _WdCtx:
                     if not _wd_is(el, "p") or bid in self.locked:
                         raise WordEditError(_WD_BAD)
                     self.fill(el, it["p"], bid)
-                elif "cells" in it:
+                elif "rows" in it:                 # 5.8: rows or columns added or taken away
                     if not _wd_is(el, "tbl") or bid in self.locked:
                         raise WordEditError(_WD_BAD)
-                    self.cells(el, bid, it["cells"], used)
+                    cx = self.restructure(el, bid, it, used)
+                    self.table_look(el, dict(it, cellx=dict(it.get("cellx") or {}, **cx)))
+                elif "cells" in it or any(k in it for k in ("look", "hdr", "eq", "cellx")):
+                    if not _wd_is(el, "tbl") or bid in self.locked:
+                        raise WordEditError(_WD_BAD)
+                    self.cells(el, bid, it.get("cells") or {}, used)
+                    self.table_look(el, it)        # 5.8
                 out.append((el, bid))
                 continue
             if "tbl" in it:                       # 3.14: a table made in the editor
@@ -8328,6 +8825,9 @@ class _WdCtx:
             sc.append(tp)
         for p in paras:
             sc.append(p)
+        if it.get("pb") is True:                   # 5.8: the contents start a page (a ready-made research proposal)
+            first = sc.find(_wd_qn("w:p"))
+            _wd_place(first.find(_wd_qn("w:pPr")), _wd_new("w:pageBreakBefore"), _WD_PPR_ORDER)
         sdt.append(sc)
         return [sdt]
 
@@ -8335,7 +8835,7 @@ class _WdCtx:
         """3.14: a table made in the editor — Word's Table Grid, its columns sharing the text's width."""
         rows = T.get("rows") if isinstance(T, dict) else None
         if not isinstance(rows, list) or not rows or len(rows) > 300 or not all(isinstance(r, list) for r in rows) \
-                or not all(isinstance(c, list) for r in rows for c in r):
+                or not all(isinstance(c, (list, dict)) for r in rows for c in r):
             raise WordEditError(_WD_BAD)
         ncols = max(len(r) for r in rows)
         if ncols < 1 or ncols > 40:
@@ -8358,9 +8858,15 @@ class _WdCtx:
         for _ in range(ncols):
             grid.append(_wd_new("w:gridCol", w=cw))
         tbl.append(grid)
-        for r in rows:
+        cellx = {}
+        for i, r in enumerate(rows):
             tr = _wd_new("w:tr")
-            for items in (r + [[]] * (ncols - len(r)))[:ncols]:
+            for j, items in enumerate((r + [[]] * (ncols - len(r)))[:ncols]):
+                if isinstance(items, dict):        # 5.8: {items, shd, va}
+                    x = {k: items[k] for k in ("shd", "va") if k in items}
+                    if x:
+                        cellx["%d.%d" % (i, j)] = x
+                    items = items.get("items")
                 tc = _wd_new("w:tc")
                 tcpr = _wd_new("w:tcPr")
                 tcpr.append(_wd_new("w:tcW", w=cw, type="dxa"))
@@ -8372,6 +8878,7 @@ class _WdCtx:
                     tc.append(_wd_new("w:p"))
                 tr.append(tc)
             tbl.append(tr)
+        self.table_look(tbl, dict({k: T[k] for k in ("look", "hdr", "eq") if k in T}, cellx=cellx))
         return tbl
 
     def cells(self, tbl, tid, cells, used):
@@ -8384,18 +8891,204 @@ class _WdCtx:
                 tc = [x for x in trs[r] if _wd_is(x, "tc")][c]
             except (ValueError, IndexError):
                 raise WordEditError(_WD_BAD)
-            built = self.build(items, used, within="%s.%d.%d." % (tid, r, c))
-            tcpr = tc.find(_wd_qn("w:tcPr"))
-            extras = [x for x in tc if x is not tcpr and _wd_tag(x)[1] not in ("p", "tbl", "sdt", "customXml", "altChunk")]
-            for x in list(tc):
-                if x is not tcpr:
-                    tc.remove(x)
-            for x in extras:
-                tc.append(x)
-            for el, _ in built:
-                tc.append(el)
-            if not built or not _wd_is(built[-1][0], "p"):
-                tc.append(_wd_new("w:p"))          # a cell always ends with a paragraph
+            self.fill_cell(tc, items, used, "%s.%d.%d." % (tid, r, c))
+
+    def fill_cell(self, tc, items, used, within):
+        built = self.build(items if isinstance(items, list) else [], used, within=within)
+        tcpr = tc.find(_wd_qn("w:tcPr"))
+        extras = [x for x in tc if x is not tcpr and _wd_tag(x)[1] not in ("p", "tbl", "sdt", "customXml", "altChunk")]
+        for x in list(tc):
+            if x is not tcpr:
+                tc.remove(x)
+        for x in extras:
+            tc.append(x)
+        for el, _ in built:
+            tc.append(el)
+        if not built or not _wd_is(built[-1][0], "p"):
+            tc.append(_wd_new("w:p"))          # a cell always ends with a paragraph
+
+    def restructure(self, tbl, tid, it, used):
+        """5.8: a table of the file with rows or columns added or taken away. Every cell of the plan is a cell of the
+        file ({"c": "r.c"}, moved with its look, its words changed if "items" says) or a new one ({"like": "r.c"}: the
+        look of that cell, empty, or with "items"). A column keeps its width; a new one takes the mean; the table keeps its
+        width. A table with joined cells can't be rebuilt this way (the editor doesn't offer it)."""
+        rows = it.get("rows")
+        if not isinstance(rows, list) or not rows or len(rows) > 300 or not all(isinstance(r, list) and r for r in rows):
+            raise WordEditError(_WD_BAD)
+        ncols = len(rows[0])
+        if ncols > 40 or any(len(r) != ncols for r in rows) or not all(isinstance(c, dict) for r in rows for c in r):
+            raise WordEditError(_WD_BAD)
+        trs = [c for c in tbl if _wd_is(c, "tr")]
+        orig = {}
+        for r, tr in enumerate(trs):
+            for c, tc in enumerate([x for x in tr if _wd_is(x, "tc")]):
+                tcpr = tc.find(_wd_qn("w:tcPr"))
+                span = _wd_num(_wd_val(tcpr.find(_wd_qn("w:gridSpan")) if tcpr is not None else None), 1) or 1
+                if span > 1 or (tcpr is not None and tcpr.find(_wd_qn("w:vMerge")) is not None):
+                    raise WordEditError("This table has joined cells — add or take away its rows and columns in Word.")
+                orig["%d.%d" % (r, c)] = (tr, tc, c)
+        grid = tbl.find(_wd_qn("w:tblGrid"))
+        widths = [_wd_num(g.get(_wd_qn("w:w")), 0) or 0 for g in grid.findall(_wd_qn("w:gridCol"))] if grid is not None else []
+        total = sum(widths) or self.text_width() * 20
+        seen, new_trs, col_src, cellx = set(), [], [None] * ncols, {}
+        for i, row in enumerate(rows):
+            model, tcs = None, []
+            for j, cell in enumerate(row):
+                cid = cell.get("c")
+                if cid is not None:
+                    cid = str(cid)
+                    if cid not in orig or cid in seen:
+                        raise WordEditError(_WD_BAD)
+                    seen.add(cid)
+                    tr0, tc, c0 = orig[cid]
+                    model = model if model is not None else tr0
+                    if col_src[j] is None:
+                        col_src[j] = c0
+                    if "items" in cell:
+                        self.fill_cell(tc, cell["items"], used, "%s.%s." % (tid, cid))
+                else:
+                    like = orig.get(str(cell.get("like") or ""))
+                    tc = _wd_new("w:tc")
+                    if like is not None:
+                        bp = like[1].find(_wd_qn("w:tcPr"))
+                        if bp is not None:
+                            bp = _wd_copy.deepcopy(bp)
+                            for t in ("gridSpan", "vMerge", "hMerge", "cellIns", "cellDel", "cellMerge", "tcPrChange"):
+                                _wd_drop(bp, t)
+                            tc.append(bp)
+                        # the new cell's words take the look of the first paragraph of the cell it is like
+                        fp = like[1].find(_wd_qn("w:p"))
+                        model = model if model is not None else like[0]
+                    self.fill_cell(tc, cell.get("items") or [], used, "new.")
+                    if like is not None and fp is not None and fp.find(_wd_qn("w:pPr")) is not None:
+                        for p_ in tc.findall(_wd_qn("w:p")):
+                            if p_.find(_wd_qn("w:pPr")) is None:
+                                np_ = _wd_copy.deepcopy(fp.find(_wd_qn("w:pPr")))
+                                for t in ("sectPr", "pPrChange", "numPr"):
+                                    _wd_drop(np_, t)
+                                p_.insert(0, np_)
+                x = {k: cell[k] for k in ("shd", "va") if k in cell}
+                if x:
+                    cellx["%d.%d" % (i, j)] = x
+                tcs.append(tc)
+            tr = _wd_new("w:tr")
+            if model is not None and model.find(_wd_qn("w:trPr")) is not None:
+                tp = _wd_copy.deepcopy(model.find(_wd_qn("w:trPr")))
+                for t in ("ins", "del", "trPrChange") + (("tblHeader",) if i > 0 else ()):
+                    _wd_drop(tp, t)
+                tr.append(tp)
+            for tc in tcs:
+                tr.append(tc)
+            new_trs.append(tr)
+        ws = [widths[c] if c is not None and c < len(widths) and widths[c] else None for c in col_src]
+        known = [w for w in ws if w]
+        mean = (sum(known) / len(known)) if known else total / ncols
+        ws = [w or mean for w in ws]
+        k = total / (sum(ws) or 1)
+        ws = [max(200, int(round(w * k))) for w in ws]
+        if grid is None:
+            grid = _wd_new("w:tblGrid")
+            tpr = tbl.find(_wd_qn("w:tblPr"))
+            tbl.insert(list(tbl).index(tpr) + 1 if tpr is not None else 0, grid)
+        for g in list(grid):
+            grid.remove(g)
+        for w in ws:
+            grid.append(_wd_new("w:gridCol", w=w))
+        at = list(tbl).index(trs[0]) if trs else len(tbl)
+        for tr in trs:
+            tbl.remove(tr)
+        for n, tr in enumerate(new_trs):
+            tbl.insert(at + n, tr)
+            for j, tc in enumerate(x for x in tr if _wd_is(x, "tc")):
+                tcpr = tc.find(_wd_qn("w:tcPr"))
+                if tcpr is None:
+                    tcpr = _wd_new("w:tcPr")
+                    tc.insert(0, tcpr)
+                _wd_place(tcpr, _wd_new("w:tcW", w=ws[j], type="dxa"), _WD_TCPR_ORDER)
+        return cellx                               # the cells' shading and alignment, in their new places
+
+    def table_look(self, tbl, it):
+        """5.8: the look chosen for a table (its lines; a header row with a line under it for "academic"; banded rows),
+        its header row repeated on every page, equal column widths, and a cell's shading and vertical alignment."""
+        tpr = tbl.find(_wd_qn("w:tblPr"))
+        if tpr is None:
+            tpr = _wd_new("w:tblPr")
+            tbl.insert(0, tpr)
+        trs = [c for c in tbl if _wd_is(c, "tr")]
+        tcs = lambda tr: [x for x in tr if _wd_is(x, "tc")]
+        def tcpr_of(tc):
+            p_ = tc.find(_wd_qn("w:tcPr"))
+            if p_ is None:
+                p_ = _wd_new("w:tcPr")
+                tc.insert(0, p_)
+            return p_
+        look = it.get("look")
+        if look in _WD_TBL_LOOKS:
+            _wd_drop(tpr, "tblStyle")             # a style's own header and banding would fight the look chosen
+            sides = _WD_TBL_LOOKS[look].split()
+            bd = _wd_new("w:tblBorders")
+            for k, names in _WD_TSIDES:
+                if k in sides:
+                    bd.append(_wd_new("w:" + names[0], val="single", sz=8 if (look == "academic" and k in "tb") else 4, space=0,
+                                      color="BFBFBF" if (look == "banded" and k == "h") else "auto"))
+                else:
+                    bd.append(_wd_new("w:" + names[0], val="nil"))
+            _wd_place(tpr, bd, _WD_TBLPR_ORDER)
+            for r, tr in enumerate(trs):
+                for tc in tcs(tr):
+                    p_ = tcpr_of(tc)
+                    _wd_drop(p_, "tcBorders")
+                    if look == "academic" and r == 0:
+                        cb = _wd_new("w:tcBorders")
+                        cb.append(_wd_new("w:bottom", val="single", sz=4, space=0, color="auto"))
+                        _wd_place(p_, cb, _WD_TCPR_ORDER)
+                    if look == "banded":
+                        _wd_drop(p_, "shd")
+                        fill = "DEEAF6" if r == 0 else ("F2F2F2" if r % 2 == 0 else None)
+                        if fill:
+                            _wd_place(p_, _wd_new("w:shd", val="clear", color="auto", fill=fill), _WD_TCPR_ORDER)
+        if isinstance(it.get("hdr"), bool):
+            for r, tr in enumerate(trs):
+                tp = tr.find(_wd_qn("w:trPr"))
+                if r == 0 and it["hdr"]:
+                    if tp is None:
+                        tp = _wd_new("w:trPr")
+                        tr.insert(0, tp)
+                    _wd_drop(tp, "tblHeader")
+                    tp.append(_wd_new("w:tblHeader"))
+                elif tp is not None and not it["hdr"]:
+                    _wd_drop(tp, "tblHeader")
+        if it.get("eq") is True:
+            grid = tbl.find(_wd_qn("w:tblGrid"))
+            gcs = grid.findall(_wd_qn("w:gridCol")) if grid is not None else []
+            if gcs and not any(_wd_num(_wd_val(tcpr_of(tc).find(_wd_qn("w:gridSpan"))), 1) > 1 for tr in trs for tc in tcs(tr)):
+                total = sum(_wd_num(g.get(_wd_qn("w:w")), 0) or 0 for g in gcs) or self.text_width() * 20
+                w = max(200, int(total // len(gcs)))
+                for g in gcs:
+                    g.set(_wd_qn("w:w"), str(w))
+                for tr in trs:
+                    for tc in tcs(tr):
+                        _wd_place(tcpr_of(tc), _wd_new("w:tcW", w=w, type="dxa"), _WD_TCPR_ORDER)
+        cellx = it.get("cellx")
+        if isinstance(cellx, dict):
+            for key, x in list(cellx.items())[:20000]:
+                try:
+                    r, c = [int(v) for v in str(key).split(".")]
+                    tc = tcs(trs[r])[c]
+                except (ValueError, IndexError):
+                    raise WordEditError(_WD_BAD)
+                if not isinstance(x, dict):
+                    continue
+                p_ = tcpr_of(tc)
+                if "shd" in x:
+                    f = str(x.get("shd") or "").lstrip("#").upper()
+                    _wd_drop(p_, "shd")
+                    if re.fullmatch(r"[0-9A-F]{6}", f):
+                        _wd_place(p_, _wd_new("w:shd", val="clear", color="auto", fill=f), _WD_TCPR_ORDER)
+                if "va" in x:
+                    _wd_drop(p_, "vAlign")
+                    if x.get("va") in ("center", "bottom"):
+                        _wd_place(p_, _wd_new("w:vAlign", val=x["va"]), _WD_TCPR_ORDER)
 
     def fill(self, p, P, pid):
         if not isinstance(P, dict):
@@ -8457,6 +9150,7 @@ class _WdCtx:
                 el.set(_wd_qn("w:firstLine"), str(int(round(first * 20))))
             elif first < 0:
                 el.set(_wd_qn("w:hanging"), str(int(round(-first * 20))))
+        self.fill58(ppr, pstyle, P)
         keep = self.marks.get(pid, []) if pid else []
         for c in list(p):
             if c is not ppr:
@@ -8471,6 +9165,65 @@ class _WdCtx:
                 p.append(m)
         if len(ppr) == 0 and not ppr.attrib:
             p.remove(ppr)
+
+    def fill58(self, ppr, pstyle, P):
+        """5.8: the Paragraph window (space before and after, exact or at-least line spacing, the right indent, keep with
+        next, keep lines together, a page break before, widow and orphan control, no space between paragraphs of the
+        same style) and the Borders and Shading buttons. Only what the plan names is touched; a setting the paragraph's
+        style already has is not written again on the paragraph."""
+        def spacing():
+            sp = ppr.find(_wd_qn("w:spacing"))
+            if sp is None:
+                sp = _wd_place(ppr, _wd_new("w:spacing"), _WD_PPR_ORDER)
+            return sp
+        for key, att in (("sb", "before"), ("sa", "after")):
+            if key in P:
+                v = _wd_num(P.get(key))
+                if v is not None and 0 <= v <= 1584:
+                    sp = spacing()
+                    for a in (att + "Autospacing", att + "Lines"):
+                        sp.attrib.pop(_wd_qn("w:" + a), None)
+                    sp.set(_wd_qn("w:" + att), str(int(round(v * 20))))
+        for key, rule in (("lx", "exact"), ("ll", "atLeast")):
+            v = _wd_num(P.get(key))
+            if v is not None and 1 <= v <= 1584:
+                sp = spacing()
+                sp.set(_wd_qn("w:line"), str(int(round(v * 20))))
+                sp.set(_wd_qn("w:lineRule"), rule)
+        if "ri" in P and not P.get("list"):
+            v = _wd_num(P.get("ri"))
+            if v is not None and 0 <= v <= 720:
+                el = ppr.find(_wd_qn("w:ind"))
+                if el is None:
+                    el = _wd_place(ppr, _wd_new("w:ind"), _WD_PPR_ORDER)
+                el.attrib.pop(_wd_qn("w:end"), None)
+                el.attrib.pop(_wd_qn("w:rightChars"), None)
+                el.set(_wd_qn("w:right"), str(int(round(v * 20))))
+        style_layers = self.styles.players(pstyle)
+        for key, tag in (("kn", "keepNext"), ("kl", "keepLines"), ("pbb", "pageBreakBefore"), ("wc", "widowControl"), ("cs", "contextualSpacing")):
+            if key not in P or not isinstance(P.get(key), bool):
+                continue
+            _wd_drop(ppr, tag)
+            if P[key] != (_wd_widow(style_layers) if key == "wc" else _wd_first_on(style_layers, tag)):
+                _wd_place(ppr, _wd_new("w:" + tag) if P[key] else _wd_new("w:" + tag, val="0"), _WD_PPR_ORDER)
+        if "bdr" in P:
+            sides = set(str(P.get("bdr") or "").split()) & {"t", "l", "b", "r"}
+            _wd_drop(ppr, "pBdr")
+            if sides or _wd_borders(style_layers):
+                bd = _wd_new("w:pBdr")
+                for k, side in _WD_SIDES:
+                    if k in sides:
+                        bd.append(_wd_new("w:" + side, val="single", sz="6", space="1" if k in "tb" else "4", color="auto"))
+                    else:
+                        bd.append(_wd_new("w:" + side, val="nil"))
+                _wd_place(ppr, bd, _WD_PPR_ORDER)
+        if "shd" in P:
+            f = str(P.get("shd") or "").lstrip("#").upper()
+            _wd_drop(ppr, "shd")
+            if re.fullmatch(r"[0-9A-F]{6}", f):
+                _wd_place(ppr, _wd_new("w:shd", val="clear", color="auto", fill=f), _WD_PPR_ORDER)
+            elif _wd_shading(style_layers):
+                _wd_place(ppr, _wd_new("w:shd", val="clear", color="auto", fill="auto"), _WD_PPR_ORDER)
 
     def set_list(self, ppr, pstyle, lst):
         sl = self.styles.list_of(pstyle)
@@ -8501,11 +9254,29 @@ class _WdCtx:
                 at = self.atoms.get(str(rs["a"]))
                 if at is None:
                     raise WordEditError(_WD_BAD)
-                out.extend(_wd_atom_xml(at))
+                xs = _wd_atom_xml(at)
+                if isinstance(rs.get("alt"), str):      # 5.8: a picture given new alt text in Write
+                    _wd_set_alt(xs, rs["alt"])
+                out.extend(xs)
                 link = None
                 continue
             if "pic" in rs:
                 out.append(self.picture(rs))
+                link = None
+                continue
+            if rs.get("note") in ("foot", "end"):      # 5.8: a new footnote or endnote, its words in the notes part
+                kind = rs["note"]
+                nid = self.notes_of(kind).add(str(rs.get("text") or ""))
+                r = _wd_new("w:r")
+                rpr = _wd_new("w:rPr")
+                rpr.append(_wd_new("w:rStyle", val="FootnoteReference" if kind == "foot" else "EndnoteReference"))
+                r.append(rpr)
+                r.append(_wd_new("w:" + ("footnote" if kind == "foot" else "endnote") + "Reference", id=nid))
+                out.append(r)
+                link = None
+                continue
+            if isinstance(rs.get("cite"), dict):   # 5.8: a citation of the person's own sources
+                out.append(self.cite_xml(rs["cite"], pstyle))
                 link = None
                 continue
             if "seq" in rs:                        # 3.15: a caption's number (SEQ Table), Word numbers it again on opening
@@ -8547,6 +9318,34 @@ class _WdCtx:
                 link = None
         return out
 
+    def cite_xml(self, c, pstyle):
+        """5.8: a citation as Word keeps it: a content control (named "Citation") holding its words, its tag saying
+        which sources it cites ("ah58c|Smi20,Jon19|p=12|n=1"), so Write knows it again when the file comes back.
+        Words between asterisks are in italics (a title cited for want of an author)."""
+        import random as _rnd
+        tag = str(c.get("c") or "")
+        if not re.fullmatch(r"ah58c\|[A-Za-z0-9_,]{1,300}(?:\|[a-z]=[^|]{0,60}){0,4}", tag):
+            raise WordEditError(_WD_BAD)
+        text = _wd_clean(c.get("x"))[:600] or "(citation)"
+        fmt = {k: c[k] for k in ("b", "i", "u", "s", "f", "sz", "c", "hl", "va") if k in c}
+        sdt = _wd_new("w:sdt")
+        spr = _wd_new("w:sdtPr")
+        spr.append(_wd_new("w:alias", val="Citation"))
+        spr.append(_wd_new("w:tag", val=tag))
+        spr.append(_wd_new("w:id", val=_rnd.randint(1, 2 ** 31 - 2)))
+        sdt.append(spr)
+        sc = _wd_new("w:sdtContent")
+        for n, seg in enumerate(re.split(r"\*", text)):
+            if seg:
+                f = dict(fmt)
+                if n % 2:
+                    f["i"] = True
+                sc.append(self.run_xml(seg, None, f, pstyle, None))
+        if not len(sc):
+            sc.append(self.run_xml(text, None, fmt, pstyle, None))
+        sdt.append(sc)
+        return sdt
+
     def run_xml(self, text, base, fmt, pstyle, href):
         import re
         r = _wd_new("w:r")
@@ -8583,6 +9382,25 @@ class _WdCtx:
                 _wd_drop(rpr, "color")
             elif cur is None or (cur.get(_wd_qn("w:val")) or "").upper() != c:
                 _wd_place(rpr, _wd_new("w:color", val=c), _WD_RPR_ORDER)
+        # 5.8: capitals, small capitals and a double strike-out as the Font window set them; a double strike-out
+        # replaces a single one (Word has one or the other)
+        for key, tag in (("caps", "caps"), ("sc", "smallCaps"), ("ds", "dstrike")):
+            if key not in fmt or not isinstance(fmt.get(key), bool):
+                continue
+            want = fmt[key]
+            _wd_drop(rpr, tag)
+            if key == "ds" and want:
+                _wd_drop(rpr, "strike")
+            if want != d[key]:
+                _wd_place(rpr, _wd_new("w:" + tag) if want else _wd_new("w:" + tag, val="0"), _WD_RPR_ORDER)
+        uk = str(fmt.get("uk") or "")
+        if uk in _WD_UNDERLINES and fmt.get("u") and not (href and base is None):
+            _wd_place(rpr, _wd_new("w:u", val=uk), _WD_RPR_ORDER)
+        if "sp" in fmt:
+            v = _wd_num(fmt.get("sp"))
+            _wd_drop(rpr, "spacing")
+            if v and -20 <= v <= 100 and abs(v - (d.get("sp") or 0)) > 0.01:
+                _wd_place(rpr, _wd_new("w:spacing", val=int(round(v * 20))), _WD_RPR_ORDER)
         if "va" in fmt:
             _wd_drop(rpr, "vertAlign")
             if fmt.get("va") in ("sup", "sub"):
@@ -8653,11 +9471,32 @@ class _WdCtx:
         w = min(w if w > 0 else 300.0, self.text_width())
         h = w * ih / max(1, iw)
         inline = self.doc.part.new_pic_inline(path, Emu(int(w * 12700)), Emu(int(h * 12700)))
+        if isinstance(rs.get("alt"), str):       # 5.8: its alt text, from Write
+            _wd_set_alt([inline], rs["alt"])
         r = _wd_new("w:r")
         d = _wd_new("w:drawing")
         d.append(inline)
         r.append(d)
         return r
+
+
+def _wd_alt_clean(v):
+    """5.8: a picture's alt text as Word keeps it: one line of plain words, at most 1,000 characters."""
+    v = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(v or ""))
+    return re.sub(r"\s+", " ", v).strip()[:1000]
+
+
+def _wd_set_alt(elements, alt):
+    """5.8: every picture in these elements says these words to those who can't see it (an empty text: none)."""
+    alt = _wd_alt_clean(alt)
+    for el in elements:
+        if el is None or not hasattr(el, "iter"):
+            continue
+        for dp in el.iter(_wd_qn("wp:docPr")):
+            if alt:
+                dp.set("descr", alt)
+            elif "descr" in dp.attrib:
+                del dp.attrib["descr"]
 
 
 def _wd_ptext(el):
@@ -8713,6 +9552,61 @@ def _wd_first_on(layers, tag):
         if e is not None:
             return bool(_wd_toggle(e))
     return False
+
+
+_WD_UNDERLINES = ("single", "double", "thick", "dotted", "dottedHeavy", "dash", "dashedHeavy", "dashLong", "dotDash",
+                  "dotDotDash", "wave", "wavyHeavy", "wavyDouble", "words")
+_WD_SIDES = (("t", "top"), ("l", "left"), ("b", "bottom"), ("r", "right"))
+
+
+def _wd_tbl_lines(layers):
+    """5.8: which lines a table has ("t l b r h v"), side by side from the nearest layer (the table, then its style)."""
+    out = []
+    for k, sides in _WD_TSIDES:
+        for L in layers:
+            bd = L.find(_wd_qn("w:tblBorders")) if L is not None else None
+            e = next((bd.find(_wd_qn("w:" + x)) for x in sides if bd is not None and bd.find(_wd_qn("w:" + x)) is not None), None)
+            if e is not None:
+                if (e.get(_wd_qn("w:val")) or "nil") not in ("nil", "none"):
+                    out.append(k)
+                break
+    return " ".join(out)
+
+
+def _wd_widow(layers):
+    """5.8: widow and orphan control: the nearest layer that says; Word keeps it on when none does."""
+    for L in layers:
+        e = L.find(_wd_qn("w:widowControl")) if L is not None else None
+        if e is not None:
+            return bool(_wd_toggle(e))
+    return True
+
+
+def _wd_borders(layers):
+    """5.8: the sides of a paragraph that have a line ("t l b r"), from the nearest layer that sets borders."""
+    for L in layers:
+        bd = L.find(_wd_qn("w:pBdr")) if L is not None else None
+        if bd is None:
+            continue
+        out = []
+        for k, side in _WD_SIDES:
+            e = bd.find(_wd_qn("w:" + side))
+            if e is None and side in ("left", "right"):
+                e = bd.find(_wd_qn("w:" + {"left": "start", "right": "end"}[side]))
+            if e is not None and (e.get(_wd_qn("w:val")) or "nil") not in ("nil", "none"):
+                out.append(k)
+        return " ".join(out)
+    return ""
+
+
+def _wd_shading(layers):
+    """5.8: a paragraph's background colour (RRGGBB), or ''."""
+    for L in layers:
+        e = L.find(_wd_qn("w:shd")) if L is not None else None
+        if e is not None:
+            f = (e.get(_wd_qn("w:fill")) or "auto").upper()
+            return f if re.fullmatch(r"[0-9A-F]{6}", f) and f != "FFFFFF" else ""
+    return ""
 
 
 def _wd_field_word(instr):
@@ -8919,6 +9813,10 @@ def _wd_style_view(ctx, sid, missing=False):
     v = {"name": st.name(sid), "b": rl["b"], "i": rl["i"], "u": rl["u"], "sz": rl["sz"], "f": rl["f"], "c": rl["c"],
          "caps": rl["caps"], "align": pl["align"], "before": pl["before"], "after": pl["after"], "line": pl["line"],
          "left": pl["left"], "first": pl["first"], "next": nxt if nxt in st.el else None, "list": lst}
+    if rl["sc"]:
+        v["sc"] = True                        # 5.8
+    if pl["right"]:
+        v["right"] = pl["right"]
     for L in st.players(sid):                 # 3.15: the outline level (Heading 1: 0) — what a table of contents lists
         ol = L.find(_wd_qn("w:outlineLvl")) if L is not None else None
         if ol is not None:
@@ -8958,8 +9856,15 @@ def word_open(path):
     num = ctx.numbering()
     for nid in sorted(ctx.used_lists):
         lists[nid] = {str(l): list(num.level(nid, l) or ("decimal", "%" + str(l + 1) + ".", 1)) for l in range(9)}
-    return {"sig": _wd_sig(path, doc) if path else "", "blocks": blocks, "styles": styles, "default": ctx.styles.default_p,
-            "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body), "hf": hf}
+    out = {"sig": _wd_sig(path, doc) if path else "", "blocks": blocks, "styles": styles, "default": ctx.styles.default_p,
+           "offer": [s for s in offer if s in styles], "lists": lists, "page": _wd_page(doc.element.body), "hf": hf}
+    try:
+        src = _wd_sources_view(doc) if path else None     # 5.8: the person's sources (and Word's), kept in the file
+    except Exception:
+        src = None
+    if src and src["list"]:
+        out["sources58"] = src
+    return out
 
 
 _WD_HIGHLIGHTS = ("yellow", "green", "cyan", "magenta", "blue", "red", "darkBlue", "darkCyan", "darkGreen", "darkMagenta",
@@ -8970,6 +9875,26 @@ _WD_SIZES = {"a4": (595.3, 841.9), "letter": (612.0, 792.0), "legal": (612.0, 10
 # ---------------------------------------------------------------- 5.7: a document's design, chosen in the editor
 _WD_FONT_OK = re.compile(r"^[A-Za-z][A-Za-z0-9 .\-]{1,39}$")
 _WD_ALIGNS = {"left": "left", "center": "center", "centre": "center", "right": "right", "both": "both", "justify": "both"}
+
+
+def _wd_ensure_styles(doc, sids):
+    """5.8: Word's own styles (Quote, No Spacing, Heading 4…) a file doesn't have yet, copied in from Word's template
+    with the styles they rest on, before anything is done to them."""
+    root = doc.styles.element
+    have = {s.get(_wd_qn("w:styleId")) for s in root.findall(_wd_qn("w:style"))}
+    tpl = {s.get(_wd_qn("w:styleId")): s for s in _wd_template().styles.element.findall(_wd_qn("w:style"))}
+    todo = [s for s in sids if s not in have and s in tpl]
+    while todo:
+        sid = todo.pop()
+        if sid in have or sid not in tpl:
+            continue
+        copy = _wd_copy.deepcopy(tpl[sid])
+        root.append(copy)
+        have.add(sid)
+        for ref in ("w:basedOn", "w:link", "w:next"):
+            v = _wd_val(copy.find(_wd_qn(ref)))
+            if v and v not in have:
+                todo.append(v)
 
 
 def _wd_restyle(doc, restyle):
@@ -8986,6 +9911,7 @@ def _wd_restyle(doc, restyle):
     from docx.enum.style import WD_STYLE_TYPE
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     aligns = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "both": WD_ALIGN_PARAGRAPH.JUSTIFY}
+    _wd_ensure_styles(doc, [str(k) for k in list(restyle)[:40]])    # 5.8: a style of Word's own the file didn't have yet
     by_id = {s.style_id: s for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH}
     done = 0
     for sid, v in list(restyle.items())[:40]:
@@ -9036,6 +9962,18 @@ def _wd_restyle(doc, restyle):
         ln = _wd_num(v.get("line"))
         if ln is not None and 0.8 <= ln <= 3:
             pf.line_spacing = round(float(ln), 2)
+        # 5.8 (Modify style): the indents, small capitals, keep with next
+        for k, attr in (("left", "left_indent"), ("right", "right_indent")):
+            n = _wd_num(v.get(k))
+            if n is not None and 0 <= n <= 720:
+                setattr(pf, attr, Pt(round(n * 2) / 2.0) if n else None)
+        n = _wd_num(v.get("first"))
+        if n is not None and -720 <= n <= 720:
+            pf.first_line_indent = Pt(round(n * 2) / 2.0) if n else None
+        if isinstance(v.get("sc"), bool):
+            font.small_caps = v["sc"]
+        if isinstance(v.get("kn"), bool):
+            pf.keep_with_next = v["kn"]
         ppr = st.element.find(_wd_qn("w:pPr"))
         if ppr is not None:
             for x in ppr.findall(_wd_qn("w:pBdr")):
@@ -9295,6 +10233,19 @@ def word_save(src_path, plan, out_dir, assets=None, name=""):
         body.append(_wd_new("w:p"))
     if sect is not None:
         body.append(sect)
+    notes = plan.get("notes")                       # 5.8: a note's words changed in Write ({"foot:3": words})
+    if isinstance(notes, dict):
+        for key, words in list(notes.items())[:2000]:
+            kind, _, nid = str(key).partition(":")
+            if kind in ("foot", "end") and re.fullmatch(r"-?\d{1,6}", nid):
+                ctx.notes_of(kind).rewrite(nid, str(words or ""))
+    for kind in ("foot", "end"):
+        if kind in getattr(ctx, "_notes", {}) or isinstance(notes, dict) or plan.get("tidy_notes"):
+            nt = ctx.notes_of(kind)
+            nt.tidy(doc.element)
+            nt.save()
+    if isinstance(plan.get("sources58"), dict):     # 5.8: the person's sources, where Word keeps a document's own
+        _wd_sources_save(doc, plan["sources58"])
     _wd_page_setup(doc, plan.get("page"))           # 3.14: size, orientation and margins
     _wd_hf_write(doc, ctx, plan.get("hf"))           # 3.15: headers and footers
     _wd_page_numbers(doc, plan.get("numbers"), plan.get("numfmt"))       # 3.14: page numbers (3.15: how they read)
