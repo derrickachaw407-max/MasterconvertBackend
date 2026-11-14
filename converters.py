@@ -11618,6 +11618,82 @@ _MD_BULLET_LINE = re.compile(r"^\s*[-*+•]\s+(.+)$")
 _MD_QUOTE_LINE = re.compile(r"^\s*>\s+(?=[\"\u201c'\u2018*_A-Za-z\u00C0-\u024F])")      # "> words", never "> 7" (greater than)
 _MD_RULE_LINE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,}|(?:[-*_]\s+){2,}[-*_])$")
 _PLAIN_HEAD_END = set(".,;:!?)\"'”’")
+# 5.9 (the owner, 14 Nov 2026 16:28: "Is there a reason the research results (including, the format, fonts, line
+# spacing, table of contents, list of tables and so on) doesn't look nice?"): a table's or a figure's title is read
+# however it is written. Until 5.9 only "Table 1: Its title" on the line right above the table was: APA's own way ("Table
+# 1" on one line, the title on the next) made "Table 1" a heading of the contents and the title a stray line, a title
+# written under the table stayed a line of the text, and the table took its section's heading ("Table 2 3 Methodology").
+_MD_CAP59 = re.compile(r"^(table|figure|fig\.)(?:\s+(\d{1,3}(?:\.\d{1,3})*[a-z]?))?\s*(?:([:.\-–—])\s*(.*)|(.*))$", re.I)
+_MD_TNOTE = re.compile(r"^[*_]{0,3}(notes?|sources?)[*_]{0,3}\s*([.:])[*_]{0,3}\s+\S", re.I)
+
+
+def _md_cap(line):
+    """(title, numbered) when a line names a table or a figure: "Table 1: Its title", "Table 1. Its title", "**Table 1.**
+    Its title", "Table 1 Its title", "Table: Its title", "### Table 1: Its title"; title "" for "Table 1" alone (APA's
+    own way: the title on the next line). None for anything else, "Table 1 shows that …" (a sentence) included."""
+    s = re.sub(r"^#{1,6}\s+", "", str(line or "").strip())
+    s = re.sub(r"\*{1,3}|(?<!\w)_{1,3}|_{1,3}(?!\w)", "", s).strip()
+    m = _MD_CAP59.match(s)
+    if not m:
+        return None
+    num, sep = m.group(2), m.group(3)
+    if sep is not None:
+        title = (m.group(4) or "").strip()
+        if not num and not title:
+            return None
+    else:
+        title = (m.group(5) or "").strip()
+        if not num or (title and not (title[0].isupper() or title[0].isdigit())):
+            return None
+    return re.sub(r"\s*\.$", "", title).strip(), bool(num)
+
+
+def _md_cap_title(line):
+    """A title written on a line of its own (under "Table 1"): its marks and a full stop at its end taken off."""
+    s = re.sub(r"^#{1,6}\s+", "", str(line or "").strip())
+    s = re.sub(r"\*{1,3}|(?<!\w)_{1,3}|_{1,3}(?!\w)", "", s).strip()
+    return re.sub(r"\s*\.$", "", s).strip()
+
+
+def _md_next(lines, i, ahead=2):
+    """The index of the next line with words after line i, looking at most `ahead` lines on (one empty line may stand
+    between), or None."""
+    for k in range(i + 1, min(i + 1 + ahead, len(lines))):
+        if lines[k].strip():
+            return k
+    return None
+
+
+def _md_table_at(lines, k):
+    return k is not None and k + 1 < len(lines) and bool(_MD_TABLE_ROW.match(lines[k].strip())) and bool(_MD_TABLE_SEP.match(lines[k + 1].strip()))
+
+
+_SECTION_NAMES = re.compile(
+    r"^(?:abstract|introduction|background(?: (?:of|to) the study)?|overview|summary|executive summary|literature review|"
+    r"review of (?:the )?literature|methods?|methodology|materials and methods|results|findings|discussion|conclusions?|"
+    r"recommendations?|references|bibliography|works cited|reference list|acknowledge?ments?|preface|foreword|aims?|"
+    r"objectives?|purpose|scope|keywords?|contents|table of contents|appendix(?: \w+)?|limitations?|résumé|resumen|"
+    r"resumo|introducción|introdução|einleitung)$", re.I)
+
+
+def _title_like(line):
+    """5.9: a writing's first line that is its title: a line of its own (not a sentence, not a numbered section, not a
+    section's usual name such as "Introduction")."""
+    t = re.sub(r"[*_`]+", "", re.sub(r"^#{1,6}\s+", "", str(line or ""))).strip()
+    if not t or len(t) > 160 or len(t.split()) > 25 or (t[-1] in ".!?;," and not re.search(r"\b(?:etc|al)\.$", t)):
+        return False
+    if re.match(r"^(?:\d{1,3}(?:\.\d{1,3})*\.?\s|[IVXLC]{1,6}\.\s|chapter\b|part\b|[-*•+]\s|\||>)", t, re.I):
+        return False
+    if t[0] != t[0].upper():
+        return False
+    return not _SECTION_NAMES.match(t.rstrip(":"))
+
+
+def _sec_name(head):
+    """A section's name without its number ("2.1 Peer tutoring" → "Peer tutoring"; "Chapter Two: Methods" → "Methods")."""
+    s = re.sub(r"^\s*chapter\s+[\w-]+\s*[:.\-–—]?\s*", "", str(head or ""), flags=re.I)
+    s = re.sub(r"^\s*(?:\d{1,3}(?:\.\d{1,3})*|[IVXLC]{1,6})\.?\s+(?=\S)", "", s)
+    return s.strip() or str(head or "").strip()
 
 
 def _plain_heading(line):
@@ -11857,6 +11933,11 @@ def _write_rich(p, text, links=None, bold=False, italic=False):
         for s, e, anchor in (links.spans(seg) if links else []):
             if s > pos:
                 (_plain_or_raised(p, seg[pos:s], b, it) if raised else p._p.append(_xrun(seg[pos:s], b, it)))
+            if getattr(links, "plain", False):
+                # 5.9: on a paper the citation is plain words (raised numbers stay raised)
+                p._p.append(_xrun(seg[s:e].translate(_SUP_DIGITS), b, it, sup=raised))
+                pos = e
+                continue
             h = OxmlElement("w:hyperlink")
             h.set(qn("w:anchor"), anchor)
             h.set(qn("w:history"), "1")
@@ -11932,7 +12013,8 @@ def _md_blocks(text, skip_heading=None):
     """The answer's markdown as blocks: ("h", level, text) headings, ("p", text) paragraphs,
     ("li", text, numbered, depth, number) list items (depth 0 to 3: a point under a point is one deeper; number: the
     one it was written with), ("table", caption, rows), ("img", caption, bytes), and since 5.5 ("quote", text) a
-    quotation and ("code", text) a block of code with its lines."""
+    quotation and ("code", text) a block of code with its lines; since 5.9 ("tnote", text) a table's note ("Note. …",
+    "Source: …") right after its table."""
     lines = (text or "").splitlines()
     blocks, buf = [], []
     skip = (skip_heading or "").strip().lower()
@@ -12005,8 +12087,28 @@ def _md_blocks(text, skip_heading=None):
                 j += 1
             width = max(len(r) for r in rows) if rows else 0
             rows = [r + [""] * (width - len(r)) for r in rows]
+            cap = pending_caption
+            notes = []
             if rows:
-                blocks.append(("table", pending_caption, rows))
+                # 5.9: its title written under it ("Table: Its title", "Table 1. Its title"), unless that line is the title
+                # of a table or a picture that follows; then its notes ("Note. …", "Source: …"), each to its empty line
+                k = _md_next(lines, j - 1)
+                if cap is None and k is not None and len(lines[k].strip()) <= 160:
+                    c2 = _md_cap(lines[k])
+                    k2 = _md_next(lines, k)
+                    if c2 and c2[0] and not (_md_table_at(lines, k2) or (k2 is not None and _MD_IMAGE.match(lines[k2].strip()))):
+                        cap, j = c2[0], k + 1
+                        k = _md_next(lines, j - 1)
+                while k is not None and len(notes) < 3 and _MD_TNOTE.match(lines[k].strip()):
+                    said = []
+                    while k < len(lines) and lines[k].strip() and not _MD_TABLE_ROW.match(lines[k].strip()):
+                        said.append(lines[k].strip())
+                        k += 1
+                    notes.append(" ".join(said))
+                    j = k
+                    k = _md_next(lines, j - 1)
+                blocks.append(("table", cap, rows))
+                blocks.extend(("tnote", n) for n in notes)
             pending_caption = None
             i = j
             continue
@@ -12022,13 +12124,23 @@ def _md_blocks(text, skip_heading=None):
             pending_caption = None
             i += 1
             continue
-        m = _MD_CAPTION.match(line)
-        nxt = next((lines[k].strip() for k in range(i + 1, min(i + 3, len(lines))) if lines[k].strip()), "")
-        if m and len(line) <= 160 and (_MD_TABLE_ROW.match(nxt) or _MD_IMAGE.match(nxt)):
-            flush()
-            pending_caption = (m.group(3) or "").strip(" *_") or None
-            i += 1
-            continue
+        # a table's or a picture's title over it: on one line, or (5.9) APA's way, "Table 1" and its title on the next line
+        cap = _md_cap(line) if len(line) <= 160 else None
+        if cap is not None:
+            starts = lambda k: _md_table_at(lines, k) or (k is not None and bool(_MD_IMAGE.match(lines[k].strip())))
+            k1 = _md_next(lines, i)
+            if starts(k1):
+                flush()
+                pending_caption = cap[0] or None
+                i = k1
+                continue
+            n1 = lines[k1].strip() if k1 is not None else ""
+            if (not cap[0] and cap[1] and n1 and len(n1) <= 160 and _md_cap(n1) is None and not _MD_TABLE_ROW.match(n1)
+                    and not _MD_BULLET_LINE.match(n1) and not _MD_NUMBER_LINE.match(n1) and starts(_md_next(lines, k1))):
+                flush()
+                pending_caption = _md_cap_title(n1) or None
+                i = _md_next(lines, k1)
+                continue
         m = _MD_HEADING_LINE.match(line)
         if m:
             flush()
@@ -12277,6 +12389,76 @@ def _para_shade(p, fill):
     _insert_pPr_child_in_order(ppr, shd)
 
 
+def _toc_table(doc, entries, text_w, spacing, deep, pages):
+    """5.9 (the owner, 14 Nov 2026 18:10, with the app's file and his own document open in his iPhone's Files: "Does mine
+    look good outside the app?"): a contents list or a list of tables as two columns without lines, the entry and its
+    page number in a column of its own at the right, so every viewer lines them up. (Built on a dotted tab, it came out
+    ragged in the iPhone's Files and in Google Docs, which draw no dotted tab.) In Word the dotted line is still drawn
+    to the number. The entries are plain words (a link is drawn blue and underlined there); the numbers are PAGEREF
+    fields, already filled in, that Word keeps right if the pages move."""
+    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
+    num_w = 0.5
+    t = _prop_table(doc, [text_w - num_w, num_w], len(entries), grid=False, header=False)
+    pr = t._tbl.tblPr
+    mar = OxmlElement("w:tblCellMar")
+    for side in ("left", "right"):
+        e = OxmlElement(f"w:{side}")
+        e.set(qn("w:w"), "0")
+        e.set(qn("w:type"), "dxa")
+        mar.append(e)
+    look = pr.find(qn("w:tblLook"))
+    if look is not None:
+        look.addprevious(mar)
+    else:
+        pr.append(mar)
+    for i, (bm, text, level) in enumerate(entries):
+        strong = deep and level == 1
+        a, b = t.cell(i, 0), t.cell(i, 1)
+        a.width, b.width = DocxInches(text_w - num_w), DocxInches(num_w)
+        pa, pb = a.paragraphs[0], b.paragraphs[0]
+        for pp in (pa, pb):
+            pf = pp.paragraph_format
+            pf.line_spacing, pf.space_before, pf.space_after = spacing, DocxPt(0), DocxPt(0)
+        pa.paragraph_format.left_indent = DocxInches(0.25 * (level - 1)) if level > 1 else DocxInches(0)
+        pa.paragraph_format.tab_stops.add_tab_stop(DocxInches(text_w - num_w - 0.06), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+        for seg, bb, it in _emphasis_runs(text):
+            pa._p.append(_xrun(seg, bb or strong, it))
+        tab = OxmlElement("w:r")
+        tab.append(OxmlElement("w:tab"))
+        pa._p.append(tab)
+        pb.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        for r in (_xfield("begin"), _xinstr(f"PAGEREF {bm}"), _xfield("separate"), _xrun(str(pages.get(bm, "")), strong), _xfield("end")):
+            pb._p.append(r)
+    return t
+
+
+def _breaks_before(doc):
+    """5.9: a page that begins after a page break begins with "page break before" on its first paragraph. (A paragraph that
+    held only a page break showed as a small box in the iPhone's Files viewer, where a title page ends and where the
+    contents end.)"""
+    body = doc.element.body
+    for p in list(body.iter(qn("w:p"))):
+        if p.getparent() is not body:
+            continue
+        runs = p.findall(qn("w:r"))
+        brs = [br for r in runs for br in r.findall(qn("w:br")) if br.get(qn("w:type")) == "page"]
+        if not brs or len(runs) != 1 or any(x.tag not in (qn("w:br"), qn("w:rPr")) for x in runs[0]):
+            continue
+        # only a paragraph that holds the break and nothing else (no section's end, no bookmark, no link) goes
+        if any(x.tag not in (qn("w:pPr"), qn("w:r")) for x in p) or any(x.tag == qn("w:pPr") and x.find(qn("w:sectPr")) is not None for x in p):
+            continue
+        nxt = p.getnext()
+        if nxt is None or nxt.tag != qn("w:p"):
+            continue
+        ppr = nxt.find(qn("w:pPr"))
+        if ppr is None:
+            ppr = OxmlElement("w:pPr")
+            nxt.insert(0, ppr)
+        if ppr.find(qn("w:pageBreakBefore")) is None:
+            _insert_pPr_child_in_order(ppr, OxmlElement("w:pageBreakBefore"))
+        body.remove(p)
+
+
 def _build_word(payload, pages, front_matter=True):
     """The document itself; pages maps each heading/caption bookmark to its page number. front_matter: the contents
     and the lists of tables and figures, when the writing has the headings and tables for them (5.5: left out of a
@@ -12297,6 +12479,11 @@ def _build_word(payload, pages, front_matter=True):
     references = [r for r in (payload.get("references") or []) if isinstance(r, dict) and (r.get("text") or r.get("url"))]
     # the list comes in the order its style asks (worked out on the server: n.d. first, one author before several, …)
     links = _CiteLinks(references, numbered, marks) if references else None
+    if links is not None:
+        # 5.9: a citation is plain words in every Word file, a paper's and notes' alike (a link to its reference was
+        # drawn as a blue web link in the iPhone's Files viewer; the owner, 14 Nov 2026: "Does mine look good outside
+        # the app?")
+        links.plain = True
     title = re.sub(r"\s+", " ", str(payload.get("title") or "Academic Response")).strip()[:200]
 
     # ---- the body as blocks
@@ -12320,6 +12507,16 @@ def _build_word(payload, pages, front_matter=True):
         if (note and len(body) > 1 and all(b[0] == "li" for b in body) and body[0][3] == 0 and all(b[3] >= 1 for b in body[1:])
                 and _norm_words(body[0][1]) == _norm_words(title)):
             body = [("li", b[1], b[2], b[3] - 1, b[4]) for b in body[1:]]
+        # 5.9: the writing's own first line, when it is its title: never said twice (a long title is not a heading's
+        # shape, so it stayed as the first paragraph under the same title), and the document's title when the app could
+        # only give a stand-in ("Written response": until 5.9 a research writing on a long topic had that on its title page)
+        if body and not note and body[0][0] in ("h", "p"):
+            first = body[0][2] if body[0][0] == "h" else body[0][1]
+            if _norm_words(first) == _norm_words(title):
+                body = body[1:]
+            elif title.lower() in ("written response", "academic response") and _title_like(first):
+                title = re.sub(r"[*_`]+", "", re.sub(r"\s+", " ", first)).strip()[:200]
+                body = body[1:]
 
     # numbers and bookmarks for headings, tables and figures
     heads, tables, figures = [], [], []
@@ -12338,13 +12535,20 @@ def _build_word(payload, pages, front_matter=True):
                 body[k] = ("table", None, b[2], None, None)
                 continue
             n = len(tables) + 1
-            cap = b[1] or (current_head or "Summary")
+            # 5.9: a table written without a title takes its section's name, without the section's number ("Table 2 3
+            # Methodology" read as nonsense in the list of tables); a second one in that section says what its columns are
+            cap = b[1]
+            if not cap:
+                cap = _sec_name(current_head) if current_head else "Summary"
+                if any(c == cap for _, _, c in tables):
+                    cols = [re.sub(r"[*_`]+", "", c).strip() for c in (b[2][0] if b[2] else []) if str(c).strip()][:5]
+                    cap = cap + (": " + (", ".join(cols[:-1]) + " and " + cols[-1] if len(cols) > 1 else cols[0]) if cols else f" ({n})")
             bm = f"_Tbl{n}"
             tables.append((bm, n, cap))
             body[k] = ("table", cap, b[2], n, bm)
         elif b[0] == "img":
             n = len(figures) + 1
-            cap = b[1] or (current_head or "Illustration")
+            cap = b[1] or (_sec_name(current_head) if current_head else "Illustration")
             bm = f"_Fig{n}"
             figures.append((bm, n, cap))
             body[k] = ("img", cap, b[2], n, bm)
@@ -12393,74 +12597,72 @@ def _build_word(payload, pages, front_matter=True):
         doc.add_paragraph().add_run().add_break(_WDB.PAGE)
 
     # ---- the title
-    if note:                    # notes: the title at the left, larger, a fine line under it
-        tp = para(WD_ALIGN_PARAGRAPH.LEFT, spacing=1.1)
-        for seg, _b, it in _emphasis_runs(title):
-            tp._p.append(_xrun(seg, True, it, size=17))
-        tp.paragraph_format.space_after = DocxPt(12)
-        _para_border(tp, "bottom", 4, _PROP_LINE, 6)
-    else:
-        tp = para(WD_ALIGN_PARAGRAPH.CENTER)
-        _write_rich(tp, title, bold=True)
+    # 5.9: after a title page, a contents page holds the contents alone, and the writing begins on the next page under
+    # its title, as APA 7 sets it out (until 5.9 the title stood over "Contents" and the writing began without it)
+    lists_here = not note and (want_toc or ((tables or figures) and front_matter))
+    title_after_lists = bool(front_lines) and lists_here
+
+    def write_title():
+        if note:                # notes: the title at the left, larger, a fine line under it
+            tp = para(WD_ALIGN_PARAGRAPH.LEFT, spacing=1.1)
+            for seg, _b, it in _emphasis_runs(title):
+                tp._p.append(_xrun(seg, True, it, size=17))
+            tp.paragraph_format.space_after = DocxPt(12)
+            _para_border(tp, "bottom", 4, _PROP_LINE, 6)
+        else:
+            tp = para(WD_ALIGN_PARAGRAPH.CENTER)
+            _write_rich(tp, title, bold=True)
+            tp.paragraph_format.keep_with_next = True
+    if not title_after_lists:
+        write_title()
 
     # ---- contents, list of tables, list of figures: real Word fields, already filled in
-    def contents(heading, entries, instr):
+    # 5.9: their lines at 1.5 at most (double-spaced, a contents list ran over two pages), a top-level line in bold when
+    # lines sit under it, as the proposal's contents has them
+    def contents(heading, entries, instr, gap=False):
         hp = para(WD_ALIGN_PARAGRAPH.CENTER)
         hp._p.append(_xrun(heading, bold=True))
-        first = None
-        for n, (bm, text, level) in enumerate(entries):
-            p = para()
-            pf = p.paragraph_format
-            pf.left_indent = DocxInches(0.25 * (level - 1)) if level > 1 else DocxInches(0)
-            from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
-            pf.tab_stops.add_tab_stop(DocxInches(6.5), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
-            if n == 0:
-                p._p.append(_xfield("begin"))
-                p._p.append(_xinstr(instr))
-                p._p.append(_xfield("separate"))
-                first = p
-            h = OxmlElement("w:hyperlink")
-            h.set(qn("w:anchor"), bm)
-            h.set(qn("w:history"), "1")
-            for seg, b, it in _emphasis_runs(text):
-                h.append(_xrun(seg, b, it))
-            tab = OxmlElement("w:r")
-            tab.append(OxmlElement("w:tab"))
-            h.append(tab)
-            h.append(_xfield("begin"))
-            h.append(_xinstr(f"PAGEREF {bm} \\h"))
-            h.append(_xfield("separate"))
-            h.append(_xrun(str(pages.get(bm, ""))))
-            h.append(_xfield("end"))
-            p._p.append(h)
-        if first is not None:
-            endp = para(spacing=1.0)
-            endp._p.append(_xfield("end"))
+        hp.paragraph_format.keep_with_next = True
+        hp.paragraph_format.space_after = DocxPt(lk["size"] * 0.5)
+        if gap:
+            hp.paragraph_format.space_before = DocxPt(lk["size"] * 1.5)
+        # 5.9: two columns (the entry; its page number at the right), so every viewer lines them up (_toc_table)
+        _toc_table(doc, entries, text_width, min(float(lk["spacing"]), 1.5), any(level > 1 for _, _, level in entries), pages)
 
+    text_width = sec.page_width.inches - lk.get("margin_left", 1.0) - 1.0
     front = False
     if want_toc:
         contents("Contents", [(bm, text, lvl) for bm, text, lvl in heads], 'TOC \\o "1-3" \\h \\z \\u')
         front = True
     if tables and front_matter and not note:
-        contents("List of Tables", [(bm, f"Table {n} {cap}", 1) for bm, n, cap in tables], 'TOC \\h \\z \\c "Table"')
+        contents("List of Tables", [(bm, f"Table {n}: {cap}", 1) for bm, n, cap in tables], 'TOC \\h \\z \\c "Table"', gap=front)
         front = True
     if figures and front_matter and not note:
-        contents("List of Figures", [(bm, f"Figure {n} {cap}", 1) for bm, n, cap in figures], 'TOC \\h \\z \\c "Figure"')
+        contents("List of Figures", [(bm, f"Figure {n}: {cap}", 1) for bm, n, cap in figures], 'TOC \\h \\z \\c "Figure"', gap=front)
         front = True
     if front:
         from docx.enum.text import WD_BREAK
         doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    if title_after_lists:
+        write_title()
 
     # ---- the body
     def caption(label, n, cap, bm):
         p = doc.add_paragraph(style="Caption")
         p.paragraph_format.line_spacing = lk["spacing"]
         p._p.append(_xrun(f"{label} ", bold=True))
-        p._p.append(_xfield("begin"))
-        p._p.append(_xinstr(f"SEQ {label} \\* ARABIC"))
-        p._p.append(_xfield("separate"))
+        # 5.9: the number's field in bold all through (a program that works the number out again drew it plain)
+        for r in (_xfield("begin"), _xinstr(f"SEQ {label} \\* ARABIC"), _xfield("separate")):
+            rpr = OxmlElement("w:rPr")
+            rpr.append(OxmlElement("w:b"))
+            r.insert(0, rpr)
+            p._p.append(r)
         p._p.append(_xrun(str(n), bold=True))
-        p._p.append(_xfield("end"))
+        end = _xfield("end")
+        rpr = OxmlElement("w:rPr")
+        rpr.append(OxmlElement("w:b"))
+        end.insert(0, rpr)
+        p._p.append(end)
         br = OxmlElement("w:r")
         br.append(OxmlElement("w:br"))
         p._p.append(br)
@@ -12469,10 +12671,18 @@ def _build_word(payload, pages, front_matter=True):
         _xbookmark(p._p, bm, next_id())
 
     lists = _Lists(doc)
-    text_width = sec.page_width.inches - lk.get("margin_left", 1.0) - 1.0
     was = None                  # the block before: (kind, its paragraph, numbered, depth)
-    for b in body:
+    report = payload.get("kind") == "report"
+    for bi, b in enumerate(body):
         kind = b[0]
+        # 5.9: the words a research report puts right under its evidence table ("Quotes are word for word …") are the
+        # table's note, set as one
+        if report and kind == "p" and bi and body[bi - 1][0] == "table" and len(b[1]) <= 300:
+            b = ("tnote", b[1])
+            kind = "tnote"
+        then = body[bi + 1][0] if bi + 1 < len(body) else ""
+        if report and kind == "table" and then == "p" and len(body[bi + 1][1]) <= 300:
+            then = "tnote"
         if kind != "li":
             lists.other()
         if note and was is not None and was[1] is not None:
@@ -12565,7 +12775,29 @@ def _build_word(payload, pages, front_matter=True):
                         tb.append(bt)
                         tcpr.append(tb)
             _prop_keep(t)          # a short table stays whole on one page; a long one keeps its first rows together
-            para(spacing=1.0)      # a little room after the table
+            if then == "tnote":    # 5.9: its note stands right under it, on the same page
+                for c in t.rows[-1].cells:
+                    for pp in c.paragraphs:
+                        pp.paragraph_format.keep_with_next = True
+            else:
+                para(spacing=1.0)  # a little room after the table
+            p = None
+        elif kind == "tnote":
+            # 5.9: a table's note, as APA sets it: right under the table, at the margin (no first line set in), "Note." in
+            # italics; then the room a table has after it
+            p = para(WD_ALIGN_PARAGRAPH.LEFT)
+            p.paragraph_format.space_before = DocxPt(3)
+            m = re.match(r"^\s*[*_]{0,3}(notes?)[*_]{0,3}\s*[.:][*_]{0,3}\s*", b[1], re.I)
+            if m:
+                p._p.append(_xrun(m.group(1)[0].upper() + m.group(1)[1:].lower() + ".", italic=True))
+                p._p.append(_xrun(" "))
+                _write_rich(p, b[1][m.end():], links)
+            else:
+                _write_rich(p, b[1], links)
+            if then == "tnote":
+                p.paragraph_format.keep_with_next = True
+            else:
+                p.paragraph_format.space_after = DocxPt(lk["size"])
             p = None
         elif kind == "img":
             _, cap, data, n, bm = b
@@ -12605,6 +12837,8 @@ def _build_word(payload, pages, front_matter=True):
                 p._p.append(_xrun(" " + after))
             _xbookmark(p._p, f"ref_{i + 1}", next_id())
 
+    doc._ah_title = title          # 5.9: the title it was given (the writing's own, when the app had only a stand-in)
+    _breaks_before(doc)
     return doc, [(bm, text) for bm, text, _ in heads], [(bm, "Table", n, cap) for bm, n, cap in tables] + [(bm, "Figure", n, cap) for bm, n, cap in figures]
 
 
@@ -12811,8 +13045,15 @@ def _essay_docx(payload, out_dir, out_path):
             if any(bm not in pages for bm in wanted):
                 _ask_word_to_update(doc)
     _rtl_pass(doc)
+    if not note:
+        # 5.9: on a paper a citation reads as plain words (it still opens its reference in Word), as the proposal's do;
+        # until 5.9 every citation of a research writing or report was printed with a dotted line under it
+        for h in doc.element.body.iter(qn("w:hyperlink")):
+            if str(h.get(qn("w:anchor")) or "").startswith("ref_"):
+                for u in list(h.iter(qn("w:u"))):
+                    u.getparent().remove(u)
     front = payload.get("front") if isinstance(payload.get("front"), dict) else {}
-    _finish_docx(doc, payload.get("title") or "", _DOC_SUBJECTS.get(str(payload.get("kind") or ""), ""), front.get("author") or "")
+    _finish_docx(doc, getattr(doc, "_ah_title", None) or payload.get("title") or "", _DOC_SUBJECTS.get(str(payload.get("kind") or ""), ""), front.get("author") or "")
     doc.save(out_path)
     return out_path
 
@@ -13045,6 +13286,8 @@ def _build_proposal(payload, pages):
     numbered = bool(marks)
     references = [r for r in (payload.get("references") or []) if isinstance(r, dict) and (r.get("text") or r.get("url"))]
     links = _CiteLinks(references, numbered, marks) if references else None
+    if links is not None:
+        links.plain = True         # 5.9: citations as plain words (a link is drawn as a blue web link in phone viewers)
     title = re.sub(r"\s+", " ", str(payload.get("title") or plan.get("title") or "Research Proposal")).strip()[:300]
     just = WD_ALIGN_PARAGRAPH.JUSTIFY if lk["align"] == "justify" else WD_ALIGN_PARAGRAPH.LEFT
     after = DocxPt(0 if lk["indent"] else round(lk["size"] * 0.67))
@@ -13408,41 +13651,11 @@ def _build_proposal(payload, pages):
               italic=True, before=8, size=10.5)
 
     # ---------------------------------------------------------------- the contents, now that every heading is known
-    def toc_para(prev):
-        p = doc.add_paragraph()
-        prev._p.addnext(p._p)
-        return p
-
-    cur = toc_anchor
-    from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
-    for n, (bm, text, level) in enumerate(toc):
-        p = toc_para(cur)
-        pf = p.paragraph_format
-        pf.line_spacing, pf.space_before, pf.space_after = 1.5, DocxPt(0), DocxPt(0)
-        pf.left_indent = DocxInches(0.25 * (level - 1))
-        pf.tab_stops.add_tab_stop(DocxInches(text_w), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
-        if n == 0:
-            p._p.append(_xfield("begin"))
-            p._p.append(_xinstr('TOC \\o "1-3" \\h \\z \\u'))
-            p._p.append(_xfield("separate"))
-        h = OxmlElement("w:hyperlink")
-        h.set(qn("w:anchor"), bm)
-        h.set(qn("w:history"), "1")
-        h.append(_xrun(_sanitize_xml_text(text), bold=(level == 1)))
-        tab = OxmlElement("w:r")
-        tab.append(OxmlElement("w:tab"))
-        h.append(tab)
-        h.append(_xfield("begin"))
-        h.append(_xinstr(f"PAGEREF {bm} \\h"))
-        h.append(_xfield("separate"))
-        h.append(_xrun(str(pages.get(bm, "")), bold=(level == 1)))
-        h.append(_xfield("end"))
-        p._p.append(h)
-        cur = p
+    # 5.9: the contents as two columns (the entry; its page number at the right), so every viewer lines them up, the
+    # iPhone's Files and Google Docs too (_toc_table); right under its heading
     if toc:
-        endp = toc_para(cur)
-        endp.paragraph_format.line_spacing = 1.0
-        endp._p.append(_xfield("end"))
+        t = _toc_table(doc, [(bm, _sanitize_xml_text(text), level) for bm, text, level in toc], text_w, 1.5, True, pages)
+        toc_anchor._p.addnext(t._tbl)
 
     # a citation is a link to its reference, and reads as plain words on paper (no line under it)
     for h in doc.element.body.iter(qn("w:hyperlink")):
@@ -13663,6 +13876,7 @@ def quiz_to_docx(title, questions, out_dir, filename="Practice_Quiz.docx"):
             expl_p.paragraph_format.keep_together = True
             run(expl_p, expl, size=11.5, color=_QUIZ_SOFT)
 
+    _breaks_before(doc)        # 5.9: the answer key's page begins with "page break before" (no box in a phone's viewer)
     _finish_docx(doc, str(title or "Practice quiz"), "Practice quiz")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename)

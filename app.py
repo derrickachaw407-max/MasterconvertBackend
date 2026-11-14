@@ -9909,6 +9909,13 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
     return restyle_result(result, sources, cited, cite_plan, given, language=None)
 
 
+# 5.9 (the owner, 14 Nov 2026: "Is there a reason the research results (including … list of tables …) doesn't look
+# nice?"): RamzAI titles a table where the Word file and the app read a table's title: on the line right over it.
+WRITE_TABLE_RULE = ("\n\nTABLES: use a table only where it truly helps (studies or figures side by side). Write its number and title on "
+                    "the line right above it, as \"Table 1: What it shows\", then the table in Markdown; a note under it, if one is "
+                    "needed, starts with \"Note.\"")
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -10038,6 +10045,8 @@ def write_endpoint():
                   "about using only the listed real sources with their exact citations.\n<<<\n" + template + "\n>>>")
     # 5.0: the language the person chose; and kinds they named that aren't in the list
     extra += language_rule(data.get("language"))
+    # 5.9: a table titled as the Word file and the app read it (the title right over the table, a note under it)
+    extra += WRITE_TABLE_RULE
     kinds_more = re.sub(r"\s+", " ", str(data.get("kinds_more") or "")).strip()[:200]
     if kinds_more:
         extra += ("\n\nTHE PERSON ALSO ASKED FOR THESE KINDS OF SOURCES: " + kinds_more + ". Use any of the listed sources that are of "
