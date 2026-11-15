@@ -93,9 +93,10 @@ _COMMON = (
     "You help a researcher prepare to DEFEND their own research work before a panel. You are given the work itself. You read "
     "it and return ONE JSON object and nothing else: no code fences, no words before or after, starting with { and ending with }.\n\n"
     "THE RULES, each one checkable:\n"
-    "1. ONLY THE WORK. What was chosen, every fact, figure, name, place, date and citation comes from the work, with its exact "
-    "meaning. Never add a fact about the study that the work does not state. Keep in-text citations exactly as the work writes "
-    "them, at the end of the point that uses them. Never invent a citation.\n"
+    "1. ONLY THE WORK. What was chosen, every fact, figure, name, place, date and source comes from the work, with its exact "
+    "meaning. Never add a fact about the study that the work does not state. The points carry NO in-text citations (no "
+    "\"(Mensah, 2023)\", no \"[3]\"): the slides are a normal presentation, and the sources go on the References slide. Never "
+    "invent a source.\n"
     "2. THE WORK'S OWN WORDS BESIDE EACH CHOICE. \"src\" is 6 to 14 consecutive words copied EXACTLY, letter for letter, from the "
     "place in the work that states that choice. It is used to check your answer against the work.\n"
     "3. REASONS. \"why\" holds 2 to 4 reasons for the choice, each at most 20 words. First the reasons the WORK itself gives: "
@@ -124,7 +125,7 @@ PROMPT_A = _COMMON + (
     '  "people": "one" or "group", as the work shows who wrote it ("" when it does not show)\n'
     "  then one object for each of these, shaped as " + _ITEM + ", or null when the work does not state it:\n"
     '  "topic": what the study is about, in one point; its reasons are the facts in the background that show why the topic '
-    "matters (from the wider world down to the place of the study), each with its citation\n"
+    "matters (from the wider world down to the place of the study)\n"
     '  "problem": the problem the study addresses; its reasons say why it must be studied now (what is not known, what goes '
     "wrong if nothing is done)\n"
     '  "general": the general objective or aim, in the work\'s words; its reasons say why this aim follows from the problem\n'
@@ -133,12 +134,13 @@ PROMPT_A = _COMMON + (
     '  "significance": who will use the findings and how, one point for each group (up to 5); "why" may be empty\n'
     '  "scope": what the study covers (people, place, time, subject); its reasons say why it is limited so\n'
     '  "limitations": the limits the work itself names (up to 4); its reasons say how each is handled, when the work says\n'
-    '  "literature": {"themes": [{"h": "<a theme of the review, at most 7 words>", "points": ["<what the studies found, with '
-    'their citations>", "..."], "src": "<the work\'s own words>"}], "say": "...", "ask": [...]} with up to 3 themes of 2 or 3 '
+    '  "literature": {"themes": [{"h": "<a theme of the review, at most 7 words>", "points": ["<what the studies found, as a '
+    'plain statement>", "..."], "src": "<the work\'s own words>"}], "say": "...", "ask": [...]} with up to 3 themes of 2 or 3 '
     "points each, or null\n"
     '  "gap": what earlier studies have not answered that this study will; its reasons may be empty\n'
-    '  "references": the entries of the work\'s reference list for the citations you kept on the points, copied exactly as '
-    "the work writes them (up to 12); [] when the work has no reference list\n"
+    '  "references": the entries of the work\'s reference list for the sources behind your points (the work\'s in-text '
+    "citations at those places say which), copied exactly as the work writes them (up to 12); [] when the work has no "
+    "reference list\n"
 )
 PROMPT_B = _COMMON + (
     "THIS TIME: how the study is done and, when it is finished, what it found (its methodology and what follows it). Return one "
@@ -226,12 +228,17 @@ def _sentences_ok(text, work):
     return " ".join(keep).strip()
 
 
-def read_item(key, raw, work, clean):
-    """One choice as the AI returned it → what can stand on a slide, or None when the work does not state it."""
+def _same(t):
+    return t
+
+
+def read_item(key, raw, work, clean, strip=_same):
+    """One choice as the AI returned it → what can stand on a slide, or None when the work does not state it.
+    strip (6.2): what a point on a slide loses (its in-text citations)."""
     if not isinstance(raw, dict):
         return None
     cap = 6 if key in LISTS else 3
-    what = [w for w in (_words(x, 260, clean) for x in (raw.get("what") if isinstance(raw.get("what"), list) else [raw.get("what")])) if w][:cap]
+    what = [w for w in (strip(_words(x, 260, clean)) for x in (raw.get("what") if isinstance(raw.get("what"), list) else [raw.get("what")])) if w][:cap]
     what = [w for w in what if work.figures_ok(w)]
     if not what or not work.has(raw.get("src")):
         return None
@@ -241,7 +248,7 @@ def read_item(key, raw, work, clean):
             r = {"t": r, "src": ""}
         if not isinstance(r, dict):
             continue
-        t = _words(r.get("t"), 240, clean)
+        t = strip(_words(r.get("t"), 240, clean))
         if not t or not work.figures_ok(t):
             continue
         why.append({"t": t, "own": bool(r.get("src")) and work.has(r.get("src"))})
@@ -261,7 +268,7 @@ def read_asks(raw, work, clean, most):
     return out[:most]
 
 
-def read_literature(raw, work, clean):
+def read_literature(raw, work, clean, strip=_same):
     if not isinstance(raw, dict):
         return None
     themes = []
@@ -269,7 +276,7 @@ def read_literature(raw, work, clean):
         if not isinstance(t, dict) or not work.has(t.get("src")):
             continue
         h = _words(t.get("h"), 90, clean)
-        pts = [p for p in (_words(x, 260, clean) for x in (t.get("points") or [])) if p and work.figures_ok(p)][:3]
+        pts = [p for p in (strip(_words(x, 260, clean)) for x in (t.get("points") or [])) if p and work.figures_ok(p)][:3]
         if h and pts:
             themes.append({"h": h, "points": pts})
     if not themes:
@@ -324,21 +331,21 @@ def _item_slide(it):
     return _slide(head, sections, it["key"], {"say": it["say"], "ask": it["ask"]}, marks)
 
 
-def build(a, b, work, clean, presenters=None, title_given=""):
+def build(a, b, work, clean, presenters=None, title_given="", strip=_same):
     """The two answers → (title, kind, slides, what the work does not say, the questions to be ready for, how many
     reasons are suggestions). Raises ValueError when the text does not read as research work."""
     a, b = a if isinstance(a, dict) else {}, b if isinstance(b, dict) else {}
     items = {}
     for key, *_ in ITEMS_A:
-        it = read_item(key, a.get(key), work, clean)
+        it = read_item(key, a.get(key), work, clean, strip)
         if it:
             items[key] = it
     for key, *_ in ITEMS_B:
-        it = read_item(key, b.get(key), work, clean)
+        it = read_item(key, b.get(key), work, clean, strip)
         if it:
             items[key] = it
-    lit = read_literature(a.get("literature"), work, clean)
-    gap = read_item("gap", a.get("gap"), work, clean) if isinstance(a.get("gap"), dict) else None
+    lit = read_literature(a.get("literature"), work, clean, strip)
+    gap = read_item("gap", a.get("gap"), work, clean, strip) if isinstance(a.get("gap"), dict) else None
     core = [k for k in ("problem", "general", "specific", "design", "population", "size", "sampling", "instrument", "analysis") if k in items]
     if len(core) < 3:
         raise ValueError("not research work")

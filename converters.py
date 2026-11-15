@@ -13014,6 +13014,70 @@ def _rough_pages(payload):
     return words / per_page + 0.5
 
 
+# 6.2 (the owner, 15 Nov 2026 12:25, his answer "Comments in the Word file"): a few notes in the margin, as a supervisor
+# would leave them, for the person to check before handing the work in. They are Word comments: they never print, and
+# Review > Delete > Delete All Comments takes them all away. Only when the app asks (notes: true): research writing, a
+# research report, a proposal.
+REVIEW_AUTHOR = "RamzAI"
+_REVIEW_FIG = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*\s?(?:%|percent\b|per cent\b)|\b\d{2,}(?:[.,]\d+)*\s+(?:students|participants|respondents|"
+                         r"people|patients|children|adults|women|men|nurses|teachers|pupils|schools|hospitals|cases|households)\b", re.I)
+_REVIEW_CITE = re.compile(r"\(([^()]*?[A-Za-z][^()]*?\b(?:1[5-9]|20)\d{2}[a-z]?)\)")
+_REVIEW_NARR = re.compile(r"\b([A-Z][\w'\u2019-]+(?:\s+et\s+al\.)?(?:\s+(?:and|&)\s+[A-Z][\w'\u2019-]+)?)\s+\(((?:1[5-9]|20)\d{2}[a-z]?)\)")
+
+
+def _review_notes(doc, papers=0, kind="writing"):
+    paras = [p for p in doc.paragraphs if p.text.strip()]
+    def style(p):
+        try:
+            return (p.style.name or "").lower()
+        except Exception:
+            return ""
+    def runs(p):
+        r = [x for x in p.runs if x.text.strip()]
+        return r if r else None
+    def note(p, words):
+        r = runs(p)
+        if not r:
+            return False
+        try:
+            doc.add_comment(r, text=words, author=REVIEW_AUTHOR, initials="R")
+            return True
+        except Exception:
+            return False
+    heads = [p for p in paras if style(p).startswith(("heading", "title"))]
+    first = heads[0] if heads else (paras[0] if paras else None)
+    if first is not None:
+        note(first, ("Written with RamzAI" + (" from " + str(papers) + (" paper" if papers == 1 else " papers") if papers else "") + ". Before you hand it in: read "
+                     "the papers it cites, check each figure, and put the ideas in your own words where you can. When you are done, "
+                     "Review > Delete > Delete All Comments takes these notes away."))
+    figures = 0
+    for p in paras:
+        if figures >= 6:
+            break
+        if style(p).startswith(("heading", "title", "toc", "caption")) or p in heads:
+            continue
+        t = p.text
+        if _REVIEW_FIG.search(t):
+            # the paper behind the first figure: the citation of the sentence it is in ("Mensah (2021)" or "(Mensah, 2021)")
+            sent = next((x for x in re.split(r"(?<=[.!?])\s+(?=[A-Z])", t) if _REVIEW_FIG.search(x)), t)
+            # (a narrative citation is named as it is written, "in Adeyemi and Okoro (2022)": made into "(… , 2022)" it
+            # would need the style's own "&" or "and")
+            n = _REVIEW_NARR.search(sent)
+            c = ((_REVIEW_CITE.findall(sent) or [""])[0].strip()) if not n else ""
+            where = ("in " + n.group(1) + " (" + n.group(2) + ")") if n else ("in the paper (" + c + ")" if c else "in the paper cited")
+            if note(p, "Check the figures here " + where + " before you rely on them."):
+                figures += 1
+    if kind == "writing" and len(heads) >= 3:
+        # the end of the first part: a place for what the person knows of their own setting
+        k = paras.index(heads[2]) if heads[2] in paras else -1
+        before = [p for p in paras[:k] if p not in heads and not style(p).startswith(("toc", "caption"))] if k > 0 else []
+        if before:
+            note(before[-1], "If you can, add a line about your own setting here (your school, town or country), with its source.")
+    ref = next((p for p in paras if p.text.strip().lower() in ("references", "reference list", "bibliography", "works cited", "sources")), None)
+    if ref is not None:
+        note(ref, "Each reference opens its paper. Read the ones you rely on most, and check that each says what your sentence says.")
+
+
 def _essay_docx(payload, out_dir, out_path):
     note = bool(_look().get("note"))
     doc, heads, caps = _build_word(payload, {}, front_matter=not note)
@@ -13053,6 +13117,12 @@ def _essay_docx(payload, out_dir, out_path):
                 for u in list(h.iter(qn("w:u"))):
                     u.getparent().remove(u)
     front = payload.get("front") if isinstance(payload.get("front"), dict) else {}
+    if payload.get("notes") is True and str(payload.get("kind") or "") in ("writing", "report"):
+        try:
+            _review_notes(doc, len(payload.get("references") or []), str(payload.get("kind") or ""))
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger("academic-home").warning(f"Review notes not added: {e}")
     _finish_docx(doc, getattr(doc, "_ah_title", None) or payload.get("title") or "", _DOC_SUBJECTS.get(str(payload.get("kind") or ""), ""), front.get("author") or "")
     doc.save(out_path)
     return out_path
@@ -13105,6 +13175,12 @@ def proposal_to_docx(payload, out_dir):
         doc, heads = _build_proposal(payload, pages)
         if any(bm not in pages for bm, _ in heads):
             _ask_word_to_update(doc)
+        if payload.get("notes") is True:           # 6.2: the margin notes, as for research writing
+            try:
+                _review_notes(doc, len(payload.get("references") or []), "proposal")
+            except Exception as e:
+                import logging as _logging
+                _logging.getLogger("academic-home").warning(f"Proposal: review notes not added: {e}")
         doc.save(out_path)
         return out_path
     finally:

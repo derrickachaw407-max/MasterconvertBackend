@@ -333,7 +333,15 @@ RESEARCH_PLANS = PRO_PLANS        # 5.0 (the owner, 10 Nov 2026): every Scholar 
 # manual research writing). They are part of the pass's points, not a second purse: whatever isn't spent on research
 # works on every other AI feature. A pass that isn't listed has no research limit (Year; and a pass bought before 5.0
 # keeps what it was bought with).
-PASS_RESEARCH_POINTS = {"month": 10, "half": 60}
+PASS_RESEARCH_POINTS = {"month": 5}
+# 6.2 (the owner, 15 Nov 2026 11:23, and his answers to three questions): "I want the monthly sholar to have 50 points
+# ... the same idea for the rest of the plans" = every pass halved: Month 50, Half year 310, Year 780 (prices unchanged);
+# Month's limit: up to 5 of its 50 points on research; Half year and Year: no research limit (only their points), and
+# "very special": research writing that reads whole papers, research, chats and library kept in the account (every
+# device), the newest slide designs and the Dramatic transitions, RamzAI's strongest model for research writing. A pass
+# bought before 6.2 keeps what it was bought with (paystack_payments.points / research_points); a Month (or shorter)
+# pass running when 6.2 came keeps every lock open until it ends (users.all_open_until).
+SPECIAL_PLANS = ("half", "year", "semester", "halfyear", "yearly")
 SCHOLAR_MORE_RESEARCH = "Scholar gives you more research."
 PLAN_NAMES = {"day": "Scholar Day", "week": "Scholar Week", "month": "Scholar Month", "half": "Scholar Half Year", "semester": "Scholar Semester", "year": "Scholar Year",
               "monthly": "Scholar Month", "halfyear": "Scholar Semester", "yearly": "Scholar Year", "free": "Free"}
@@ -349,7 +357,7 @@ FREE_MONTH_POINTS = 5
 FREE_MONTH_RESEARCH = 2
 TRIAL_POINTS = FREE_MONTH_POINTS   # the old name; older apps read "trial_points" from /api/paystack/config
 SCHOLAR_DAY_CAP = 60       # the most points any pass spends in one day (catches runaway or automated use)
-BONUS_MONTH_POINTS = 100   # a bonus month given before 5.0 works like Scholar Month (5.0: 100 points, 10 of them for research)
+BONUS_MONTH_POINTS = 50    # a bonus month given before 5.0 works like Scholar Month (6.2: 50 points, 5 of them for research)
 # 5.0 (the owner, 10 Nov 2026, 08:44): "Inviting a friend fetches you 10 points including two research points."
 # The person whose code a friend joined with gets INVITE_POINTS points that never end; INVITE_RESEARCH of them may go on
 # research (users.bonus_research, used after a pass's own research points or Free's research writings of the month).
@@ -735,6 +743,23 @@ def init_db():
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS open_word_created ON open_word (created_at)")
+            # 6.2: a Month (or shorter) pass running when 6.2 came keeps every lock open until it ends; done once
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS all_open_until TIMESTAMPTZ")
+            cur.execute("SELECT 1 FROM app_flags WHERE name = 'plans62'")
+            if not cur.fetchone():
+                cur.execute("UPDATE users SET all_open_until = plan_expires_at WHERE plan IN ('month', 'monthly', 'day', 'week') "
+                            "AND plan_expires_at > now() AND all_open_until IS NULL")
+                cur.execute("INSERT INTO app_flags (name, until) VALUES ('plans62', now()) ON CONFLICT (name) DO NOTHING")
+            # 6.2 (the owner, 15 Nov 11:53): reminders at 25, 50 and 75 percent of a pass's points spent need what the
+            # running pass(es) gave; a pass running when 6.2 came: the points of its last payment, or what it has left
+            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pass_points_given INTEGER NOT NULL DEFAULT 0")
+            cur.execute("SELECT 1 FROM app_flags WHERE name = 'given62'")
+            if not cur.fetchone():
+                cur.execute("UPDATE users u SET pass_points_given = GREATEST(COALESCE(u.pass_points, 0), COALESCE((SELECT p.points FROM paystack_payments p "
+                            "WHERE p.user_id = u.id AND p.applied_at IS NOT NULL AND p.points IS NOT NULL ORDER BY p.applied_at DESC LIMIT 1), 0)) "
+                            "WHERE u.plan_expires_at > now() AND COALESCE(u.pass_points, 0) > 0")
+                cur.execute("INSERT INTO app_flags (name, until) VALUES ('given62', now()) ON CONFLICT (name) DO NOTHING")
+            _sync_tables(cur)
             _meet_tables(cur)
     except Exception as e:
         logger.error("init_db: table setup failed: %s", e)
@@ -1471,6 +1496,29 @@ def _points_state(row):
     return trial_left + bought, 0, bought, trial_left, None, None
 
 
+def _points_given(row):
+    """6.2: the points the running pass (or passes bought on top of each other) came with; Free: the month's free points."""
+    try:
+        plan = effective_plan(row)
+        if plan == "free":
+            return FREE_MONTH_POINTS
+        return max(int(row.get("pass_points_given") or 0), int(row.get("pass_points") or 0))
+    except Exception:
+        return 0
+
+
+def _points_period(row):
+    """6.2: the pass or the month the reminders belong to: a new pass, or a new month on Free, starts them again."""
+    try:
+        if effective_plan(row) == "free":
+            return "free-" + _month_start().isoformat()
+        exp = row.get("plan_expires_at")
+        given = int(row.get("pass_points_given") or 0)
+        return "pass-" + (exp.isoformat() if exp else "") + "-" + str(given)
+    except Exception:
+        return ""
+
+
 def _month_start(now=None):
     d = (now or datetime.now(timezone.utc)).date()
     return d.replace(day=1)
@@ -1568,6 +1616,14 @@ def user_row_to_dict(row):
         "points_day_cap": day_cap,
         "plan_name": PLAN_NAMES.get(effective_plan(row), "Scholar"),
         "scholar": effective_plan(row) in PRO_PLANS,
+        # 6.2: the special features of Half year and Year (see SPECIAL_PLANS)
+        "special": _special(row),
+        # 6.2: for the reminders at 25, 50 and 75 percent spent: what the running pass(es) gave (pass_points is what is
+        # left), and which pass or month the marks belong to (they are shown once in each)
+        "points_given": _points_given(row),
+        "points_period": _points_period(row),
+        # 6.2: Keep on every device is on (Half year and Year; the person turns it on)
+        "kept_on": bool(row.get("kept_on")) if hasattr(row, "get") else False,
         "plans": {k: {"amount_ghs": v[0] / 100, "days": v[1], "points": v[2], "research_points": PASS_RESEARCH_POINTS.get(k),
                       "name": PLAN_NAMES.get(k, "Points")} for k, v in PAYSTACK_PLANS.items() if k in PAYSTACK_ON_SALE},
         "id": row["id"],
@@ -1630,7 +1686,7 @@ def auth_required(fn):
             conn = get_db()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0, research_points = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
+                    cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0, pass_points_given = 0, research_points = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
                 conn.commit()
             except Exception as e:
                 logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
@@ -1665,9 +1721,9 @@ def auth_required(fn):
             try:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE users SET plan = 'month', plan_expires_at = now() + interval '30 days', plan_source = 'bonus', pass_points = pass_points + %s, "
-                                "research_points = %s, "
+                                "research_points = %s, pass_points_given = COALESCE(pass_points, 0) + %s, "
                                 "bonus_credit_months = bonus_credit_months - 1 WHERE id = %s AND plan = 'free' AND bonus_credit_months > 0 RETURNING *",
-                                (BONUS_MONTH_POINTS, PASS_RESEARCH_POINTS["month"], user_id))
+                                (BONUS_MONTH_POINTS, PASS_RESEARCH_POINTS["month"], BONUS_MONTH_POINTS, user_id))
                     started = cur.fetchone()
                 conn.commit()
                 if started:
@@ -1932,11 +1988,18 @@ AI_ROOM_MAX = 16000                             # the most room a second try is 
 _AI_THINK_KEPT = {}                             # model -> the time until which that part is left out
 
 
-def _ai_tune(payload):
+# 6.2: the stronger model also answers without thinking first when its caller asks (research writing on Half year and
+# Year: a plain request, no tools, the default effort): the AI service's thinking page says Claude Opus 5 accepts
+# "thinking": {"type": "disabled"} at effort high or below (high is its default). RamzAI's chat is not asked to.
+AI_THINK_OFF_ON_ASK = ("claude-opus-5",)
+
+
+def _ai_tune(payload, no_think=False):
     """5.5: says, in a request, that the model answers without thinking first, where that is right: a plain request (no
     tools) to a model that accepts it. Anything else is sent without that part, as before."""
     model = payload.get("model")
-    if model in AI_THINK_OFF_MODELS and not payload.get("tools") and _AI_THINK_KEPT.get(model, 0) <= time.time():
+    if (model in AI_THINK_OFF_MODELS or (no_think and model in AI_THINK_OFF_ON_ASK)) and not payload.get("tools") \
+            and _AI_THINK_KEPT.get(model, 0) <= time.time():
         payload["thinking"] = {"type": "disabled"}
     else:
         payload.pop("thinking", None)
@@ -2101,7 +2164,7 @@ def _ai_declined(data):
 
 
 def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=False, return_meta=False, model=None, messages=None,
-                timeout=None, feature=None, on_text=None, on_search=None):
+                timeout=None, feature=None, on_text=None, on_search=None, no_think=False):
     """messages, when given, is sent to the API exactly as the native
     multi-turn conversation it already is (alternating user/assistant
     turns) — the correct way to give Claude real conversational
@@ -2125,7 +2188,7 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
     }
     if use_search:
         payload["tools"] = [{"type": "web_search_20260318", "name": "web_search", "max_uses": 5}]
-    _ai_tune(payload)                            # 5.5: max_tokens is the room for the words (see AI_THINK_OFF_MODELS)
+    _ai_tune(payload, no_think)                  # 5.5: max_tokens is the room for the words (see AI_THINK_OFF_MODELS)
     wait = timeout or (140 if use_search else 110)
     began = time.time()
 
@@ -2172,7 +2235,7 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
             payload["system"] = payload["system"].replace(THINKING_INSTRUCTION, "").strip()
         elif attempt < 2 and payload["model"] != ANTHROPIC_MODEL:
             payload["model"] = ANTHROPIC_MODEL
-            _ai_tune(payload)
+            _ai_tune(payload, no_think)
         else:
             logger.error(f"AI: nothing else to try: the person is asked to say it another way ({feature or '-'})")
             raise ConversionError(AI_MSG_DECLINED)
@@ -3558,8 +3621,57 @@ def build_sources_block(sources):
             line += f" — {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
         if s.get("abstract"):
             line += f"\n    Abstract: {s['abstract'][:700]}"
+        if s.get("paper_text"):            # 6.2: read in full (Half year and Year)
+            line += f"\n    From the paper itself: {s['paper_text']}"
         lines.append(line)
     return "\n".join(lines)
+
+
+W62_READ_SECONDS = 18                  # research writing on Half year and Year: how long the papers may take to be read
+W62_PAPER_CHARS = 1400                 # what the writing sees of each paper's own text
+
+
+def read_papers_for_writing(sources, topic, seconds=W62_READ_SECONDS):
+    """6.2 (the owner, 15 Nov 2026: Half year and Year "very special", research that reads whole papers): research writing
+    reads the papers themselves where they are free to open (Europe PMC's full text, or the open PDF: Research's own
+    reader since 5.1), and the sentences that bear on the topic, not already in the abstract, stand beside each abstract
+    for the writing and for its check. A paper that can't be read keeps its abstract alone. Never raises.
+    Returns how many papers were read."""
+    try:
+        until = time.time() + seconds
+        terms = _paper_terms(topic)
+        todo = []
+        for src in sources or []:
+            if src.get("paper_text") or not (src.get("pmcid") or src.get("pdf")) or src.get("kind") == "mine":
+                continue
+            p = dict(src)
+            p["sents"] = _rs_split(src.get("abstract") or "")
+            todo.append((src, p))
+        if not todo:
+            return 0
+        n = 0
+        pool = _futures.ThreadPoolExecutor(max_workers=RS_READ_AT_ONCE)
+        try:
+            jobs = {pool.submit(_rs_read_one, p, terms, until): src for src, p in todo}
+            done, _late = _futures.wait(jobs, timeout=max(0.5, until - time.time() + 1.5))
+            for job in done:
+                src = jobs[job]
+                try:
+                    got = job.result()
+                except Exception:
+                    continue
+                body = [x for x, _c in (got.get("body") or [])]
+                if body:
+                    src["paper_text"] = " ".join(body)[:W62_PAPER_CHARS]
+                    src["read"] = got.get("read") or "paper"
+                    n += 1
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        logger.info(f"Research writing: {n} of {len(todo)} papers read themselves (Half year / Year)")
+        return n
+    except Exception as e:
+        logger.warning(f"Research writing: the papers couldn't be read ({e}); their abstracts are used")
+        return 0
 
 
 def build_references_list(sources, cited=None):
@@ -3661,6 +3773,43 @@ def _cite_norm(s):
     s = str(s or "").replace("&", " and ").replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').replace("*", "").lower()
     s = re.sub(r"\s+", " ", s)
     return s.strip(" ,.;")
+
+
+_SLIDE_NUM_CITE = re.compile(r"\s*\[\s*\d{1,3}(?:\s*[,–\-]\s*\d{1,3})*\s*\]")
+
+
+def strip_slide_citations(text):
+    """6.2 (the owner, 15 Nov 2026: "Make the slides normal powerpoint with no in-text citations ... with references"):
+    a slide's point without its in-text citations. "(Mensah & Boateng, 2023)", "(WHO, 2022; Owusu, 2021, p. 4)" and
+    "[3]" go; "Mensah et al. (2023) found" keeps the names and loses the year ("Mensah et al. found"); "(Table 2)",
+    "(Type 2)", "(Accra)" and an Act's year stay. The References slide lists the sources, as before.
+    Returns (text, True when something was taken out)."""
+    s = str(text or "")
+    if not s:
+        return s, False
+    out = s
+
+    def paren(m):
+        inner = m.group(1)
+        parts = [_CITE_LEAD.sub("", p.strip()) for p in inner.split(";")]
+        return "" if parts and all(p and _CITE_SHAPE.match(p) for p in parts) else m.group(0)
+    out = re.sub(r"[ \t]*\(([^()]{2,400})\)", paren, out)
+
+    def narr(m):
+        who = m.group(1)
+        last = re.split(r"\s+", who.replace(",", " ").strip())[0]
+        if _NARR_NOT_AUTHOR.match(last) or _PLACES_RX.search(who.lower()):
+            return m.group(0)
+        return who
+    out = _NARRATIVE.sub(narr, out)
+    out = _SLIDE_NUM_CITE.sub("", out)
+    out = re.sub(r"[ \t]+([.,;:!?])", r"\1", out)
+    out = re.sub(r"([,;:])\1+", r"\1", out)
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    out = re.sub(r"^[,;:]\s*|\s*[,;:]$", "", out).strip()
+    if not re.search(r"\w", out):          # a point that was only a citation: nothing is left of it
+        out = ""
+    return out, out != s.strip()
 
 
 def _narr_key(s):
@@ -5456,9 +5605,10 @@ PAYSTACK_PLANS = {
     # 5.0 (the owner, 10 Nov 2026): Month = 100 points, 10 of them for research; Half year "stays 620" (his answer at
     # 10:05), 60 of them for research (six months of Month's 10); Year unchanged, with no research limit
     # (PASS_RESEARCH_POINTS)
-    "month": (16000, 30, 100),
-    "half": (48000, 182, 620),
-    "year": (120000, 365, 1560),
+    # 6.2 (the owner, 15 Nov 2026): every pass halved: Month 50, Half year 310, Year 780; prices unchanged
+    "month": (16000, 30, 50),
+    "half": (48000, 182, 310),
+    "year": (120000, 365, 780),
     # 4.1 to 4.6: no longer sold, kept so a pass bought then still applies
     "day": (2000, 1, 40),
     "week": (6000, 7, 150),
@@ -5543,8 +5693,9 @@ def _paystack_apply(reference, paid_amount, currency):
                     new_research = (max(0, int(cur_row.get("research_points") or 0)) if running else 0) + int(research)
                 cur.execute(
                     "UPDATE users SET plan = %s, plan_expires_at = GREATEST(COALESCE(plan_expires_at, now()), now(), %s::timestamptz) + make_interval(days => %s), "
-                    "plan_source = 'paystack', pass_points = pass_points + %s, research_points = %s WHERE id = %s",
-                    (new_plan, start, days, credits, new_research, pay["user_id"]))
+                    "plan_source = 'paystack', pass_points = pass_points + %s, research_points = %s, "
+                    "pass_points_given = GREATEST(CASE WHEN %s THEN COALESCE(pass_points_given, 0) ELSE 0 END + %s, COALESCE(pass_points, 0) + %s) WHERE id = %s",
+                    (new_plan, start, days, credits, new_research, running, credits, credits, pay["user_id"]))
                 if pay["plan"] in ("month", "half", "semester", "year", "monthly", "halfyear", "yearly") and _reward_referral(cur, pay["user_id"], pay.get("referral_code")):
                     cur.execute("UPDATE paystack_payments SET referral_applied = TRUE WHERE reference = %s", (reference,))
             elif credits:
@@ -6942,6 +7093,20 @@ def _is_pro(user):
     return (user or {}).get("plan") in PRO_PLANS
 
 
+def _special(row):
+    """6.2: Half year and Year (and the older Semester, half-year and yearly plans), or a Month pass that was running when
+    6.2 came (it keeps every lock open until it ends): the plans with the special features."""
+    try:
+        row = _with_promo(row)
+        plan = effective_plan(row)
+        if plan in SPECIAL_PLANS:
+            return True
+        until = row.get("all_open_until")
+        return bool(plan in PRO_PLANS and until and until > datetime.now(timezone.utc))
+    except Exception:
+        return False
+
+
 def _scholar_gate(user, feature, research=False):
     """A JSON answer (402) when a Scholar feature is asked for and the account can't have it now; None when it may go
     on. Research writing (research=True): as often as the points allow on Half a year and Year; on Free, Month and the
@@ -7170,11 +7335,15 @@ def _word_proofread(user, text, charged):
               "spelling, grammar, punctuation, wrong words, agreement, tense, capital letters, repeated words, and sentences that "
               "are unclear or too long. Reply with one JSON object only, no code fences: "
               '{"issues": [{"from": "<the exact words in TEXT to change, 1 to 12 words, copied exactly>", "to": "<the words to put '
-              'instead>", "why": "<one short plain reason, at most 12 words>", "kind": "spelling|grammar|punctuation|clarity|style"}], '
-              '"summary": "<one friendly sentence on how the writing reads overall>"}. '
+              'instead>", "why": "<one short plain reason, at most 12 words>", "kind": "spelling|grammar|punctuation|clarity|style", '
+              '"title": "<what the fix is, 2 to 5 words, e.g. Correct subject-verb agreement, Correct word choice, Add a comma>"}], '
+              '"summary": "<one friendly sentence on how the writing reads overall>", '
+              '"tone": [{"name": "<one word for how the writing sounds, e.g. Formal, Informative, Confident, Friendly, Worried>", '
+              '"level": <1 to 5: how strongly>}]}. '
               "Rules: from must appear in TEXT exactly once if possible (add a word of context to make it unique); never change "
               "names, quotations or facts; keep the writer's voice; at most 25 issues, the most important first; if TEXT is clean, "
-              "issues is an empty list and summary says so. Write why in the language of TEXT.")
+              "issues is an empty list and summary says so; tone has one to three entries, the strongest first. Write why, title and "
+              "the tone's names in the language of TEXT.")
     try:
         raw = call_claude(system, "TEXT:\n" + text[:12000], max_tokens=2400, feature="word-proofread")
     except ConversionError as e:
@@ -7192,8 +7361,20 @@ def _word_proofread(user, text, charged):
         if not frm or frm == to or frm not in text:
             continue
         issues.append({"from": frm[:300], "to": to[:300], "why": str(x.get("why") or "").strip()[:160],
-                       "kind": x.get("kind") if x.get("kind") in ("spelling", "grammar", "punctuation", "clarity", "style") else "grammar"})
-    return jsonify({"issues": issues, "summary": str(obj.get("summary") or "").strip()[:240]})
+                       "kind": x.get("kind") if x.get("kind") in ("spelling", "grammar", "punctuation", "clarity", "style") else "grammar",
+                       "title": re.sub(r"\s+", " ", str(x.get("title") or "")).strip().rstrip(".")[:60]})
+    # 6.2: how the writing sounds (the proofreader shows it as words with a small meter)
+    tone = []
+    for t in (obj.get("tone") if isinstance(obj.get("tone"), list) else [])[:3]:
+        if isinstance(t, dict):
+            name = re.sub(r"[^\w\s'-]", "", str(t.get("name") or "")).strip()[:24]
+            try:
+                level = max(1, min(5, int(t.get("level") or 0)))
+            except (TypeError, ValueError):
+                level = 0
+            if name and level:
+                tone.append({"name": name[:1].upper() + name[1:], "level": level})
+    return jsonify({"issues": issues, "summary": str(obj.get("summary") or "").strip()[:240], "tone": tone})
 
 
 @app.route("/api/word/ai", methods=["POST", "OPTIONS"])
@@ -7464,8 +7645,8 @@ def _summary_structure_prompt(audience):
             '  "references": every reference or citation that appears in the material, copied exactly as written there '
             "(with its web address \u2014 DOI or link \u2014 when the material gives one). Never invent, complete or add a reference; "
             "if the material cites nothing, return [].\n"
-            "When the material uses in-text citations such as (Mensah & Boateng, 2023), keep them at the end of the points "
-            "that use them, copied exactly.\n"
+            "No in-text citations on the points: when the material cites a source, such as (Mensah & Boateng, 2023) or [3], "
+            "write the point as a plain statement without it; the sources go on the References slide.\n"
             + SUMMARY_STRUCTURE[audience])
 
 
@@ -7512,6 +7693,20 @@ def _structure_summary(audience, obj, slides, presenters):
         out += plain("Discussion", questions, "numbered")
         out.append({"kind": "thanks", "header": "Thank you", "bullets": [], "icon": "", "chart": None, "is_cta": False})
     return title, out
+
+
+def _slides_without_citations(slides):
+    """6.2: a Summary deck's points without in-text citations (strip_slide_citations); a slide left with nothing goes."""
+    out = []
+    for sl in slides or []:
+        sl["bullets"] = [t for t in (strip_slide_citations(b)[0] for b in (sl.get("bullets") or [])) if t]
+        if sl.get("sections"):
+            for sec in sl["sections"]:
+                sec["points"] = [t for t in (strip_slide_citations(p)[0] for p in (sec.get("points") or [])) if t]
+            sl["sections"] = [sec for sec in sl["sections"] if sec.get("subheading") or sec.get("points")] or None
+        if sl.get("bullets") or sl.get("chart"):
+            out.append(sl)
+    return out or slides
 
 
 def _parse_summary_json(raw_text):
@@ -7927,6 +8122,26 @@ def _c34_put(sentence, mark):
     return sentence[:cut].rstrip() + " " + mark + sentence[cut:]
 
 
+# 6.2 (the owner, 15 Nov 2026 12:25: "Organize … to make it feel natural"): a research writing may open a part with one
+# line on what the part covers, and lead on to the next part. Such a line states nothing about the world, so it needs no
+# source: the check keeps it only when it says so AND it reads as one (names the piece or a part, a verb of what the part
+# does, no figure, no finding).
+_C34_SIGN = re.compile(r"\b(?:this|the next|the following|the last|the final|the present|each|the first|the second|the third|the remaining)\s+"
+                       r"(?:section|part|chapter|subsection|review|essay|paper|piece|report|discussion|sections|parts|chapters)\b", re.I)
+_C34_SIGN_VERB = re.compile(r"\b(?:looks?\s+at|turns?\s+to|moves?\s+(?:on\s+)?to|considers?|examines?|sets?\s+out|describes?|reviews?|"
+                            r"begins?\s+with|starts?\s+with|ends?\s+with|closes?\s+with|focus(?:es)?\s+on|returns?\s+to|brings?\s+(?:\w+\s+){0,3}together|"
+                            r"discuss(?:es)?|outlines?|explores?|is\s+organi[sz]ed|is\s+divided|introduces?|presents?|covers?)\b", re.I)
+_C34_SIGN_NOT = re.compile(r"\b(?:that|because|found|finds|shows?|showed|proves?|proved|caus(?:e|es|ed)|leads?\s+to|increas\w*|reduc\w*|"
+                           r"decreas\w*|associat\w*|linked|evidence|significant\w*|most|many|few|all|majority|percent)\b|%", re.I)
+
+
+def _c34_signpost(s):
+    t = re.sub(r"\([^()]*\)|\[[^\]]*\]", " ", str(s or ""))
+    t2 = re.sub(r"\b(?:section|chapter|part)\s+\d+(?:\.\d+)*", "", t, flags=re.I)
+    return bool(_C34_SIGN.search(t) and _C34_SIGN_VERB.search(t) and not _C34_SIGN_NOT.search(t) and not re.search(r"\d", t2)
+                and len(t.split()) <= 28)
+
+
 def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline):
     """Asks the AI, sentence by sentence, which listed evidence supports each one, or that none does.
     Returns {"skip": bool, "cite": {i: [ids]}, "drop": {i}} \u2014 or None when the check couldn't run."""
@@ -7944,6 +8159,11 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
         + (" These sentences are the points of a slide deck: a point that states no fact (it only names a topic or a "
            "heading, or is an activity, an instruction or a question for the audience) is answered {\"n\": 3, \"keep\": true}."
            if kind == "deck" else "")
+        + (" A sentence that states nothing about the world, because it only says what this piece or one of its parts covers "
+           "or leads on to the next part (for example \"This section looks at how sleep is measured.\" or \"The next part "
+           "turns to what students themselves report.\"), is answered {\"n\": 3, \"keep\": true}. A sentence that also "
+           "says what was found, what causes what, or how much is NOT such a sentence: it needs its evidence."
+           if kind == "writing" else "")
         + "\n\nEVIDENCE:\n" + "\n".join(evidence_lines))
     user = ("REQUEST:\n" + str(request_text or "")[:1500] + "\n\nSENTENCES:\n"
             + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
@@ -7971,7 +8191,7 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
         ids = [str(x).strip().upper() for x in (it.get("cite") or []) if str(x).strip()][:3]
         if ids and not it.get("drop"):
             out["cite"][i] = ids
-        elif it.get("keep") is True and kind == "deck":
+        elif it.get("keep") is True and (kind == "deck" or (kind == "writing" and _c34_signpost(sentences[i]))):
             out["keep"].add(i)
         else:
             out["drop"].add(i)
@@ -8165,6 +8385,8 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
 
     def decision(i):
         r = results[i // C34_CHUNK] if i // C34_CHUNK < n_chunks else None
+        if r is not None and kind == "writing" and (i % C34_CHUNK) in r.get("keep", set()):
+            return "keep"
         return None if r is None else set(r["cite"].get(i % C34_CHUNK, []))
 
     fixed = dropped = moved = unchecked = 0
@@ -8173,6 +8395,8 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
         sent = text[a:b]
         old = set(cited_ids(sent))
         new = decision(i)
+        if new == "keep":
+            continue                    # 6.2: a line on what a part covers, or a link to the next part: it stands as written
         if new is None:
             # no check looked at it: a cited sentence must still not give a figure its source doesn't, or copy it
             unchecked += 1
@@ -8208,7 +8432,7 @@ def _c34_enforce(kind, text, request_text, is_cited, evidence_lines, make_mark, 
             text = _c34_cut(text, a, b); dropped += 1
     text = _c34_tidy(text)
     need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
-    left = [s for s in need if not is_cited(text[s[0]:s[1]])]
+    left = [s for s in need if not is_cited(text[s[0]:s[1]]) and not (kind == "writing" and _c34_signpost(text[s[0]:s[1]]))]
     unsourced = 0
     if left:
         if not ran and not any_cited and allow_skip and kind != "writing":
@@ -8387,6 +8611,8 @@ def _c34_write_parts(sources):
         line = f"[S{i}] {s.get('citation_key', '')} {s.get('title', '')}"
         if s.get("abstract"):
             line += f" \u2014 {str(s['abstract'])[:600]}"
+        if s.get("paper_text"):            # 6.2: what the paper itself says (Half year and Year)
+            line += f" From the paper itself: {str(s['paper_text'])[:900]}"
         lines.append(line)
 
     def mark(ids):
@@ -8803,9 +9029,9 @@ def summarize_endpoint():
             max_tokens=max_tokens + (900 if audience else 0),
         )
         if not audience:
-            return jsonify({"slides": _parse_summary_json(result)})
+            return jsonify({"slides": _slides_without_citations(_parse_summary_json(result))})
         obj = _json_object(result)
-        slides = _parse_summary_json(json.dumps(obj.get("slides") or []))
+        slides = _slides_without_citations(_parse_summary_json(json.dumps(obj.get("slides") or [])))
         title, deck = _structure_summary(audience, obj, slides, presenters)
         return jsonify({"slides": deck, "title": title, "audience": audience})
     except ConversionError as e:
@@ -8848,7 +9074,8 @@ def _defence_reply(data, text):
             a, b = ja.result(timeout=150), jb.result(timeout=150)
         if a is None or b is None:
             raise ConversionError("RamzAI's reading of the work came back in a form it could not use. Please try again.")
-        title, kind, deck, gaps, asked, suggested = _defence.build(a, b, work, clean, presenters)
+        title, kind, deck, gaps, asked, suggested = _defence.build(a, b, work, clean, presenters,
+                                                                   strip=lambda t: strip_slide_citations(t)[0])
     except ValueError:
         _refund_sage_message(user, charged_from, POINTS_DECK)
         return jsonify({"error": DEFENCE_NOT_RESEARCH + AI_MSG_NOT_COUNTED, "not_research": True}), 422
@@ -9337,6 +9564,268 @@ def _open_word_sweeper():
 
 if DATABASE_URL and not os.environ.get("AH_NO_SWEEPER"):
     _threading.Thread(target=_open_word_sweeper, name="open-word-sweeper", daemon=True).start()
+
+
+# ======================= 6.2: Keep on every device (Half year and Year) =======================
+# The owner, 15 Nov 2026 11:23 (his answer: "Kept on every device" is one of Half year's and Year's special features).
+# Only when the person turns it on (the Scholar page): copies of their RamzAI chats and research writing chats, what the
+# app keeps after a research (reports, defence slides, summaries) and their library's list of papers are kept in their
+# account, so another phone or computer signed in to the same account gets them too. Their own PDFs are not copied.
+# Turning it off deletes everything kept here at once; so does deleting the account (ON DELETE CASCADE). When Half year or
+# Year has ended, nothing new is kept, and what is here is deleted 90 days after the account was last seen with one
+# (users.kept_seen). The privacy notice says all of this. The server never reads what is kept: it keeps it as it came.
+KEPT_STORES = ("chats", "kept", "lib")
+KEPT_ITEM_MAX = 1_500_000          # characters of one item (its meta and its body)
+KEPT_USER_MAX = 40_000_000         # all of one account's
+KEPT_PULL_MAX = 120                # items in one answer
+KEPT_PULL_BYTES = 4_000_000        # and about this much of them (always at least one)
+KEPT_AFTER_DAYS = 90
+KEPT_GONE_DAYS = 60                # a deletion is remembered this long, so every device hears of it
+KEPT_OFF = "Keeping your work on every device comes with Scholar Half year and Year."
+
+
+def _sync_tables(cur):
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS kept_on BOOLEAN NOT NULL DEFAULT FALSE")
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS kept_seen TIMESTAMPTZ")
+    # when it was turned on: a device that kept a record from an earlier time it was on starts again from nothing
+    cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS kept_from TIMESTAMPTZ")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_kept (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            store TEXT NOT NULL,
+            key TEXT NOT NULL,
+            updated BIGINT NOT NULL,
+            gone BOOLEAN NOT NULL DEFAULT FALSE,
+            meta TEXT,
+            body TEXT,
+            size INTEGER NOT NULL DEFAULT 0,
+            changed TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (user_id, store, key)
+        )
+        """)
+    cur.execute("CREATE INDEX IF NOT EXISTS user_kept_changed ON user_kept (user_id, changed)")
+    # 6.2: Free writes only the first part of a work in manual research writing: which part that was, for each work
+    # (the work and the part as hashes of their words, not the words)
+    cur.execute("CREATE TABLE IF NOT EXISTS free_work (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, "
+                "work TEXT NOT NULL, part TEXT NOT NULL, at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (user_id, work))")
+
+
+def _kept_state(cur, user_id):
+    cur.execute("SELECT COUNT(*) FILTER (WHERE NOT gone) AS n, COALESCE(SUM(size), 0) AS bytes FROM user_kept WHERE user_id = %s", (user_id,))
+    r = cur.fetchone() or {}
+    return int(r.get("n") or 0), int(r.get("bytes") or 0)
+
+
+def _kept_row(user):
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user["id"],))
+            return cur.fetchone() or {}
+    finally:
+        conn.close()
+
+
+def _kept_seen(cur, row):
+    if _special(row):
+        cur.execute("UPDATE users SET kept_seen = now() WHERE id = %s", (row["id"],))
+
+
+@app.route("/api/kept", methods=["GET", "OPTIONS"])
+@limiter.limit("120 per hour", key_func=_account_or_ip_key)
+@auth_required
+def kept_status():
+    if request.method == "OPTIONS":
+        return "", 204
+    row = _kept_row(request.current_user)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            _kept_seen(cur, row)
+            n, size = _kept_state(cur, row["id"])
+    finally:
+        conn.close()
+    return jsonify({"special": _special(row), "on": bool(row.get("kept_on")), "items": n, "bytes": size, "max_bytes": KEPT_USER_MAX})
+
+
+@app.route("/api/kept/switch", methods=["POST", "OPTIONS"])
+@limiter.limit("30 per hour", key_func=_account_or_ip_key)
+@auth_required
+def kept_switch():
+    if request.method == "OPTIONS":
+        return "", 204
+    on = bool((request.get_json(silent=True) or {}).get("on"))
+    row = _kept_row(request.current_user)
+    if on and not _special(row):
+        return jsonify({"error": KEPT_OFF, "special": False}), 402
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET kept_on = %s, kept_from = CASE WHEN NOT %s THEN NULL WHEN kept_on AND kept_from IS NOT NULL "
+                        "THEN kept_from ELSE clock_timestamp() END WHERE id = %s", (on, on, row["id"]))
+            if not on:
+                cur.execute("DELETE FROM user_kept WHERE user_id = %s", (row["id"],))
+            _kept_seen(cur, row)
+            n, size = _kept_state(cur, row["id"])
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"special": _special(row), "on": on, "items": n, "bytes": size, "max_bytes": KEPT_USER_MAX})
+
+
+@app.route("/api/kept/push", methods=["POST", "OPTIONS"])
+@limiter.limit("240 per hour", key_func=_account_or_ip_key)
+@auth_required
+def kept_push():
+    """Items from a device: {"items": [{"store", "key", "updated", "gone", "meta", "body"}]}. An item replaces what is kept
+    for it only when it is as new or newer (its own time, set by the device that changed it)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    row = _kept_row(request.current_user)
+    if not _special(row):
+        return jsonify({"error": KEPT_OFF, "special": False}), 402
+    if not row.get("kept_on"):
+        return jsonify({"error": "Turn on Keep on every device first.", "on": False}), 409
+    items = (request.get_json(silent=True) or {}).get("items")
+    if not isinstance(items, list) or len(items) > 40:
+        return jsonify({"error": "Nothing to keep."}), 400
+    saved, refused, newer, full = [], [], [], False
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            _, used = _kept_state(cur, row["id"])
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                store, key = str(it.get("store") or ""), str(it.get("key") or "")[:300]
+                try:
+                    updated = int(it.get("updated") or 0)
+                except (TypeError, ValueError):
+                    updated = 0
+                if store not in KEPT_STORES or not key or updated <= 0:
+                    continue
+                gone = bool(it.get("gone"))
+                meta = None if gone else json.dumps(it.get("meta"), ensure_ascii=False, separators=(",", ":"))
+                body = None if gone else json.dumps(it.get("body"), ensure_ascii=False, separators=(",", ":"))
+                size = (len(meta) if meta else 0) + (len(body) if body else 0)
+                if size > KEPT_ITEM_MAX:
+                    refused.append({"store": store, "key": key, "why": "big"})
+                    continue
+                cur.execute("SELECT size FROM user_kept WHERE user_id = %s AND store = %s AND key = %s", (row["id"], store, key))
+                had = cur.fetchone()
+                had = int(had["size"]) if had else 0
+                if not gone and used - had + size > KEPT_USER_MAX:
+                    refused.append({"store": store, "key": key, "why": "full"})
+                    full = True
+                    continue
+                cur.execute(
+                    "INSERT INTO user_kept (user_id, store, key, updated, gone, meta, body, size, changed) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, clock_timestamp()) "
+                    "ON CONFLICT (user_id, store, key) DO UPDATE SET updated = EXCLUDED.updated, gone = EXCLUDED.gone, "
+                    "meta = EXCLUDED.meta, body = EXCLUDED.body, size = EXCLUDED.size, changed = clock_timestamp() "
+                    "WHERE user_kept.updated <= EXCLUDED.updated RETURNING 1",
+                    (row["id"], store, key, updated, gone, meta, body, size))
+                if cur.fetchone():
+                    saved.append({"store": store, "key": key})
+                    used += size - had
+                else:
+                    # the account holds a newer one (changed on another device since): it goes back, and wins
+                    cur.execute("SELECT store, key, updated, gone, meta, body FROM user_kept WHERE user_id = %s AND store = %s AND key = %s",
+                                (row["id"], store, key))
+                    r = cur.fetchone()
+                    if r and len(newer) < 10:
+                        newer.append({"store": r["store"], "key": r["key"], "updated": int(r["updated"]), "gone": bool(r["gone"]),
+                                      "meta": r["meta"], "body": r["body"]})
+            _kept_seen(cur, row)
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"saved": saved, "refused": refused, "newer": newer, "full": full})
+
+
+@app.route("/api/kept/pull", methods=["GET", "OPTIONS"])
+@limiter.limit("240 per hour", key_func=_account_or_ip_key)
+@auth_required
+def kept_pull():
+    """What changed in the account since a time this server gave before (the first time: everything), oldest first.
+    The first page of a round looks five seconds further back (a change saved at the same moment as the last answer is
+    not missed; a device takes an item only when it is newer than its own, so one seen twice changes nothing)."""
+    if request.method == "OPTIONS":
+        return "", 204
+    row = _kept_row(request.current_user)
+    if not row.get("kept_on"):
+        return jsonify({"on": False, "items": [], "more": False, "now": None})
+    since = str(request.args.get("since") or "")[:40].strip().replace(" ", "+")     # a "+" not escaped in the address
+    try:
+        since_t = datetime.fromisoformat(since.replace("Z", "+00:00")) if since else None
+    except ValueError:
+        since_t = None
+    if since_t and since_t.tzinfo is None:
+        since_t = since_t.replace(tzinfo=timezone.utc)
+    if since_t and request.args.get("first") == "1":
+        since_t = since_t - timedelta(seconds=5)
+    low = since_t or datetime(2000, 1, 1, tzinfo=timezone.utc)
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT size, changed FROM user_kept WHERE user_id = %s AND changed > %s ORDER BY changed LIMIT %s",
+                        (row["id"], low, KEPT_PULL_MAX + 1))
+            heads = cur.fetchall()
+            take, total = 0, 0
+            for h in heads[:KEPT_PULL_MAX]:
+                if take and total + int(h["size"] or 0) > KEPT_PULL_BYTES:
+                    break
+                take += 1
+                total += int(h["size"] or 0)
+            more = len(heads) > take
+            rows = []
+            if take:
+                top = heads[take - 1]["changed"]
+                cur.execute("SELECT store, key, updated, gone, meta, body, changed FROM user_kept WHERE user_id = %s AND changed > %s "
+                            "AND changed <= %s ORDER BY changed", (row["id"], low, top))
+                rows = cur.fetchall()
+            _kept_seen(cur, row)
+    finally:
+        conn.close()
+    out = [{"store": r["store"], "key": r["key"], "updated": int(r["updated"]), "gone": bool(r["gone"]),
+            "meta": r["meta"], "body": r["body"]} for r in rows]
+    last = rows[-1]["changed"].isoformat() if rows else (since or None)
+    epoch = row.get("kept_from")
+    return jsonify({"on": True, "items": out, "more": more, "now": last, "epoch": epoch.isoformat() if epoch else "",
+                    "special": _special(row)})
+
+
+def _kept_sweep():
+    """Hourly: a deletion is remembered KEPT_GONE_DAYS (every device hears of it), then forgotten. An account whose Half
+    year or Year has ended loses what was kept KEPT_AFTER_DAYS after it was last seen with one, and the switch goes off."""
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM user_kept WHERE gone AND changed < now() - interval '{KEPT_GONE_DAYS} days'")
+                cur.execute(f"SELECT u.* FROM users u WHERE (u.kept_seen IS NULL OR u.kept_seen < now() - interval '{KEPT_AFTER_DAYS} days') "
+                            "AND EXISTS (SELECT 1 FROM user_kept k WHERE k.user_id = u.id) LIMIT 500")
+                for row in cur.fetchall():
+                    if _special(row):
+                        cur.execute("UPDATE users SET kept_seen = now() WHERE id = %s", (row["id"],))
+                    else:
+                        cur.execute("DELETE FROM user_kept WHERE user_id = %s", (row["id"],))
+                        cur.execute("UPDATE users SET kept_on = FALSE, kept_from = NULL WHERE id = %s", (row["id"],))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Keep on every device: couldn't tidy what is kept: {e.__class__.__name__}")
+
+
+def _kept_sweeper():
+    while True:
+        time.sleep(3600)
+        _kept_sweep()
+
+
+if DATABASE_URL and not os.environ.get("AH_NO_SWEEPER"):
+    _threading.Thread(target=_kept_sweeper, name="kept-sweeper", daemon=True).start()
 
 
 @app.route("/api/open-word", methods=["POST", "OPTIONS"])
@@ -9835,6 +10324,7 @@ def split_memory_note(text):
 
 # 5.0: how long a piece may be, how much one answer holds, and the line that says "there is more to come"
 WRITE_MAX_WORDS = 12000
+WRITE_FIGURE_PAPERS = 4         # 6.2: papers added by the search for the world's and the place's figures
 WRITE_ONE_WORDS = 3000          # up to here a piece is one answer, as before 5.0
 WRITE_PART_WORDS = 2400
 WRITE_MORE_MARK = "\u27e6more\u27e7"
@@ -9884,7 +10374,13 @@ PROPOSAL_CITED_RULES = (
     "'Mensah et al. (2021) found…', using the same key's names and year). Write no sentence you can't cite: leave it out "
     "instead, and keep each paragraph only as long as the sources support. Never copy a run of words from an abstract. Never "
     "write a placeholder in place of a citation. No bullet points, no bold or italic marks, no heading other than the markers "
-    "asked for, no reference list (it is made separately).")
+    "asked for, no reference list (it is made separately)."
+    # 6.2 (the owner, 15 Nov 2026 12:25): "make it feel natural and human … a little group of statements … (eg. In Ghana a
+    # researcher find out that…)": a small group of studies is introduced in plain words, naming where or who, and cited
+    " To make it read naturally, introduce a small group of studies in plain words, often naming where or who, as a "
+    "narrative citation that carries its own key: 'In Ghana, Mensah (2021) found that…', 'Two studies from Nigeria point "
+    "the same way…', 'Not every study agrees: …'. Vary how sentences begin and how long they are, and avoid stock phrases "
+    "('It is important to note that', 'plays a crucial role', 'delve', 'in today's world').")
 
 
 def _prop_prev(previous_refs, cite_plan):
@@ -9910,7 +10406,7 @@ def _prop_prev(previous_refs, cite_plan):
     return prev, given
 
 
-def _prop_sources(prev, found, style, cap):
+def _prop_sources(prev, found, style, cap, read_topic=None):
     """One list for a part: the earlier parts' papers first (their keys kept), then the papers found now that are new and
     can't be mistaken for an earlier one (a new paper by the same first author in the same year would need the earlier
     citations changed, so it is left out). Returns (sources, how many of them the part may write from)."""
@@ -9933,6 +10429,8 @@ def _prop_sources(prev, found, style, cap):
             continue
         fresh.append(c)
     fresh = enrich_sources(fresh[:max(0, cap - live)], style)
+    if read_topic:                          # 6.2: Half year and Year: the papers themselves
+        read_papers_for_writing(fresh, read_topic, seconds=14)
     return prev + fresh, live + len(fresh)
 
 
@@ -10012,9 +10510,12 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
     outline2 = _prop.clean_outline(spec.get("outline2"), plan) if key != "ch1" else None
     title = plan.get("title") or ""
 
+    strong = _special(request.current_user)        # 6.2: Half year and Year write with RamzAI's strongest model
+
     def ask(system, user, max_tokens, feature, timeout=100):
         return _write_more(str(call_claude(system_prompt=system + house, user_message=user, max_tokens=max_tokens, use_search=False,
-                                           timeout=timeout, feature=feature) or "").strip())[0]
+                                           timeout=timeout, feature=feature, model=ANTHROPIC_MODEL_STRONG if strong else None,
+                                           no_think=strong) or "").strip())[0]
 
     def plan_part(raw, system, wanted, feature, extra_text=""):
         """A plan part's sections; any that didn't come are asked for once more, alone, while there is time."""
@@ -10040,7 +10541,7 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
             if place and not any(place.lower() in q.lower() for q, _ in queries):
                 queries.append((f"{wide} {place}", False))
         found, diag = _prop_find(find_raw, queries, 10 if depth == "short" else 12)
-        sources, usable = _prop_sources(prev, found, style, pool_n)
+        sources, usable = _prop_sources(prev, found, style, pool_n, read_topic=(title or None) if strong else None)
         if not usable:
             raise ConversionError("RamzAI found no papers it can open for this topic, so it can’t write the background honestly. "
                                   "Try wording the topic a little differently, or allow older papers. Nothing was taken.")
@@ -10052,7 +10553,10 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
             f"⟦background⟧ Background of the Study: {D['bg']} paragraphs of five or six sentences each, as a funnel from the widest "
             "view to the narrowest: " + ", then ".join(where) + ". Use each source for the level its own study was done at "
             "(its title or abstract says where); when no source speaks to a level, leave that level out. Start with what the "
-            "subject is and how common or serious it is; end with what the sources show closest to the study's setting.\n"
+            "subject is and how common or serious it is; end with what the sources show closest to the study's setting. "
+            # 6.2 (the owner, 15 Nov 2026 12:46): prevalence and statistics, the world first (about two paragraphs), then down
+            "Give prevalence, rates and other figures exactly as the sources give them at each level: about two paragraphs "
+            "on the world first, then down to the place.\n"
             f"⟦problem⟧ Problem Statement: {D['problem']} paragraph{'s' if D['problem'] > 1 else ''} of five or six sentences each: how large and "
             "how serious the problem is for the people in the study, with the sources' own figures, and what has and has not been "
             "examined in the listed studies. Do not state the aim of the study and do not claim a gap in general: that sentence is "
@@ -10097,7 +10601,7 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
         mine = _prop.share_themes(outline2, plan, key)
         first, last = key == "ch2-1", key == "ch2-%d" % D["ch2_parts"]
         found, diag = _prop_find(find_raw, [(t["q"], False) for t in mine] or [(title, True)], 6 if len(mine) > 3 else 8)
-        sources, usable = _prop_sources(prev, found, style, pool_n)
+        sources, usable = _prop_sources(prev, found, style, pool_n, read_topic=(title or None) if strong else None)
         if not usable and not any(s.get("abstract") for s in sources):
             raise ConversionError("RamzAI found no papers it can open for this part of the literature. Try again in a moment, "
                                   "or allow older papers. Nothing was taken.")
@@ -10112,7 +10616,9 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
                 "so it carries no citation.\n") if first else "")
             + marks + f"\nEach numbered section: {P} paragraph{'s' if P > 1 else ''} of five or six sentences, reviewing what the "
             "listed studies found on that theme: what was studied, where, among whom, and the result, comparing studies that "
-            "agree and those that differ. Keep to the theme; a study belongs where its findings fit."
+            "agree and those that differ. Keep to the theme; a study belongs where its findings fit. Where the studies give "
+            "prevalence, rates or other figures, report them exactly as given, from studies done worldwide down to those done "
+            "closest to the study's own setting."
             + ("\n⟦summary⟧ Summary of the Literature: one paragraph of five or six sentences that draws together what the "
                "reviewed studies show, each sentence citing the sources it draws on. Do not claim a gap and do not state the "
                "study's aim: that is added separately." if last else "")
@@ -10221,6 +10727,124 @@ WRITE_TABLE_RULE = ("\n\nTABLES: use a table only where it truly helps (studies 
                     "needed, starts with \"Note.\"")
 
 
+# 6.2 (the owner, 15 Nov 2026 12:25 and his answers): "every statement should be cited, and it still stands. But it doesn't
+# feel natural so you add something short not for statement but a little group of statements that are suitable for a
+# little highlights (eg. In Ghana a researcher find out that…). Please make it feel natural and human." And: organise the
+# research writing (a short lead-in to each part, links between the parts). Good academic prose, not a list of findings.
+WRITE_NATURAL_RULE = (
+    "\n\nWRITE IT SO IT READS NATURALLY, AS A CAREFUL STUDENT WOULD, AND KEEP IT ORGANISED:\n"
+    "- Open each part with one short sentence on what the part covers (it states no finding and needs no citation), "
+    "for example \"This section looks at how late phone use affects sleep.\"\n"
+    "- Inside a part, gather the studies into small groups by what they found. Introduce a group in plain words, often "
+    "naming where or who, as a narrative citation: \"In Ghana, Mensah (2021) found that…\", \"Two studies from Nigeria "
+    "point the same way (Okoro, 2020; Adeyemi, 2022).\", \"Not every study agrees: Haddad (2024) found…\". Such a line "
+    "carries its citation like every other statement, and says only what its sources say, place included.\n"
+    "- Where it helps the reader, close a part with one sentence that leads on to the next part (\"The next section "
+    "turns to …\"); it states no finding.\n"
+    "- Vary how sentences begin and how long they are. Avoid stock phrases (\"It is important to note that\", "
+    "\"Furthermore,\" or \"Moreover,\" opening sentence after sentence, \"delve\", \"in today's world\", \"plays a "
+    "crucial role\"). Plain, clear words; no padding.\n"
+    "- Every statement about the world still carries its citation; nothing is invented.")
+
+# 6.2 (the owner, 15 Nov 2026 12:46): "in the research don't forget to add prevalence, statistics, and other related
+# information. Always write them in the manner of providing information from the world wide aspect (about two paragraphs),
+# and coming down to the locality of where the person is conducting the research. This shouldn't be restrictive any way
+# (and this can be applied to the introduction and the literature review)." Figures only as the cited papers give them.
+def write_figures_rule(place=""):
+    place = re.sub(r"\s+", " ", str(place or "")).strip(" .")[:80]
+    return ("\n\nFIGURES, FROM THE WORLD DOWN TO THE PLACE: in the introduction or background, and in a literature review, give the "
+            "prevalence, rates, numbers and other figures that fit the topic, whatever its field (how common, how many, how much, how "
+            "it has changed), exactly as the listed sources give them, each with its citation. Begin with the world: about two "
+            "paragraphs on the picture worldwide. Then come down step by step to the continent or region, the country, and the place "
+            "where the research is done" + (" (" + place + ")" if place else "") + ". Use only figures the listed sources give; where no "
+            "source gives a figure for a level, say what the sources do show there, without a number, and never invent one. A topic "
+            "that has no such figures needs none, and the rest of the piece is not held back by this.")
+
+
+# 6.2 (the owner, 15 Nov 2026 11:42): "The free 5 points per month should not be able to complete a full research work."
+# His answer: on Free, RamzAI writes the plan and the first part of any research work (automatic and manual research
+# writing, a proposal); the rest of that same work opens with Scholar. Research a question stays on Free.
+FREE_PART_WORDS = 500
+FREE_PLAN_MARK = "\u27e6plan\u27e7"
+_FREE_PLAN = re.compile(r"\s*\u27e6\s*plan\s*\u27e7\s*", re.I)
+FREE_REST = "On Free, RamzAI writes the plan and the first part of a research work. The rest of this work is written with Scholar."
+FREE_PART_RULE = (
+    "\n\nTHIS PERSON IS ON FREE, WHICH WRITES ONLY THE BEGINNING OF A RESEARCH WORK. Plan the whole piece first (its "
+    "sections, in order). Then write its title line, if it has one, and only its FIRST section, whole, in at most about "
+    f"{FREE_PART_WORDS} words, with its citations, ending at the end of that section. Write no later section, no conclusion, "
+    "and no sentence about what the later sections will say. After that section write the line "
+    f"{FREE_PLAN_MARK} and then the heading of every LATER section, one per line, as it would stand in the piece, and nothing "
+    "after them.")
+
+
+def _free_part(user):
+    """6.2: on Free, research writing writes only the beginning of a work."""
+    try:
+        return effective_plan(_with_promo(user)) == "free"
+    except Exception:
+        return False
+
+
+def _free_work_key(topic, sub):
+    norm = lambda t: re.sub(r"[^\w]+", " ", str(t or "").lower()).strip()
+    return hashlib.sha256(norm(topic).encode()).hexdigest()[:24], hashlib.sha256(norm(sub).encode()).hexdigest()[:24]
+
+
+def _free_work_check(user, topic, sub):
+    """Manual research writing on Free: (work, part) when this part may be written: the work's first part, or that same
+    part again; False when the work already had another part written on Free; None when it can't be told (no database)."""
+    work, part = _free_work_key(topic, sub)
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT part FROM free_work WHERE user_id = %s AND work = %s", (user["id"], work))
+                r = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if r and r["part"] != part:
+        return False
+    return (work, part)
+
+
+def _free_work_note(user, wp):
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO free_work (user_id, work, part) VALUES (%s, %s, %s) ON CONFLICT (user_id, work) DO NOTHING",
+                            (user["id"], wp[0], wp[1]))
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _free_rest_reply(feature="The rest of this research work"):
+    return jsonify({"error": FREE_REST, "scholar_needed": True, "free_rest": True, "feature": feature}), 402
+
+
+def _free_follow(history):
+    """A message after a piece was written, in the same chat: the rest of that work, or changes to it. (A piece written
+    is long; a question RamzAI asked before writing is short.)"""
+    return any(isinstance(h, dict) and h.get("role") == "assistant" and len(str(h.get("content") or "")) > 1200 for h in history or [])
+
+
+def _free_plan_split(text):
+    """(the text before the plan line, [the headings of the later sections])."""
+    if not text or not _FREE_PLAN.search(text):
+        return text, []
+    before, after = _FREE_PLAN.split(text, maxsplit=1)
+    rest = []
+    for line in after.splitlines():
+        h = re.sub(r"^\s*(?:#{1,6}\s*|[-*\u2022]\s+)", "", line).strip().strip("*_ ").strip()
+        if h and len(h) <= 140 and h.lower() not in ("references", "reference list", "bibliography"):
+            rest.append(h)
+    return before.strip(), rest[:16]
+
+
 @app.route("/api/write", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -10268,6 +10892,16 @@ def write_endpoint():
     gate = _scholar_gate(request.current_user, "Automatic research writing", research=True)
     if gate:
         return gate
+    # 6.2: on Free, only the beginning of a work: its first part (a proposal: its first part too)
+    free_part = _free_part(request.current_user)
+    if free_part:
+        if data.get("continue_previous") or _free_follow(history):
+            return _free_rest_reply()
+        if proposal_plan is not None:
+            _keys = [p["key"] for p in _prop.parts(proposal_plan)]
+            _part = str((data.get("proposal") or {}).get("part") or "ch1")
+            if _keys and _part != _keys[0]:
+                return _free_rest_reply("The rest of this proposal")
     try:
         charged_from = _log_sage_message_and_consume(request.current_user, POINTS_WRITE, research=True)
     except ConversionError as e:
@@ -10305,18 +10939,52 @@ def write_endpoint():
     length_words = max(150, min(WRITE_MAX_WORDS, length_words)) if length_words > 0 else 0
     n_sources = 8 if length_words <= 1500 else 12 if length_words <= 3000 else 16 if length_words <= 6000 else 20
 
-    def _find(text, n=None, topic=True):
+    def _find(text, n=None, topic=True, figures=False):
         """Real, downloadable papers for this request, cited in the chosen style — from the years the person asked
         for, others added (with a note) when too few came up."""
-        papers, diag = _find_raw(text, n, topic)
-        return enrich_sources(papers, style), diag
+        papers, diag = _find_raw(text, n, topic, figures)
+        found = enrich_sources(papers, style)
+        if strong:                           # 6.2: Half year and Year: the papers themselves (set below, before any search)
+            got = read_papers_for_writing(found, text)
+            if got:
+                said = f"RamzAI read {got} of these papers in full, not only their abstracts."
+                if said not in note["text"]:
+                    note["text"] = (note["text"] + " " if note["text"] else "") + said
+        return found, diag
 
-    def _find_raw(text, n=None, topic=True):
+    def _figures_more(text, have):
+        """6.2: papers that give the figures, the world's and the place's (two more searches side by side), not already found."""
+        qs = [text + " prevalence worldwide"]
+        try:
+            if write_place and write_place.lower() not in text.lower():
+                qs.append(text + " " + write_place)
+        except NameError:
+            pass
+        got = []
+        def one(q):
+            try:
+                ps, _ = search_papers(q, max_results=6, since=since, kinds=kinds, **({"until": until} if until else {}))
+                return [p for p in ps if (p.get("kind") or "article") in kinds]
+            except Exception:
+                return []
+        with _futures.ThreadPoolExecutor(max_workers=2) as pool:
+            for ps in pool.map(one, qs):
+                for p in ps:
+                    if p.get("url") and p["url"] not in have and p["url"] not in {x.get("url") for x in got}:
+                        got.append(p)
+        return got[:WRITE_FIGURE_PAPERS]
+
+    def _find_raw(text, n=None, topic=True, figures=False):
         """The same papers before they are given their citations (5.4: a proposal joins several searches into one list)."""
         n = n or n_sources
         look = paper_topic_search if topic else search_papers
         papers, diag = look(text, max_results=n, since=since, kinds=kinds, **({"until": until} if until else {}))
         papers = [p for p in papers if (p.get("kind") or "article") in kinds]
+        if figures and papers:
+            try:
+                papers = papers + _figures_more(text, {p.get("url") for p in papers})
+            except Exception as e:
+                logger.info(f"Research writing: the search for figures didn't add papers ({e.__class__.__name__})")
         if (since or until) and len(papers) < 3 and diag != "not a topic":
             older, _ = look(text, max_results=n, kinds=kinds)
             older = [p for p in older if (p.get("kind") or "article") in kinds]
@@ -10352,12 +11020,18 @@ def write_endpoint():
     extra += language_rule(data.get("language"))
     # 5.9: a table titled as the Word file and the app read it (the title right over the table, a note under it)
     extra += WRITE_TABLE_RULE
+    extra += WRITE_NATURAL_RULE         # 6.2: organised, and natural to read (every statement still cited)
+    _focus = re.search(r"Focus on:\s*([^\n.]{2,80})", reqs or "")
+    write_place = _focus.group(1).strip() if _focus else ""
+    extra += write_figures_rule(write_place)          # 6.2: prevalence and figures, from the world to the place
     kinds_more = re.sub(r"\s+", " ", str(data.get("kinds_more") or "")).strip()[:200]
     if kinds_more:
         extra += ("\n\nTHE PERSON ALSO ASKED FOR THESE KINDS OF SOURCES: " + kinds_more + ". Use any of the listed sources that are of "
                   "those kinds; never claim a source is of a kind it isn't.")
     extra_fixed = extra
-    if length_words and length_words <= WRITE_ONE_WORDS:
+    if free_part and proposal_plan is None:
+        extra += FREE_PART_RULE
+    elif length_words and length_words <= WRITE_ONE_WORDS:
         extra += (f"\n\nLENGTH: write about {length_words} words in total (within 10%), not counting the reference list. "
                   "If the piece needs more room than one answer allows, stop at a natural break \u2014 it will be continued.")
     elif length_words:
@@ -10374,6 +11048,8 @@ def write_endpoint():
         try:
             out = _proposal_write(data, proposal_plan, style, cite_plan, CS, _find_raw, note, started)
             _research_note(request.current_user, proposal_plan, out)        # 5.7: RamzAI remembers the research
+            if free_part and isinstance(out, dict):     # 6.2: on Free, the parts still to write are the plan of the rest
+                out["free_part"] = {"rest": [p["label"] for p in _prop.parts(proposal_plan)[1:]], "words": None}
             return jsonify(out)
         except ConversionError as e:
             _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
@@ -10387,12 +11063,16 @@ def write_endpoint():
             return jsonify({"error": "RamzAI couldn’t write this part just now. Please try again; nothing was taken."}), 502
     _call_claude = globals()["call_claude"]
 
+    strong = _special(request.current_user)        # 6.2: Half year and Year write with RamzAI's strongest model
+
     def call_claude(*args, **kw):
         if extra:
             if "system_prompt" in kw:
                 kw["system_prompt"] = kw["system_prompt"] + extra
             elif args:
                 args = (args[0] + extra,) + tuple(args[1:])
+        if strong and not kw.get("model") and not kw.get("use_search"):
+            kw["model"], kw["no_think"] = ANTHROPIC_MODEL_STRONG, True
         return _call_claude(*args, **kw)
 
     # Continuation of a truncated previous answer — a distinct, simpler path:
@@ -10502,6 +11182,10 @@ def write_endpoint():
             # Outline mode: e.g. "5.1 Discussion / 5.1.1 General Awareness / 5.1.2 ..."
             # Cap section count so one request can't run unbounded.
             outline = outline[:14]
+            free_rest = None
+            if free_part:                         # 6.2: Free writes the first section; the others are the plan
+                free_rest = [((s.get("number") or "") + " " + (s.get("heading") or "")).strip() for s in outline[1:]]
+                outline = outline[:1]
             combined_headings = "; ".join(s["heading"] for s in outline)
             if length_words > WRITE_ONE_WORDS:
                 extra = extra_fixed          # an outline is written section by section: the "in parts" rule isn't for it
@@ -10567,6 +11251,7 @@ def write_endpoint():
                 ],
                 "references": build_references_list(sources, cited_all), "references_title": CS["heading"], "source_note": note["text"], "style": style,
                 "title": next((s["heading"] for s in outline if s.get("level", 1) <= 1 and s.get("heading")), None),
+                **({"free_part": {"rest": free_rest, "words": FREE_PART_WORDS}} if free_part else {}),
             }, sources, cited_all, cite_plan, language=data.get("language")))
 
         # Chat mode (history present) and simple mode (first message, no history
@@ -10592,7 +11277,7 @@ def write_endpoint():
                 prior_user = next((t["content"] for t in reversed(history) if t["role"] == "user"), "")
                 if prior_user:
                     search_query = f"{prior_user} {topic}"
-            sources, search_diag = _find(search_query)
+            sources, search_diag = _find(search_query, figures=True)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -10629,7 +11314,7 @@ def write_endpoint():
 
                 )
         else:
-            sources, search_diag2 = _find(topic)
+            sources, search_diag2 = _find(topic, figures=True)
 
             if sources:
                 sources_block = build_sources_block(sources)
@@ -10673,7 +11358,7 @@ def write_endpoint():
             return_meta=True,
         )
         raw_text, more_to_come = _write_more(result["text"].strip())
-        truncated = result["stop_reason"] == "max_tokens" or more_to_come
+        truncated = (result["stop_reason"] == "max_tokens" or more_to_come) and not free_part
 
         thinking, after_thinking = split_thinking(raw_text)
         is_clarify, text = split_clarify(after_thinking)
@@ -10693,6 +11378,11 @@ def write_endpoint():
         if is_clarify:
             return jsonify({"type": "clarify", "text": text, "thinking": thinking, "noted": noted, **({"memory_full": True} if memory_full else {})})
 
+        free_rest = None
+        if free_part:                             # 6.2: the plan of the rest comes out of the words, as a list
+            text, free_rest = _free_plan_split(text)
+            text = _FREE_PLAN.sub("\n\n", text).strip()
+
         text, cited = keep_known_citations(text, sources, style)
         text, cited = _c34_write(text, sources, style, topic, note, started)
         if cite_plan and cite_plan["marks"]:
@@ -10704,6 +11394,7 @@ def write_endpoint():
             "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
             "title": _topic_title(topic) if not attachment else None,
             "truncated": truncated, "noted": noted, **({"memory_full": True} if memory_full else {}),
+            **({"free_part": {"rest": free_rest or [], "words": FREE_PART_WORDS}} if free_part else {}),
         }, sources, cited, cite_plan, language=data.get("language")))
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
@@ -10829,6 +11520,15 @@ def guide_statements():
     gate = _scholar_gate(request.current_user, "Manual research writing", research=True)
     if gate:
         return gate
+    # 6.2: on Free, manual research writing gives the plan and the statements of its first part, once: more statements
+    # (exclude holds the papers already offered) or another part of the same work need Scholar
+    free_work = None
+    if _free_part(request.current_user):
+        if exclude:
+            return _free_rest_reply()
+        free_work = _free_work_check(request.current_user, topic or sub, sub)
+        if free_work is False:
+            return _free_rest_reply()
     query = f"{topic} {sub}".strip() if sub and topic and sub.lower() not in topic.lower() else (sub or topic)
     papers, diag = search_papers(query, max_results=GUIDE_PAPERS, since=since, kinds=kinds, **until_kw)
     papers = [p for p in papers if (p.get("kind") or "article") in kinds]
@@ -10850,10 +11550,14 @@ def guide_statements():
         return jsonify({"error": "The papers found for that are by authors already cited in your page. Try other words, or a wider topic.",
                         "no_papers": True}), 404
     sources = enrich_sources(picked, style)
+    if _special(request.current_user):        # 6.2: Half year and Year: the papers themselves
+        read_papers_for_writing(sources, sub or topic, seconds=14)
     try:
         charged_from = _log_sage_message_and_consume(request.current_user, POINTS_RESEARCH, research=True)
     except ConversionError as e:
         return _points_reply(e)
+    if free_work:
+        _free_work_note(request.current_user, free_work)
     heading = sub or topic
     system = ("You help a researcher write, one evidence-based statement at a time. You are given real papers, each with a "
               "number, its citation key and its abstract. Reply with one JSON object only, no code fences: "
@@ -10873,7 +11577,9 @@ def guide_statements():
                      + (f"\n    Abstract: {src['abstract'][:900]}" if src.get("abstract") else ""))
     user = f"Heading: {heading}" + (f"\nMain topic: {topic}" if topic and sub else "") + "\n\nPapers:\n" + "\n".join(lines)
     try:
-        raw = call_claude(system, user, max_tokens=3200, timeout=120, feature="guide")
+        strong = _special(request.current_user)    # 6.2: Half year and Year: RamzAI's strongest model
+        raw = call_claude(system, user, max_tokens=3200, timeout=120, feature="guide",
+                          model=ANTHROPIC_MODEL_STRONG if strong else None, no_think=strong)
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
         return jsonify({"error": str(e)}), 502
@@ -13410,7 +14116,7 @@ def write_export_docx_endpoint():
                  "extras": extras,
                  # the institution's logo for the cover: sent with this request alone, made safe, printed, not kept
                  "logo": _prop.clean_logo(spec.get("logo")),
-                 "complete": bool(spec.get("complete")), "date": _prop.today_words(),
+                 "complete": bool(spec.get("complete")), "date": _prop.today_words(), "notes": data.get("notes") is True,
                  "marks": data.get("cite_marks") if data.get("cite_marks") in NUM_MARKS + ("ieee",) else None,
                  "look": data.get("look") if isinstance(data.get("look"), dict) else None, "style": str(data.get("style") or "apa")[:20]},
                 work_dir)
@@ -13425,7 +14131,9 @@ def write_export_docx_endpoint():
              "front": data.get("front") if isinstance(data.get("front"), dict) else None,      # 5.0: the title page
              # 5.5: what the writing is ("answer" and "notes" are set out as notes; a "report" and "writing" as a paper;
              # an app from before 5.5 doesn't say, and gets the paper's look as before)
-             "kind": data.get("kind") if data.get("kind") in ("answer", "notes", "report", "writing") else ""},
+             "kind": data.get("kind") if data.get("kind") in ("answer", "notes", "report", "writing") else "",
+             # 6.2: margin notes to check before handing it in (the app asks for them on research writing and reports)
+             "notes": data.get("notes") is True},
             work_dir,
         )
         return send_file(
@@ -14328,6 +15036,15 @@ def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", 
         if sl.get("notes"):
             cited.update(keep_known_citations(sl["notes"], sources, style)[1])
     refs = build_references_list(sources, cited) if sources else []
+    # 6.2 (the owner, 15 Nov 2026): "normal powerpoint with no in-text citations ... with references": every point was
+    # checked against its paper above; now the citations come off the slides, and the References slide keeps the papers
+    for sl in body:
+        for name in ("bullets", "left", "right"):
+            for b in (sl.get(name) or []):
+                b["text"] = strip_slide_citations(b.get("text") or "")[0]
+        for name in ("bullets", "left", "right"):
+            if sl.get(name):
+                sl[name] = [b for b in sl[name] if str(b.get("text") or "").strip()]
     lines = lambda rs: [re.sub(r"[*_]", "", r["text"]) + (" " + r["url"] if r.get("url") else "") + (" " + r["after"] if r.get("after") else "") for r in rs]
 
     def plain(title, items, per=5):
