@@ -2,8 +2,10 @@ import json
 import logging
 import base64
 import hmac
+import io
 import os
 import hashlib
+import html
 import random
 import re
 import secrets
@@ -49,6 +51,8 @@ import convert315 as _any                          # 3.15: every other kind of f
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
 import proposal as _prop                           # 5.4: a research proposal (the approach, and what needs no AI)
 import defence as _defence                         # 5.7: slides from research work are a research defence
+import onelang as _onelang                         # 6.0: every word of a piece in its own language
+import quiz60 as _quiz60                           # 6.0: much harder practice questions, checked by an examiner
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -718,6 +722,19 @@ def init_db():
                 )
                 """
             )
+            # 6.0: Open in Word: a Word file kept for ten minutes behind a secret link, for the Word app to open (see open_word_put)
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS open_word (
+                    token TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    body BYTEA NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS open_word_created ON open_word (created_at)")
             _meet_tables(cur)
     except Exception as e:
         logger.error("init_db: table setup failed: %s", e)
@@ -2403,7 +2420,7 @@ def search_semantic_scholar(query, max_results=4):
         abstract = (paper.get("abstract") or "").strip()
         if not (title and url):
             continue
-        author_names = [a.get("name", "").strip() for a in (paper.get("authors") or []) if a.get("name")]
+        author_names = _clean_authors([a.get("name", "").strip() for a in (paper.get("authors") or []) if a.get("name")])
         sources.append({
             "title": title,
             "url": url,
@@ -2565,7 +2582,105 @@ def _is_preprint(venue, doi):
     return bool((venue and _PREPRINT_VENUE.search(str(venue))) or (doi and _PREPRINT_DOI.match(str(doi))))
 
 
+# 6.0 (the owner, 15 Nov 2026, with "A* et al. (2025)" circled in a proposal: "correct all associated issues like that"):
+# what a paper index sends is cleaned before anything is written from it. An author's name loses the marks indexes
+# leave on it (* for the corresponding author, daggers, affiliation numbers, superscripts, an e-mail or ORCID, a title
+# or degree); "Smith JA" (surname first, then initials, as PubMed writes it) becomes "Smith, J. A."; a name in capitals
+# is set in ordinary capitals; what is left without a real name ("A*", "-", "et al.") is dropped, so the next author
+# leads the citation. Titles, journals and abstracts lose HTML entities, mis-decoded characters ("Ã©" for "é") and
+# invisible characters.
+_AUTH_MARKS = re.compile("[*\u2020\u2021\u00a7\u00b6#^~\u2217\u204e\u2051\u2051\u00b9\u00b2\u00b3\u2070-\u209f\u2032\u2033]+")
+_AUTH_PRE = re.compile(r"^(?:(?:Prof(?:essor)?|Dr|Mr|Mrs|Ms|Miss|Sir|Dame|Rev)\.?\s+)+", re.I)
+_AUTH_DEGREE = re.compile(r"(?:,\s*|\s+)(?:Ph\.?\s?D|M\.?\s?Phil|D\.?\s?Phil|M\.?\s?Sc|B\.?\s?Sc|M\.?\s?P\.?\s?H|M\.?\s?B\.?\s?B\.?\s?S|"
+                          r"Dr\.?\s?P\.?\s?H|F\.?\s?R\.?\s?C\.?\s?[PS]\w*|F\.?\s?W\.?\s?A\.?\s?C\.?\s?S|F\.?\s?G\.?\s?C\.?\s?S|M\.?\s?B\.?\s?A)\.?(?=$|[\s,])",
+                          re.I)
+_JUNK_CHARS = re.compile("[\u200b\u2060\ufeff\ufffd\u00ad]")
+
+
+# a UTF-8 letter read as Windows-1252 or Latin-1: its lead byte (Â…ô) and one to three continuation bytes (\x80-\xbf as
+# Windows-1252 shows them: € ‚ ƒ „ … † ‡ ˆ ‰ Š ‹ Œ Ž ‘ ’ “ ” • – — ˜ ™ š › œ ž Ÿ, or \xa0-\xbf)
+_MOJI_C = "\u0080-\u00bf\u0152\u0153\u0160\u0161\u0178\u017d\u017e\u0192\u02c6\u02dc\u2013\u2014\u2018-\u201a\u201c-\u201e\u2020-\u2022\u2026\u2030\u2039\u203a\u20ac\u2122"
+_MOJI = re.compile(f"[\u00c2-\u00df][{_MOJI_C}]|[\u00e0-\u00ef][{_MOJI_C}]{{2}}|[\u00f0-\u00f4][{_MOJI_C}]{{3}}")
+
+
+def _fix_mojibake(s):
+    """"MÃ¼ller" (UTF-8 read as Windows-1252 or Latin-1) back to "Müller", letter by letter (so a title that also has a
+    letter those can't hold, "α", is mended too); anything that isn't such a letter stays as it is."""
+    if not s or not re.search("[\u00c2-\u00f4]", s):
+        return s
+
+    def one(m):
+        t = m.group(0)
+        raw = bytearray()
+        for ch in t:                     # each character as the byte it was (Windows-1252, or Latin-1 for \x80-\x9f)
+            try:
+                raw += ch.encode("cp1252")
+            except UnicodeEncodeError:
+                if ord(ch) > 0xff:
+                    return t
+                raw.append(ord(ch))
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return t
+    return _MOJI.sub(one, s)
+
+
+def _clean_text_field(s):
+    s = _JUNK_CHARS.sub("", html.unescape(str(s or "")))
+    return _fix_mojibake(s)
+
+
+def _title_case_name(s):
+    def one(w):
+        low = w.lower()
+        if low in _NAME_PARTICLES:
+            return low
+        return "-".join("'".join(x[:1].upper() + x[1:] for x in part.split("'")) for part in low.split("-"))
+    return " ".join(one(w) for w in s.split())
+
+
+def _clean_author(a):
+    """One author's name as a reference list prints it, or None when nothing that is a name is left."""
+    s = _clean_text_field(a)
+    s = re.sub(r"\S+@\S+", " ", s)                                                   # an e-mail
+    s = re.sub(r"\(?(?:https?://orcid\.org/)?\d{4}-\d{4}-\d{4}-\d{3}[\dX]\)?", " ", s)   # an ORCID
+    s = re.sub(r"\((?:[^)]*\b(?:corresponding|equal(?:ly)?|joint|contribut)[^)]*)\)", " ", s, flags=re.I)
+    s = _AUTH_MARKS.sub("", s)
+    s = re.sub(r"(?<=[A-Za-z\u00C0-\u024F.])\d+(?:\s*,\s*\d+)*(?=\s|,|$)", "", s)       # "Mensah1,2"
+    s = _AUTH_DEGREE.sub("", s)
+    s = _AUTH_PRE.sub("", s.strip())
+    s = re.sub(r"\s+", " ", s).strip(" ,;:-\u2013\u2014")
+    if re.fullmatch(r"\[?(?:et\.?\s*al\.?|and others|anonymous|unknown|n\.?\s*a\.?|none|null)\]?", s, re.I):
+        return None
+    # PubMed's way, surname first and initials after: "Mensah KA" -> "Mensah, K. A.", "van den Berg J" -> "van den Berg, J."
+    m = re.fullmatch(r"((?:[a-z\u00e0-\u00ff]{1,5}\s){0,3}[A-Z\u00C0-\u00DE][\w'\u2019\-]+(?:\s[A-Z\u00C0-\u00DE][\w'\u2019\-]+)?)\s([A-Z]{1,3})", s)
+    if m and not m.group(1).isupper():
+        s = m.group(1) + ", " + " ".join(c + "." for c in m.group(2))
+    elif s.isupper() and len(re.sub(r"[^A-Z]", "", s)) > 3 and not _ORG_WORDS.search(s.title()):
+        s = _title_case_name(s)                                                         # "KOFI MENSAH" -> "Kofi Mensah"
+    letters = [c for c in s if c.isalpha()]
+    if len(letters) < 2:
+        return None                                                                     # "A*", "-", "A."
+    if all(re.fullmatch(r"[^\W\d_]\.?", w) for w in re.split(r"[\s,]+", s) if w):
+        return None                                                                     # "A. B.": initials and no surname
+    return s
+
+
+def _clean_authors(authors):
+    out, seen = [], set()
+    for a in authors or []:
+        c = _clean_author(a)
+        if c and c.lower() not in seen:
+            seen.add(c.lower())
+            out.append(c)
+    return out
+
+
 def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, cites=0, biblio=None):
+    title = _clean_text_field(title)
+    venue = _clean_text_field(venue) if venue else venue
+    abstract = _clean_text_field(abstract) if abstract else abstract
     title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(title or ""))).strip().rstrip(".")
     if not title or not pdf or not str(pdf).startswith("http") or _RETRACTED_TITLE.match(title):
         return None
@@ -2573,7 +2688,7 @@ def _paper(title, authors, year, venue, doi, pdf, landing, abstract, found_in, c
         year = int(year) if year else None
     except (TypeError, ValueError):
         year = None
-    authors = [re.sub(r"\s+", " ", str(a)).strip() for a in (authors or []) if str(a or "").strip()][:100]
+    authors = _clean_authors([re.sub(r"\s+", " ", str(a)).strip() for a in (authors or []) if str(a or "").strip()][:100])
     abstract = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(abstract or ""))).strip() or None
     doi = _norm_doi(doi)
     return {"title": title[:400], "authors": authors or None, "year": year, "venue": (str(venue).strip()[:200] or None) if venue else None,
@@ -4146,7 +4261,7 @@ def language_rule(language):
     return (f"\n\nLANGUAGE: write everything you write in {lang}, in the formal register of academic writing in {lang}. Keep every "
             "citation key exactly as given (its names, its \"&\", \"and\" or \"et al.\" and its year are never translated), and always "
             "place citations in brackets after the claim (never as \"Name (Year)\" inside a sentence). Write every number in digits. "
-            "A paper's title or a quotation from it stays in its own language.")
+            "A paper's title or a quotation from it stays in its own language; apart from those, every word is in " + lang + ".")
 
 
 @app.after_request
@@ -9070,11 +9185,27 @@ def _parse_quiz_json(raw_text):
     return questions
 
 
+def _quiz_harden(questions, difficulty, text, started):
+    """6.0: every multiple-choice question read for giveaways and answered by an examiner who isn't told the key; a
+    question found at fault is rewritten (server/quiz60.py). Inside the time a request has (the server stops one at 240 s).
+    Never stops a quiz: what can't be checked in time goes out as it was written."""
+    def ask(system, user, max_tokens, timeout):
+        return call_claude(system, user, max_tokens=max_tokens, model=ANTHROPIC_MODEL, timeout=timeout,
+                           feature="quiz-check" if system.startswith("You are an examiner") else "quiz-rewrite")
+    out, st = _quiz60.harden(questions, difficulty, text, ask, started + 225, standalone=_standalone)
+    logger.info(f"Quiz check: {st['mc']} multiple-choice question(s), {st['examined']} answered by the examiner; found at fault: "
+                f"{st['code']} by code, {st['disagree']} with another answer than the key, {st['not_one']} with more than one "
+                f"defensible answer, {st['giveaway']} giving the answer away, {st['low']} easier than asked; {st['rewritten']} "
+                f"rewritten, {st['kept']} kept as written" + (" (a check didn't answer)" if st["failed"] else ""))
+    return out
+
+
 @app.route("/api/quiz/generate", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 @_once
 def quiz_generate_endpoint():
+    started = time.time()
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     title = (data.get("title") or "Practice Quiz").strip()[:150]
@@ -9092,13 +9223,7 @@ def quiz_generate_endpoint():
 
     # How hard, and the lecturer's own requirements (topics, focus, format) — both optional.
     difficulty = data.get("difficulty") if data.get("difficulty") in ("easy", "medium", "hard", "mixed") else "mixed"
-    level = {
-        "easy": "DIFFICULTY: make every question introductory \u2014 clear understanding of the key ideas, one simple step of reasoning. Mark each \"easy\".",
-        "medium": "DIFFICULTY: make every question course-level \u2014 understanding and applying ideas, one or two steps of reasoning. Mark each \"medium\".",
-        "hard": ("DIFFICULTY: make every question exam-level and challenging \u2014 applying ideas to new cases, analysing and comparing, "
-                 "multi-step reasoning. Mark each \"hard\"."),
-        "mixed": "DIFFICULTY: a genuine range from easy to hard across the set, each question marked with its own level.",
-    }[difficulty]
+    level = _quiz60.LEVELS[difficulty]       # 6.0: every level asks for more (server/quiz60.py)
     audience = "tutor" if data.get("audience") == "tutor" else "student"
     reqs = str(data.get("requirements") or "").strip()[:1200]
     reqs_block = ("\n\nTHE LECTURER'S REQUIREMENTS \u2014 follow them exactly (topics to cover, question focus, examples, "
@@ -9134,7 +9259,8 @@ def quiz_generate_endpoint():
     # of which one handles this request.
     n_case = num_questions if style == "case_study" else (max(1, round(num_questions / 3)) if audience == "tutor" else 0)
     # A little more room: explanations now teach, and a case study's scenario runs long.
-    max_tokens = min(64000, max(4000, num_questions * 360 + n_case * 260 + 600))
+    # 6.0: harder questions carry their findings in the stem: more room, and more time to write them
+    max_tokens = min(64000, max(4000, num_questions * (360 if difficulty == "easy" else 460) + n_case * 260 + 600))
 
     # 4.0: a quiz costs a point — taken before the call, given back if the call fails
     try:
@@ -9143,11 +9269,14 @@ def quiz_generate_endpoint():
         return _points_reply(e)
     try:
         result = call_claude(
-            system_prompt=QUIZ_SYSTEM_PROMPT + QUIZ_STANDALONE_RULES + (_quiz_case_rules(n_case, num_questions, audience == "tutor") if n_case else "") + reqs_block,
+            system_prompt=QUIZ_SYSTEM_PROMPT + _quiz60.HARD_RULES + QUIZ_STANDALONE_RULES + (_quiz_case_rules(n_case, num_questions, audience == "tutor") if n_case else "") + reqs_block,
             user_message=user_message,
             max_tokens=max_tokens,
+            timeout=min(170, 70 + num_questions * 5),
+            feature="quiz",
         )
         questions = _parse_quiz_json(result)
+        questions = _quiz_harden(questions, difficulty, text, started)
         if title in ("", "Practice Quiz"):
             try:
                 made = json.loads(result[result.find("{"):result.rfind("}") + 1]) if "{" in result else {}
@@ -9161,6 +9290,120 @@ def quiz_generate_endpoint():
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
         return jsonify({"error": str(e)}), 502
+
+
+# ======================= 6.0: Open in Word =======================
+# The owner, 15 Nov 2026 00:11: "The open in word is not opening in word. I want it to open directly in my Word. So remove
+# preview." A web page can't hand a file to the Word app; it can only give Word a link. So the app sends the Word file it
+# made here; it is kept for ten minutes behind a secret link (192 random bits, never shown, never logged), the Word app
+# is given that link (ms-word:ofe|u|<link>) and opens the file from it; after ten minutes the file is deleted (every
+# minute, and whenever one is asked for or sent) and the link no longer answers. Nothing else is kept: not who opened
+# it, not its words. The privacy notice says so.
+OPEN_WORD_TTL = 600
+OPEN_WORD_MAX = 15 * 1024 * 1024
+_OPEN_WORD_SWEPT = [0.0]
+
+
+def _ow_name(raw, ext="docx"):
+    """The file's name as the Word (or PowerPoint) app shows it: letters, digits, spaces made _, ending in .docx (.pptx)."""
+    s = re.sub(r"\.(docx?|pptx?)$", "", unicodedata.normalize("NFKC", str(raw or "")).strip(), flags=re.I)
+    s = re.sub(r"[^\w\-.() ]+", " ", s)
+    s = re.sub(r"\s+", "_", s).strip("._-")[:110]
+    return (s or ("Presentation" if ext == "pptx" else "Document")) + "." + ext
+
+
+def _open_word_sweep(force=False):
+    """Deletes every file kept longer than ten minutes (at most once a minute unless forced)."""
+    if not DATABASE_URL or (not force and time.time() - _OPEN_WORD_SWEPT[0] < 60):
+        return
+    _OPEN_WORD_SWEPT[0] = time.time()
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DELETE FROM open_word WHERE created_at < now() - interval '{OPEN_WORD_TTL} seconds'")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Open in Word: couldn't delete old files: {e.__class__.__name__}")
+
+
+def _open_word_sweeper():
+    while True:
+        time.sleep(60)
+        _open_word_sweep(force=True)
+
+
+if DATABASE_URL and not os.environ.get("AH_NO_SWEEPER"):
+    _threading.Thread(target=_open_word_sweeper, name="open-word-sweeper", daemon=True).start()
+
+
+@app.route("/api/open-word", methods=["POST", "OPTIONS"])
+@limiter.limit("40 per hour;200 per day", key_func=_account_or_ip_key)
+@auth_required
+def open_word_put():
+    """The Word file the app made, kept ten minutes for the Word app. Answers the link's path (the app adds its server)."""
+    raw = request.get_data(cache=False) or b""
+    if len(raw) > OPEN_WORD_MAX:
+        return jsonify({"error": "This file is too big to open from here. Download it, then open it from your files."}), 413
+    # 6.1: a PowerPoint file too (Open in PowerPoint: straight into the PowerPoint app, the deck exactly as it is)
+    ext = None
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = set(z.namelist())
+        if raw.startswith(b"PK\x03\x04") and "[Content_Types].xml" in names:
+            ext = "docx" if "word/document.xml" in names else "pptx" if "ppt/presentation.xml" in names else None
+        if not ext:
+            raise ValueError("not a Word or PowerPoint file")
+    except Exception:
+        return jsonify({"error": "That isn't a Word or PowerPoint file the app made. Try again."}), 400
+    name = _ow_name(request.args.get("name"), ext)
+    token = secrets.token_urlsafe(24)
+    _open_word_sweep()
+    try:
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO open_word (token, user_id, name, body) VALUES (%s, %s, %s, %s)",
+                            (token, request.current_user["id"], name, psycopg2.Binary(raw)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Open in Word: couldn't keep the file: {e.__class__.__name__}")
+        return jsonify({"error": "Couldn't get the file ready for Word. Try again."}), 503
+    logger.info(f"Open in Word: a {len(raw) // 1024} KB file kept for {OPEN_WORD_TTL // 60} minutes")
+    from urllib.parse import quote as _quote
+    return jsonify({"path": f"/api/open-word/{token}/{_quote(name)}", "expires_in": OPEN_WORD_TTL})
+
+
+@app.route("/api/open-word/<token>/<path:name>", methods=["GET"])
+@limiter.limit("60 per minute")
+def open_word_get(token, name):
+    """What the Word app reads: the file, for ten minutes, to whoever has the secret link."""
+    _open_word_sweep()
+    row = None
+    if re.fullmatch(r"[A-Za-z0-9_-]{30,40}", token or ""):
+        try:
+            conn = get_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT name, body FROM open_word WHERE token = %s AND created_at > now() - interval '{OPEN_WORD_TTL} seconds'", (token,))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning(f"Open in Word: couldn't read a file: {e.__class__.__name__}")
+    if not row:
+        r = Response("This link has ended. Open the file in Academic-Home again.", status=404, mimetype="text/plain")
+        r.headers["Cache-Control"] = "no-store"
+        return r
+    kind = "pptx" if str(row["name"]).lower().endswith(".pptx") else "docx"
+    r = send_file(io.BytesIO(bytes(row["body"])), mimetype=MIME_TYPES[kind], as_attachment=False, download_name=row["name"], max_age=0)
+    r.headers["Cache-Control"] = "no-store, private"
+    r.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return r
 
 
 @app.route("/api/quiz/export-docx", methods=["POST", "OPTIONS"])
@@ -9214,14 +9457,17 @@ STYLE_PROSE = (
     "unlock, elevate, in today's world, fast-paced, it is important to note, it is worth noting, a wide range of, in "
     "conclusion, overall, ultimately, and sentences that open with Moreover, Furthermore or Additionally. Don't announce "
     "what you are about to do, don't sum up what you did, and don't end with an offer. Never leave a placeholder ([Name], "
-    "[insert], XX): write the real thing or leave it out. Get every fact right, and leave out anything you are not sure of."
+    "[insert], XX): write the real thing or leave it out. Get every fact right, and leave out anything you are not sure of. "
+    "Write every word in the language of the piece: never let a word or a character of another language or script slip "
+    "in, unless it is a name, a title or a quotation in its own language, or the person asked for it."
 )
 STYLE_WORDS = (
     "\n\nIN THE WORDS YOU WRITE (this always applies): no dashes as punctuation (no em dash, no en dash, no spaced hyphen "
     "used as a dash: brackets, a colon or commas instead, and 'to' or a plain hyphen for a range), no emoji, no bold or "
     "italic marks (any list or heading marks the instructions above ask for are fine), no stock phrases (delve, pivotal, "
     "crucial role, multifaceted, foster, leverage, robust, seamless, holistic, in today's world, it is important to note) "
-    "and no filler. Plain, specific, accurate words."
+    "and no filler. Plain, specific, accurate words, every one in the language of the piece (never a word or a character "
+    "of another language or script slipping in, unless it is a name, a title, a quotation or what the person asked for)."
 )
 _STYLE_PATHS = (
     (re.compile(r"^/api/(write|sage|research)$"), STYLE_PROSE),
@@ -9236,6 +9482,8 @@ def _house_style():
         from flask import has_request_context
         if not has_request_context():
             return ""
+        if g.get("_plain_ask"):
+            return ""                    # 6.0: a request of the server's own that answers JSON (see _lang_ask)
         for rx, style in _STYLE_PATHS:
             if rx.match(request.path or ""):
                 return style
@@ -9357,6 +9605,8 @@ def _finish_text(text, kind="chat"):
         t = "\n\n".join(paras)
     t = _FIN_HOLD.sub("", t)
     t = re.sub(r"(?<=\w)[ \t]+(?=[,;:.!?](?:\s|$))", "", t)            # "Dear , thank you" (a placeholder gone)
+    # 6.0: a small word written twice by mistake ("the the", "of of"): once
+    t = re.sub(r"\b(the|a|an|of|to|in|and|for|on|with|by|from|at|or)[ \t]+\1\b", r"\1", t, flags=re.I)
     t = _fin_spaces(t)
     t = re.sub(r"[ \t]+\n", "\n", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
@@ -9397,19 +9647,74 @@ def _fin_walk(v, kind, live):
     return v
 
 
+# 6.0 (the owner, 15 Nov 2026: "Institutional 管理 and administration" in a proposal's Word file; "Translate each and every
+# word in the work well and appropriately. And correct all associated issues like that."): every research product and
+# every other piece RamzAI writes from the person's material is in one language (server/onelang.py). Not RamzAI's chat
+# and not the Word editor's AI: there a person may ask for words of another language, and only they know.
+_LANG_PATHS = re.compile(r"^/api/(write|study-notes|quiz/generate|summarize|slides/(draft|assist|assist-all)|guide/(statements|outline))$")
+
+
+def _lang_ask(system, user, max_tokens, timeout=30):
+    """onelang's one request: only the sentences that hold a word of another script, that word marked. It answers JSON,
+    so the house style is left out of it. Nothing is charged: it is part of the piece already paid for."""
+    try:
+        g._plain_ask = True
+    except Exception:
+        pass
+    try:
+        return call_claude(system, user, max_tokens=max_tokens, model=ANTHROPIC_MODEL, timeout=timeout, feature="language")
+    finally:
+        try:
+            g._plain_ask = False
+        except Exception:
+            pass
+
+
+def _lang_said(where, st):
+    if st.get("runs") or st.get("tidied"):
+        logger.info(f"One language ({where}): {st.get('runs', 0)} word(s) of another script in {st.get('sentences', 0)} sentence(s): "
+                    f"{st.get('fixed', 0)} put into the piece's language, {st.get('kept', 0)} kept (the sentence is about it), "
+                    f"{st.get('removed', 0)} taken out; {st.get('tidied', 0)} look-alike letter(s) or wide mark(s) set right"
+                    + ("; the AI didn't answer" if st.get("ai_failed") else ""))
+
+
+@app.before_request
+def _note_start():
+    g._t0 = time.time()          # 6.0: how long a request has run (the server stops one at 240 s)
+
+
+def _one_language(data, language=None, context=""):
+    """Every word a person reads in an answer in the piece's language (server/onelang.py). Never stops an answer: when the
+    request has run long (a quiz checked by its examiner, a long proposal), there is no time to ask the AI, and a stray
+    word is taken out instead."""
+    try:
+        left = 232 - (time.time() - (g.get("_t0") or time.time()))
+        ask = (lambda a, b, c: _lang_ask(a, b, c, timeout=int(min(30, left - 4)))) if left >= 10 else None
+        data, st = _onelang.fix_tree(data, language, context, ask)
+        _lang_said(request.path if request else "-", st)
+    except Exception as e:
+        logger.warning(f"One language skipped: {e.__class__.__name__}: {str(e)[:160]}")
+    return data
+
+
 @app.after_request
 def _finish_ai_answers(resp):
-    """3.15: the AI's words, tidied on their way out (see _finish_text)."""
+    """3.15: the AI's words, tidied on their way out (see _finish_text). 6.0: and in one language (_one_language)."""
     try:
         if request.method != "POST" or resp.status_code != 200 or resp.mimetype != "application/json":
             return resp
         if resp.direct_passthrough or resp.headers.get("Content-Encoding") or resp.headers.get("X-Once"):
             return resp        # 4.9: a kept answer sent again was finished the first time
         kind = next((k for rx, k in _FIN_PATHS if rx.match(request.path or "")), None)
-        if not kind:
+        lang_on = bool(_LANG_PATHS.match(request.path or ""))
+        if not kind and not lang_on:
             return resp
         data = json.loads(resp.get_data(as_text=True))
-        data = _fin_walk(data, kind, False)
+        if kind:
+            data = _fin_walk(data, kind, False)
+        if lang_on and isinstance(data, dict) and not data.get("error"):
+            asked = request.get_json(silent=True) or {}
+            data = _one_language(data, asked.get("language") if isinstance(asked, dict) else None, _onelang.context_text(asked))
         resp.set_data(json.dumps(data, ensure_ascii=False))
     except Exception as e:
         logger.warning(f"Finishing an AI answer skipped: {e}")
@@ -11073,7 +11378,7 @@ def _rs_library(raw):
             abstract = re.sub(r"\s+", " ", str(it.get("abstract") or "")).strip()[:9000]
             if len(abstract) < 120:
                 continue
-            authors = [re.sub(r"\s+", " ", str(a)).strip()[:120] for a in (it.get("authors") or []) if str(a or "").strip()][:40]
+            authors = _clean_authors([re.sub(r"\s+", " ", str(a)).strip()[:120] for a in (it.get("authors") or []) if str(a or "").strip()][:40])
             url = str(it.get("url") or "")[:600]
             pdf = str(it.get("pdf") or "")[:600]
             was = it.get("was") if it.get("was") in RS_KINDS else "article"
@@ -12906,7 +13211,24 @@ def research_endpoint():
                             for s in sents:
                                 text, _named = _rs_unmark(s)
                                 flat.append({"h": head, "t": text})
-                        fc = pool.submit(_rs_check, question, papers, [x["t"] for x in flat], deadline)
+                        # 6.0: every word in the report's language before its sentences are checked (server/onelang.py);
+                        # in the pool, so the lines that keep the connection open still go while it runs
+                        def one_language_then_check(flat=flat):
+                            try:
+                                heads = sorted({x["h"] for x in flat if x["h"]})
+                                seen_words = " ".join([question, context] + [" ".join([p.get("title") or ""] + list(p.get("authors") or []))
+                                                                             for p in papers])
+                                left = max(8, min(30, int(deadline - time.time() - 60)))
+                                done, st = _onelang.fix_texts([x["t"] for x in flat] + heads, language or None, seen_words,
+                                                              lambda a, b, c: _lang_ask(a, b, c, timeout=left))
+                                new_heads = dict(zip(heads, done[len(flat):]))
+                                for x, t in zip(flat, done):
+                                    x["t"], x["h"] = t, new_heads.get(x["h"], x["h"])
+                                _lang_said("research", st)
+                            except Exception as e:
+                                logger.warning(f"One language skipped in research: {e.__class__.__name__}: {str(e)[:160]}")
+                            return _rs_check(question, papers, [x["t"] for x in flat], deadline)
+                        fc = pool.submit(one_language_then_check)
                         pending.add(fc)
                     elif f is fc:
                         chk = f.result()

@@ -31,7 +31,7 @@ from lxml import etree
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_LABEL_POSITION, XL_MARKER_STYLE
 from pptx.enum.dml import MSO_THEME_COLOR
 from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE, PP_PLACEHOLDER
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
@@ -1864,6 +1864,8 @@ _readable_templates()
 # words already read at AAA on whatever is behind them, so they're not deepened again)
 import scenes315 as _SC
 TEMPLATES.update(_SC.build())
+import scenes61 as _SC61          # 6.1: fifty more designs (the owner, 15 Nov 2026: "add 50 more templates")
+TEMPLATES.update(_SC61.build())
 TUTOR_TEXT = "1A1A1A"      # classic lecture templates: points (the theme's own grey was 404040)
 TUTOR_TITLE = "262626"     # and titles
 
@@ -2352,6 +2354,102 @@ def _add_chart(slide, spec, left, top, width, height):
         plot.data_labels.number_format = "0%"
         plot.data_labels.show_percentage = True
         plot.data_labels.show_value = False
+    # 6.1: a modern design's chart in the design's own colours (the first the one Slide Studio shows), never the theme's
+    # first colour alone (in 39 designs that is the titles' near-black) or Office's stock grey for a third series
+    colours = [c for c in (spec.get("colours") or []) if isinstance(c, str) and re.fullmatch(r"[0-9A-Fa-f]{6}", c)]
+    if colours:
+        plot = chart.plots[0]
+        if kind == "pie":
+            plot.vary_by_categories = True
+            n = len(cats)
+            pick = [colours[i % len(colours)] for i in range(n)]
+            if n > 2 and len(colours) > 2 and pick[-1] == pick[0]:      # the last slice touches the first: never the same colour
+                pick[-1] = next(c for c in colours if c not in (pick[0], pick[-2]))
+            for i, point in enumerate(plot.series[0].points):
+                point.format.fill.solid()
+                point.format.fill.fore_color.rgb = RGBColor.from_string(pick[i])
+                point.format.line.color.rgb = RGBColor.from_string(str(spec.get("gap_colour") or "FFFFFF"))
+                point.format.line.width = Pt(1.5)
+            # the percentages beside the slices, in the words' colour (on a dark slice dark figures could not be read)
+            plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
+            if re.fullmatch(r"[0-9A-Fa-f]{6}", str(spec.get("label_colour") or "")):
+                plot.data_labels.font.color.rgb = RGBColor.from_string(spec["label_colour"])
+            plot.data_labels.font.size = Pt(14)
+        else:
+            for i, ser in enumerate(plot.series):
+                c = RGBColor.from_string(colours[i % len(colours)])
+                if kind == "line":
+                    ser.format.line.color.rgb = c
+                    ser.format.line.width = Pt(3)
+                    ser.smooth = False
+                    ser.marker.style = XL_MARKER_STYLE.CIRCLE
+                    ser.marker.size = 8
+                    ser.marker.format.fill.solid()
+                    ser.marker.format.fill.fore_color.rgb = c
+                    ser.marker.format.line.color.rgb = c
+                else:
+                    ser.format.fill.solid()
+                    ser.format.fill.fore_color.rgb = c
+
+
+def _oklab(h):
+    lin = [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4) for c in (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))]
+    r, g, b = lin
+    l_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3.0)
+    m_ = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3.0)
+    s_ = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3.0)
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_, 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+def _from_oklab(L, a, b):
+    l_, m_, s_ = L + 0.3963377774 * a + 0.2158037573 * b, L - 0.1055613458 * a - 0.0638541728 * b, L - 0.0894841775 * a - 1.2914855480 * b
+    l, m, s = l_ ** 3, m_ ** 3, s_ ** 3
+    rgb = (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s, -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+           -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+    out = ""
+    for c in rgb:
+        c = min(1.0, max(0.0, c))
+        c = c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+        out += "%02X" % int(round(c * 255))
+    return out
+
+
+def _chart_colours(tpl, want=4):
+    """6.1: a modern design's chart colours. Its emph first (what Slide Studio draws the chart in), then its accent, ink, ink2
+    and muted; each made to stand out on the slide (3:1, what a chart's bars, lines and slices need) and kept only if the
+    eye tells it from every one before at once (15 apart in OKLab ×100). A design with fewer than four such colours gets
+    its emph turned round the colour wheel (a third, two thirds, a sixth…) at the same lightness: colours that belong
+    with it, so a third series or a pie's slices never repeat the first."""
+    import math
+    bg = str(tpl.get("bg") or "FFFFFF").lstrip("#")
+
+    def far(c, chosen):
+        return all(sum((x - y) ** 2 for x, y in zip(_oklab(c), _oklab(o))) ** 0.5 * 100 >= 15 for o in chosen)
+
+    def take(h):
+        h = str(h or "").lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+            c = _deepen(h, bg, 3.0)
+            if far(c, out):
+                out.append(c)
+
+    out = []
+    for h in (tpl.get("emph"), tpl.get("accent"), tpl.get("ink"), tpl.get("ink2")):
+        take(h)
+    if out:
+        L, A, B = _oklab(out[0])
+        C, hue = max(math.hypot(A, B), 0.13), math.atan2(B, A)
+        # the same lightness first; then a little lighter and a little darker (a pie of five or six needs them all)
+        for dl in (0.0, 0.14, -0.1):
+            for turn in (120, 240, 60, 300, 180, 30, 210, 90, 270, 150, 330):
+                if len(out) >= want:
+                    break
+                t = hue + math.radians(turn)
+                take(_from_oklab(min(0.9, max(0.25, L + dl)), C * math.cos(t), C * math.sin(t)))
+    if len(out) < min(3, want):
+        take(tpl.get("muted"))           # grey only last, and only where nothing else could be told apart
+    return out[:max(want, 1)]
 
 
 def _picture_area(tpl):
@@ -2981,12 +3079,33 @@ TRANSITIONS = {
     "cover": {"dir": "l"},
     "split": {"orient": "vert", "dir": "out"},
     "zoom": {},
+    # 6.1 (the owner, 15 Nov 2026 02:19: "morph transitions, both nice and scary ones"): PowerPoint's own transitions,
+    # written the way PowerPoint writes them. The base set (2006) is understood by every app; the 2010 (p14) and 2013
+    # (p15) ones go inside mc:AlternateContent with a Fade for apps that don't have them.
+    "dissolve": {}, "uncover": {"_el": "pull", "dir": "l"}, "blinds": {"dir": "horz"}, "checker": {"dir": "horz"},
+    "circle": {}, "diamond": {}, "plus": {}, "wheel": {"spokes": "1"}, "bars": {"_el": "randomBar", "dir": "horz"},
+    "comb": {"dir": "horz"}, "strips": {"dir": "rd"}, "newsflash": {},
+    "reveal": {"_p14": "reveal", "dir": "l"}, "flash": {"_p14": "flash"}, "ripple": {"_p14": "ripple", "dir": "center"},
+    "honeycomb": {"_p14": "honeycomb"}, "switch": {"_p14": "switch", "dir": "r"}, "flip": {"_p14": "flip", "dir": "r"},
+    "gallery": {"_p14": "gallery", "dir": "l"}, "cube": {"_p14": "prism", "dir": "l"}, "doors": {"_p14": "doors", "dir": "vert"},
+    "window": {"_p14": "window", "dir": "vert"}, "ferris": {"_p14": "ferris", "dir": "l"}, "conveyor": {"_p14": "conveyor", "dir": "l"},
+    "pan": {"_p14": "pan", "dir": "u"}, "flythrough": {"_p14": "flythrough", "dir": "in"}, "glitter": {"_p14": "glitter", "dir": "l", "pattern": "hexagon"},
+    "vortex": {"_p14": "vortex", "dir": "r"}, "shred": {"_p14": "shred", "pattern": "strip", "dir": "in"}, "warp": {"_p14": "warp", "dir": "in"},
+    "prestige": {"_p15": "prestige"}, "peeloff": {"_p15": "peelOff"}, "pagecurl": {"_p15": "pageCurlDouble"}, "airplane": {"_p15": "airplane"},
+    "origami": {"_p15": "origami"}, "curtains": {"_p15": "curtains"}, "drape": {"_p15": "drape"}, "wind": {"_p15": "wind"},
+    "fracture": {"_p15": "fracture"}, "crush": {"_p15": "crush"}, "fallover": {"_p15": "fallOver"},
 }
+# how long each lasts in PowerPoint (ms; the newer ones are slower, as PowerPoint makes them)
+TRANSITION_MS = {"vortex": 3000, "shred": 2500, "fracture": 2000, "crush": 2000, "fallover": 2000, "drape": 2000, "curtains": 2000,
+                 "wind": 2000, "glitter": 2500, "warp": 1500, "ripple": 1400, "honeycomb": 2500, "prestige": 2000, "airplane": 2000,
+                 "origami": 2000, "pagecurl": 1500, "peeloff": 1500, "flash": 1000}
 
 
 _MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _P159 = "http://schemas.microsoft.com/office/powerpoint/2015/09/main"
 _P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+_P15 = "http://schemas.microsoft.com/office/powerpoint/2012/main"
+_PML = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
 
 def _morph_transition():
@@ -2995,7 +3114,22 @@ def _morph_transition():
         '<mc:AlternateContent xmlns:mc="%s" xmlns:p="%s"><mc:Choice xmlns:p159="%s" Requires="p159">'
         '<p:transition xmlns:p14="%s" spd="slow" p14:dur="1600"><p159:morph option="byObject"/></p:transition></mc:Choice>'
         '<mc:Fallback><p:transition spd="slow"><p:fade/></p:transition></mc:Fallback></mc:AlternateContent>'
-        % (_MC, "http://schemas.openxmlformats.org/presentationml/2006/main", _P159, _P14))
+        % (_MC, _PML, _P159, _P14))
+
+
+def _newer_transition(kind):
+    """6.1: a PowerPoint 2010 (p14) or 2013 (p15) transition, as PowerPoint writes it, with a Fade for older apps."""
+    spec = TRANSITIONS[kind]
+    attrs = "".join(' %s="%s"' % (k, v) for k, v in spec.items() if not k.startswith("_"))
+    ms = TRANSITION_MS.get(kind, 1200)
+    if "_p15" in spec:
+        choice = ('<mc:Choice xmlns:p15="%s" Requires="p15"><p:transition xmlns:p14="%s" spd="slow" p14:dur="%d">'
+                  '<p15:prstTrans prst="%s"%s/></p:transition></mc:Choice>' % (_P15, _P14, ms, spec["_p15"], attrs))
+    else:
+        choice = ('<mc:Choice xmlns:p14="%s" Requires="p14"><p:transition spd="slow" p14:dur="%d"><p14:%s%s/></p:transition></mc:Choice>'
+                  % (_P14, ms, spec["_p14"], attrs))
+    return etree.fromstring('<mc:AlternateContent xmlns:mc="%s" xmlns:p="%s">%s<mc:Fallback><p:transition spd="slow"><p:fade/></p:transition>'
+                            '</mc:Fallback></mc:AlternateContent>' % (_MC, _PML, choice))
 
 
 def _set_transition(slide, kind):
@@ -3008,26 +3142,52 @@ def _set_transition(slide, kind):
             sld.remove(old)
     if kind not in TRANSITIONS:
         return
+    spec = TRANSITIONS[kind]
     if kind == "morph":
         tr = _morph_transition()
+    elif "_p14" in spec or "_p15" in spec:
+        tr = _newer_transition(kind)
     else:
         tr = etree.Element(qn("p:transition"))
-        tr.set("spd", "med")
-        effect = etree.SubElement(tr, qn("p:" + kind))
-        for k, v in TRANSITIONS[kind].items():
-            effect.set(k, v)
+        tr.set("spd", "slow" if kind in ("dissolve", "wheel", "newsflash") else "med")
+        effect = etree.SubElement(tr, qn("p:" + spec.get("_el", kind)))
+        for k, v in spec.items():
+            if not k.startswith("_"):
+                effect.set(k, v)
     anchor = sld.find(qn("p:clrMapOvr"))
     if anchor is None:
         anchor = sld.find(qn("p:cSld"))
     anchor.addnext(tr)
 
 
+# the element a transition is written as → our name (6.1: the newer ones too, so a deck brought in keeps them)
+_TR_BY_ELEMENT = {}
+for _k, _v in TRANSITIONS.items():
+    if "_p15" in _v:
+        _TR_BY_ELEMENT[("p15", _v["_p15"])] = _k
+    elif "_p14" in _v:
+        _TR_BY_ELEMENT.setdefault(("p14", _v["_p14"]), _k)
+    else:
+        _TR_BY_ELEMENT.setdefault(("p", _v.get("_el", _k)), _k)
+
+
 def _transition_of(slide):
+    for ac in slide._element.findall("{%s}AlternateContent" % _MC):     # 3.15: Morph, or a newer transition's fallback
+        if ac.find(".//{%s}morph" % _P159) is not None:
+            return "morph"
+        choice = ac.find("{%s}Choice" % _MC)
+        if choice is not None:
+            for el in choice.iter():
+                if not isinstance(el.tag, str):
+                    continue
+                ns, name = etree.QName(el).namespace, etree.QName(el).localname
+                if ns == _P15 and name == "prstTrans" and ("p15", el.get("prst")) in _TR_BY_ELEMENT:
+                    return _TR_BY_ELEMENT[("p15", el.get("prst"))]
+                if ns == _P14 and ("p14", name) in _TR_BY_ELEMENT:
+                    return _TR_BY_ELEMENT[("p14", name)]
     tr = slide._element.find(qn("p:transition"))
     if tr is None:
-        for ac in slide._element.findall("{%s}AlternateContent" % _MC):     # 3.15: Morph, or a newer transition's fallback
-            if ac.find(".//{%s}morph" % _P159) is not None:
-                return "morph"
+        for ac in slide._element.findall("{%s}AlternateContent" % _MC):
             tr = ac.find(".//" + qn("p:transition"))
             if tr is not None:
                 break
@@ -3035,8 +3195,8 @@ def _transition_of(slide):
         return None
     for child in tr:
         name = etree.QName(child).localname
-        if name in TRANSITIONS:
-            return name
+        if ("p", name) in _TR_BY_ELEMENT:
+            return _TR_BY_ELEMENT[("p", name)]
     return None
 
 
@@ -3126,6 +3286,8 @@ def _set_timing(slide, kind, clicks):
     if not len(builds):
         timing.remove(builds)
     anchor = sld.find(qn("p:transition"))
+    if anchor is None:          # 6.1: a transition PowerPoint wraps (Morph, the 2010 and 2013 ones): the timing goes after it too
+        anchor = next((ac for ac in sld.findall("{%s}AlternateContent" % _MC) if ac.find(".//" + qn("p:transition")) is not None), None)
     if anchor is None:
         anchor = sld.find(qn("p:clrMapOvr"))
     if anchor is None:
@@ -3657,6 +3819,9 @@ def _modern_slide(prs, deck, sd, number, logo, tpl):
         if media and media_box:
             if tpl.get("plain") and media.get("type") == "table":
                 media = dict(media, plain=True)
+            if media.get("type") == "chart" and not tpl.get("plain"):
+                many = len(media.get("categories") or []) if media.get("chart_type") == "pie" else len(media.get("series") or [])
+                media = dict(media, colours=_chart_colours(tpl, max(4, min(6, many))), label_colour=tpl.get("text"), gap_colour=tpl.get("bg"))
             _add_media(s, media, tuple(Inches(v) for v in media_box))
     _m_footer(s, tpl, deck, number)
     _notes(s, sd)
@@ -4724,10 +4889,17 @@ def _o_render(path, work_dir, clear, blank_name, to_pdf=None):
         for sh in _flat_shapes(s.shapes):
             if sh.shape_id in ids and getattr(sh, "has_text_frame", False):
                 _o_clear(sh)
-    # drop slides past the limit, then add the blank one
+    # drop slides past the limit, then add the blank one. 6.1: their parts go too — before, they stayed in the package, the
+    # blank slide was given one of their names (slide61.xml), the copy could not be drawn, and every deck longer than
+    # ORIG_MAX_SLIDES opened in one of our designs instead of its own
     lst = prs.slides._sldIdLst
     for sid in list(lst)[ORIG_MAX_SLIDES:]:
+        rid = sid.get(qn("r:id"))
         lst.remove(sid)
+        try:
+            prs.part.drop_rel(rid)
+        except Exception:
+            pass
     # this copy's own layout (a layout from another opened copy would bring a second set of parts)
     blank_layout = next((lay for lay in prs.slide_layouts if lay.name == blank_name), None) if blank_name else None
     if blank_layout is not None:
@@ -4823,7 +4995,7 @@ def parse_pptx_original(path, work_dir, to_pdf=None):
         raise StudioError("That PowerPoint file couldn't be opened — it may be damaged or password-protected.")
     th = _o_theme(prs)
     emu = 914400.0
-    out = {"w": round(prs.slide_width / emu, 3), "h": round(prs.slide_height / emu, 3), "slides": []}
+    out = {"w": round(prs.slide_width / emu, 3), "h": round(prs.slide_height / emu, 3), "slides": [], "total": len(prs.slides)}
     clear = {}
     for i, s in enumerate(list(prs.slides)[:ORIG_MAX_SLIDES]):
         title, body = _o_pick(s, prs, i == 0)
@@ -5257,7 +5429,11 @@ def build_original_deck(deck, original_path, out_dir, filename="Presentation.ppt
         if fix:
             _o_apply_fix(slide, o, fix, cover)
         order.append(slide)
-    # the deck's order; slides it doesn't use are dropped
+    # 6.1: slides past what Slide Studio shows (ORIG_MAX_SLIDES) were never seen there: they stay, as they are, after the rest
+    for s0 in originals[ORIG_MAX_SLIDES:]:
+        if s0 not in order:
+            order.append(s0)
+    # the deck's order; slides it doesn't use (the person removed them) are dropped
     by_id = {sid.get("id"): sid for sid in lst}
     wanted = [by_id.get(str(s.slide_id)) for s in order]
     keep = set(id(e) for e in wanted if e is not None)

@@ -1735,7 +1735,7 @@ def _iter_all_runs(paragraph):
                 results.append(t.text or "")
             elif t.tag in (qn("w:br"), qn("w:cr")) and t.get(qn("w:type")) not in ("page", "column"):
                 # A line break (Shift+Enter) keeps the words apart — it used to
-                # be dropped, so "Nalerigu⏎Department" came out "NaleriguDepartment".
+                # be dropped, so "Sankofa⏎Department" came out "SankofaDepartment".
                 results.append("\n")
             elif t.tag == qn("w:tab"):
                 results.append("\t")
