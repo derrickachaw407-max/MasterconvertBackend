@@ -14025,7 +14025,8 @@ REMY_PLAN_SYSTEM = (
     "empty list. free is true when typing an answer makes sense.\n"
     '3. {"do":"plan","tool":"<tool>","title":"<one line: what RamzAI will make>","detail":["<a choice made, in plain words>", ...],'
     '"params":{...},"next":["<something useful to do afterwards>", ...]} when enough is known. Fill every param, using the '
-    "defaults when the person did not say; put the choices that matter in detail (2 to 4 lines, so the person can change them). "
+    "defaults when the person did not say; put the choices that matter in detail (1 to 3 short lines, each a choice the person "
+    "could change, such as 'For students', '8 questions' or 'APA style'; never a claim about quality, sources or what it covers). "
     "next has 2 or 3 short things. For tools with no params use an empty object.\n"
     '4. {"do":"suggest","say":"<one friendly line>","options":["<a concrete thing RamzAI can do>", ...]} when the person is vague '
     'about what they want ("help me study", "I have an exam on Friday", "what can you do"). Give 3 or 4 concrete, specific '
