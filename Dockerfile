@@ -13,6 +13,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# 6.4: fonts for the files that are NOT written in those five. Until now every other font (Aptos, the font of new Word
+# files; Calibri Light, Georgia, Verdana, Garamond and the rest) was drawn in the wide DejaVu Sans, and Chinese, Hindi, Amharic,
+# Thai and emoji came out as empty boxes. office-fonts.conf says which free font stands in for which.
+# One package at a time, and a package this Debian does not have is passed over: fonts must never stop the server's build.
+RUN apt-get update && for p in fonts-opensymbol fonts-dejavu-core fonts-liberation-sans-narrow fonts-urw-base35 \
+    fonts-noto-core fonts-wqy-microhei fonts-noto-color-emoji fonts-comic-neue fonts-inconsolata \
+    fonts-open-sans; do \
+      apt-get install -y --no-install-recommends "$p" || echo "6.4: no font package $p here; the server goes on without it"; \
+    done; rm -rf /var/lib/apt/lists/*
+COPY office-fonts.conf /etc/fonts/conf.d/50-office-fonts.conf
+RUN fc-cache -f
+
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

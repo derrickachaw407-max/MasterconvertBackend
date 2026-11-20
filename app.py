@@ -46,6 +46,7 @@ from converters import _soffice_convert   # the server's own LibreOffice runner
 from converters import proposal_to_docx   # 5.4: a research proposal's Word file
 from converters import pdf_apply_plan, pdf_plan_needs_pro, pdf_to_images   # 3.1: the PDF editor
 from converters import word_open, word_save   # 3.1: the Word editor
+import converters as _conv   # 6.4: the notes a conversion leaves for the person (take_notes)
 from converters import CONVERTERS as _OLD_PAIRS   # 3.15: the pairs Convert always had (kept as they were)
 import convert315 as _any                          # 3.15: every other kind of file
 from slidestudio import build_template_deck, parse_pptx_to_deck, template_catalog, StudioError, parse_pptx_original, build_original_deck
@@ -6652,6 +6653,7 @@ def convert_endpoint():
         file.save(src_path)
 
         try:
+            _conv.take_notes()                                # none left over from an earlier request on this thread
             if ppt_in:
                 src_path = _pptx_for(src_path, to_fmt, work_dir)
             base_name = safe_download_name(file.filename).rsplit(".", 1)[0]
@@ -6664,7 +6666,9 @@ def convert_endpoint():
             else:
                 result_path = _any.convert_any(src_path, from_fmt, to_fmt, os.path.join(work_dir, "out"), stem=base_name)
         except (ConversionError, StudioError) as e:
-            return jsonify({"error": str(e)}), 422
+            # 6.4: with the way on, where the refusal names one (the app makes a button of it)
+            nxt = _conv.refusal_next(str(e))
+            return jsonify({"error": str(e), "next": nxt} if nxt else {"error": str(e)}), 422
         except FileNotFoundError as e:
             return jsonify({"error": f"Required conversion tool missing on server: {e}"}), 500
 
@@ -6677,12 +6681,18 @@ def convert_endpoint():
         zipped = result_path.lower().endswith(".zip") and to_fmt != "zip"
         download_name = f"{base_name}.{'zip' if zipped else to_fmt}"
 
-        return send_file(
+        resp = send_file(
             result_path,
             mimetype="application/zip" if zipped else (MIME_TYPES.get(to_fmt) or _any.MIME.get(to_fmt) or "application/octet-stream"),
             as_attachment=True,
             download_name=download_name,
         )
+        # 6.4: what the person should know about the file (a scan whose words were read, pages kept as pictures):
+        # said beside the file, never written into it
+        notes = _conv.take_notes()
+        if notes:
+            resp.headers["X-Docente-Note"] = " ".join(notes).encode("ascii", "ignore").decode()[:300]
+        return resp
     except Exception as e:
         logger.error(f"Conversion failed unexpectedly: {e}", exc_info=True)
         return jsonify({"error": "Conversion failed. Please try again."}), 500

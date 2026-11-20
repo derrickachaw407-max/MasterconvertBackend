@@ -197,8 +197,31 @@ def _md_to_html(text):
     return _page(body)
 
 
-def _page(body, title="Document"):
+def _page(body, title=""):
+    # 6.4: the page is given no title of ours (it said "Document", an e-book's said "Book"): the owner, 19 Nov 2026,
+    # "never add anything I mean anything at all to converted files"
     return ("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" + _html.escape(title) + "</title></head><body>" + body + "</body></html>")
+
+
+_PIC_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp", "bmp": "image/bmp"}
+
+
+def _inline_pictures(body, base_dir, root):
+    """6.4: the book's pictures are written into the page itself. Left as pointers to files, they were pointers in the
+    Word file too (LibreOffice links a web page's pictures, it does not take them in), and the person got a Word file,
+    a web page or a Markdown file whose pictures were gone: the files they pointed to never left the server."""
+    import base64
+    import urllib.parse
+
+    def one(m):
+        src = urllib.parse.unquote(m.group(2).split("#")[0].split("?")[0])
+        p = os.path.normpath(os.path.join(base_dir, src))
+        ext = os.path.splitext(p)[1].lower().lstrip(".")
+        if not p.startswith(root) or not os.path.isfile(p) or ext not in _PIC_MIME or os.path.getsize(p) > 12 * 1024 * 1024:
+            return m.group(0)
+        with open(p, "rb") as fh:
+            return m.group(1) + "data:" + _PIC_MIME[ext] + ";base64," + base64.b64encode(fh.read()).decode("ascii") + '"'
+    return re.sub(r'(<img\b[^>]*\bsrc=")(?!https?:|data:)([^"]+)"', one, body)
 
 
 def _epub_to_html(src, work):
@@ -232,19 +255,38 @@ def _epub_to_html(src, work):
         rel = os.path.relpath(os.path.dirname(p), os.path.join(work, base))
         if rel != ".":   # pictures relative to the chapter, from where the page is written
             body = re.sub(r'(<img\b[^>]*\bsrc=")(?!https?:|data:)([^"]+)"', lambda mm: mm.group(1) + os.path.normpath(os.path.join(rel, mm.group(2))) + '"', body)
+        body = _inline_pictures(body, os.path.join(work, base), os.path.abspath(work))
         parts.append(body)
     if not parts:
         raise ConversionError("This e-book's chapters couldn't be read.")
     out = os.path.join(work, base, "book.html")
+    m = re.search(r"<dc:title[^>]*>([^<]*)</dc:title>", opf)
+    title = _html.unescape(m.group(1)).strip() if m else ""
+    if title.lower() in ("unknown title", "unknown"):
+        title = ""
+    # 6.4: a chapter starts on a new page, as it does in the book (a line used to be drawn between chapters: a line the
+    # book does not have). The mark goes on the chapter's first heading, paragraph, list or table: LibreOffice does not
+    # read it from a box round the chapter.
+    def new_page(chapter):
+        def mark(m):
+            tag, rest = m.group(1), m.group(2)
+            if re.search(r'\bstyle="', rest):
+                return "<" + tag + re.sub(r'\bstyle="', 'style="page-break-before: always; ', rest, count=1) + ">"
+            return "<" + tag + ' style="page-break-before: always"' + rest + ">"
+        return re.sub(r"<(h[1-6]|p|ul|ol|table|blockquote|pre)\b([^>]*)>", mark, chapter, count=1, flags=re.I)
+    body = parts[0] + "".join("\n" + new_page(p) for p in parts[1:])
     with open(out, "w", encoding="utf-8") as fh:
-        fh.write(_page("\n<hr/>\n".join(parts), "Book"))
+        fh.write(_page(body, title))
     return out
 
 
 def _html_to_md(html_text):
     from markdownify import markdownify
     m = re.search(r"<body[^>]*>(.*)</body>", html_text, re.S | re.I)      # the page itself (not its head or XML line)
-    md = markdownify(m.group(1) if m else html_text, heading_style="ATX", bullets="-")
+    try:        # (a table's first row is its header, as it is in the file: no empty row of ours above it)
+        md = markdownify(m.group(1) if m else html_text, heading_style="ATX", bullets="-", table_infer_header=True)
+    except TypeError:
+        md = markdownify(m.group(1) if m else html_text, heading_style="ATX", bullets="-")
     # a table needs its divider under the first row
     lines, out = md.split("\n"), []
     for k, line in enumerate(lines):
@@ -258,6 +300,136 @@ def _html_to_md(html_text):
     return md.strip() + "\n"
 
 
+# 6.4: Markdown is made from LibreOffice's plain web page, which says a heading with <h1>, bold with <b> and a list
+# with <ol><li>. (Its XHTML page, used until now, says all of these with CSS classes that Markdown cannot read: bold and
+# italic were lost, a numbered list came out as "1. 1.Mark the plot corners", and a heading that was not Word's own
+# heading style was a plain line.)
+_MD_FILTER = "HTML (StarWriter):EmbedImages"
+_MD_BULLETS = "\u2022\u25e6\u25aa\u25ab\u25cf\u25cb\u25a0\u25a1\u2023\u2043\u00b7\uf0b7\uf0a7"
+
+
+def _docx_base_size(path):
+    """The size (points) a Word file's plain text is written in: its Normal style's, or the document's default."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            st = z.read("word/styles.xml").decode("utf-8", "ignore")
+        for m in re.finditer(r"<w:style\b[^>]*>.*?</w:style>", st, re.S):
+            head = m.group(0)[:m.group(0).index(">") + 1]
+            if 'w:default="1"' in head and 'w:type="paragraph"' in head:
+                z_ = re.search(r'<w:sz w:val="(\d+)"', m.group(0))
+                if z_:
+                    return int(z_.group(1)) / 2.0
+        m = re.search(r'<w:docDefaults>.*?<w:sz w:val="(\d+)".*?</w:docDefaults>', st, re.S)
+        return int(m.group(1)) / 2.0 if m else 10.0
+    except Exception:
+        return None
+
+
+def _md_ready(html_text, base=None):
+    """LibreOffice's plain web page, readied for Markdown. Nothing is added and no word is changed:
+      - the page's own line ends inside a paragraph are not the document's (they made hard-wrapped Markdown);
+      - page numbers and page counts go (a Markdown file has no pages), and with them a page head or foot that held
+        nothing else;
+      - a line that only LOOKS like a heading (all of it bold and bigger than the plain text: a PDF has no heading
+        styles, and many Word files are written this way) is a heading, as it is to the reader's eye; only in a
+        document that has no real headings of its own;
+      - a paragraph that begins with a bullet sign is a list item (a PDF's bullets are signs typed before the words).
+    base: the size, in points, of the document's plain text, when it is known."""
+    from bs4 import BeautifulSoup, NavigableString
+    m = re.search(r"<body[^>]*>(.*)</body>", html_text, re.S | re.I)
+    body = m.group(1) if m else html_text
+    parts = re.split(r"(<pre\b.*?</pre>)", body, flags=re.S | re.I)
+    body = "".join(p if k % 2 else re.sub(r"[ \t]*\r?\n[ \t]*", " ", p) for k, p in enumerate(parts))
+    soup = BeautifulSoup(body, "html.parser")
+    for f in soup.find_all("sdfield"):
+        if (f.get("type") or "").upper() in ("PAGE", "DOCSTAT"):
+            f.decompose()
+        else:
+            f.unwrap()
+    for d in soup.find_all("div", attrs={"title": re.compile(r"^(header|footer)$", re.I)}):
+        if not re.search(r"\w", re.sub(r"(?i)\b(page|of)\b", "", d.get_text(" "))):
+            d.decompose()
+        else:
+            d.unwrap()
+
+    def size_of(node):                                   # the size a piece of text is written in, where it is said
+        el = node.parent
+        while el is not None and getattr(el, "name", None) not in (None, "p", "td", "th", "li", "body", "[document]"):
+            z = re.search(r"font-size:\s*([0-9.]+)pt", el.get("style") or "")
+            if z:
+                return float(z.group(1))
+            el = el.parent
+        return None
+
+    def bold(node):
+        el = node.parent
+        while el is not None and getattr(el, "name", None) not in (None, "p", "td", "th", "li", "body", "[document]"):
+            if el.name in ("b", "strong") or re.search(r"font-weight:\s*(bold|[6-9]00)", el.get("style") or ""):
+                return True
+            el = el.parent
+        return False
+
+    paras = [q for q in soup.find_all("p") if q.find_parent(["table", "li", "ul", "ol", "blockquote"]) is None]
+    # ---- bullets typed as signs
+    run = None
+    for q in paras:
+        text = q.get_text()
+        z = re.match(r"^\s*[" + _MD_BULLETS + r"][\s\u00a0]+(?=\S)", text)
+        if not z:
+            run = None
+            continue
+        left = len(z.group(0))
+        for t in list(q.find_all(string=True)):
+            if left <= 0:
+                break
+            cut = min(left, len(t))
+            left -= cut
+            t.replace_with(NavigableString(t[cut:]))
+        q.name = "li"
+        q.attrs = {}
+        nxt = run.next_sibling if run is not None else None
+        while isinstance(nxt, NavigableString) and not nxt.strip():
+            nxt = nxt.next_sibling
+        if run is not None and nxt is q:
+            run.append(q.extract())
+        else:
+            run = soup.new_tag("ul")
+            q.replace_with(run)
+            run.append(q)
+    # ---- lines that look like headings
+    if not soup.find(re.compile(r"^h[1-6]$")):
+        if base is None:
+            tally = {}
+            for q in paras:
+                for t in q.find_all(string=True):
+                    if t.strip():
+                        k = size_of(t)
+                        tally[k] = tally.get(k, 0) + len(t.strip())
+            best = max(tally, key=tally.get) if tally else None
+            base = best if best is not None else 12.0
+        cands = []
+        for q in paras:
+            if q.name != "p" or q.find("img") is not None:
+                continue
+            texts = [t for t in q.find_all(string=True) if t.strip()]
+            words = " ".join(t.strip() for t in texts)
+            if not texts or len(words) > 150:
+                continue
+            sizes = [size_of(t) for t in texts]
+            if any(z is None for z in sizes) or len(set(sizes)) != 1:
+                continue
+            z = sizes[0]
+            if (all(bold(t) for t in texts) and z >= base + 1.0) or z >= base + 5.0:
+                cands.append((q, z))
+        levels = sorted(set(z for _, z in cands), reverse=True)
+        for q, z in cands:
+            q.name = "h%d" % min(3, levels.index(z) + 1)
+            q.attrs = {}
+            for b in q.find_all(["b", "strong"]):
+                b.unwrap()                                # (a heading is not written **bold** as well)
+    return str(soup)
+
+
 def _writer_source(src, a, work):
     """A file LibreOffice Writer can open, and the filter to open it with."""
     if a == "md":
@@ -269,11 +441,44 @@ def _writer_source(src, a, work):
     return src, _LO_IN.get(a)
 
 
-def _pdf_pages(pdf, b, out_dir, stem):
-    """A PDF's pages as pictures: one picture, or a .zip of them."""
+PAGES_MAX = 60            # pages made into pictures at a time
+OCR_MAX = 20              # scanned pages whose words are read at a time...
+OCR_SECONDS = 110         # ...and the time their reading may take
+TABLE_PAGES_MAX = 80      # pages read for their tables at a time
+
+
+def _say(text):
+    """A word for the person about the file that was made (shown beside it in the app, never written into it)."""
+    try:
+        from converters import _note
+        _note(text)
+    except Exception:
+        pass
+
+
+def _pdf_count(pdf):
+    try:
+        from pypdf import PdfReader
+        rd = PdfReader(pdf)
+        if rd.is_encrypted:
+            rd.decrypt("")
+        return len(rd.pages)
+    except Exception:
+        return None
+
+
+def _pdf_pages(pdf, b, out_dir, stem, own=True):
+    """A PDF's pages as pictures: one picture, or a .zip of them. own: the PDF is the person's own file (not one made
+    here on the way from a document or slides).
+    6.4: a file with more than 60 pages gave its first 60 and said nothing of the rest. Now it is said, before any work."""
+    n = _pdf_count(pdf)
+    if n is not None and n > PAGES_MAX:
+        raise ConversionError(("This PDF has %d pages. Up to %d can be made into pictures at a time: split it first (PDF tools, "
+                               "Split a PDF), then convert each part." % (n, PAGES_MAX)) if own else
+                              ("This file has %d pages. Up to %d can be made into pictures at a time." % (n, PAGES_MAX)))
     work = _work(out_dir, "pages")
     fmt = "-jpeg" if b == "jpg" else "-png"
-    _run(["pdftoppm", "-r", "150", fmt, "-l", "60", pdf, os.path.join(work, "p")], what="the page renderer")
+    _run(["pdftoppm", "-r", "150", fmt, "-l", str(PAGES_MAX), pdf, os.path.join(work, "p")], what="the page renderer")
     pics = sorted(f for f in os.listdir(work) if f.endswith("." + ("jpg" if b == "jpg" else "png")))
     if not pics:
         raise ConversionError("No pages came out of that file.")
@@ -287,27 +492,59 @@ def _pdf_pages(pdf, b, out_dir, stem):
 
 
 def _pdf_text(src, out_dir):
-    """The words of a PDF; a scanned one is read with OCR (up to 15 pages)."""
+    """The words of a PDF, page after page. A page that is a scan (a picture of a page) is read with OCR.
+    6.4: before, only a PDF with no words AT ALL was read with OCR, and then its first 15 pages, silently: a PDF of
+    typed pages with a few scanned ones lost the scanned pages' words without a word, and so did page 16 onwards of a
+    scan. Now every page without words is looked at; what was read from pictures, and what could not be read, is said
+    beside the file. The page-end sign of the PDF reader (a form feed, shown as a box by many phones) is not left in."""
+    import time as _time
     txt = os.path.join(out_dir, "words.txt")
     _run(["pdftotext", "-enc", "UTF-8", src, txt], what="the PDF reader")
-    t = open(txt, encoding="utf-8", errors="ignore").read()
-    if len(t.strip()) >= 20:
-        return t
-    work = _work(out_dir, "ocr")
-    _run(["pdftoppm", "-r", "200", "-png", "-l", "15", src, os.path.join(work, "p")], what="the page renderer")
-    words = []
-    for f in sorted(os.listdir(work)):
-        r = subprocess.run(["tesseract", os.path.join(work, f), "-", "--psm", "3"], capture_output=True, text=True, timeout=60)
-        words.append(r.stdout.strip())
-    t = "\n\n".join(w for w in words if w)
+    raw = open(txt, encoding="utf-8", errors="ignore").read()
+    pages = raw.split("\f")
+    if pages and not pages[-1].strip():
+        pages.pop()
+    empty = [k for k, t in enumerate(pages) if len(t.strip()) < 20]
+    read = unread = 0
+    if empty:
+        work = _work(out_dir, "ocr")
+        began = _time.time()
+        for k in empty:
+            if read >= OCR_MAX or _time.time() - began > OCR_SECONDS:
+                unread += 1
+                continue
+            root = os.path.join(work, "p%d" % k)
+            try:
+                subprocess.run(["pdftoppm", "-r", "200", "-png", "-f", str(k + 1), "-l", str(k + 1), "-singlefile", src, root],
+                               capture_output=True, timeout=60)
+                r = subprocess.run(["tesseract", root + ".png", "-", "--psm", "3"], capture_output=True, text=True, timeout=60)
+                got = (r.stdout or "").strip()
+            except Exception:
+                got = ""
+            finally:
+                try:
+                    os.remove(root + ".png")
+                except OSError:
+                    pass
+            if len(got) >= 20:
+                pages[k] = got + "\n"
+                read += 1
+    t = "\n".join(p.rstrip("\n") + "\n" for p in pages if p.strip())
     if not t.strip():
         raise ConversionError("No words could be found in this PDF.")
+    if read:
+        _say("%s scanned: the words were read from the picture, so check them against the original."
+             % ("1 page was" if read == 1 else "%d pages were" % read))
+    if unread:
+        _say("%s could not be read this time: split the PDF (PDF tools, Split a PDF) and convert the rest."
+             % ("1 more scanned page" if unread == 1 else "%d more scanned pages" % unread))
     return t
 
 
-def _gap_rows(page):
+def _gap_rows(page, tops=False):
     """A page's lines, each cut into cells where the gap between two words is wider than a couple of spaces (a table
-    drawn without lines keeps its columns; a paragraph's line stays one cell)."""
+    drawn without lines keeps its columns; a paragraph's line stays one cell). tops: each line with how far down the
+    page it stands, [(top, cells)]."""
     words = page.extract_words(x_tolerance=1.5, y_tolerance=2.5) or []
     lines = []
     for w in sorted(words, key=lambda w: (round(w["top"]), w["x0"])):
@@ -316,7 +553,7 @@ def _gap_rows(page):
         else:
             lines.append([w["top"], [w]])
     rows = []
-    for _, ws in lines:
+    for top, ws in lines:
         ws.sort(key=lambda w: w["x0"])
         cells, cur = [], [ws[0]]
         for prev, w in zip(ws, ws[1:]):
@@ -326,8 +563,8 @@ def _gap_rows(page):
             else:
                 cur.append(w)
         cells.append(cur)
-        rows.append([" ".join(x["text"] for x in c) for c in cells])
-    return rows
+        rows.append((top, [" ".join(x["text"] for x in c) for c in cells]))
+    return rows if tops else [r for _, r in rows]
 
 
 def _pdf_tables(src, out_dir, stem):
@@ -335,24 +572,57 @@ def _pdf_tables(src, out_dir, stem):
     from openpyxl import Workbook
     wb = Workbook()
     wb.remove(wb.active)
+    wb.properties.creator = ""
+    wrote = 0
     with pdfplumber.open(src) as pdf:
-        for n, page in enumerate(pdf.pages[:80], 1):
-            tables = [t for t in (page.extract_tables() or []) if t and any(any(c for c in row) for row in t)]
-            ws = wb.create_sheet(f"Page {n}")
-            if tables:
-                r = 1
-                for t in tables:
-                    for row in t:
-                        for c, v in enumerate(row, 1):
-                            ws.cell(row=r, column=c, value=_cell(v))
-                        r += 1
-                    r += 1
-            else:      # no ruled tables: each line, cut into its columns where it has them
-                for r, row in enumerate(_gap_rows(page), 1):
+        if len(pdf.pages) > TABLE_PAGES_MAX:       # (6.4: page 81 onwards used to be left out without a word)
+            raise ConversionError("This PDF has %d pages. Up to %d can be turned into Excel at a time: split it first (PDF tools, "
+                                  "Split a PDF), then convert each part." % (len(pdf.pages), TABLE_PAGES_MAX))
+        for n, page in enumerate(pdf.pages, 1):
+            ws = wb.create_sheet(f"Sheet{n}")          # Excel's own name for a tab (6.4: it was "Page 1": a word of ours)
+            # 6.4: the page's tables AND the lines around them, in the page's own order. (Where a page had a table,
+            # only the table was written: every heading and paragraph of that page was left out without a word.)
+            found = []
+            try:
+                for tb in page.find_tables() or []:
+                    rows = tb.extract() or []
+                    if rows and any(any(c for c in row) for row in rows):
+                        found.append((tb.bbox, rows))
+            except Exception:
+                found = []
+            rest = page
+            if found:
+                boxes = [b for b, _ in found]
+
+                def outside(o, boxes=boxes):
+                    if o.get("object_type") != "char":
+                        return True
+                    x, y = (o["x0"] + o["x1"]) / 2.0, (o["top"] + o["bottom"]) / 2.0
+                    return not any(b[0] - 1 <= x <= b[2] + 1 and b[1] - 1 <= y <= b[3] + 1 for b in boxes)
+                try:
+                    rest = page.filter(outside)
+                except Exception:
+                    rest = None
+            blocks = [(b[1], rows) for b, rows in found]
+            if rest is not None:
+                blocks += [(top, [row]) for top, row in _gap_rows(rest, tops=True)]
+            blocks.sort(key=lambda x: x[0])
+            r, was_table = 1, False
+            for _top, rows in blocks:
+                table = len(rows) > 1 or any(rows is fr for _, fr in found)
+                if (table or was_table) and r > 1:
+                    r += 1                              # an empty row sets a table apart from what is round it
+                for row in rows:
                     for c, v in enumerate(row, 1):
                         ws.cell(row=r, column=c, value=_cell(v))
+                        wrote += 1 if v not in (None, "") else 0
+                    r += 1
+                was_table = table
     if not wb.sheetnames:
         raise ConversionError("This PDF has no pages to read.")
+    if not wrote:      # (6.4: a scan used to give a workbook of empty sheets, and nothing was said)
+        raise ConversionError("No words could be found in this PDF: its pages are pictures (a scan). PDF to Word reads the "
+                              "words of a scan; convert it to Word first.")
     out = os.path.join(out_dir, stem + ".xlsx")
     wb.save(out)
     return out
@@ -361,7 +631,8 @@ def _pdf_tables(src, out_dir, stem):
 def _cell(v):
     if v is None:
         return None
-    s = str(v).strip()
+    # a bullet drawn with the Symbol or Wingdings font is a private sign in the PDF: outside that font it shows as a box
+    s = str(v).strip().replace("\uf0b7", "\u2022").replace("\uf0a7", "\u25aa")
     if re.fullmatch(r"-?\d+", s) and len(s) < 15:
         return int(s)
     if re.fullmatch(r"-?\d+\.\d+", s) and len(s) < 18:
@@ -372,6 +643,14 @@ def _cell(v):
 def convert_doc(src, a, b, out_dir, stem):
     from converters import pdf_to_docx
     if a == "pdf":
+        # 6.4: a PDF with a password is said to be one, with the way on (the PDF reader said "it may be damaged")
+        try:
+            from pdf2word import pdf_lock
+            why = pdf_lock(src)
+        except ImportError:
+            why = None
+        if why:
+            raise ConversionError(why)
         if b in ("jpg", "png"):
             return _pdf_pages(src, b, out_dir, stem)
         if b == "txt":
@@ -384,16 +663,19 @@ def convert_doc(src, a, b, out_dir, stem):
         return convert_doc(docx, "docx", b, out_dir, stem) if b != "docx" else _named(docx, out_dir, stem, "docx")
     if b in ("jpg", "png"):
         pdf = convert_doc(src, a, "pdf", _work(out_dir, "topdf"), stem)
-        return _pdf_pages(pdf, b, out_dir, stem)
+        return _pdf_pages(pdf, b, out_dir, stem, own=False)
     work = _work(out_dir, "w")
     if b == "md":
         if a == "html":
             h = open(src, encoding="utf-8", errors="ignore").read()
         elif a == "txt":
             return _named(shutil.copy(src, os.path.join(work, "t.md")), out_dir, stem, "md")
+        elif a == "epub":      # the book's own page: its headings, lists and pictures as the book has them
+            h = open(_epub_to_html(src, _work(work, "book")), encoding="utf-8", errors="ignore").read()
         else:
             s, inf = _writer_source(src, a, work)
-            h = open(_lo(s, "html", work, _LO_OUT["html"][1], inf), encoding="utf-8", errors="ignore").read()
+            h = _md_ready(open(_lo(s, "html", work, _MD_FILTER, inf), encoding="utf-8", errors="ignore").read(),
+                          _docx_base_size(s) if a == "docx" else None)
         p = os.path.join(out_dir, stem + ".md")
         open(p, "w", encoding="utf-8").write(_html_to_md(h))
         return p
@@ -403,6 +685,8 @@ def convert_doc(src, a, b, out_dir, stem):
         return p
     s, inf = _writer_source(src, a, work)
     ext, filt = _LO_OUT[b]
+    if b == "epub":
+        s, inf = _epub_ready(s, inf, work), None
     out = _lo(s, ext, work, filt, inf)
     if b == "txt":     # no byte-order mark at the start
         raw = open(out, "rb").read()
@@ -411,16 +695,46 @@ def convert_doc(src, a, b, out_dir, stem):
     return _named(out, out_dir, stem, b)
 
 
+def _epub_ready(src, infilter, work):
+    """6.4: LibreOffice's e-book writer LEAVES OUT the heading rows of a table (the rows Word repeats at the top of each
+    page: the first row of most tables in a report). The book then had the table's figures and not what they were
+    figures of. The document is first written as an OpenDocument file in which those rows are ordinary rows; the
+    e-book is made from that. Nothing else in the document is touched."""
+    odt_dir = _work(work, "odt")
+    odt = _lo(src, "odt", odt_dir, _LO_OUT["odt"][1], infilter)
+    try:
+        with zipfile.ZipFile(odt) as z:
+            items = [(i, z.read(i.filename)) for i in z.infolist()]
+        out, changed = [], False
+        for info, data in items:
+            if info.filename == "content.xml":
+                t = data.decode("utf-8")
+                u = re.sub(r"</?table:table-header-rows>", "", t)
+                if u != t:
+                    changed, data = True, u.encode("utf-8")
+            out.append((info, data))
+        if changed:
+            tmp = odt + ".tmp"
+            with zipfile.ZipFile(tmp, "w") as z:
+                for info, data in out:
+                    z.writestr(info, data, compress_type=zipfile.ZIP_STORED if info.filename == "mimetype" else zipfile.ZIP_DEFLATED)
+            os.replace(tmp, odt)
+    except Exception:
+        pass
+    return odt
+
+
 # ---------------------------------------------------------------- slides
 def convert_slides(src, a, b, out_dir, stem):
     from converters import pptx_to_docx
     work = _work(out_dir, "s")
     if b in ("jpg", "png"):
         pdf = _lo(src, "pdf", work, "impress_pdf_Export")
-        return _pdf_pages(pdf, b, out_dir, stem)
+        return _pdf_pages(pdf, b, out_dir, stem, own=False)
     if b == "docx":
+        # 6.4: pages that look like the slides, as for a .pptx (it was the plain handout: a look of the app's own)
         pptx = src if a == "pptx" else _lo(src, "pptx", work, "Impress MS PowerPoint 2007 XML")
-        return _named(pptx_to_docx(pptx, _work(out_dir, "pd")), out_dir, stem, "docx")
+        return _named(pptx_to_docx(pptx, _work(out_dir, "pd"), style="same"), out_dir, stem, "docx")
     filt = {"pptx": "Impress MS PowerPoint 2007 XML", "ppt": "MS PowerPoint 97", "odp": "impress8", "pdf": "impress_pdf_Export"}[b]
     return _named(_lo(src, b, work, filt), out_dir, stem, b)
 
@@ -442,6 +756,7 @@ def _csv_to_xlsx(src, out):
             ws.cell(row=r, column=c, value=_cell(v))
         if r > 200000:
             break
+    wb.properties.creator = ""            # 6.4: not the tool's name ("openpyxl") as the file's author
     wb.save(out)
     return out
 
@@ -585,7 +900,7 @@ def convert_image(src, a, b, out_dir, stem):
         (f if f.mode in ("RGB", "RGBA", "L", "LA", "P") else f.convert("RGBA")).save(out, "PNG", optimize=True)
     elif b == "pdf":
         pages = [_flat(f) for f in frames]
-        pages[0].save(out, "PDF", resolution=150.0, save_all=len(pages) > 1, append_images=pages[1:])
+        pages[0].save(out, "PDF", resolution=150.0, save_all=len(pages) > 1, append_images=pages[1:], title="")
     elif b == "ico":
         f = frames[0].convert("RGBA")
         f.thumbnail((256, 256))
@@ -661,8 +976,91 @@ def kind_of(fmt):
     return FORMATS.get(fmt, (None, None, None))[1]
 
 
+def _tidy_html(path):
+    """A web page LibreOffice wrote. It gives a page without a title the title "- no title specified", and a workbook of
+    several sheets a list headed "Overview", a line between sheets and "Sheet 1:" before each sheet's name. None of
+    that is in the person's file: it goes (a sheet keeps its own name as its heading)."""
+    try:
+        t = open(path, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return
+    u = re.sub(r"(<title\b[^>]*>)\s*-?\s*no title specified\s*(</title>)", r"\1\2", t, flags=re.I)
+    # a picture's description (its alt text) was also written out beside the picture, as words on the page
+    u = re.sub(r'(<img\b[^>]*\balt="([^"]+)"[^>]*/?>)\s*\2\s*(?=</span>)', r"\1", u)
+    # LibreOffice's own notes in the page's source, and its word about itself
+    u = re.sub(r"<!--\s*(?:This file was converted to xhtml by LibreOffice|Next '[a-z:]+' (?:is|was) a)[^>]*-->\s*", "", u)
+    u = re.sub(r'<meta\s+name="(?:DCTERMS\.source|xsl:vendor|generator)"[^>]*>\s*', "", u, flags=re.I)
+    if re.search(r"<h1>\s*Overview\s*</h1>", u, flags=re.I) and re.search(r'<a\s+name="table0"', u, flags=re.I):
+        u = re.sub(r"<hr>\s*<p>\s*<center>\s*<h1>\s*Overview\s*</h1>.*?</center>\s*</p>\s*", "", u, count=1, flags=re.I | re.S)
+        u = re.sub(r"<hr>\s*(?=<a\s+name=\"table\d+\")", "", u, flags=re.I)
+        u = re.sub(r"(<a\s+name=\"table\d+\">\s*<h1>)\s*Sheet\s+\d+:\s*<em>(.*?)</em>\s*(</h1>)", r"\1\2\3", u, flags=re.I | re.S)
+        u = re.sub(r"<!--\s*\*+\s*-->\s*", "", u)
+    if u != t:
+        open(path, "w", encoding="utf-8").write(u)
+
+
+def _tidy_epub(path, stem):
+    """An e-book LibreOffice wrote calls a book without a title "Unknown Title" (and its writer "Unknown Author"). A book
+    must have a title: it takes the name the person gave the file."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            items = [(i, z.read(i.filename)) for i in z.infolist()]
+    except Exception:
+        return
+    changed = False
+    name = _html.escape(stem)
+    out = []
+    for info, data in items:
+        if info.filename.endswith((".opf", ".ncx", ".xhtml")):
+            t = data.decode("utf-8", "ignore")
+            u = re.sub(r"(<dc:title[^>]*>)\s*Unknown Title\s*(</dc:title>)", lambda m: m.group(1) + name + m.group(2), t)
+            u = re.sub(r"<dc:creator[^>]*>\s*Unknown Author\s*</dc:creator>", "", u)
+            u = re.sub(r"(<docTitle>\s*<text>)\s*Unknown Title\s*(</text>)", lambda m: m.group(1) + name + m.group(2), u)
+            u = re.sub(r"<docAuthor>\s*<text>\s*Unknown Author\s*</text>\s*</docAuthor>", "", u)
+            u = re.sub(r"(<title>)\s*Unknown Title\s*(</title>)", lambda m: m.group(1) + name + m.group(2), u)
+            u = re.sub(r'<meta\s+content="[^"]*"\s+name="generator"\s*/>|<meta\s+name="generator"\s+content="[^"]*"\s*/>', "", u)
+            # LibreOffice describes every picture by the place it keeps it in ("OEBPS/images/image0001.png"): read
+            # aloud to someone who cannot see the picture, and shown where the picture cannot be. No description then.
+            u = re.sub(r'(<img\b[^>]*\balt=")OEBPS/images/[^"]*(")', r"\1\2", u)
+            if len(re.findall(r">\s*Section \d+\s*<", u)) == 1:      # a book without headings: its one chapter is the book
+                u = re.sub(r">\s*Section 1\s*<", ">" + name + "<", u)
+            if u != t:
+                changed = True
+                data = u.encode("utf-8")
+        out.append((info, data))
+    if not changed:
+        return
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w") as z:
+        for info, data in out:        # "mimetype" stays first and unpacked, as an e-book must have it
+            z.writestr(info, data, compress_type=zipfile.ZIP_STORED if info.filename == "mimetype" else zipfile.ZIP_DEFLATED)
+    os.replace(tmp, path)
+
+
+def _tidy(path, b, stem):
+    """6.4: a converted file holds only what the person's own file holds (the owner, 19 Nov 2026: "never add anything I
+    mean anything at all to converted files"). What the tools that made it wrote into it of their own goes."""
+    try:
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        if ext == "html":
+            _tidy_html(path)
+        elif ext == "epub":
+            _tidy_epub(path, stem)
+        elif ext in ("docx", "pptx", "xlsx"):
+            from converters import strip_tool_marks
+            strip_tool_marks(path)
+    except Exception:
+        pass
+    return path
+
+
 def convert_any(src, a, b, out_dir, stem="converted"):
     """Turns src (a file of kind a) into kind b. Returns the result's path (.zip when it's more than one file)."""
+    stem0 = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem)[:120] or "converted"
+    return _tidy(_convert_any(src, a, b, out_dir, stem), b, stem0)
+
+
+def _convert_any(src, a, b, out_dir, stem="converted"):
     if not can(a, b):
         raise ConversionError(f"{FORMATS.get(a, (a,))[0]} can't be turned into {FORMATS.get(b, (b,))[0]} here.")
     if os.path.getsize(src) == 0:
