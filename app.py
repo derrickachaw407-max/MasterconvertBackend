@@ -54,6 +54,9 @@ import proposal as _prop                           # 5.4: a research proposal (t
 import defence as _defence                         # 5.7: slides from research work are a research defence
 import onelang as _onelang                         # 6.0: every word of a piece in its own language
 import quiz60 as _quiz60                           # 6.0: much harder practice questions, checked by an examiner
+import valid65 as _v65                             # 6.5: what a research tool checks before a sentence or a paper may stand
+import ground66 as _g66                            # 6.6: what is made from the person's own file says only what it says
+import meetnotes66 as _mn66                        # 6.6, round 55: a meeting's notes say only what was said, where it was said
 
 # Load LibreOffice into memory in the background as each worker starts, so
 # the first conversion after a deploy or restart isn't the slow one.
@@ -140,6 +143,77 @@ def _exempt_cors_preflight():
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("academic-home")
+
+
+# ---------------------------------------------------------------- 6.6, round 128: the log never holds what a person typed
+# (the owner, 21 Nov 2026 00:47: "Raise the app's validity"; his rule 9: every privacy promise must be true.) The privacy
+# notice says the server's logs record "technical details of requests (never what you type or your files)". An exception's
+# message can quote either: a value that wouldn't convert ("could not convert string to float: '…'"), a row the database
+# refused ("Failing row contains (…)"), an address with a search in it. So the log names an exception by its kind, where it
+# happened in our code and, for a service that answered, its status and host (_why); and a traceback keeps its files, lines
+# and code but names each exception by its kind alone (_NoMessages).
+import traceback as _tb_mod
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _why(e):
+    """An exception as the log may say it ("ValueError at app.py line 1234", "HTTPError 401 from api.example.org"), never
+    its message."""
+    try:
+        where, tb = "", getattr(e, "__traceback__", None)
+        while tb is not None:                       # the last place in our own files
+            name = tb.tb_frame.f_code.co_filename
+            if os.path.dirname(os.path.abspath(name)) == _HERE:
+                where = f" at {os.path.basename(name)} line {tb.tb_lineno}"
+            tb = tb.tb_next
+        extra, resp = "", getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+        if not isinstance(code, int):
+            code = getattr(e, "status_code", None)
+        if not isinstance(code, int):
+            code = getattr(e, "code", None)
+        if isinstance(code, int) and not isinstance(code, bool):
+            extra += f" {code}"
+        url = getattr(getattr(e, "request", None), "url", None) or getattr(resp, "url", None) or getattr(e, "url", None)
+        host = urlparse(str(url)).hostname if isinstance(url, str) and url else None
+        if host:
+            extra += f" from {host}"
+        if isinstance(getattr(e, "pgcode", None), str):
+            extra += f" (database code {e.pgcode})"
+        if isinstance(getattr(e, "errno", None), int):
+            extra += f" (errno {e.errno})"
+        return type(e).__name__ + extra + where
+    except Exception:
+        return type(e).__name__
+
+
+class _NoMessages(logging.Formatter):
+    """A traceback in the log keeps its files, lines and code; each exception in it is named by its kind alone (see _why)."""
+
+    def formatException(self, ei):
+        try:
+            te, chain, seen = _tb_mod.TracebackException(*ei), [], set()
+            while te is not None and id(te) not in seen:
+                seen.add(id(te))
+                chain.append(te)
+                te = te.__cause__ or (None if te.__suppress_context__ else te.__context__)
+            out = []
+            for i, t in enumerate(reversed(chain)):
+                if i:
+                    out.append("\nWhile handling that, another exception happened:\n\n")
+                out.append("Traceback (most recent call last):\n")
+                out.extend(t.stack.format())
+                kind = getattr(t, "exc_type_str", None) or getattr(getattr(t, "exc_type", None), "__qualname__", None) or "Exception"
+                out.append(str(kind).rsplit(".", 1)[-1] + "\n")
+            return "".join(out).rstrip("\n")
+        except Exception:
+            return f"{getattr(ei[0], '__name__', 'Exception')} (its traceback couldn't be written)"
+
+
+for _h in logging.getLogger().handlers:
+    _h.setFormatter(_NoMessages(logging.BASIC_FORMAT))
+
+
 if not (os.environ.get("EMAIL_ADDRESS") and (os.environ.get("EMAIL_APP_PASSWORD") or os.environ.get("BREVO_API_KEY"))):
     logger.warning("Email: NOT set up — add EMAIL_ADDRESS and EMAIL_APP_PASSWORD on Render so new accounts can confirm their email")
 
@@ -553,7 +627,7 @@ def init_db():
             "init_db: could not connect to the database — the server will still "
             "boot, but every DB-backed route (auth, conversions, promo codes, "
             "memory) will fail until this is fixed. This is often an expired "
-            "Render free Postgres instance. Error: %s", e,
+            "Render free Postgres instance. Error: %s", _why(e),
         )
         return
     try:
@@ -763,7 +837,7 @@ def init_db():
             _sync_tables(cur)
             _meet_tables(cur)
     except Exception as e:
-        logger.error("init_db: table setup failed: %s", e)
+        logger.error("init_db: table setup failed: %s", _why(e))
     finally:
         conn.close()
 
@@ -831,7 +905,7 @@ def _research_note(user, plan, out):
         elif _memory_is_full(user["id"]):
             out["memory_full"] = True
     except Exception as e:
-        logger.warning(f"Research note not kept: {e}")
+        logger.warning(f"Research note not kept: {_why(e)}")
 
 
 def _memory_on(user_row):
@@ -1046,7 +1120,7 @@ def _set_email_pause(minutes):
         finally:
             conn.close()
     except Exception as e:
-        logger.warning(f"Couldn't save the email pause: {e}")
+        logger.warning(f"Couldn't save the email pause: {_why(e)}")
 
 
 def _email_refused(why, retry_minutes=0):
@@ -1463,7 +1537,7 @@ def _invite_joined(row, device_id):
             row = dict(row)
             row["referral_rewarded"] = True
     except Exception as e:
-        logger.warning(f"Couldn't look at the invite of user {row.get('id')}: {e}")
+        logger.warning(f"Couldn't look at the invite of user {row.get('id')}: {_why(e)}")
     return row
 
 
@@ -1690,7 +1764,7 @@ def auth_required(fn):
                     cur.execute("UPDATE users SET plan = 'free', plan_expires_at = NULL, pass_points = 0, pass_points_given = 0, research_points = NULL WHERE id = %s AND plan_expires_at <= now()", (user_id,))
                 conn.commit()
             except Exception as e:
-                logger.warning(f"Couldn't end an expired pass for user {user_id}: {e}")
+                logger.warning(f"Couldn't end an expired pass for user {user_id}: {_why(e)}")
             finally:
                 conn.close()
             row = dict(row)
@@ -1705,7 +1779,7 @@ def auth_required(fn):
                 conn.commit()
                 logger.warning(f"Removed a Monthly/Yearly plan with no payment behind it from user {user_id}")
             except Exception as e:
-                logger.warning(f"Couldn't remove an unpaid plan from user {user_id}: {e}")
+                logger.warning(f"Couldn't remove an unpaid plan from user {user_id}: {_why(e)}")
             finally:
                 conn.close()
             row = dict(row)
@@ -1731,7 +1805,7 @@ def auth_required(fn):
                     row = started
                     logger.info(f"Bonus month started for user {user_id}")
             except Exception as e:
-                logger.warning(f"Couldn't start a bonus month for user {user_id}: {e}")
+                logger.warning(f"Couldn't start a bonus month for user {user_id}: {_why(e)}")
             finally:
                 conn.close()
         # Free Pro during the promotion (bonus months stay banked until it ends).
@@ -1794,7 +1868,7 @@ def _once_settle(uid, key, resp):
         finally:
             conn.close()
     except Exception as e:
-        logger.warning(f"once: couldn't keep an answer: {e}")
+        logger.warning(f"once: couldn't keep an answer: {_why(e)}")
 
 
 def _once_settle_json(uid, key, body):
@@ -1813,7 +1887,7 @@ def _once_settle_json(uid, key, body):
         finally:
             conn.close()
     except Exception as e:
-        logger.warning(f"once: couldn't keep an answer: {e}")
+        logger.warning(f"once: couldn't keep an answer: {_why(e)}")
 
 
 @app.after_request
@@ -1866,7 +1940,7 @@ def _once(fn):
             finally:
                 conn.close()
         except Exception as e:
-            logger.warning(f"once: {e}")              # the table isn't there yet: work as before
+            logger.warning(f"once: {_why(e)}")              # the table isn't there yet: work as before
             return fn(*args, **kwargs)
         g._once_pending = (uid, key)       # kept (or forgotten) by _once_keep when the answer leaves
         try:
@@ -2024,7 +2098,7 @@ def _ai_send(payload, timeout, feature=None):
         logger.warning(f"AI: no answer in time ({feature or '-'})")
         raise ConversionError(AI_MSG_SLOW)
     except requests.exceptions.RequestException as e:
-        logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {e}")
+        logger.warning(f"AI: couldn't reach the AI service ({feature or '-'}): {_why(e)}")
         raise ConversionError(AI_MSG_FAILED)
     if resp.status_code != 200:
         raise (_AiBadRequest if resp.status_code == 400 else ConversionError)(_ai_failure(resp.status_code, resp.text, feature))
@@ -2201,7 +2275,7 @@ def call_claude(system_prompt, user_message=None, max_tokens=600, use_search=Fal
             try:
                 return _ai_send_stream(payload, limit, feature, on_text, on_search)
             except _AiStreamTrouble as e:
-                logger.warning(f"AI: an answer couldn't be read as it was written ({e}); asked again the plain way ({feature or '-'})")
+                logger.warning(f"AI: an answer couldn't be read as it was written ({_why(e)}); asked again the plain way ({feature or '-'})")
         return _ai_send(payload, limit, feature)
 
     def send(stream=False, limit=None):
@@ -2363,8 +2437,8 @@ def search_web_sources(topic, max_results=4):
         return [], f"web search request failed: {e}"
     if resp.status_code != 200:
         logger.warning(
-            "search_web_sources: non-200 (%s) for a %d-character topic — body: %s",
-            resp.status_code, len(topic or ""), resp.text[:300],
+            "search_web_sources: non-200 (%s) for a %d-character topic (its answer: %d characters)",
+            resp.status_code, len(topic or ""), len(resp.text or ""),
         )
         return [], f"web search returned HTTP {resp.status_code}: {resp.text[:200]}"
     data = resp.json()
@@ -2467,8 +2541,8 @@ def search_semantic_scholar(query, max_results=4):
         break
     if resp.status_code != 200:
         logger.warning(
-            "search_semantic_scholar: non-200 (%s) for %r — body: %s",
-            resp.status_code, query[:80], resp.text[:500],
+            "search_semantic_scholar: non-200 (%s) for a %d-character query (its answer: %d characters)",
+            resp.status_code, len(query or ""), len(resp.text or ""),
         )
         reason = "rate-limited (too many requests)" if resp.status_code == 429 else f"HTTP {resp.status_code}"
         return [], f"Semantic Scholar {reason}: {resp.text[:200]}"
@@ -2854,6 +2928,12 @@ def _openalex_papers(query, n, since=None, kinds=None, until=None):
         if p:
             p["preprint"] = p["preprint"] or str(w.get("type") or "").lower() == "preprint"
             p["kind"] = "preprint" if p["preprint"] else _oa_kind(w)
+            # 6.6, round 61: a book's publisher (a chapter is known as one from the publisher's record, which also gives its
+            # book's title: the index names a platform or a series there, never the book)
+            if p["kind"] == "book":
+                pub = ((prim.get("source") or {}).get("host_organization_name")) or ((best.get("source") or {}).get("host_organization_name"))
+                if pub:
+                    p["publisher"] = str(pub)[:160]
             if p["kind"] == "thesis":       # a thesis names the university that gave the degree (its author's, then)
                 inst = next((((i or {}).get("display_name")) for a in (w.get("authorships") or [])[:1] for i in ((a or {}).get("institutions") or [])
                              if (i or {}).get("display_name")), None)
@@ -3014,7 +3094,74 @@ def _pdf_alive(url):
         return True
 
 
-def search_papers(query, max_results=8, since=None, check_links=True, kinds=None, stats=None, until=None):
+# Crossref asks every program that reads its records for a contact address (its "polite pool": 10 records a second and 3
+# at a time; without one, 5 a second and 1 at a time, and a 429 beyond). The app's own published support address is the
+# contact. Two processes run on Render: each asks at most 2 at a time and 4 a second, so together they stay inside it.
+V65_CONTACT = "support.docente@gmail.com"
+_V65_CR_SEM = _threading.BoundedSemaphore(2)
+_V65_CR_LOCK = _threading.Lock()
+_V65_CR_NEXT = [0.0]
+_V65_CR_GAP = 0.25
+_V65_CACHE = {}                    # a registry's answer, by address, for a day (a DOI's record rarely changes)
+_V65_CACHE_MAX = 3000
+
+
+def _v65_get(url, params):
+    """One request to a DOI registry or to OpenAlex, for server/valid65.py: (status, its JSON or None)."""
+    registry = url.startswith("https://api.crossref.org/") or url.startswith("https://doi.org/api/")
+    if params is not None and "openalex.org" in url and OPENALEX_API_KEY:
+        params = dict(params, api_key=OPENALEX_API_KEY)
+    if url.startswith("https://api.crossref.org/"):
+        params = dict(params or {}, mailto=V65_CONTACT)
+    if registry:
+        hit = _V65_CACHE.get(url)
+        if hit and time.time() - hit[0] < 86400:
+            return hit[1], hit[2]
+        with _V65_CR_SEM:
+            with _V65_CR_LOCK:
+                now = time.time()
+                wait = max(0.0, _V65_CR_NEXT[0] - now)
+                _V65_CR_NEXT[0] = max(now, _V65_CR_NEXT[0]) + _V65_CR_GAP
+            if wait:
+                time.sleep(wait)
+            r = requests.get(url, params=params, headers=_PAPER_UA, timeout=5)
+    else:
+        r = requests.get(url, params=params, headers=_PAPER_UA, timeout=5)
+    try:
+        js = r.json() if "json" in str(r.headers.get("content-type") or "").lower() else None
+    except ValueError:
+        js = None
+    if registry and r.status_code in (200, 404):
+        if len(_V65_CACHE) >= _V65_CACHE_MAX:
+            for k in list(_V65_CACHE)[: _V65_CACHE_MAX // 4]:
+                _V65_CACHE.pop(k, None)
+        _V65_CACHE[url] = (time.time(), r.status_code, js)
+    if registry and r.status_code == 429:
+        logger.warning("Papers: a DOI registry asked the app to slow down (429)")
+    return r.status_code, js
+
+
+def _v65_registry(papers, budget=8.0):
+    """The papers that may be cited (see search_papers), their authors written as their registry holds them. Never raises."""
+    try:
+        kept, reg = _v65.registry_check(papers, _v65_get, datetime.now(timezone.utc).year, workers=2, budget=budget)
+    except Exception as e:
+        logger.warning(f"Papers: the registry check didn't run ({_why(e)})")
+        return papers, {"unreached": True}
+    for p in kept:
+        names = p.pop("authors_registry", None)
+        if names:
+            clean = _clean_authors(names)
+            if clean:
+                p["authors"] = clean
+        if p.get("doi"):
+            p["url"] = f"https://doi.org/{p['doi']}"
+    if any(reg.get(k) for k in ("retracted", "wrong_doi", "unknown_doi", "unidentified", "future")) or reg.get("unreached"):
+        logger.info("Papers: registry check: " + ", ".join(f"{k} {v}" for k, v in reg.items() if v))
+    return kept, reg
+
+
+def search_papers(query, max_results=8, since=None, check_links=True, kinds=None, stats=None, until=None, registry=True):
     """Real, downloadable papers for a topic: [{title, authors, year, venue, doi, pdf, url,
     abstract, ...}] most relevant first, and a reason when there are none. kinds (4.6, Research): the kinds of work
     asked for, passed to the indexes that can filter by them. stats (a dict, optional) gets how many different papers
@@ -3073,10 +3220,22 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
     if stats is not None:
         stats["found"] = len(merged)
         stats["from"] = [name for name, _ in order if got.get(name)]
+        # 6.6, round 2: the search record (what was searched, where, and what became of what was found)
+        stats["query"] = query
+        stats["by_source"] = {name: len(got.get(name) or []) for name, _ in order}
+        stats["duplicates"] = len(found) - len(merged)
+    n0 = len(merged)
     if until:          # an index that couldn't filter by the last year (or a record dated later) is filtered here
         merged = [p for p in merged if not p.get("year") or int(p["year"]) <= until]
+    n1 = len(merged)
+    # 6.6, round 3: when journal articles are asked for, a preprint with a DOI waits for its registry: if it has been
+    # published since, the published paper is cited (registry_check); if not, it goes like any kind not asked for
+    wait_pub = bool(registry and kinds and "preprint" not in kinds and ("article" in kinds or "review" in kinds))
     if kinds:          # 5.0: an index that couldn't filter by kind is filtered here (a record with no kind counts as an article)
-        merged = [p for p in merged if (p.get("kind") or "article") in kinds]
+        merged = [p for p in merged if (p.get("kind") or "article") in kinds or (wait_pub and p.get("preprint") and p.get("doi"))]
+    if stats is not None:
+        stats["out_years"] = n0 - n1
+        stats["out_kinds"] = n1 - len(merged)
     ranked = _rank_papers(merged, query)[: max_results * 2]
     if check_links and ranked:
         alive = {}
@@ -3090,7 +3249,30 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
                         alive[jobs[job]] = True
             except _futures.TimeoutError:
                 pass
+        if stats is not None:
+            stats["no_copy"] = sum(1 for i in range(len(ranked)) if not alive.get(i, True))
         ranked = [p for i, p in enumerate(ranked) if alive.get(i, True)]
+    # 6.5 (the owner, 20 Nov 2026: "Make it extremely valid"): before a paper may be cited, its DOI's registry is asked:
+    # a retracted paper is left out whichever index found it; the reference's data is the publisher's record (Crossref);
+    # a DOI that doesn't exist or belongs to another paper, or a paper with neither a DOI nor a journal, publisher or
+    # institution, is left out. The registries unreachable: the index's data stays (server/valid65.py).
+    if registry and ranked:
+        # the papers that can be used, and a few more to take the place of any left out (the registries are asked a few
+        # records a second, so not for papers that would be cut anyway)
+        ranked, reg = _v65_registry(ranked[: max_results + 3])
+        n2 = len(ranked)
+        if since:
+            ranked = [p for p in ranked if not p.get("year") or int(p["year"]) >= since]
+        if until:
+            ranked = [p for p in ranked if not p.get("year") or int(p["year"]) <= until]
+        if stats is not None:
+            stats["registry"] = reg
+            stats["out_years"] = stats.get("out_years", 0) + n2 - len(ranked)      # (the publisher's year was outside them)
+    if wait_pub:       # a preprint that is still a preprint (or became a kind not asked for) goes now
+        n3 = len(ranked)
+        ranked = [p for p in ranked if not p.get("preprint") and (p.get("kind") or "article") in kinds]
+        if stats is not None:
+            stats["out_kinds"] = stats.get("out_kinds", 0) + n3 - len(ranked)
     papers = ranked[:max_results]
     for p in papers:
         p.pop("_rank", None)
@@ -3098,12 +3280,13 @@ def search_papers(query, max_results=8, since=None, check_links=True, kinds=None
     return papers, (None if papers else ("; ".join(why) or "no open papers with a PDF were found"))
 
 
-def paper_topic_search(text, max_results=8, since=None, until=None, kinds=None):
+def paper_topic_search(text, max_results=8, since=None, until=None, kinds=None, stats=None):
     """search_papers for what a person wrote: by its topic, and not at all for small talk."""
     query = _search_topic(text)
     if not _worth_searching(query):
         return [], "not a topic"
-    return search_papers(query, max_results=max_results, since=since, **({"until": until} if until else {}), **({"kinds": kinds} if kinds else {}))
+    return search_papers(query, max_results=max_results, since=since, stats=stats, **({"until": until} if until else {}),
+                         **({"kinds": kinds} if kinds else {}))
 
 
 def _no_sources_note(diag, subject):
@@ -3135,7 +3318,7 @@ def _no_sources_note(diag, subject):
 # ------------------------------------------------ 4.5: references and in-text citations, as the style guides say
 # Every part comes from the record a paper index gave (authors, year, title, journal, volume, issue, pages, DOI);
 # nothing is invented. Checked against: APA 7 (8.17–8.19, 9.8–9.11, 9.44–9.49), Cite Them Right Harvard, MLA 9 and
-# Chicago author-date (17th).
+# Chicago author-date (18th, 2024, the current edition: "et al." from three authors in the text; up to six in the list).
 _NAME_PARTICLES = {"van", "von", "de", "del", "della", "der", "den", "di", "da", "du", "la", "le", "dos", "das", "do", "ter",
                    "ten", "bin", "ibn", "al", "el", "zu", "vom", "af"}
 _NAME_SUFFIX = re.compile(r"^(?:jr|sr|ii|iii|iv)\.?$", re.I)
@@ -3297,6 +3480,95 @@ def _tidy_title(t):
     return " ".join(words)
 
 
+# ---- 6.6, round 51: sentence case where the style asks for it (the owner, 21 Nov 2026: "Raise the app's validity")
+# APA 7 (6.17, 9.19), Cite Them Right, Vancouver (NLM) and IEEE write an article's (and a book's, a report's) title in
+# sentence case: the first word, a subtitle's first word in APA, proper nouns and acronyms capitalised, nothing else. The
+# registries give many titles as the journal printed them, in Title Case or in CAPITALS, and RamzAI's lists printed them
+# so ("Late-Night Social Media Use and Sleep among Senior High School Students"): one of the faults markers find first.
+# A word is lowered only where the paper's own abstract (or text) writes it in lower case inside a sentence; a word the
+# abstract writes with a capital (Kumasi, Ghana, Saharan), an acronym (HIV), a word with a capital or a digit inside
+# (mHealth, COVID-19) and a word the abstract doesn't have are left as the title gives them (a small word goes lower).
+_SC_WORD = re.compile(r"[A-Za-zÀ-ɏ][A-Za-zÀ-ɏ0-9'’]*")
+_SC_SMALL = set(_SMALL_TITLE) | {"its", "their", "his", "her", "our", "your", "is", "are", "was", "were", "be", "been", "being", "do",
+                                 "does", "did", "not", "no", "what", "how", "why", "when", "where", "who", "which", "that", "this",
+                                 "these", "those", "after", "before", "about", "under", "around", "while", "if", "whether", "can",
+                                 "will", "should", "may", "might", "could", "would", "has", "have", "had"}
+_SC_ACRO = {"HIV", "AIDS", "COVID", "WHO", "USA", "UK", "US", "EU", "BMI", "ICU", "PTSD", "ADHD", "SES", "ICT", "STEM", "NGO", "NGOS",
+            "UN", "UNICEF", "DNA", "RNA", "MRI", "TB", "SARS", "STI", "STIS", "LMIC", "LMICS", "SDG", "SDGS", "GDP", "HPV", "IUD",
+            "ART", "PREP", "MCH", "ANC", "NHIS", "GES", "JHS", "SHS", "WASSCE", "BECE", "KNUST", "UCC", "UG"}
+
+
+def _sc_forms(text):
+    """How each word of a text is written where it doesn't start a sentence: {lower case: {forms}}."""
+    forms = {}
+    for sent in re.split(r"(?<=[.!?:;])\s+|\n+", str(text or "")):
+        for k, m in enumerate(_SC_WORD.finditer(sent)):
+            if k:
+                forms.setdefault(m.group(0).lower(), set()).add(m.group(0))
+    return forms
+
+
+def _sentence_case(title, evidence="", subtitle="cap"):
+    """The title in sentence case, as far as the paper's own words show which words are names (see above). subtitle: what
+    a subtitle's first word is: "cap" (APA), "low" (Cite Them Right, Vancouver: like any word), "keep" (IEEE: as given)."""
+    t = str(title or "")
+    letters = [c for c in t if c.isalpha()]
+    if len(letters) < 4:
+        return t
+    allcaps = sum(1 for c in letters if c.isupper()) > 0.85 * len(letters)
+    words = list(_SC_WORD.finditer(t))
+    big = [m.group(0) for m in words if len(m.group(0)) > 3]
+    if not allcaps and (not big or sum(1 for w in big if w[:1].isupper()) < 0.6 * len(big)):
+        return t                                  # (already in sentence case, near enough: as given)
+    forms = _sc_forms(evidence)
+    ev = str(evidence or "")
+
+    def word(w, prev, nxt):
+        if re.search(r"\d", w) or (not allcaps and re.search(r"[a-zß-ÿ][A-ZÀ-Þ]", w)):
+            return w                              # (COVID-19, mHealth, iPhone)
+        if w.isupper() and len(w) >= 2 and (not allcaps or w.rstrip("'’S") in _SC_ACRO or w in _SC_ACRO):
+            return w                              # (an acronym)
+        key = w.lower()
+        f = forms.get(key, set())
+        low = any(x == key for x in f)
+        acro = any(x.isupper() and len(x) > 1 for x in f)
+        cap = sorted(x for x in f if x[:1].isupper() and not x.isupper())
+        if cap and not low:
+            return cap[0]                         # (a name: Kumasi, Ghana, Saharan)
+        if acro and not low:
+            return key.upper()
+        if low and cap:                           # written both ways: a name where the abstract has it beside the same neighbour
+            c = cap[0]
+            if (prev and re.search(re.escape(prev) + r"\s+" + re.escape(c) + r"\b", ev)) or \
+               (nxt and re.search(r"\b" + re.escape(c) + r"\s+" + re.escape(nxt[:1].upper() + nxt[1:]), ev)):
+                return c
+            return key
+        if low or key in _SC_SMALL or allcaps:
+            return key
+        return w                                  # (not in the abstract: as the title gives it)
+
+    out, pos, prev = [], 0, ""
+    for i, m in enumerate(words):
+        w, before = m.group(0), t[pos:m.start()]
+        nxt = words[i + 1].group(0) if i + 1 < len(words) else ""
+        sub = i > 0 and bool(re.search(r"[:?!]|\s[—–]\s", before))
+        if i == 0 or (sub and subtitle == "cap"):
+            new = word(w, prev, nxt) if allcaps else w
+            new = new[:1].upper() + new[1:]
+        elif sub and subtitle == "keep":
+            new = word(w, prev, nxt) if allcaps else w
+        else:
+            new = word(w, prev, nxt)
+        out.append(before + new)
+        pos, prev = m.end(), new
+    return "".join(out) + t[pos:]
+
+
+def _sc_evidence(s):
+    """What a source's own words are, for its title's sentence case: its abstract and what was read of the paper."""
+    return " ".join(str(s.get(k) or "") for k in ("abstract", "abstract_full", "paper_text"))[:20000]
+
+
 def _short_title(t, n=4):
     w = re.sub(r"[.:;,?!]+$", "", " ".join(str(t or "").split()[:n]))
     return w
@@ -3371,6 +3643,33 @@ def _biblio_parts(e):
     return vol[:20], iss[:20], pages[:30]
 
 
+def _biblio_article(e):
+    """6.6, round 3 (the six styles checked against their manuals): a journal's article number standing where the pages
+    would (the registry's "article-number", an e-number like "e0123456", a long number with no last page), or "".
+    APA writes it "Article e0123456", Cite Them Right "article 108125", MLA "article 23", IEEE "Art. no. 108125";
+    Chicago and Vancouver put it where the pages go."""
+    b = e.get("biblio") or {}
+    first, last = str(b.get("first_page") or "").strip(), str(b.get("last_page") or "").strip()
+    if not first or (last and last != first):
+        return ""
+    if b.get("article") or re.fullmatch(r"[eE]\d{3,}", first) or (first.isdigit() and len(first) >= 5):
+        return first[:30]
+    return ""
+
+
+def _mla_pages(pages):
+    """MLA 9's inclusive numbers: the second number in full through 99; above that, only its last two digits unless more
+    are needed (571–86, 103–04, 395–401, 1608–774)."""
+    a, _, b = str(pages or "").replace("-", "–").partition("–")
+    a, b = a.strip(), b.strip()
+    if not (a.isdigit() and b.isdigit()) or int(a) < 100 or len(a) != len(b) or int(b) <= int(a):
+        return f"{a}–{b}" if a and b and a != b else a
+    for k in range(2, len(b) + 1):
+        if a[:len(a) - k] == b[:len(b) - k]:
+            return f"{a}–{b[-k:]}"
+    return f"{a}–{b}"
+
+
 CITE_STYLES = {
     "apa": {"name": "APA 7", "heading": "References", "example": "(Smith, 2023)"},
     "harvard": {"name": "Harvard", "heading": "Reference list", "example": "(Smith, 2023)"},
@@ -3385,15 +3684,15 @@ def _intext_names(names, style, n_full=None):
     sur = [_au_surname(a) for a in names]
     amp = " & " if style == "apa" else " and "
     if n_full and n_full < len(sur):
-        return ", ".join(sur[:n_full]) + ", et al."
+        return ", ".join(sur[:n_full]) + (" et al." if style == "harvard" else ", et al.")
     if n_full and n_full >= len(sur) and len(sur) > 2:
         return ", ".join(sur[:-1]) + ("," if style in ("apa", "chicago", "mla") else "") + amp + sur[-1]
     if len(sur) == 1:
         return sur[0]
     if len(sur) == 2:
         return sur[0] + amp + sur[1]
-    if len(sur) == 3 and style in ("harvard", "chicago"):
-        return f"{sur[0]}, {sur[1]}" + ("," if style == "chicago" else "") + f" and {sur[2]}"
+    if len(sur) == 3 and style == "harvard":         # (Cite Them Right: et al. from four; Chicago 18 and APA 7: from three)
+        return f"{sur[0]}, {sur[1]} and {sur[2]}"
     return sur[0] + " et al."
 
 
@@ -3405,6 +3704,33 @@ def _it_dot(t):
 
 def _no_date(style):
     return "no date" if style == "harvard" else "n.d."
+
+
+# 6.6, round 61 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a book and a chapter in a book are written as
+# the styles write them. A chapter was taken for a whole book, and a book's series or platform for a journal: "Malaria in
+# children. *Malaria*, 1–20." where APA writes "Malaria in children. In *Malaria* (pp. 1–20). IntechOpen." The publisher
+# and a chapter's editors come from the publisher's record (Crossref) or the index (OpenAlex).
+def _eds_of(e):
+    """A chapter's editors, each as name parts (none when the record names none)."""
+    eds = e.get("editors") if isinstance(e.get("editors"), list) else []
+    return [a for a in (_name_parts(x) for x in eds[:12] if isinstance(x, str)) if a and not a.get("org")]
+
+
+def _join_names(names, amp=" and ", serial=True):
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return names[0] + amp + names[1]
+    return ", ".join(names[:-1]) + ("," if serial else "") + amp + names[-1]
+
+
+def _book_bits(e):
+    """(is it a chapter, the book's title, the publisher, its editors) for a book or a chapter."""
+    venue = str(e.get("venue") or "").strip()
+    chapter = bool(e.get("chapter")) and bool(venue)
+    return chapter, venue if chapter else "", str(e.get("publisher") or "").strip(), _eds_of(e) if chapter else []
 
 
 def enrich_sources(sources, style="apa"):
@@ -3431,8 +3757,10 @@ def enrich_sources(sources, style="apa"):
             ini = _initials(e["_names"][0]["given"])
             if ini and style in ("apa", "mla", "chicago", "harvard"):
                 e["_intext"] = (ini.split(" ")[0] if style == "mla" else ini) + " " + e["_intext"]
-    # APA 8.18: works whose "et al." forms collide name as many authors as it takes to tell them apart
-    if style == "apa":
+    # APA 8.18 and Chicago (CMOS 15.28/13.118): works whose "et al." forms collide name as many authors as it takes to tell
+    # them apart, "(Osei, Darko, et al. 2023)". Cite Them Right gives the first author alone from four authors, so its way
+    # is the letter after the year, below (6.6, rounds 46 and 47: two such works had one key in Harvard and Chicago)
+    if style in ("apa", "chicago"):
         groups = {}
         for e in out:
             if e["_names"] and len(e["_names"]) >= 3:
@@ -3447,22 +3775,28 @@ def enrich_sources(sources, style="apa"):
                 while n < len(sur) and sum(1 for o in g if [_au_surname(a).lower() for a in o["_names"]][:n] == sur[:n]) > 1:
                     n += 1
                 e["_intext"] = _intext_names(e["_names"], style, n_full=n)
-    # the same authors in the same year: a, b, c after the year, in title order (APA 8.19, Harvard, Chicago)
+    # the same authors in the same year: a, b, c after the year, in title order (APA 8.19, Harvard, Chicago); in Harvard
+    # also works of four or more authors that would both be "(Osei et al., 2023)" (Cite Them Right's way, round 47)
     letters = {}
     for e in out:
         who = tuple(_au_surname(a).lower() + "|" + _initials(a.get("given") or []) for a in e["_names"]) if e["_names"] else ("t:" + _sort_title(e["_title"]),)
+        if style == "harvard" and e["_names"] and len(e["_names"]) >= 4:
+            who = ("etal:" + str(e["_intext"]).lower(),)
         e["_who"] = who
         letters.setdefault((who, e["_year"]), []).append(e)
     for g in letters.values():
-        if len(g) > 1:
-            g.sort(key=lambda e: _sort_title(e["_title"]))
+        if len(g) > 1:                                   # (in the order the list gives them: by the authors, then the title)
+            g.sort(key=lambda e: (tuple((_au_surname(a).lower(), _initials(a.get("given") or []).lower()) for a in e["_names"]),
+                                  _sort_title(e["_title"])))
             for i, e in enumerate(g):
                 e["_letter"] = "abcdefghijklmnopqrstuvwxyz"[i] if i < 26 else str(i)
     for e in out:
         L = e.get("_letter", "")
         yd = (e["_year"] + L) if e["_year"] else (_no_date(style) + ("-" + L if L and style != "harvard" else (L if L else "")))
         e["year_display"] = yd
-        title, venue = e["_title"], (e.get("venue") or "").strip()
+        title, venue = e["_title"], str(e.get("venue") or "").strip()
+        if style in ("apa", "harvard"):                  # 6.6, round 51: sentence case (APA 6.17, Cite Them Right)
+            title = _sentence_case(title, _sc_evidence(e), "cap" if style == "apa" else "low")
         vol, iss, pages = _biblio_parts(e)
         pre = " [Preprint]" if e.get("preprint") else ""
         doi_url = f"https://doi.org/{e['doi']}" if e.get("doi") else ""
@@ -3483,8 +3817,10 @@ def enrich_sources(sources, style="apa"):
                 head = ""
                 body = _end_dot(title) + f" ({yd})."
             tail = ""
-            if venue and not e.get("preprint"):
-                tail = f" *{venue}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "") + (f", {pages}" if pages else "") + "."
+            art = _biblio_article(e)
+            if venue and not e.get("preprint"):          # APA 9.29: an article number is "Article e0123"
+                tail = (f" *{venue}*" + (f", *{vol}*" if vol else "") + (f"({iss})" if vol and iss else "")
+                        + (f", Article {art}" if art else f", {pages}" if pages else "") + ".")
             elif venue:
                 tail = f" {venue}."
             # 5.0: a paper in published proceedings (APA 10.5), a thesis (10.6) and a report (10.4)
@@ -3495,7 +3831,17 @@ def enrich_sources(sources, style="apa"):
                 body, tail = f"*{title}*" + (f" [Thesis, {inst}]." if inst else " [Thesis]."), (f" {venue}." if venue and venue != inst else "")
             elif kind == "report" and not e.get("preprint"):
                 body, tail = _it_dot(title), (f" {venue}." if venue else "")
-            if kind in ("conference", "thesis", "report") and not e["_names"] and not e.get("preprint"):
+            elif kind == "book" and not e.get("preprint"):       # 6.6, round 61
+                chap, book, pub, eds = _book_bits(e)
+                if chap:
+                    ed = [(_initials(a["given"]) + " " if _initials(a["given"]) else "") + a["surname"] for a in eds]
+                    body = _end_dot(title)
+                    tail = (" In " + (_join_names(ed, " & ") + (" (Ed.), " if len(ed) == 1 else " (Eds.), ") if ed else "")
+                            + f"*{_sentence_case(book, _sc_evidence(e), 'cap')}*" + (f" (pp. {pages})" if pages else "") + "."
+                            + (f" {_end_dot(pub)}" if pub else ""))
+                else:
+                    body, tail = _it_dot(title), (f" {_end_dot(pub or venue)}" if (pub or venue) else "")
+            if kind in ("conference", "thesis", "report", "book") and not e["_names"] and not e.get("preprint"):
                 head, body = "", body + f" ({yd})."
             e["ref_text"] = (head + body + tail).strip()
         elif style == "harvard":
@@ -3503,8 +3849,10 @@ def enrich_sources(sources, style="apa"):
             avail = " Available at:" if (doi_url or e.get("url")) else ""
             if e.get("url") and not doi_url:          # Cite Them Right: a link with no DOI is followed by when it was read
                 e["ref_after"] = f"(Accessed: {_today_words()})."
-            if venue and not e.get("preprint"):
-                src = f"*{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "") + (f", pp. {pages}" if pages else "") + "."
+            art = _biblio_article(e)
+            if venue and not e.get("preprint"):          # Cite Them Right: "article 108125"; "p. 7" for one page
+                src = (f"*{venue}*" + (f", {vol}" if vol else "") + (f"({iss})" if vol and iss else "")
+                       + (f", article {art}" if art else (f", pp. {pages}" if "–" in pages else f", p. {pages}") if pages else "") + ".")
             else:
                 src = ""
             kind, inst = e.get("kind"), (e.get("institution") or "").strip()
@@ -3515,9 +3863,19 @@ def enrich_sources(sources, style="apa"):
                 special = _it_dot(title) + " Thesis." + (f" {inst}." if inst else "")
             elif kind == "report" and not e.get("preprint"):
                 special = _it_dot(title) + (f" {venue}." if venue else "")
+            elif kind == "book" and not e.get("preprint"):       # 6.6, round 61
+                chap, book, pub, eds = _book_bits(e)
+                if chap:
+                    ed = [_au_inverted_apa(a) for a in eds]
+                    special = (f"‘{title}’, in " + (_join_names(ed, " and ", False) + (" (ed.) " if len(ed) == 1 else " (eds) ") if ed else "")
+                               + f"*{_sentence_case(book, _sc_evidence(e), 'low')}*" + (f". {pub}" if pub else "")
+                               + ((f", pp. {pages}" if "–" in pages else f", p. {pages}") if pages else "") + ".")
+                else:
+                    special = _it_dot(title) + (f" {_end_dot(pub or venue)}" if (pub or venue) else "")
             if nm:
                 parts = [_au_inverted_apa(a) for a in nm]
-                auth = parts[0] + " et al." if len(parts) > 3 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+                # Cite Them Right (current edition): the reference list names every author; "et al." only past ten
+                auth = parts[0] + " et al." if len(parts) > 10 else parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
                 key = f"({e['_intext']}, {yd})"
                 if special:
                     body = special
@@ -3539,8 +3897,8 @@ def enrich_sources(sources, style="apa"):
                 auth = ""
             elif len(full) == 1:
                 auth = _au_inverted_full(nm[0])
-            elif len(full) > 10:
-                auth = _au_inverted_full(nm[0]) + ", " + ", ".join(full[1:7]) + ", et al."
+            elif len(full) > 6:                          # Chicago 18 (2024): up to six named; more: the first three, et al.
+                auth = _au_inverted_full(nm[0]) + ", " + ", ".join(full[1:3]) + ", et al."
             elif len(full) == 2:
                 auth = f"{_au_inverted_full(nm[0])}, and {full[1]}"
             else:
@@ -3558,6 +3916,13 @@ def enrich_sources(sources, style="apa"):
                 src = " Thesis" + (f", {inst}" if inst else "") + "."
             elif kind == "report" and not e.get("preprint"):
                 ttl_part, src = _it_dot(ttl), (f" {venue}." if venue else "")
+            elif kind == "book" and not e.get("preprint"):       # 6.6, round 61 (CMOS 18: the place may be left out)
+                chap, book, pub, eds = _book_bits(e)
+                if chap:
+                    src = (f" In *{_title_case(book)}*" + (", edited by " + _join_names([_au_full(a) for a in eds]) if eds else "")
+                           + (f", {pages}" if pages else "") + "." + (f" {_end_dot(pub)}" if pub else ""))
+                else:
+                    ttl_part, src = _it_dot(ttl), (f" {_end_dot(pub or venue)}" if (pub or venue) else "")
             e["ref_text"] = (lead + ttl_part + (" " + _end_dot(yd) if not nm else "") + src).strip()
         else:   # MLA 9
             nm = e["_names"]
@@ -3579,14 +3944,24 @@ def enrich_sources(sources, style="apa"):
                 bits.append(f"no. {iss}")
             if e["_year"]:
                 bits.append(e["_year"])
-            if pages:
-                bits.append(f"pp. {pages}")
+            if pages:               # MLA 9: "pp. 571–86" (its inclusive numbers), "p. 7", an article number "article 23"
+                art = _biblio_article(e)
+                bits.append(f"article {art}" if art else (f"pp. {_mla_pages(pages)}" if "–" in pages else f"p. {pages}"))
             e["ref_text"] = (lead + f"“{_end_dot(ttl)}” " + (", ".join(bits) + "." if bits else "")).strip()
             # 5.0: a thesis (MLA 9: title in italics, the year, the institution and the kind of work) and a report
             if kind == "thesis" and not e.get("preprint"):
                 e["ref_text"] = (lead + _it_dot(ttl) + (f" {e['_year']}." if e["_year"] else "") + (f" {inst}, Thesis." if inst else " Thesis.")).strip()
             elif kind == "report" and not e.get("preprint"):
                 e["ref_text"] = (lead + _it_dot(ttl) + " " + ", ".join(x for x in (_title_case(venue) if venue else "", e["_year"]) if x) + ".").strip().replace(" .", ".")
+            elif kind == "book" and not e.get("preprint"):       # 6.6, round 61
+                chap, book, pub, eds = _book_bits(e)
+                if chap:
+                    ed = [_au_full(a) for a in eds]
+                    by = ("edited by " + (ed[0] + " et al." if len(ed) > 2 else _join_names(ed))) if ed else ""
+                    pg = (f"pp. {_mla_pages(pages)}" if "–" in pages else f"p. {pages}") if pages else ""
+                    e["ref_text"] = (lead + f"“{_end_dot(ttl)}” *{_title_case(book)}*, " + ", ".join(x for x in (by, pub, e["_year"], pg) if x) + ".").strip()
+                else:
+                    e["ref_text"] = (lead + _it_dot(ttl) + " " + ", ".join(x for x in (pub or venue, e["_year"]) if x) + ".").strip().replace(" .", ".")
         e["citation_key"] = key
         e["author_intext"] = e["_intext"] or _short_title(title)
         e["_sort"] = (tuple((_au_surname(a).lower(), _initials(a.get("given") or []).lower()) for a in e["_names"]) if e["_names"] else ((_sort_title(title), ""),),
@@ -3614,16 +3989,20 @@ def _today_words():
 
 def build_sources_block(sources):
     """Source list for the writing prompt, keyed by the exact citation (in the chosen style) the model must copy
-    verbatim, with a short excerpt of each abstract."""
+    verbatim. 6.5: with each paper's whole abstract (it was its first 700 characters, so the results of a structured
+    abstract were cut off), in the same sentences the check reads, and what was read of the paper itself."""
     lines = []
     for s in sources:
         line = f"{s['citation_key']} {s['title']}"
         if s.get("venue") or s.get("year"):
             line += f" — {s.get('venue') or 'paper'}, {s.get('year') or 'n.d.'}"
-        if s.get("abstract"):
-            line += f"\n    Abstract: {s['abstract'][:700]}"
-        if s.get("paper_text"):            # 6.2: read in full (Half year and Year)
-            line += f"\n    From the paper itself: {s['paper_text']}"
+        ab, body = _v65_sents(s)
+        if ab:
+            line += "\n    Abstract: " + _v65_join(ab, V65_WRITER_CHARS)
+        if body:                           # 6.2: read in full (Half year and Year)
+            line += "\n    From the paper itself: " + " ".join(body)
+        if not ab and not body:
+            line += "\n    (Only its title is known here: cite it for nothing new.)"
         lines.append(line)
     return "\n".join(lines)
 
@@ -3646,7 +4025,7 @@ def read_papers_for_writing(sources, topic, seconds=W62_READ_SECONDS):
             if src.get("paper_text") or not (src.get("pmcid") or src.get("pdf")) or src.get("kind") == "mine":
                 continue
             p = dict(src)
-            p["sents"] = _rs_split(src.get("abstract") or "")
+            p["sents"] = _v65_sents(src)[0]          # 6.5: the whole abstract, as the writing and its check see it
             todo.append((src, p))
         if not todo:
             return 0
@@ -3671,7 +4050,7 @@ def read_papers_for_writing(sources, topic, seconds=W62_READ_SECONDS):
         logger.info(f"Research writing: {n} of {len(todo)} papers read themselves (Half year / Year)")
         return n
     except Exception as e:
-        logger.warning(f"Research writing: the papers couldn't be read ({e}); their abstracts are used")
+        logger.warning(f"Research writing: the papers couldn't be read ({_why(e)}); their abstracts are used")
         return 0
 
 
@@ -3942,6 +4321,15 @@ def keep_known_citations(text, sources, style="apa", locators=False, allow=None)
         return m.group(0)[:m.group(0).rfind("(")] + "(" + m.group(2) + ")"
 
     out = _NARRATIVE.sub(narr_fix, out)
+
+    # 6.6, round 30: in a sentence two authors are joined with "and" in every author-date style ("Mensah and Boateng
+    # (2022)"; APA keeps "&" for inside brackets); the person's own words (allow) stay as they wrote them
+    def narr_and(m):
+        if " & " not in m.group(1) or (allow and _narr_key(m.group(0)) in allow):
+            return m.group(0)
+        return m.group(0).replace(" & ", " and ", 1)
+    if style in ("apa", "harvard", "mla", "chicago"):
+        out = _NARRATIVE.sub(narr_and, out)
     bad = []
     for m in _NARRATIVE.finditer(out):
         if _narr_key(m.group(0)) in allow:
@@ -4048,8 +4436,9 @@ def _nlm_pages(pages):
 def numbered_ref(src, style):
     """One source's reference in Vancouver (NLM, as most universities teach it: up to six authors) or IEEE."""
     names = [a for a in (_name_parts(x) for x in (src.get("authors") or [])) if a]
-    title = _tidy_title(src.get("title") or "")
-    venue = (src.get("venue") or "").strip()
+    title = _sentence_case(_tidy_title(src.get("title") or ""), _sc_evidence(src),       # 6.6, round 51 (NLM, IEEE)
+                           "low" if style == "vancouver" else "keep")
+    venue = str(src.get("venue") or "").strip()
     year = str(src.get("year") or "")
     vol, iss, pages = _biblio_parts(src)
     doi = _norm_doi(src.get("doi"))
@@ -4068,10 +4457,19 @@ def numbered_ref(src, style):
             body = f"{title} [thesis]." + (f" {inst};" if inst else "") + f" {yr}."
         elif kind == "conference" and venue:
             body = f"{t} In: {venue}; {yr}." + (f" p. {_nlm_pages(pages)}." if pages else "")
-        elif kind in ("book", "report") or not venue:
+        elif kind == "book":                                     # 6.6, round 61 (NLM: a book; a chapter in a book)
+            chap, book, pub, eds = _book_bits(src)
+            if chap:
+                body = (f"{t} In: " + (", ".join(_van_author(a) for a in eds) + (", editor." if len(eds) == 1 else ", editors.") + " " if eds else "")
+                        + _end_dot(book) + (f" {pub};" if pub else "") + f" {yr}." + (f" p. {_nlm_pages(pages)}." if pages else ""))
+            else:
+                body = f"{t}" + (f" {pub or venue};" if (pub or venue) else "") + f" {yr}."
+        elif kind == "report" or not venue:
             body = f"{t}" + (f" {venue};" if venue else "") + f" {yr}."
         else:
-            body = f"{t} {venue}. {yr}" + (f";{vol}" if vol else "") + (f"({iss})" if iss else "") + (f":{_nlm_pages(pages)}" if pages else "") + "."
+            # 6.6, round 67: NLM names the journal by its abbreviation ("J Sleep Res"), as its publisher registered it
+            jn = (src.get("journal_abbrev") or "").strip() or venue
+            body = f"{t} {jn}. {yr}" + (f";{vol}" if vol else "") + (f"({iss})" if iss else "") + (f":{_nlm_pages(pages)}" if pages else "") + "."
         return re.sub(r"\s+", " ", f"{auth} {body}{link}").strip()
     # IEEE
     au = [_ieee_author(a) for a in names]
@@ -4083,10 +4481,21 @@ def numbered_ref(src, style):
         auth = " and ".join(au)
     q = title.rstrip(".")
     qt = f"“{q}”" if q.endswith(("?", "!")) else f"“{q},”"
-    pp = f"pp. {pages}" if pages and ("-" in pages or "–" in pages) else (f"p. {pages}" if pages else "")
+    art = _biblio_article(src)
+    pp = f"Art. no. {art}" if art else (f"pp. {pages}" if pages and ("-" in pages or "–" in pages) else (f"p. {pages}" if pages else ""))
     tail = (f", doi: {doi}." if doi else (f". [Online]. Available: {url}" if url else "."))
-    if kind == "book" or (not venue and kind not in ("thesis", "report", "preprint")):
-        out = f"*{q}*." + (f" {venue}," if venue else "") + f" {year}" + (f". doi: {doi}." if doi else ".")
+    if kind == "book":                                           # 6.6, round 61 (IEEE: a book; a chapter in a book)
+        chap, book, pub, eds = _book_bits(src)
+        if chap:
+            ed = [_ieee_author(a) for a in eds]
+            head = ", ".join(b for b in (f"in *{book}*", (_join_names(ed) + (", Ed." if len(ed) == 1 else ", Eds.")) if ed else "") if b)
+            rest = ", ".join(b for b in (pub, year, f"pp. {pages}" if pages else "") if b)
+            out = qt + " " + head + ((" " if ed else ", ") + rest if rest else "") + (f", doi: {doi}." if doi else ".")
+        else:
+            out = f"*{q}*." + (f" {pub or venue}," if (pub or venue) else "") + f" {year}" + (f". doi: {doi}." if doi else ".")
+        return re.sub(r"\s+", " ", ((auth + ", ") if auth else "") + out).strip()
+    if not venue and kind not in ("thesis", "report", "preprint"):
+        out = f"*{q}*." + f" {year}" + (f". doi: {doi}." if doi else ".")
         return re.sub(r"\s+", " ", ((auth + ", ") if auth else "") + out).strip()
     if kind == "conference":
         parts = [qt, f"in *{venue}*", year, pp]
@@ -4283,7 +4692,7 @@ def refs_like_example(entries, example, name):
         obj = _guide_json(raw) or {}
         got = obj.get("refs") if isinstance(obj.get("refs"), list) else []
     except Exception as e:
-        logger.warning(f"Couldn't lay out references like the example: {e}")
+        logger.warning(f"Couldn't lay out references like the example: {_why(e)}")
         got = []
     out = []
     for k, (src, built) in enumerate(entries):
@@ -4304,9 +4713,36 @@ def ref_title_for(language):
     return REF_TITLES.get(re.sub(r"\s+", " ", str(language or "")).strip().lower())
 
 
-def restyle_result(result, sources, cited, plan, given=None, language=None):
+_APA_PART = re.compile(r"^[^\d()]{2,160}?,\s(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?)$")
+
+
+def _apa_bracket_order(text):
+    """6.6, round 90: APA 7 (8.12) lists the works in one bracket as the reference list does: by the first author's surname,
+    one author's works by year, earliest first. Only a bracket of plain keys ("(Osei, 2019; Mensah, 2021)") is put in
+    order; one with "see", a page or other words keeps the writer's. For a finished APA piece only: the other styles are
+    made in APA's keys too and number their works by first citation, which this would change."""
+    def one(m):
+        parts = [x.strip() for x in m.group(1).split(";")]
+        if len(parts) < 2 or not all(_APA_PART.match(x) for x in parts) or any(_CITE_LEAD.match(x) for x in parts):
+            return m.group(0)
+        key = lambda x: (_cite_norm(re.sub(r",\s(?:(?:1[5-9]|20)\d{2}[a-z]?|n\.\s?d\.(?:-[a-z])?)$", "", x)),
+                         (re.search(r"(?:1[5-9]|20)\d{2}[a-z]?$", x) or re.search(r"$", x)).group(0) or "0000")
+        in_order = sorted(parts, key=key)
+        return m.group(0) if in_order == parts else "(" + "; ".join(in_order) + ")"
+    return re.sub(r"\(([^()]{2,400})\)", one, str(text or ""))
+
+
+def restyle_result(result, sources, cited, plan, given=None, language=None, made_in=None):
     """Turns a finished piece (made with author-date citations, all checked) into the style the person asked for.
-    result: the reply about to be sent (text or sections, references). cited: the indices of the sources it cites."""
+    result: the reply about to be sent (text or sections, references). cited: the indices of the sources it cites.
+    made_in (6.6, round 90): the style it was made in; a piece that stays APA has its brackets put in APA's order."""
+    if not plan and made_in == "apa":
+        if result.get("sections"):
+            for sec in result["sections"]:
+                if sec.get("text"):
+                    sec["text"] = _apa_bracket_order(sec["text"])
+        elif result.get("text"):
+            result["text"] = _apa_bracket_order(result["text"])
     if not plan:
         if ref_title_for(language):
             result["references_title"] = ref_title_for(language)
@@ -4471,7 +4907,7 @@ def handle_method_not_allowed(e):
 
 @app.errorhandler(500)
 def handle_server_error(e):
-    logger.error(f"Unhandled server error: {e}", exc_info=True)
+    logger.error(f"Unhandled server error: {_why(getattr(e, 'original_exception', None) or e)}", exc_info=True)
     return jsonify({"error": "Something went wrong on our end. Please try again."}), 500
 
 
@@ -4946,7 +5382,7 @@ def google_signin():
         # credential (a ValueError) — worth its own message, since "isn't
         # valid" would be misleading for what's actually a connectivity
         # blip on our end.
-        logger.error(f"Google sign-in verification failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Google sign-in verification failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't reach Google to verify sign-in. Please try again."}), 503
 
     google_sub = payload["sub"]
@@ -5204,7 +5640,7 @@ def _device_seen(row, device_id):
         finally:
             conn.close()
     except Exception as e:
-        logger.warning(f"Couldn't record the device for user {row.get('id')}: {e}")
+        logger.warning(f"Couldn't record the device for user {row.get('id')}: {_why(e)}")
     return row
 
 
@@ -5760,7 +6196,7 @@ def paystack_initialize():
                          "custom_fields": [{"display_name": "Academic-Home plan", "variable_name": "plan", "value": plan}]},
         })
     except Exception as e:
-        logger.error(f"Paystack couldn't start payment {reference}: {e} \u2014 if this repeats, check PAYSTACK_SECRET_KEY "
+        logger.error(f"Paystack couldn't start payment {reference}: {_why(e)} \u2014 if this repeats, check PAYSTACK_SECRET_KEY "
                      "and the Paystack account's settings (GHS payments switched on).")
         return jsonify({"error": "Paystack couldn't start the payment just now. Please try again in a moment."}), 502
     return jsonify({"authorization_url": data.get("authorization_url"), "access_code": data.get("access_code"), "reference": reference})
@@ -5786,7 +6222,7 @@ def paystack_verify():
     try:
         data = _paystack_call("GET", f"/transaction/verify/{reference}")
     except Exception as e:
-        logger.warning(f"Paystack verify failed for {reference}: {e}")
+        logger.warning(f"Paystack verify failed for {reference}: {_why(e)}")
         return jsonify({"error": "Couldn't check the payment with Paystack — please try again in a moment."}), 502
     status = data.get("status")
     if status != "success" or data.get("reference") != reference:
@@ -5827,7 +6263,7 @@ def paystack_webhook():
         try:
             _paystack_apply(str(data.get("reference") or ""), data.get("amount"), data.get("currency"))
         except Exception as e:
-            logger.warning(f"Paystack webhook apply failed: {e}")
+            logger.warning(f"Paystack webhook apply failed: {_why(e)}")
             return jsonify({"ok": False}), 500
     return jsonify({"ok": True})
 
@@ -5872,7 +6308,7 @@ def paystack_sync():
             try:
                 data = _paystack_call("GET", f"/transaction/verify/{ref}", timeout=8)
             except Exception as e:
-                logger.warning(f"Paystack sync couldn't check {ref}: {e}")
+                logger.warning(f"Paystack sync couldn't check {ref}: {_why(e)}")
                 continue
             if data.get("status") == "success" and data.get("reference") == ref:
                 _, outcome = _paystack_apply(ref, data.get("amount"), data.get("currency"))
@@ -5916,7 +6352,7 @@ def _paystack_reconcile_once():
                     try:
                         data = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
                     except Exception as e:
-                        logger.warning(f"Paystack check couldn't reach {r['reference']}: {e}")
+                        logger.warning(f"Paystack check couldn't reach {r['reference']}: {_why(e)}")
                         continue
                     st = data.get("status")
                     if st == "success" and data.get("reference") == r["reference"]:
@@ -5958,7 +6394,7 @@ def _paystack_explain_recent():
                 try:
                     d = _paystack_call("GET", f"/transaction/verify/{r['reference']}", timeout=8)
                 except Exception as e:
-                    logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> Paystack couldn't say: {e}")
+                    logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> Paystack couldn't say: {_why(e)}")
                     continue
                 logger.warning(f"Paystack reason: {r['reference']} ({r['plan']}) -> {d.get('status')} | channel: {d.get('channel') or '-'} | Paystack says: {d.get('gateway_response') or '-'}")
             time.sleep(20)       # keep the lock a little longer, past the other worker's start
@@ -5971,12 +6407,12 @@ def _paystack_reconcile_loop():
     try:
         _paystack_explain_recent()
     except Exception as e:
-        logger.warning(f"Paystack reason check failed: {e}")
+        logger.warning(f"Paystack reason check failed: {_why(e)}")
     while True:
         try:
             _paystack_reconcile_once()
         except Exception as e:
-            logger.warning(f"Paystack check pass failed: {e}")
+            logger.warning(f"Paystack check pass failed: {_why(e)}")
         time.sleep(300)
 
 
@@ -6310,7 +6746,7 @@ def _log_conversion_and_consume(user_row, from_fmt, to_fmt):
                     conn.commit()
                     return
             except Exception as e:
-                logger.warning(f"once (conversion history): {e}")
+                logger.warning(f"once (conversion history): {_why(e)}")
                 conn.rollback()
                 cur.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_row["id"],))
                 row = cur.fetchone()
@@ -6369,7 +6805,7 @@ def _refund_sage_message(user_row, source="allowance", points=1, research=False,
                 cur.execute("UPDATE users SET research_points = research_points + %s WHERE id = %s AND research_points IS NOT NULL", (points - bonus, user_row["id"]))
         conn.commit()
     except Exception as e:
-        logger.error("Couldn't refund points for user %s: %s", user_row.get("id"), e)
+        logger.error("Couldn't refund points for user %s: %s", user_row.get("id"), _why(e))
         if conn:
             conn.rollback()
     finally:
@@ -6676,7 +7112,7 @@ def convert_endpoint():
             try:
                 _colour_not_bold(result_path)
             except Exception as e:   # a finished deck is never lost to this tidy-up
-                logger.warning(f"Colour-not-bold pass skipped: {e}")
+                logger.warning(f"Colour-not-bold pass skipped: {_why(e)}")
 
         zipped = result_path.lower().endswith(".zip") and to_fmt != "zip"
         download_name = f"{base_name}.{'zip' if zipped else to_fmt}"
@@ -6694,7 +7130,7 @@ def convert_endpoint():
             resp.headers["X-Docente-Note"] = " ".join(notes).encode("ascii", "ignore").decode()[:300]
         return resp
     except Exception as e:
-        logger.error(f"Conversion failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Conversion failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Conversion failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -6752,7 +7188,7 @@ def preview_file_endpoint():
 
         return send_file(result_path, mimetype="application/pdf", as_attachment=False)
     except Exception as e:
-        logger.error(f"Preview generation failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Preview generation failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't generate a preview. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -6862,7 +7298,7 @@ def convert_batch_endpoint():
                     try:
                         _colour_not_bold(result_path)
                     except Exception as e:   # a finished deck is never lost to this tidy-up
-                        logger.warning(f"Colour-not-bold pass skipped: {e}")
+                        logger.warning(f"Colour-not-bold pass skipped: {_why(e)}")
                 base_name = safe_download_name(filename).rsplit(".", 1)[0]
                 converted.append((result_path, f"{base_name}.{'zip' if result_path.lower().endswith('.zip') else to_fmt}"))
                 details.append({"filename": filename, "success": True})
@@ -6898,7 +7334,7 @@ def convert_batch_endpoint():
         response.headers["X-Batch-Summary"] = json.dumps(summary)
         return response
     except Exception as e:
-        logger.error(f"Batch conversion failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Batch conversion failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Batch conversion failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -6968,7 +7404,7 @@ def pdf_edit_endpoint():
             download_name=f"{base_name}_edited.pdf",
         )
     except Exception as e:
-        logger.error(f"PDF edit failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"PDF edit failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "PDF edit failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7005,7 +7441,7 @@ def pdf_thumbnails_endpoint():
                 thumbnails.append(base64.b64encode(f.read()).decode("ascii"))
         return jsonify({"page_count": len(thumbnails), "thumbnails": thumbnails})
     except Exception as e:
-        logger.error(f"Thumbnail generation failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Thumbnail generation failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Thumbnail generation failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7055,7 +7491,7 @@ def pdf_split_endpoint():
                 zf.write(p, arcname=os.path.basename(p))
         return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name="split_pages.zip")
     except Exception as e:
-        logger.error(f"PDF split failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"PDF split failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Split failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7093,7 +7529,7 @@ def images_to_pdf_endpoint():
             return jsonify({"error": str(e)}), 422
         return send_file(result_path, mimetype="application/pdf", as_attachment=True, download_name="images.pdf")
     except Exception as e:
-        logger.error(f"images-to-pdf failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"images-to-pdf failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Combining these images into a PDF failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7169,7 +7605,7 @@ def pdf_shrink_endpoint():
         resp.headers["X-Size-Info"] = json.dumps(info)
         return resp
     except Exception as e:
-        logger.error(f"PDF shrink failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"PDF shrink failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Making the PDF smaller failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7231,7 +7667,7 @@ def pdf_apply_endpoint():
             resp.headers["X-Docente-Note"] = " ".join(notes)[:300]
         return resp
     except Exception as e:
-        logger.error(f"PDF editor save failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"PDF editor save failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Saving the PDF failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7266,7 +7702,7 @@ def pdf_to_images_endpoint():
                 zf.write(p, arcname=f"{base} - page {n}.jpg")
         return send_file(zip_path, mimetype="application/zip", as_attachment=True, download_name=f"{base} (pages).zip")
     except Exception as e:
-        logger.error(f"PDF to pictures failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"PDF to pictures failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Turning the PDF into pictures failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7303,7 +7739,7 @@ def word_open_endpoint():
             data["docx"] = made
         return jsonify(data)
     except Exception as e:
-        logger.error(f"Word editor open failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Word editor open failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Opening the Word file failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7322,19 +7758,130 @@ WORD_AI_ACTIONS = {
     "fix": "Correct the spelling, grammar and punctuation of TEXT. Change nothing else: keep its words, tone, meaning and paragraph breaks.",
     "paraphrase": "Rewrite TEXT in your own words: different words and sentence shapes, exactly the same meaning and facts, about the same length. Nothing may be copied from TEXT except names, numbers and technical terms.",
     "academic": "Rewrite TEXT in careful academic English: precise terms, no contractions, hedged claims where the evidence is not certain, the same meaning.",
-    "confident": "Rewrite TEXT so it sounds sure of itself: direct sentences, active voice, no hedging or filler, the same meaning.",
+    "confident": ("Rewrite TEXT so it sounds sure of itself: direct sentences, active voice, no filler, the same meaning. Keep every "
+                  "word that says how certain a finding is (may, might, suggests, is linked to): a claim stays exactly as strong as TEXT "
+                  "makes it."),     # 6.6, round 50: "no hedging" turned "may reduce" into "reduces", a claim TEXT never made
     "plain": "Rewrite TEXT in plain English for a general reader: everyday words, one idea per sentence, no jargon (explain a term in brackets if it must stay), the same meaning.",
     "bullets": "Turn TEXT into short bullet points, one point per line starting with '- ', keeping every fact.",
     "prose": "Turn TEXT (notes or bullet points) into flowing paragraphs, keeping every fact, with sentences that connect.",
     "proofread": "PROOFREAD",
     "summarize": "Summarize TEXT as 3 to 6 short bullet points.",
     "outline": "Make an outline for a document about what the person asks for: a title, then headings, each with a few bullet points.",
-    "translate": "Translate TEXT into LANGUAGE. Keep its paragraph breaks, headings and lists.",
+    "translate": ("Translate TEXT into LANGUAGE. Keep its paragraph breaks, headings and lists, and every number exactly as TEXT "
+                  "gives it (digits stay digits: 38.5% may be written as LANGUAGE writes a decimal, never as another number)."),
     "explain": "Explain TEXT in plain words, in 3 to 6 sentences, for a student.",
 }
 # 3.15: the world's languages, most-spoken first, then regional ones (the app's Translate lists)
 WORD_AI_LANGS = (
     "English", "Spanish", "French", "Arabic", "Chinese", "Hindi", "Portuguese", "Bengali", "Russian", "Japanese", "German", "Korean", "Italian", "Turkish", "Indonesian", "Vietnamese", "Urdu", "Persian", "Swahili", "Dutch", "Polish", "Ukrainian", "Thai", "Filipino", "Malay", "Greek", "Hebrew", "Romanian", "Czech", "Swedish", "Hungarian", "Tamil", "Telugu", "Marathi", "Punjabi", "Gujarati", "Amharic", "Somali", "Hausa", "Yoruba", "Igbo", "Zulu", "Xhosa", "Afrikaans", "Twi", "Ewe", "Ga")
+
+
+# ---- 6.6, round 50 (the owner, 21 Nov 2026: "Raise the app's validity"): RamzAI in the Word editor never changes a fact
+# of the person's text. A rewrite (improve, fix, paraphrase, academic, plain …) keeps every figure and year of TEXT and adds
+# none; one that shortens or explains adds none; none says more than TEXT ("may reduce" made "reduces", a link made a cause,
+# "significant", "the most", "globally", the direction turned). A rewrite that does is asked for once more, told what changed;
+# then, if it still does, it isn't shown (the point is given back). A proofreader's fix that would change a figure or a year,
+# add or take away a "not", turn a word into its opposite, or make a claim stronger is not offered.
+_WF_KEEP = {"improve", "simpler", "formal", "friendly", "fix", "paraphrase", "academic", "confident", "plain", "bullets", "prose"}
+_WF_NOTHING_NEW = _WF_KEEP | {"shorter", "longer", "summarize", "explain"}
+_WF_NEG = {"not", "no", "never", "none", "nobody", "nothing", "neither", "nor", "without"}
+_WF_OPP = [("increase", "decrease"), ("increased", "decreased"), ("increases", "decreases"), ("increasing", "decreasing"),
+           ("higher", "lower"), ("rise", "fall"), ("rose", "fell"), ("risen", "fallen"), ("rising", "falling"), ("positive", "negative"),
+           ("positively", "negatively"), ("improve", "worsen"), ("improved", "worsened"), ("improves", "worsens"), ("above", "below"),
+           ("before", "after"), ("maximum", "minimum"), ("majority", "minority"), ("most", "least"), ("always", "never"),
+           ("accept", "reject"), ("accepted", "rejected"), ("support", "oppose"), ("supported", "opposed"), ("greater", "smaller"),
+           ("larger", "smaller"), ("stronger", "weaker"), ("strong", "weak"), ("present", "absent"), ("included", "excluded"),
+           ("gain", "loss"), ("benefit", "harm"), ("success", "failure"), ("passed", "failed"), ("earlier", "later"),
+           ("older", "younger"), ("more", "less"), ("more", "fewer"), ("over", "under"), ("maximum", "minimum"),
+           ("reduce", "increase"), ("reduced", "increased"), ("reduces", "increases"), ("reducing", "increasing")]  # 6.6, round 56
+
+
+def _wf_digits(t):
+    """The numbers written in t, as digits (number words too: "five" is 5; 1,200 is 1200), counted."""
+    return Counter(re.findall(r"\d+(?:\.\d+)?", _c45_ev_norm(str(t or ""))))
+
+
+def _wf_years(t):
+    return set(re.findall(r"(?<![\d.,])(?:1[5-9]|20)\d{2}(?![\d.,]\d)", str(t or "")))
+
+
+def _wf_words(t):
+    return re.findall(r"[a-z]+", str(t or "").lower().replace("n’t", " not").replace("n't", " not").replace("cannot", "can not"))
+
+
+def _wf_stronger(sentence, ground):
+    """How a sentence says more than the person's own words do ("" when it doesn't): the claim rules of research
+    writing (server/valid65.py), with the person's text as what it may say."""
+    for why, ok in (("no “may” where your text has one", lambda: _v65.hedge_ok(sentence, ground)),
+                    ("more certain than your text", lambda: _v65.certainty_ok(sentence, ground)),
+                    ("“the most” or “the best”", lambda: _v65.superlative_ok(sentence, ground)),
+                    ("“significant”", lambda: _v65.significance_ok(sentence, ground)),
+                    ("the whole world", lambda: _v65.world_ok(sentence, ground)),
+                    ("the other direction", lambda: _v65.direction_ok(sentence, ground) and _v65.polarity_ok(sentence, ground)),
+                    ("a cause where your text gives a link", lambda: _v65.cause_ok(sentence, ground) and _v65.cause2_ok(sentence, ground))):
+        try:
+            if not ok():
+                return why
+        except Exception:
+            continue
+    return ""
+
+
+def _wf_issue_problem(frm, to, kind=""):
+    """What a proofreader's fix would change of a fact ("" when nothing)."""
+    if _wf_digits(frm) != _wf_digits(to):
+        return "a figure"
+    wf, wt = _wf_words(frm), _wf_words(to)
+    if sum(1 for w in wf if w in _WF_NEG) != sum(1 for w in wt if w in _WF_NEG):
+        return "a “not”"
+    sf, st = set(wf), set(wt)
+    for a, b in _WF_OPP:
+        if (a in sf and b in st and b not in sf and a not in st) or (b in sf and a in st and a not in sf and b not in st):
+            return "the opposite word"
+    if kind != "spelling" and _wf_stronger(to, frm):
+        return "a stronger claim"
+    return ""
+
+
+def _wf_digit_strings(t):
+    """The numbers of t as strings of digits, whatever the language writes between them (1,200 · 1.200 · 1 200 · 38,5)."""
+    return Counter(re.sub(r"[^\d]", "", m.group(0)) for m in re.finditer(r"\d+(?:[.,\u00a0\u202f ]\d+)*", str(t or "")))
+
+
+def _wf_rewrite_problems(action, text, out):
+    """What a rewrite changed of the person's facts, as short phrases (empty when nothing)."""
+    if action == "translate":                   # (a translation keeps every number; the claim rules are English, so only those)
+        a, b = _wf_digit_strings(text), _wf_digit_strings(out)
+        if a != b:
+            gone, new = sorted((a - b).elements())[:4], sorted((b - a).elements())[:4]
+            return ["numbers changed in the translation" + (f" (yours: {', '.join(gone)})" if gone else "") + (f" (its: {', '.join(new)})" if new else "")]
+        return []
+    if action not in _WF_NOTHING_NEW:
+        return []
+    probs = []
+
+    def shown(nums):
+        return ", ".join(v + ("%" if u == "%" else "") for v, u in nums[:4])
+    new = [x for x in _c45_numbers(out) if not _c45_numbers_in([x], text)]
+    if new:
+        probs.append("figures your text doesn’t give (" + shown(new) + ")")
+    ny = sorted(_wf_years(out) - _wf_years(text))
+    if ny:
+        probs.append("years your text doesn’t give (" + ", ".join(ny[:4]) + ")")
+    if action in _WF_KEEP:
+        miss = [x for x in _c45_numbers(text) if not _c45_numbers_in([x], out)]
+        if miss:
+            probs.append("figures of your text left out (" + shown(miss) + ")")
+        my = sorted(_wf_years(text) - _wf_years(out))
+        if my:
+            probs.append("years of your text left out (" + ", ".join(my[:4]) + ")")
+    for a, b in _c34_sentences(out)[:80]:
+        why = _wf_stronger(out[a:b], text)
+        if why:
+            probs.append(f"“{out[a:b][:90]}”: {why}")
+            if len(probs) >= 5:
+                break
+    return probs
 
 
 def _word_proofread(user, text, charged):
@@ -7369,6 +7916,10 @@ def _word_proofread(user, text, charged):
             continue
         frm, to = str(x.get("from") or "").strip(), str(x.get("to") or "").strip()
         if not frm or frm == to or frm not in text:
+            continue
+        changed = _wf_issue_problem(frm, to, str(x.get("kind") or ""))          # 6.6, round 50: a fix never changes a fact
+        if changed:
+            logger.info(f"Word proofread (6.6): a fix was not offered: it would change {changed}")
             continue
         issues.append({"from": frm[:300], "to": to[:300], "why": str(x.get("why") or "").strip()[:160],
                        "kind": x.get("kind") if x.get("kind") in ("spelling", "grammar", "punctuation", "clarity", "style") else "grammar",
@@ -7436,10 +7987,29 @@ def word_ai_endpoint():
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged)
         return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
-    out = (out or "").strip()
-    out = re.sub(r"^(?:here(?:'s| is)[^\n]*:\s*\n+)", "", out, flags=re.I)        # a preamble, if one slips in
-    out = out.replace("**", "").replace("__", "")
-    out = _c45_word_citations(out, text)
+    def tidy(o):
+        o = (o or "").strip()
+        o = re.sub(r"^(?:here(?:'s| is)[^\n]*:\s*\n+)", "", o, flags=re.I)        # a preamble, if one slips in
+        o = o.replace("**", "").replace("__", "")
+        return _c45_word_citations(o, text)
+    out = tidy(out)
+    probs = _wf_rewrite_problems(action, text, out) if out else []
+    if probs:                                       # 6.6, round 50: once more, told what changed
+        logger.info(f"Word AI (6.6): '{action}' changed {len(probs)} fact(s) of the text; asked once more")
+        try:
+            out2 = tidy(call_claude(system + " Your first version changed what TEXT says: " + "; ".join(probs) + ". Write it again: "
+                                    "every figure, year and claim exactly as TEXT gives it (as strong or as cautious), and nothing TEXT "
+                                    "doesn't say.", material, max_tokens=2600 if action in ("write", "outline", "longer", "translate") else 1600,
+                                    feature="word-" + action))
+        except ConversionError:
+            out2 = ""
+        probs2 = _wf_rewrite_problems(action, text, out2) if out2 else ["nothing came"]
+        if probs2:
+            logger.info(f"Word AI (6.6): '{action}' still changed the text's facts; not shown")
+            _refund_sage_message(request.current_user, charged)
+            return jsonify({"error": "RamzAI’s version changed a figure or a claim of your text, so it isn’t shown. Please try again."
+                                     + AI_MSG_NOT_COUNTED}), 502
+        out = out2
     if not out:
         _refund_sage_message(request.current_user, charged)
         return jsonify({"error": "RamzAI had nothing to add — try asking another way." + AI_MSG_NOT_COUNTED}), 502
@@ -7510,7 +8080,7 @@ def word_save_endpoint():
         return send_file(result, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                          as_attachment=True, download_name=name)
     except Exception as e:
-        logger.error(f"Word editor save failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Word editor save failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Saving the Word file failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7538,7 +8108,7 @@ def text_to_pptx_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Text-to-presentation failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Text-to-presentation failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't build the presentation. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -7572,7 +8142,7 @@ def extract_text_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Text extraction failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Text extraction failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't read this file. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -8055,18 +8625,52 @@ _C34_END = re.compile(r"[.!?]+[\"\u201d\u2019')\]*_]*")
 _C34_AFTER = re.compile(r"([.!?])((?:[ \t]*(?:\[\d{1,2}(?:\s*[,\u2013\-]\s*\d{1,2})*\]|\u27e6w:\d+\u27e7))+)")
 
 
+_C34_CAPTION = re.compile(r"^\s*[*_]*(?:Table|Figure|Fig\.)\s+\d+[A-Za-z]?[*_]*\s*(?:[.:]|$)")
+_C34_TNOTE = re.compile(r"^\s*[*_]*Notes?[*_]*\s*[.:]")
+
+
+def _c34_captions(lines):
+    """6.6, round 49: the line numbers of a table's (or a picture's) title right over it ("Table 1: What it shows", or APA's
+    "Table 1" with its title on the next line) and of its note right under it ("Note. …"). They describe the table; they
+    state nothing that needs a source (they were taken for statements, and a table's title was cut as unsourced)."""
+    block = [l.lstrip().startswith(("|", "![")) for l in lines]
+    out = set()
+    for k in range(len(lines)):
+        if block[k] and (k == 0 or not block[k - 1]):
+            j = k - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            if j >= 0 and _C34_CAPTION.match(lines[j]):
+                out.add(j)
+            elif j >= 0 and re.match(r"^\s*([*_]{1,2})[^*_\n]{2,200}\1\s*$", lines[j]):
+                i = j - 1
+                while i >= 0 and not lines[i].strip():
+                    i -= 1
+                if i >= 0 and re.match(r"^\s*[*_]*(?:Table|Figure)\s+\d+[A-Za-z]?[*_]*\s*$", lines[i]):
+                    out.update((i, j))
+        if block[k] and (k == len(lines) - 1 or not block[k + 1]):
+            j = k + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and (_C34_TNOTE.match(lines[j]) or (_C34_CAPTION.match(lines[j]) and block[k] and lines[k].lstrip().startswith("!["))):
+                out.add(j)
+    return out
+
+
 def _c34_sentences(text):
     """Every sentence of the answer's prose, as (start, end) spans in text. Headings, tables, code, pictures and
-    bold labels aren't sentences; a list item's marker isn't part of its sentence."""
+    bold labels aren't sentences, nor a table's title and note (6.6); a list item's marker isn't part of its sentence."""
     out, pos, fence = [], 0, False
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    captions = _c34_captions(lines)
+    for n_line, line in enumerate(lines):
         start = pos
         pos += len(line) + 1
         st = line.strip()
         if st.startswith("```") or st.startswith("~~~"):
             fence = not fence
             continue
-        if fence or not st or _C34_SKIP_LINE.match(line) or _C34_LABEL.match(line):
+        if fence or not st or _C34_SKIP_LINE.match(line) or _C34_LABEL.match(line) or n_line in captions:
             continue
         m = _C34_ITEM.match(line)
         off = m.end() if m else len(line) - len(line.lstrip())
@@ -8186,7 +8790,7 @@ def _c34_check(kind, request_text, evidence_lines, sentences, context, deadline)
         if not isinstance(obj, dict):
             raise ValueError("its reply wasn't the JSON asked for")
     except Exception as e:
-        logger.warning(f"Citations ({kind}): the sentence check didn't run ({str(e)[:100]})")
+        logger.warning(f"Citations ({kind}): the sentence check didn't run ({_why(e)})")
         return None
     out = {"skip": obj.get("skip") is True, "cite": {}, "drop": set(), "keep": set()}
     for it in obj.get("sentences") or []:
@@ -8246,6 +8850,8 @@ def _c45_unit(word):
     if low in _C45_UNITS:
         return _C45_UNITS[low]
     w = low[:4]
+    if low in ("part", "parts", "internet", "interest", "interests", "interview", "interviews", "interventions", "intervention"):
+        return w                                # (6.6, round 25: "12 schools took part" counts no people)
     return "people" if w in _C45_PEOPLE else w
 
 
@@ -8271,8 +8877,8 @@ def _c45_numbers(sentence):
             run = re.match(r"\s*([A-Za-z][A-Za-z\-]*)(?:\s+([A-Za-z][A-Za-z\-]*))?(?:\s+([A-Za-z][A-Za-z\-]*))?", plain[m.end():])
             ws = []
             for w in (run.groups() if run else ()):
-                if not w or w.lower() in _C45_STOP:
-                    break
+                if not w or w.lower() in _C45_STOP or w.lower() in _C45_VERBS:
+                    break                               # ("12 students took part": what it counts is "students", not "took")
                 ws.append(_c45_unit(w))
             unit = "|".join(ws)
             if f < 10 and not unit:
@@ -8299,7 +8905,8 @@ _C45_VERBS = {"took", "take", "takes", "made", "make", "gave", "give", "got", "g
               "should", "became", "become", "felt", "left", "kept", "won", "lost", "ran", "began", "grew", "sat", "spent"}
 _C45_EVN = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?|\.\d+)(?!\d)")
 _C45_PCT = re.compile(r"\s?(?:%|percent\b|per cent\b|percentage points?\b)", re.I)
-_C45_RANGE_PCT = re.compile(r"\s*(?:[–\-]|to\b|and\b)\s*\d+(?:\.\d+)?\s?(?:%|percent\b|per cent\b|percentage points?\b)", re.I)
+# (6.6, round 50: a range stays on its line: "2021\n- 38%", a year and a list's next point, is no "2021–38%")
+_C45_RANGE_PCT = re.compile(r"[ \t]*(?:[–\-]|to\b|and\b)[ \t]*\d+(?:\.\d+)?[ \t]?(?:%|percent\b|per cent\b|percentage points?\b)", re.I)
 
 
 def _c45_numbers_in(numbers, evidence):
@@ -8318,7 +8925,7 @@ def _c45_numbers_in(numbers, evidence):
         pct = bool(_C45_PCT.match(after) or _C45_RANGE_PCT.match(after))
         pp = bool(re.match(r"\s?-?\s?(?:percentage\s+)?points?\b|\s?pp\b", after, re.I))
         nxt = re.match(r"\s*-?([A-Za-z][A-Za-z\-]*)", after)
-        occ.append((val, pct, pp, after, t[max(0, m.start() - 40):m.start()], nxt.group(1).lower() if nxt else ""))
+        occ.append((val, pct, pp, after, t[max(0, m.start() - 40):m.start()], nxt.group(1).lower() if nxt else "", _rs_dec(m.group(1))))
     for v, unit in numbers:
         try:
             fv = float(v)
@@ -8326,18 +8933,26 @@ def _c45_numbers_in(numbers, evidence):
             return False
         ok = False
         units = set(unit.split("|")) if unit not in ("%", "pp") else set()
-        for val, pct, pp, after, before, nxt in occ:
+        d_s = _rs_dec(v)
+        for val, pct, pp, after, before, nxt, d_e in occ:
             if abs(val - fv) > 1e-9:
-                continue
+                # 6.6, round 29: the paper's figure rounded to fewer decimals (38 for 38.4), never a p-value
+                if not (d_e > d_s and _rs_round_half_up(val, d_s) == round(fv, 6) and not _RS_P_BEFORE.search(before[-8:])):
+                    continue
             if unit == "%":
                 ok = pct and not pp
             elif unit == "pp":
                 ok = pp or pct                       # "15 percentage points" against "a 15-point rise" (or "15%")
             elif unit:
-                if pct or pp:
+                # 6.6, round 55: "a five-point Likert scale" counts points of a scale, and so does the evidence's "five-point
+                # scale": the same thing (it was skipped as a percentage point, so the sentence was cut as unsupported)
+                if pct or (pp and "pp" not in units):
                     continue
                 near = [_c45_unit(w) for w in re.findall(r"[A-Za-z][A-Za-z\-]*", after)[:4]]
-                near += [_c45_unit(w) for w in re.findall(r"[A-Za-z][A-Za-z\-]*", before)[-3:]]
+                # the words before it say what it counts ("of 412 students, 137 slept…") unless its own noun follows: in
+                # "a 5-point scale and 7 items" the 7 counts items, not points of a scale (6.6, round 55)
+                if not (nxt and (nxt in _C45_UNITS or (len(nxt) >= 4 and nxt.endswith("s") and not nxt.endswith("ss")))):
+                    near += [_c45_unit(w) for w in re.findall(r"[A-Za-z][A-Za-z\-]*", before)[-3:]]
                 # the evidence doesn't say what it counts when no noun follows ("aged 6–12 took part")
                 ok = (bool(units & set(near)) or not nxt or nxt in _C45_STOP or nxt in _C45_VERBS
                       or bool(re.search(r"(?:ed|ing|ly)$", nxt)))
@@ -8648,14 +9263,608 @@ def _c34_write(text, sources, style, request_text, note, started):
             note["text"] = (note["text"] + " " if note["text"] else "") + \
                 "No papers were found for this, so nothing in it is cited. Check every statement before you use it."
         return text, set()
-    is_cited = lambda s: bool(keep_known_citations(s, sources, style)[1])
-    lines, mark = _c34_write_parts(sources)
+    # 6.5: checked against the papers' own sentences, by label (see _v65_enforce); what was checked goes into the note
+    report = {}
     has_cite = bool(keep_known_citations(text, sources, style)[1])
+    text, unsourced = _v65_enforce(text, request_text, sources, style, started + 150, report, allow_skip=not has_cite)
+    ev = report.pop("evidence", None)
+    if ev:
+        have = note.setdefault("evidence", [])
+        have.extend(ev[:max(0, V65_EVIDENCE_MAX - len(have))])
+    rep = note.setdefault("checked", {})
+    for k, v in report.items():
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                rep.setdefault(k, {})[k2] = rep.get(k, {}).get(k2, 0) + v2
+        else:
+            rep[k] = rep.get(k, 0) + v
+    if unsourced:
+        note["text"] = (note["text"] + " " if note["text"] else "") + \
+            "Some sentences in this piece have no source \u2014 check them before you use it."
+    if report.get("unchecked"):
+        said = "Not every sentence could be checked against its paper this time \u2014 check the citations before you use it."
+        if said not in note["text"]:
+            note["text"] = (note["text"] + " " if note["text"] else "") + said
+    return keep_known_citations(text, sources, style)
+
+
+# ---------------- 6.5: research writing checked the way Research is (the owner, 20 Nov 2026: "Make it extremely valid")
+# Before 6.5 the writing's check saw 600 characters of each abstract (the writer 700): a structured abstract's results come
+# last, so a paper was cited from its background and methods, and a sentence written from the rest was taken out. And the
+# check named only the paper, so a figure was looked for anywhere in its abstract. Now the writer and the check see the
+# same sentences of each paper (its whole abstract and, on Half year and Year, what was read of the paper itself); the
+# check names the paper's own sentences that state each sentence ("full") or part of it ("part"), by label (S3-2), and
+# every label is verified; a figure must be in those sentences; and a sentence may not say more than they do
+# (server/valid65.py: a year, a place, the world, "studies show", words in quotation marks, a cause, a group of people).
+# What a paper says of earlier work or of its field (its background) never stands as what it found.
+V65_ABSTRACT_SENTS = 30        # an abstract's sentences: all of them in practice
+V65_BODY_SENTS = 16            # sentences read from the paper itself (Half year and Year)
+V65_WRITER_CHARS = 3200        # what the writer is shown of an abstract, in whole sentences (all of nearly every abstract)
+_V65_BG_WORDS = r"(?:background|introduction|context|rationale)"
+_V65_NEXT_WORDS = (r"(?:objectives?|aims?|purpose|methods?|methodology|study\s+design|design|settings?|participants|subjects|"
+                   r"population|interventions?|main\s+outcome\s+measures?|outcome\s+measures?|measures?|materials?\s+and\s+methods|"
+                   r"data\s+sources?|study\s+selection|data\s+extraction|eligibility\s+criteria|synthesis|analysis|results?|"
+                   r"findings|conclusions?|discussion|interpretation|implications?|limitations?|significance|recommendations?)")
+# where an abstract with no labels starts to speak of its own study
+_V65_STUDY_START = re.compile(r"\b(?:we|our|this (?:study|paper|article|review|research|work|survey|trial|analysis|project)|"
+                              r"the (?:present|current) (?:study|review|research|paper)|aim(?:s|ed)?|objectives?|purpose|sought|set out|"
+                              r"(?:was|were) (?:conducted|carried out|performed|undertaken|recruited|surveyed|interviewed|enrolled|sampled|"
+                              r"collected|analy[sz]ed|assigned|allocated)|cross-?sectional|cohort|randomi[sz]ed|systematic(?:ally)? review|"
+                              r"meta-?analys\w*|data (?:from|were|was)|using data|a total of|participants|respondents)\b", re.I)
+_V65_FOUND = re.compile(r"\b(?:found|find|finds|showed|shows|shown|reported|reports|revealed|reveals|observed|observes|demonstrated|"
+                        r"demonstrates|noted|notes|documented|identified|concluded|established|discovered)\b", re.I)
+
+
+def _v65_label(s, words):
+    """s starts with one of an abstract's section labels: "Background:", "BACKGROUND", or "Background" before a capital
+    (an index that lost the label's colon), never a sentence that starts with the word ("Introduction of the policy…")."""
+    m = re.match(r"\s*(" + words + r")(?![\w-])\s*([:.\-–—]?)\s*(\S?)", str(s or ""), re.I)
+    if not m:
+        return False
+    word, punct, nxt = m.group(1), m.group(2), m.group(3)
+    if punct:
+        return True
+    if word.isupper() and len(word) > 2:
+        return True
+    return bool(nxt) and nxt.isupper() and word[:1].isupper()
+
+
+def _v65_background(sents):
+    """The indices of an abstract's sentences that set out its background, not its own study: under a "Background" label,
+    before its first label, or (no labels) before it first speaks of its own study (within its first five sentences)."""
+    bg, inside, first = set(), False, None
+    for i, s in enumerate(sents):
+        if _v65_label(s, _V65_BG_WORDS):
+            inside = True
+            first = i if first is None else first
+        elif _v65_label(s, _V65_NEXT_WORDS):
+            inside = False
+            first = i if first is None else first
+        if inside:
+            bg.add(i)
+    if first is not None:
+        return bg | set(range(first))
+    for i, s in enumerate(sents[:6]):
+        own = _rs_own_part(s)
+        if own and _V65_STUDY_START.search(own) and not _RS_NOT_SELF.search(own):
+            return set(range(i)) if i <= 4 else set()
+    return set()
+
+
+def _v65_sents(s):
+    """A source's sentences as the writer and its check both see them: its abstract's whole sentences, then those read from
+    the paper itself (Half year and Year). Another version's abstract (a preprint's, lent to its journal article) is not
+    this paper's words, and is not used."""
+    ab_text = "" if s.get("abstract_lent") else re.sub(r"\s+", " ", str(s.get("abstract_full") or s.get("abstract") or "")).strip()
+    ab = _rs_split(ab_text, limit=V65_ABSTRACT_SENTS)
+    if not ab and len(ab_text.split()) >= 8:
+        ab = [ab_text[:1500]]                          # no sentence ends at all: the words, kept whole
+    body = _rs_split(s.get("paper_text") or "", limit=V65_BODY_SENTS) if s.get("paper_text") else []
+    return ab, body
+
+
+def _v65_join(sents, cap):
+    out, n = [], 0
+    for t in sents:
+        if out and n + len(t) + 1 > cap:
+            break
+        out.append(t)
+        n += len(t) + 1
+    return " ".join(out)
+
+
+def _v65_papers(sources):
+    """The sources as the check reads them: [{"n", "key", "title", "year", "sents", "abs_n", "bg"}], n from 1 (S1, S2…)."""
+    out = []
+    for i, s in enumerate(sources or [], 1):
+        ab, body = _v65_sents(s)
+        out.append({"n": i, "key": str(s.get("citation_key") or ""), "title": str(s.get("title") or ""), "year": s.get("year"),
+                    "sents": ab + body, "abs_n": len(ab), "bg": _v65_background(ab),
+                    "url": str(s.get("url") or ""), "pdf": str(s.get("pdf") or ""), "kind": str(s.get("kind") or "")})
+    return out
+
+
+V65_EVIDENCE_MAX = 240         # sentences whose evidence goes back with a piece (the app shows it when a citation is tapped)
+
+
+def _v65_evidence(sentence, cites, by_n):
+    """What the app shows when a citation is tapped (6.5, higher): the sentence as it stands and, for each paper that backs
+    it, the paper's own sentences the check named, word for word, and how far they back it ("full" or "part")."""
+    out = []
+    for pn, ks, v in cites[:4]:
+        p = by_n.get(pn)
+        if not p:
+            continue
+        q = [p["sents"][k][:600] for k in ks[:3] if 0 <= k < len(p["sents"])]
+        if not q:
+            continue
+        out.append({"k": p.get("key") or "", "t": p.get("title") or "", "y": p.get("year"), "u": p.get("url") or "",
+                    "f": p.get("pdf") or "", "m": p.get("kind") == "mine", "q": q,
+                    "a": all(k < p.get("abs_n", 0) for k in ks), "v": "part" if v == "part" else "full"})
+    return {"s": re.sub(r"\s+", " ", str(sentence or "")).strip()[:900], "c": out} if out else None
+
+
+def _v65_text(papers):
+    lines = []
+    for p in papers:
+        if not p["sents"]:
+            continue                      # nothing of it can be read here: it backs nothing
+        lines.append(f"[S{p['n']}] {p['key']} {p['title']} ({p.get('year') or 'n.d.'})")
+        for k, t in enumerate(p["sents"]):
+            if k == p["abs_n"]:
+                lines.append("  From the paper itself:")
+            tag = " (background: what the paper says of earlier work or of its field, not its own finding)" if k in p["bg"] else ""
+            lines.append(f"  S{p['n']}-{k}{tag}: {t}")
+    return "\n".join(lines)
+
+
+def _v65_idx(raw, pn, n_sents):
+    """The sentence numbers the check gave for paper pn, verified: labels like "S3-2" (or "P3-S2") for this paper, or whole
+    numbers, each a real sentence of it. None when anything given is not (a wrong label voids the claim: nothing is guessed)."""
+    items = raw if isinstance(raw, list) else [raw]
+    out = []
+    for x in items[:2]:
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            k = x
+        elif isinstance(x, str):
+            m = re.fullmatch(r"\s*(?:[SP](\d{1,2})\s*-\s*S?)?(\d{1,3})\s*", x, re.I)
+            if not m or (m.group(1) and int(m.group(1)) != pn):
+                return None
+            k = int(m.group(2))
+        else:
+            return None
+        if not 0 <= k < n_sents:
+            return None
+        if k not in out:
+            out.append(k)
+    return sorted(out) or None
+
+
+def _v65_check(kind, request_text, papers, sentences, context, deadline):
+    """For each sentence: the papers' own sentences that state it ("full") or part of it ("part"), by label; or drop; or
+    (writing) keep, for a line on what a part covers. Returns {"cite": {i: [(n, [k], v)]}, "doubt": {i: bool}, "drop": {i},
+    "keep": {i}}, or None when the check couldn't run."""
+    shown = _v65_text(papers)
+    if not sentences or not shown or time.time() > deadline - 4:
+        return None
+    system = (
+        "You check academic writing so that every sentence that states something is backed by the papers' own words. Below: "
+        "the PAPERS, each sentence of each paper labelled like S3-2 (paper 3, sentence 2), then the person's REQUEST, then the "
+        "numbered SENTENCES of the writing (their citations taken off: judge each one by what it says, not by where it came "
+        "from). For each sentence give the paper sentences that state what it says:\n"
+        "- \"full\" when the paper sentences you give state everything the sentence says, every figure, year, place and group "
+        "of people included;\n"
+        "- \"part\" when they state only part of it.\n"
+        "Keep a sentence only when the papers you give together state all of it (at least one \"full\", or \"part\" ones from "
+        "two papers or more that together cover every part). Otherwise mark it drop. At most 3 papers per sentence and at "
+        "most 2 sentences per paper. Never pair a sentence with a paper sentence that doesn't state it. A paper sentence "
+        "marked (background) is what that paper says of earlier work or of its field: it may back a general statement, never "
+        "a sentence saying that this paper found, showed or reported it. " + _v65.STRENGTH_RULES
+        + (" A sentence that states nothing about the world, because it only says what this piece or one of its parts covers "
+           "or leads on to the next part (for example \"This section looks at how sleep is measured.\"), is answered "
+           "{\"n\": 3, \"keep\": true}; a sentence that also says what was found, what causes what, or how much needs its "
+           "evidence." if kind == "writing" else "")
+        + (" If the REQUEST doesn't call for evidence at all (editing or translating the person's own text, a questionnaire, "
+           "a table they pasted in, a plan, an email), answer {\"skip\": true}." if kind == "writing" else "")
+        + (" These sentences are the points of a slide deck: a point that states no fact (it only names a topic or a heading, "
+           "or is an activity, an instruction or a question for the audience) is answered {\"n\": 3, \"keep\": true}."
+           if kind == "deck" else "")
+        + " Reply with JSON only, like {\"sentences\": [{\"n\": 1, \"cite\": [{\"p\": 3, \"s\": [\"S3-2\"], \"v\": \"full\"}]}, "
+        "{\"n\": 2, \"drop\": true}]}.\n\nPAPERS:\n" + shown)
+    user = ("REQUEST:\n" + str(request_text or "")[:1500] + "\n\nSENTENCES:\n"
+            + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+            + ("\n\nTHE WHOLE PIECE, for context:\n" + str(context)[:6000] if context else ""))
+    try:
+        raw = str(call_claude(system_prompt=system, user_message=user, max_tokens=min(3000, 90 * len(sentences) + 200),
+                              timeout=max(5, min(50, deadline - time.time())), feature=kind + "-check") or "")
+        obj = _rs_json(raw)
+    except Exception as e:
+        logger.warning(f"Citations ({kind}): the sentence check didn't run ({_why(e)})")
+        return None
+    by_n = {p["n"]: p for p in papers}
+    out = {"cite": {}, "doubt": {}, "drop": set(), "keep": set(), "skip": obj.get("skip") is True and kind == "writing"}
+    for it in obj.get("sentences") or []:
+        try:
+            if not isinstance(it, dict):
+                continue
+            i = it.get("n")
+            if isinstance(i, bool) or not isinstance(i, int):
+                i = int(str(i)) if re.fullmatch(r"\d{1,3}", str(i or "")) else None
+            if i is None or not 1 <= i <= len(sentences):
+                continue
+            i -= 1
+            if it.get("keep") is True and ((kind == "writing" and _c34_signpost(sentences[i])) or kind == "deck"):
+                out["keep"].add(i)
+                continue
+            if it.get("drop"):
+                out["drop"].add(i)
+                continue
+            cites, bad = [], False
+            given = it.get("cite") if isinstance(it.get("cite"), list) else []
+            for c in given[:3]:
+                pn = c.get("p") if isinstance(c, dict) else None
+                if isinstance(pn, str):
+                    m = re.fullmatch(r"\s*[SP]?(\d{1,2})\s*", pn)
+                    pn = int(m.group(1)) if m else None
+                if isinstance(pn, bool) or not isinstance(pn, int):
+                    pn = None
+                p = by_n.get(pn)
+                v = c.get("v") if isinstance(c, dict) else None
+                nums = _v65_idx(c.get("s"), pn, len(p["sents"])) if p else None
+                if not p or not nums or v not in ("full", "part") or any(pn == x[0] for x in cites):
+                    bad = True
+                    continue
+                cites.append((pn, nums, v))
+            if len(given) > 3:
+                bad = True
+            if cites:
+                out["cite"][i] = cites
+                out["doubt"][i] = bad
+            else:
+                out["drop"].add(i)
+        except Exception:
+            continue
+    return out
+
+
+def _v65_found_ok(plain, cites, by_n, bg, n_cited):
+    """A sentence that says a study found, showed or reported something stands on the papers' OWN sentences: at least
+    one named sentence is not background, and its figures are in those (a judge that adds one finding sentence to a
+    background one doesn't make the background's figure a finding)."""
+    own = " ".join(by_n[pn]["sents"][k] for pn, ks, _ in cites for k in ks if k not in bg(by_n[pn]))
+    if not own.strip():
+        return False
+    return _rs_figures_ok(plain, own, n_cited=n_cited, n_read=len(by_n))       # (figures in words too: "up to one hour")
+
+
+def _v65_own_text(papers, bg=None):
+    """What papers say of their own study: their titles and every sentence that is not their background."""
+    bg = bg or (lambda p: p.get("bg") or set())
+    return " ".join(str(p.get("title") or "") + ". " + " ".join(t for k, t in enumerate(p["sents"]) if k not in bg(p)) for p in papers)
+
+
+def _v65_grams(text, run=10):
+    w = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return {tuple(w[i:i + run]) for i in range(len(w) - run + 1)}
+
+
+def _v65_copied(sentence, grams, run=10):
+    w = re.findall(r"[a-z0-9]+", str(sentence or "").lower())
+    return any(tuple(w[i:i + run]) in grams for i in range(len(w) - run + 1))
+
+
+def _v65_first_name(p):
+    """A paper's first author's surname, from its authors or its citation ("(Mensah et al., 2021)" -> "mensah")."""
+    a = (p.get("authors") or [None])[0]
+    if a:
+        a = str(a).strip()
+        return re.sub(r"[^a-z]", "", (a.split(",")[0] if "," in a else a.split()[-1]).lower())
+    k = re.sub(r"^[(\[]|[)\]]$", "", str(p.get("key") or "")).strip()
+    k = re.split(r"\s+et\s+al\b|\s*&\s*|\s+and\s+|,", k, maxsplit=1)[0]
+    return re.sub(r"[^a-z]", "", k.lower())
+
+
+def _v65_n_studies(papers):
+    """6.6, round 18: how many different studies the papers are. Two records of one study (a conference abstract and its
+    journal paper, a report and its article) count once: the same DOI, or the same first author, years at most two apart
+    and most of their titles' words the same. ("Studies show" from one study twice over is one study.)"""
+    def same(a, b):
+        if a.get("doi") and b.get("doi") and str(a["doi"]).lower() == str(b["doi"]).lower():
+            return True
+        fa, fb = _v65_first_name(a), _v65_first_name(b)
+        if not fa or fa != fb:
+            return False
+        try:
+            ya, yb = int(a.get("year") or 0), int(b.get("year") or 0)
+        except (TypeError, ValueError):
+            ya = yb = 0
+        if ya and yb and abs(ya - yb) > 2:
+            return False
+        wa = set(re.findall(r"[a-z]{4,}", str(a.get("title") or "").lower()))
+        wb = set(re.findall(r"[a-z]{4,}", str(b.get("title") or "").lower()))
+        return len(wa) >= 4 and len(wb) >= 4 and len(wa & wb) / len(wa | wb) >= 0.8
+    groups = []
+    for p in papers or []:
+        for g in groups:
+            if same(p, g[0]):
+                g.append(p)
+                break
+        else:
+            groups.append([p])
+    return len(groups)
+
+
+def _v65_keep(sentence, cites, doubtful, by_n, grams, alone=False):
+    """Whether a checked sentence may stay with the papers its check named: fully backed (one "full"; or "part" from two
+    papers when nothing the check gave was wrong; alone: one paper must back it all), every figure in those papers'
+    sentences, nothing said that they don't say (a year, a place, the world, "studies show", a quotation, a cause, a group),
+    never a paper's background stated as its finding, and in its own words. Returns (keep, the reason when not)."""
+    if not cites:
+        return False, "unbacked"
+    full = any(v == "full" for _, _, v in cites)
+    if not full and (alone or doubtful or len({pn for pn, _, _ in cites}) < 2):
+        return False, "part"
+    plain = _v65.bare(sentence)
+    quoted = " ".join(by_n[pn]["sents"][k] for pn, ks, _ in cites for k in ks)
+    cited = [by_n[pn] for pn in sorted({pn for pn, _, _ in cites})]
+    n_cited = _v65_n_studies(cited)              # 6.6, round 18: studies, not records (one study twice over is one)
+    if not _rs_figures_ok(plain, quoted, n_cited=n_cited, n_read=len(by_n)):
+        return False, "figure"
+    nums = _c45_numbers(_rs_unp(_rs_pp_mask(_rs_scaled(_rs_unratio(plain)), _rs_digits(_rs_scaled(quoted), False))))
+    if nums and not _c45_numbers_in(nums, _rs_digits(_rs_scaled(quoted), False)):
+        return False, "figure"           # 6.5, further: "12 schools" is not 12% or 12 pupils there
+    bad = _v65.claim_problems(sentence, quoted, _v65_own_text(cited), n_cited, [p.get("year") for p in cited],
+                              all_text=" ".join(p["title"] + ". " + " ".join(p["sents"]) for p in cited))
+    if bad:
+        return False, bad[0]
+    if _V65_FOUND.search(plain) and not _v65_found_ok(plain, cites, by_n, lambda p: p["bg"], n_cited):
+        return False, "background"           # "Mensah (2021) found…" what Mensah only says of earlier work
+    if grams and _v65_copied(plain, grams):
+        return False, "copied"
+    if any(len(q.split()) >= 4 for q in _V66_QUOTE.findall(plain)):
+        return False, "quote-page"           # 6.6, round 53: a quotation needs its page, which RamzAI never has (APA 8.25)
+    return True, None
+
+
+# 6.6, round 53: a direct quotation of four words or more in a sentence RamzAI keeps as sourced. The writer is told to
+# paraphrase; a quotation it writes anyway would stand with no page or paragraph (every style asks for one: APA 8.25, Cite
+# Them Right, MLA, Chicago), the papers' pages are never read, and its own Check my citations tells the person so. It goes,
+# as a figure its paper doesn't give goes. (A short term in quotation marks, "digital natives", stays.)
+_V66_QUOTE = re.compile(r"[\u201c\"]([^\u201d\"]{3,400})[\u201d\"]")
+
+
+V65_VERIFY_CHUNK = 25          # sentences per second check
+V65_VERIFY_SECONDS = 35        # how long the second check may take after the first check's time is up
+
+
+def _v65_quotes(cites, by_n):
+    """The papers' own sentences a check named for a sentence, each after its paper's citation: what the second check reads."""
+    out = []
+    for pn, ks, _v in cites:
+        p = by_n[pn]
+        key = p.get("key") or f"Paper {pn}"
+        out.append(key + " " + " ".join(p["sents"][k] for k in ks))
+    return " | ".join(out)
+
+
+def _v65_verify(items, deadline, feature="writing", system=None):
+    """6.5, further (the owner, 20 Nov 2026 23:50: "Increase the validity of the research tools further"): a second,
+    independent check of the sentences the first check kept. It sees only each sentence and the papers' own sentences
+    named for it (not the papers, not the rest of the piece), and says "ok" only when they state all of it.
+    items: [(key, sentence, quotes)]. Returns ({key: what isn't stated} for the sentences it finds not backed, how many it
+    answered for), or None when it couldn't run at all."""
+    items = [it for it in items if it[1] and it[2]]
+    if not items or time.time() > deadline - 4:
+        return None
+    system = system or (
+        "You are the second, independent checker of academic writing. Each numbered ITEM is one SENTENCE (as it will stand, "
+        "with its citation if it has one) and the QUOTES it rests on: the cited papers' own sentences, each after its paper's "
+        "citation. Answer \"ok\" only when the quotes, taken together, state everything the sentence says, with the same "
+        "strength and scope: every figure, year, place, group of people, kind of study and direction of a finding; a link is "
+        "not a cause; \"may\" is not \"does\"; one study is not \"studies\"; what one place or group showed is not shown for "
+        "another or for everyone; a sentence that names authors (\"Mensah (2021) found…\") names the paper the quotes come "
+        "from; a change over time (\"rising\", \"has increased\", \"increasingly\") needs the quotes to show one; how big or "
+        "wide a study was (\"national\", \"representative\", \"large\", \"multicentre\"), a share in words (\"one in three\"), "
+        "\"recent\" or \"the first\" need the quotes to say so; \"no link\" is not \"a link\". Words that only join or "
+        "organise the writing (\"In contrast\", \"Similarly\", \"Taken together\") need nothing "
+        "more. Otherwise answer \"no\" and say in a few words what the quotes don't state. Judge only by the quotes, never by "
+        "what you know. Reply with JSON only, like {\"items\": [{\"n\": 1, \"v\": \"ok\"}, {\"n\": 2, \"v\": \"no\", "
+        "\"why\": \"the quotes give 38%, not 45%\"}]}.")
+    chunks = [items[k:k + V65_VERIFY_CHUNK] for k in range(0, len(items), V65_VERIFY_CHUNK)][:C34_MAX_CHUNKS]
+
+    def run(chunk):
+        user = "ITEMS:\n" + "\n".join(f"{n}. SENTENCE: {s}\n   QUOTES: {q[:3000]}" for n, (_k, s, q) in enumerate(chunk, 1))
+        try:
+            raw = str(call_claude(system_prompt=system, user_message=user, max_tokens=min(2400, 45 * len(chunk) + 250),
+                                  timeout=max(5, min(40, deadline - time.time())), feature=feature + "-verify") or "")
+            obj = _rs_json(raw)
+        except Exception as e:
+            logger.warning(f"Citations ({feature}): the second check didn't run ({_why(e)})")
+            return None
+        got = {}
+        for it in obj.get("items") or []:
+            try:
+                n = it.get("n") if isinstance(it, dict) else None
+                n = int(str(n)) if re.fullmatch(r"\d{1,3}", str(n or "")) else None
+                v = str(it.get("v") or "").strip().lower()
+                if n and 1 <= n <= len(chunk) and v in ("ok", "no"):
+                    got[n - 1] = (v, re.sub(r"\s+", " ", str(it.get("why") or "")).strip()[:160])
+            except Exception:
+                continue
+        return got
+
+    results = [None] * len(chunks)
+    if len(chunks) == 1:
+        results[0] = run(chunks[0])
+    else:
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = {pool.submit(run, c): ci for ci, c in enumerate(chunks)}
+            for job, ci in jobs.items():
+                try:
+                    results[ci] = job.result(timeout=max(2, deadline - time.time() + 3))
+                except Exception:
+                    results[ci] = None
+    if not any(r is not None for r in results):
+        return None
+    no, answered = {}, 0
+    for chunk, got in zip(chunks, results):
+        for idx, (key, _s, _q) in enumerate(chunk):
+            if got and idx in got:
+                answered += 1
+                if got[idx][0] == "no":
+                    no[key] = got[idx][1] or "not stated in its papers"
+    return no, answered
+
+
+# ---- 6.6, round 49: the rows of a table are checked too (the owner, 21 Nov 2026: "Raise the app's validity")
+# A table's lines were never sentences to the check (_c34_sentences skips them), so a row of a table of studies could give
+# another place, another sample, a figure no paper gives, or a study that isn't one of the sources ("| Johnson (2018) | …",
+# which the citation keeper takes out of a sentence but not out of a cell), and stand as sourced. Now every row that cites a
+# paper is held to that paper's own words as a sentence is (its figures, the claim rules), then read by the second check;
+# in a table of studies a row that cites no known paper goes; elsewhere a row is the writer's own (a plan, a list of
+# variables) and only a study named in it that isn't a source is taken out of its cell.
+# (a header that names the studies themselves: "Study", "Author (year)", "Source"; never "Study variable" or "Study area")
+_V66_STUDY_HEAD = re.compile(r"^\s*[*_]*(?:the\s+)?(?:stud(?:y|ies)|authors?|author\s*(?:and|&)\s*year|first\s+author|sources?|references?|"
+                             r"citations?|papers?|articles?|reviews?|trials?|publications?)\s*(?:\(\s*years?\s*\)|,\s*years?|\s+and\s+years?)?[*_]*\s*$", re.I)
+_V66_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _v66_cells(line):
+    t = line.strip()
+    t = t[1:] if t.startswith("|") else t
+    t = t[:-1] if t.endswith("|") and not t.endswith("\\|") else t
+    return [c.strip() for c in re.split(r"(?<!\\)\|", t)]
+
+
+def _v66_tables(lines):
+    """The Markdown tables among the lines: (first, last) line numbers of each, header and separator included."""
+    out, i = [], 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("|") and i + 1 < len(lines) and _V66_SEP.match(lines[i + 1]):
+            j = i + 2
+            while j < len(lines) and lines[j].lstrip().startswith("|"):
+                j += 1
+            out.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _v66_without(text, gone):
+    """The text without the table rows at these line numbers; a table left with no row goes whole, with its title right
+    over it ("Table 2: …") and its note right under it ("Note. …")."""
+    lines = text.split("\n")
+    drop = set(gone)
+    caps = _c34_captions(lines)
+    for a, b in _v66_tables(lines):
+        if (a + 2 <= b) and all(k in drop for k in range(a + 2, b + 1)):
+            drop.update(range(a, b + 1))
+            for step, k0 in ((-1, a - 1), (1, b + 1)):
+                k = k0
+                while 0 <= k < len(lines) and not lines[k].strip():
+                    k += step
+                while 0 <= k < len(lines) and k in caps:          # (its title, APA's two lines of it, or its note)
+                    drop.add(k)
+                    k += step
+                    while 0 <= k < len(lines) and not lines[k].strip():
+                        k += step
+    return _c34_tidy("\n".join(l for k, l in enumerate(lines) if k not in drop))
+
+
+def _v66_rows(text, sources, style, by_n, grams):
+    """The rows of the text's tables held to their papers. Returns (text, items for the second check as
+    (("row", line), sentence, quotes), Counter of why rows went, how many rows were checked)."""
+    lines = text.split("\n")
+    tables = _v66_tables(lines)
+    if not tables:
+        return text, [], Counter(), 0
+    gone, verify, why, checked = set(), [], Counter(), 0
+    for a, b in tables:
+        head = _v66_cells(lines[a])
+        body = list(range(a + 2, b + 1))
+        info = []
+        for k in body:
+            cells = _v66_cells(lines[k])
+            new_cells, known, unknown = [], set(), False
+            for c in cells:
+                kc, idx = keep_known_citations(c, sources, style)
+                if c.strip() and not kc.strip() and re.search(r"\((?:1[5-9]|20)\d{2}[a-z]?\b|\bn\.\s?d\.", c):
+                    unknown = True                 # a study named in it that isn't one of the sources
+                new_cells.append(kc.strip())
+                known |= {i + 1 for i in idx}
+            info.append((k, cells, new_cells, known, unknown))
+        # a table of studies: its header names them, or most rows begin with one (a row is a study)
+        first_cites = sum(1 for x in info if x[1] and (keep_known_citations(x[1][0], sources, style)[1]
+                                                        or re.search(r"\((?:1[5-9]|20)\d{2}[a-z]?\)|,\s*(?:1[5-9]|20)\d{2}[a-z]?\)", x[1][0])))
+        studies = bool(head and _V66_STUDY_HEAD.match(head[0])) or 2 * first_cites > max(1, len(info))
+        for k, cells, new_cells, known, unknown in info:
+            if not any(c.strip() for c in cells):
+                continue
+            if studies and (unknown or not known):
+                gone.add(k)
+                why["unknown study" if unknown else "unbacked"] += 1
+                continue
+            if new_cells != cells:                 # (a source's name that isn't one of the sources, out of its cell)
+                lines[k] = "|" + "|".join(f" {c} " if c else " " for c in new_cells) + "|"
+            if not known:
+                continue
+            checked += 1
+            cited = [by_n[n] for n in sorted(known) if n in by_n and by_n[n]["sents"]]
+            if not cited:
+                gone.add(k)
+                why["unbacked"] += 1
+                continue
+            years = {str(p.get("year") or "") for p in cited}
+            parts = [c for c in new_cells if c and c not in years]
+            row = "; ".join(parts).rstrip(".") + "."
+            plain = _v65.bare(row)
+            body_text = " ".join(p["title"] + ". " + " ".join(p["sents"]) for p in cited)
+            nums = _c45_numbers(plain)
+            bad = (["figure"] if nums and not _c45_numbers_in(nums, body_text) else []) \
+                + _v65.claim_problems(row, "", _v65_own_text(cited), _v65_n_studies(cited), [p.get("year") for p in cited], all_text=body_text)
+            if not bad and _v65_copied(plain, grams):
+                bad = ["copied"]
+            if bad:
+                gone.add(k)
+                why[bad[0]] += 1
+                continue
+            said = "; ".join(f"{h}: {c}" if h else c for h, c in zip(head + [""] * len(new_cells), new_cells) if c).rstrip(".") + "."
+            verify.append((("row", lines[k]), "A row of a table: " + said,
+                           " | ".join((p.get("key") or "") + " " + " ".join(p["sents"]) for p in cited)))
+    text = "\n".join(lines)
+    if gone:
+        text = _v66_without(text, gone)
+    return text, verify, why, checked
+
+
+def _v66_drop_lines(text, rows):
+    """The text without these table rows (by their exact line), and without a table they leave empty."""
+    lines = text.split("\n")
+    want, gone = list(rows), set()
+    for k, l in enumerate(lines):
+        if l in want:
+            gone.add(k)
+            want.remove(l)
+    return _v66_without(text, gone) if gone else text
+
+
+def _v65_enforce(text, request_text, sources, style, deadline, report, allow_skip=False):
+    """Every sentence of research writing that states something keeps a source whose own sentences state it, or goes
+    (_c34_enforce's way, with the 6.5 check above), and then a second, independent check reads each kept sentence against
+    the papers' sentences named for it (_v65_verify). report gets "checked", "kept", "out", "reasons", "unchecked",
+    "second" (sentences the second check answered for) and "second_missing". Returns (text, unsourced)."""
+    papers = _v65_papers(sources)
+    by_n = {p["n"]: p for p in papers}
+    _lines, mark = _c34_write_parts(sources)
+    is_cited = lambda s: bool(keep_known_citations(s, sources, style)[1])
 
     def own(sent):
-        return {f"S{i + 1}" for i in keep_known_citations(sent, sources, style)[1]}
+        return {i + 1 for i in keep_known_citations(sent, sources, style)[1]}
 
-    def bare(sent):
+    def unmark(sent):
         if any(_NARRATIVE.finditer(sent)):
             return None
         def drop_keys(m):
@@ -8663,24 +9872,281 @@ def _c34_write(text, sources, style, request_text, note, started):
         out = re.sub(r"[ \t]*\(([^()]{2,400})\)", drop_keys, sent)
         return re.sub(r"[ \t]+([.,;:!?])", r"\1", out)
 
-    def ev(ids):
-        return " ".join((sources[int(x[1:]) - 1].get("title") or "") + " " + (sources[int(x[1:]) - 1].get("abstract") or "")
-                        for x in ids if x[:1] == "S" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
+    grams = _v65_grams(" ".join(" ".join(p["sents"]) for p in papers))
+    text, row_items, row_why, rows_checked = _v66_rows(text, sources, style, by_n, grams)      # 6.6, round 49: tables
+    if report is not None and (rows_checked or row_why):
+        report["rows"] = report.get("rows", 0) + rows_checked
+        report["rows_out"] = report.get("rows_out", 0) + sum(row_why.values())
+    todo = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+    if not todo and not row_items:
+        if row_why:
+            logger.info(f"Citations (writing, 6.6): {rows_checked} table rows checked → {sum(row_why.values())} taken out ({dict(row_why)})")
+        return text, 0
+    shown = [(unmark(text[a:b]) or _v65.bare(text[a:b])) for a, b in todo]
+    n_chunks = min(C34_MAX_CHUNKS, (len(todo) + C34_CHUNK - 1) // C34_CHUNK)
+    results = [None] * n_chunks
 
-    def abstracts(ids):
-        return " ".join(sources[int(x[1:]) - 1].get("abstract") or ""
-                        for x in ids if x[:1] == "S" and x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
+    def run(ci):
+        return _v65_check("writing", request_text, papers, shown[ci * C34_CHUNK:(ci + 1) * C34_CHUNK], text, deadline)
 
-    report = {}
-    text, unsourced = _c34_enforce("writing", text, request_text, is_cited, lines, mark, started + 150, allow_skip=not has_cite,
-                                   cited_ids=own, unmark=bare, evidence_text=ev, abstract_text=abstracts, report=report)
-    if unsourced:
-        note["text"] = (note["text"] + " " if note["text"] else "") + \
-            "Some sentences in this piece have no source \u2014 check them before you use it."
-    if report.get("unchecked"):
-        note["text"] = (note["text"] + " " if note["text"] else "") + \
-            "Not every sentence could be checked against its paper this time \u2014 check the citations before you use it."
-    return keep_known_citations(text, sources, style)
+    if n_chunks == 1:
+        results[0] = run(0)
+    else:
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = {pool.submit(run, ci): ci for ci in range(n_chunks)}
+            for job, ci in jobs.items():
+                try:
+                    results[ci] = job.result(timeout=max(2, deadline - time.time() + 3))
+                except Exception:
+                    results[ci] = None
+    ran = [r for r in results if r]
+    if ran and allow_skip and all(r["skip"] for r in ran):
+        logger.info("Citations (writing, 6.5): the request doesn't call for evidence — left as it is")
+        return text, 0
+    reasons, unchecked = Counter(), 0
+    plan = {}                  # i -> ("cut", why) | ("keep", None) | ("mark", new text of the sentence)
+    verify = []                # (i, the sentence as it will stand, the quotes it rests on)
+    ev_for = {}                # i -> (the sentence as it will stand, the cites that back it): what a tapped citation shows
+    for i in range(len(todo)):
+        a, b = todo[i]
+        sent = text[a:b]
+        r = results[i // C34_CHUNK] if i // C34_CHUNK < n_chunks else None
+        j = i % C34_CHUNK
+        old = own(sent)
+        if r is None:
+            # no check could look at it: it stays only when it is cited and says nothing its papers don't (figures included)
+            unchecked += 1
+            cited = [by_n[n] for n in sorted(old) if n in by_n and by_n[n]["sents"]]
+            if not cited:
+                plan[i] = ("cut", "unbacked")
+                continue
+            body = " ".join(p["title"] + ". " + " ".join(p["sents"]) for p in cited)
+            plain = _v65.bare(sent)
+            nums = _c45_numbers(plain)
+            bad = (["figure"] if nums and not _c45_numbers_in(nums, body) else []) \
+                + _v65.claim_problems(sent, "", _v65_own_text(cited), _v65_n_studies(cited), [p.get("year") for p in cited], all_text=body)
+            if not bad and _v65_copied(plain, grams):
+                bad = ["copied"]
+            if not bad and any(len(q.split()) >= 4 for q in _V66_QUOTE.findall(plain)):
+                bad = ["quote-page"]                  # (6.6, round 53)
+            if bad:
+                plan[i] = ("cut", bad[0])
+            else:
+                plan[i] = ("keep", None)
+                verify.append((i, sent, " | ".join((p.get("key") or "") + " " + " ".join(p["sents"]) for p in cited)))
+            continue
+        if j in r["keep"]:
+            plan[i] = ("keep", None)
+            continue                     # a line on what a part covers, or a link to the next part: it stands as written
+        cites = r["cite"].get(j)
+        if j in r["drop"] or not cites:
+            plan[i] = ("cut", "unbacked")
+            continue
+        ok, why = _v65_keep(sent, cites, r["doubt"].get(j, False), by_n, grams)
+        if not ok:
+            plan[i] = ("cut", why)
+            continue
+        new = {pn for pn, _, _ in cites}
+        if old and not (old & new) and unmark(sent) is None:
+            plan[i] = ("cut", "wrong source")     # "Mensah (2021) found…", but what Mensah (2021) says doesn't state it
+            continue
+        keep_ids = (old & new) if old & new else new
+        final = sent
+        if old and keep_ids == old:
+            plan[i] = ("keep", None)
+        else:
+            base = unmark(sent) if old else sent
+            if base is None:
+                plan[i] = ("keep", None)          # a narrative citation that names a paper that backs it: as written
+            else:
+                m = mark([f"S{n}" for n in sorted(keep_ids)])
+                if not m:
+                    plan[i] = ("cut", "unbacked")
+                    continue
+                final = _c34_put(base.rstrip(), m)
+                plan[i] = ("mark", final)
+        backing = [c for c in cites if c[0] in keep_ids] or cites
+        verify.append((i, final, _v65_quotes(backing, by_n)))
+        ev_for[i] = (final, backing)
+    # the second, independent check (each kept sentence against the papers' sentences named for it; and each table row)
+    verify = verify + row_items
+    second, second_missing = 0, len(verify)
+    rows_no = []
+    if verify:
+        got = _v65_verify(verify, deadline + V65_VERIFY_SECONDS, "writing")
+        if got is not None:
+            no, second = got
+            second_missing = len(verify) - second
+            for i, why in no.items():
+                if isinstance(i, tuple):
+                    rows_no.append(i[1])
+                    logger.info(f"Citations (writing, 6.6): the second check took a table row out: {why}")
+                    continue
+                plan[i] = ("cut", "second check")
+                logger.info(f"Citations (writing, 6.5): the second check took a sentence out: {why}")
+    kept = 0
+    for i in sorted(range(len(todo)), key=lambda i: -todo[i][0]):
+        a, b = todo[i]
+        what, val = plan.get(i, ("keep", None))
+        if what == "cut":
+            text = _c34_cut(text, a, b)
+            reasons[val] += 1
+        elif what == "mark":
+            text = text[:a] + val + text[b:]
+            kept += 1
+        else:
+            kept += 1
+    text = _c34_tidy(text)
+    if rows_no:
+        text = _v66_drop_lines(text, rows_no)
+        row_why["second check"] += len(rows_no)
+        if report is not None:
+            report["rows_out"] = report.get("rows_out", 0) + len(rows_no)
+    need = [s for s in _c34_sentences(text) if _c34_needs(text[s[0]:s[1]])]
+    left = [s for s in need if not is_cited(text[s[0]:s[1]]) and not _c34_signpost(text[s[0]:s[1]])]
+    unsourced = 0
+    if left:
+        if any(results) and len(left) * 2 <= len(need):
+            for a, b in sorted(left, key=lambda s: -s[0]):
+                text = _c34_cut(text, a, b)
+            text = _c34_tidy(text)
+            reasons["unbacked"] += len(left)
+            kept = max(0, kept - len(left))
+        else:
+            unsourced = len(left)
+    out = sum(reasons.values())
+    evidence = []
+    for i in sorted(ev_for, key=lambda i: todo[i][0]):
+        if plan.get(i, ("keep", None))[0] != "cut":
+            e = _v65_evidence(ev_for[i][0], ev_for[i][1], by_n)
+            if e:
+                evidence.append(e)
+    if report is not None:
+        for k, v in (("checked", len(todo)), ("kept", kept), ("out", out), ("unchecked", unchecked), ("second", second),
+                     ("second_missing", second_missing)):
+            report[k] = report.get(k, 0) + v
+        report.setdefault("evidence", []).extend(evidence)
+        rs = report.setdefault("reasons", {})
+        for k, v in reasons.items():
+            rs[k] = rs.get(k, 0) + v
+    logger.info(f"Citations (writing, 6.5): {len(todo)} sentences checked in {n_chunks} part(s), {second} checked a second time "
+                f"→ {out} taken out ({dict(reasons) or 'none'}), {unsourced} kept with a note, {unchecked} not checked"
+                + (f"; {rows_checked} table rows → {sum(row_why.values())} taken out ({dict(row_why)})" if rows_checked or row_why else ""))
+    return text, unsourced
+
+
+_V65_MERGE = _threading.Lock()
+
+
+def _v65_merge(into, reg):
+    """Adds one search's registry findings to a request's (several searches can run side by side)."""
+    if not isinstance(into, dict) or not isinstance(reg, dict):
+        return
+    with _V65_MERGE:
+        for k, v in reg.items():
+            if isinstance(v, bool):
+                into[k] = bool(into.get(k)) or v
+            elif isinstance(v, (int, float)):
+                into[k] = into.get(k, 0) + v
+
+
+def _v65_reg_words(reg, papers):
+    """What the person is told of the papers' check with their registries (6.5), in one sentence ("" when nothing)."""
+    papers = [p for p in (papers or []) if isinstance(p, dict) and p.get("kind") != "mine"]
+    reg = reg if isinstance(reg, dict) else {}
+    n, n_reg = len(papers), sum(1 for p in papers if p.get("registry"))
+    gone = int(reg.get("retracted") or 0)
+    worry = int(reg.get("concern") or 0)
+    bad = sum(int(reg.get(k) or 0) for k in ("wrong_doi", "unknown_doi", "unidentified", "future"))
+    if n and n_reg == n:
+        line = "each paper\u2019s details were checked with its publisher\u2019s record"
+    elif n_reg:
+        line = f"{n_reg} of the {n} papers\u2019 details were checked with their publishers\u2019 records"
+    elif n and reg.get("unreached"):
+        line = "the publishers\u2019 records couldn\u2019t be reached this time, so the papers\u2019 details are as the paper indexes give them"
+    else:
+        line = ""
+    parts = [x for x in ((f"{gone} retracted paper{'' if gone == 1 else 's'}" if gone else ""),
+                         (f"{worry} paper{'' if worry == 1 else 's'} under an expression of concern" if worry else ""),
+                         (f"{bad} paper{'' if bad == 1 else 's'} whose details couldn\u2019t be confirmed" if bad else "")) if x]
+    left = (", ".join(parts[:-1]) + " and " + parts[-1]) if len(parts) > 1 else "".join(parts)
+    if left:
+        line = (line + ", and " if line else "") + left + (" was" if gone + worry + bad == 1 else " were") + " left out"
+    out = (line[0].upper() + line[1:] + ".") if line else ""
+    # 6.6, round 3: a preprint published since is cited as the published paper (its own record, abstract and free copy)
+    pub = sum(1 for p in papers if p.get("preprint_doi"))
+    if pub:
+        out = (out + " " if out else "") + (f"{pub} preprint{'' if pub == 1 else 's'} {'is' if pub == 1 else 'are'} cited as the published "
+                                            f"paper{'' if pub == 1 else 's'} {'it' if pub == 1 else 'they'} became.")
+    fixed = _v65_corrected_words(papers)                 # 6.6, round 94
+    if fixed:
+        out = (out + " " if out else "") + fixed
+    return out
+
+
+def _v65_corrected_words(papers):
+    """6.6, round 94: the papers its journal has published a correction to, named, so that the figures used from them are
+    checked against the correction (an abstract may be from before it). "" when none."""
+    rows = []
+    for p in papers or []:
+        if not isinstance(p, dict) or not p.get("corrected"):
+            continue
+        try:
+            parts = [a for a in (_name_parts(x) for x in (p.get("authors") or [])[:20] if isinstance(x, str)) if a]
+            who = _intext_names(parts, "chicago") if parts else "One paper"
+        except Exception:
+            who = "One paper"
+        y = p.get("corrected") if isinstance(p.get("corrected"), int) and not isinstance(p.get("corrected"), bool) else 0
+        rows.append((f"{who} ({p['year']})" if p.get("year") else who, y))
+    if not rows:
+        return ""
+    if len(rows) == 1:
+        name, y = rows[0]
+        return (f"{name} has a published correction{f' ({y})' if y else ''}: check the figures used from it against the "
+                f"correction.")
+    names = [r[0] for r in rows[:3]] + ([f"{len(rows) - 3} more"] if len(rows) > 3 else [])
+    return (", ".join(names[:-1]) + " and " + names[-1] + " have published corrections: check the figures used from them "
+            "against the corrections.")
+
+
+def _v65_designs(papers):
+    """6.6, round 11: what kinds of study a piece of research writing rests on, said as Research a question says it
+    (_rs_designs_line), from each cited paper's own abstract (and what was read of the paper itself)."""
+    rows = []
+    for p in papers or []:
+        try:
+            ab, body = _v65_sents(p)
+        except Exception:
+            ab, body = [], []
+        rows.append({"design": _rs_design(ab) or _rs_design(body) or ("Review" if p.get("kind") == "review" else None), "cited": True,
+                     "kind": p.get("kind") or "article"})
+    line = _rs_designs_line(rows)
+    return line.replace("The answer rests on ", "Its papers: ", 1) if line else ""
+
+
+def _v65_say(note, papers):
+    """What was checked, for the note under a piece of research writing (6.5): the sentences, then the papers."""
+    rep = note.get("checked") or {}
+    bits = []
+    if rep.get("checked") and not rep.get("unchecked"):        # (when some couldn't be checked, the note says that instead)
+        out = rep.get("out", 0)
+        who = "It" if "RamzAI" in str(note.get("text") or "") else "RamzAI"
+        twice = rep.get("second", 0) > 0 and not rep.get("second_missing")
+        bits.append(who + " checked every sentence " + ("twice " if twice else "") + "against its papers\u2019 own words"
+                    + (f" and took out {out} that went further than the papers." if out else "."))
+        rows_out = rep.get("rows_out", 0)                # 6.6, round 49: the rows of its tables are checked too
+        if rows_out:
+            bits.append(f"It also took out {rows_out} table row{'s' if rows_out != 1 else ''} that said more than "
+                        f"{'their' if rows_out != 1 else 'its'} papers.")
+    words = _v65_reg_words(note.get("registry"), papers)
+    if words:
+        bits.append(words)
+    designs = _v65_designs(papers)                       # 6.6, round 11: the kinds of study the piece rests on
+    if designs:
+        bits.append(designs)
+    said = " ".join(bits)
+    if said and said not in note.get("text", ""):
+        note["text"] = (note["text"] + " " if note.get("text") else "") + said
 
 
 def _c34_write_sections(outline, sources, style, request_text, note, started):
@@ -8778,7 +10244,7 @@ def sage_endpoint():
         try:
             papers, _ = paper_topic_search(message, max_results=REMY_PAPERS_PRO if _is_pro(user) else REMY_PAPERS_FREE)
         except Exception as e:
-            logger.warning(f"RamzAI's paper search failed: {e}")
+            logger.warning(f"RamzAI's paper search failed: {_why(e)}")
             papers = []
     if papers:
         system_prompt += "\n\n" + _remy_papers_block(papers)
@@ -8937,7 +10403,7 @@ def _sage_as_written(answer, show_words=True):
             if status == 200:
                 body = _fin_walk(body, "chat", False)
         except Exception as e:
-            logger.error(f"RamzAI's answer failed while it was written: {e.__class__.__name__}: {str(e)[:200]}", exc_info=True)
+            logger.error(f"RamzAI's answer failed while it was written: {_why(e)}", exc_info=True)
             body, status = {"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}, 502
         finally:
             good = status == 200 and isinstance(body, dict)
@@ -8966,11 +10432,266 @@ def _sage_as_written(answer, show_words=True):
                     headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
 
 
+# ---------------- 6.6, round 1 (the owner, 21 Nov 2026 00:47: "Raise the app's validity. Do as much as a research tool can
+# be."): a summary's slides and study notes say only what the person's own file says. Every point is checked against the
+# file's own sentences (labelled M1, M2…), the way research writing is checked against its papers (_v65_check): a check
+# names the sentences behind each point, the rules of server/valid65.py hold the point to them (a figure, a date, a
+# place, a cause, "always", "the most", a trend…), and a second, independent check reads each point with only those
+# sentences (_v65_verify). What the file doesn't say goes. When the AI can't check, the check by words alone stands in
+# (every figure, date and name must be the file's: ground66.words_ok) and the person is told.
+MAT_CHUNK = 40                 # points per check
+MAT_CHECK_SYSTEM = (
+    "You check study notes and slides against a student's own MATERIAL. The material's sentences are labelled M1, M2, "
+    "M3 and so on. Each numbered ITEM was made from the material. For each item give exactly one answer:\n"
+    "{\"n\": 1, \"m\": [\"M4\", \"M9\"], \"v\": \"full\"} when those sentences of the material, taken together, state "
+    "everything the item says;\n"
+    "{\"n\": 2, \"m\": [\"M3\"], \"v\": \"part\"} when they state only part of it;\n"
+    "{\"n\": 3, \"drop\": true} when the material does not state it: a fact, a figure, a name, a date, a definition, an "
+    "example or an explanation that is not in the material, even if it is true;\n"
+    "{\"n\": 4, \"keep\": true} when the item states no fact of its own: a title, a label, a question, or words that only "
+    "organise (\"Causes\", \"Key points\").\n"
+    "Judge only by the material, never by what you know. A figure, a date, a name, a place or a term is the material's own "
+    "or it is not in it. What the material says of one group, place or time is not said of another; \"may\" is not "
+    "\"does\"; a link is not a cause; \"always\", \"the most\" or \"most\" only where the material says as much. Name at "
+    "most 4 sentences for an item. Reply with JSON only: {\"items\": [...]}, one entry for every item.")
+MAT_VERIFY_SYSTEM = (
+    "You are the second, independent checker of study notes made from a student's own material. Each numbered ITEM is "
+    "one POINT, as it will stand, and the QUOTES it rests on: sentences of the material. Answer \"ok\" only when the "
+    "quotes, taken together, state everything the point says: every figure, date, name, place, term, definition, example, "
+    "cause and claim, with the same strength and scope (\"may\" is not \"does\"; a link is not a cause). Otherwise "
+    "answer \"no\" and say in a few words what the quotes don't state. Judge only by the quotes, never by what you know. "
+    "Reply with JSON only, like {\"items\": [{\"n\": 1, \"v\": \"ok\"}, {\"n\": 2, \"v\": \"no\", \"why\": \"...\"}]}.")
+
+
+def _mat_rules(point, quoted, material):
+    """What a point says that the file's sentences named for it don't (empty when nothing): its figures (in digits or in
+    words), dates and quotation marks, a place, and the strength rules of research (server/valid65.py)."""
+    bad = []
+    if not _rs_figures_ok(point, quoted):
+        bad.append("figure")
+    if not _v65.years_ok(point, quoted):
+        bad.append("year")
+    if not _v65.quotes_ok(point, material):
+        bad.append("quote")
+    if not _v65.places_ok(point, material):
+        bad.append("place")
+    for name, ok in (("cause", _v65.cause_ok(point, quoted) and _v65.cause2_ok(point, quoted)), ("certainty", _v65.certainty_ok(point, quoted)),
+                     ("superlative", _v65.superlative_ok(point, quoted)), ("whose", _v65.superlative_whose_ok(point, quoted)),   # (round 103)
+                     ("share", _v65.shares_ok(point, quoted) and _v65.ratio_ok(point, quoted)),
+                     ("direction", _v65.direction_ok(point, quoted) and _v65.polarity_ok(point, quoted)
+                                    and _v65.level_ok(point, quoted) and _v65.share_sign_ok(point, quoted)     # (6.6, round 101)
+                                    and _v65.comparison_ok(point, quoted) and _v65.sign_ok(point, quoted)),    # (6.6, round 102)
+                     ("trend", _v65.trend_ok(point, quoted)),
+                     ("hedge", _v65.hedge_ok(point, quoted)), ("design", _v65.design_ok(point, quoted)),
+                     ("significance", _v65.significance_ok(point, quoted)), ("first", _v65.first_ok(point, quoted)),
+                     ("scale", _v65.scale_ok(point, material) and _v65.scope_ok(point, quoted + " " + material)), ("all", _v65.all_ok(point, quoted)),
+                     # 6.6, round 4: a lasting effect, a ratio in words, percent and percentage points, a gradient
+                     ("long", _v65.long_ok(point, quoted)), ("times", _v65.times_ok(point, quoted)),
+                     ("points", _v65.points_ok(point, quoted)), ("dose", _v65.dose_ok(point, quoted)),
+                     ("region", _v65.region_ok(point, material)),
+                     # 6.6, round 12: prevalence and incidence, mortality and case fatality, odds and risk
+                     ("measure", _v65.measure_ok(point, quoted)),
+                     ("whom", _v65.denominator_ok(point, quoted) and _v65.narrowing_ok(point, quoted)), ("period", _v65.period_ok(point, quoted)),
+                     ("often", _v65.frequency_ok(point, quoted)), ("when", _v65.when_ok(point, quoted)),            # (6.6, rounds 108 to 110)
+                     # 6.6, round 26: what research hasn't done, a correlation's strength, the world, the people (the file's own)
+                     ("absence", _v65.absence_ok(point, quoted)), ("strength", _v65.strength_ok(point, quoted)),
+                     # 6.6, round 60: how strong the evidence is, as the file says it
+                     ("evidence", _v65.evidence_ok(point, quoted, 1)),
+                     ("world", _v65.world_ok(point, material)), ("group", _v65.groups_ok(point, material) and _v65.qualifiers_ok(point, material))):
+        if not ok:
+            bad.append(name)
+    return bad
+
+
+def _mat_check(material, points, deadline, feature="notes"):
+    """Checks points (a list of their words) against the person's own file (material). Returns {"bad": {i: why},
+    "checked", "out", "second", "second_missing", "unchecked", "reasons"}: bad holds the points that go."""
+    sents = _g66.split_material(material)
+    rep = {"bad": {}, "checked": len(points), "out": 0, "second": 0, "second_missing": 0, "unchecked": 0, "reasons": {}}
+    if not points:
+        return rep
+    head = "MATERIAL:\n" + _g66.labelled(sents) + "\n\nITEMS:\n"
+    chunks = [list(range(k, min(len(points), k + MAT_CHUNK))) for k in range(0, len(points), MAT_CHUNK)]
+
+    def run(idx):
+        user = head + "\n".join(f"{n}. {points[i]}" for n, i in enumerate(idx, 1))
+        try:
+            raw = str(call_claude(system_prompt=MAT_CHECK_SYSTEM, user_message=user, max_tokens=min(3000, 45 * len(idx) + 300),
+                                  timeout=max(5, min(70, deadline - time.time())), feature=feature + "-check") or "")
+            obj = _rs_json(raw)
+        except Exception as e:
+            logger.warning(f"Checked against the file ({feature}): the check didn't run ({_why(e)})")
+            return None
+        got = {}
+        for it in obj.get("items") or []:
+            try:
+                n = int(str(it.get("n"))) if isinstance(it, dict) and re.fullmatch(r"\d{1,3}", str(it.get("n") or "")) else None
+            except Exception:
+                n = None
+            if not n or not 1 <= n <= len(idx):
+                continue
+            if it.get("keep") is True:
+                got[idx[n - 1]] = ("keep", None)
+            elif it.get("drop") is True:
+                got[idx[n - 1]] = ("drop", None)
+            else:
+                ks = _g66.labels_ok(it.get("m"), len(sents))
+                v = str(it.get("v") or "").lower()
+                got[idx[n - 1]] = (("full" if v == "full" else "part"), ks) if ks else ("drop", None)
+        return got
+
+    results = {}
+    if time.time() < deadline - 6 and sents:
+        with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+            jobs = [pool.submit(run, idx) for idx in chunks]
+            for job in jobs:
+                try:
+                    r = job.result(timeout=max(2, deadline - time.time() + 3))
+                except Exception:
+                    r = None
+                if r:
+                    results.update(r)
+    reasons = Counter()
+    verify = []
+    for i, words in enumerate(points):
+        got = results.get(i)
+        if got is None:                         # no check answered for it: the check by words alone
+            rep["unchecked"] += 1
+            if not _g66.words_ok(words, material):
+                rep["bad"][i] = "words"
+            continue
+        what, ks = got
+        if what == "keep":
+            if not _g66.words_ok(words, material):
+                rep["bad"][i] = "words"          # "only a label" that gives a figure or a name the file hasn't
+            continue
+        if what != "full":
+            rep["bad"][i] = "not in the file" if what == "drop" else "part"
+            continue
+        quoted = " ".join(sents[k] for k in ks)
+        bad = _mat_rules(words, quoted, material)
+        if bad:
+            rep["bad"][i] = bad[0]
+            continue
+        verify.append((i, words, " | ".join(sents[k] for k in ks)))
+    if verify:
+        got = _v65_verify(verify, deadline + 25, feature, system=MAT_VERIFY_SYSTEM)
+        if got is None:
+            rep["second_missing"] = len(verify)
+        else:
+            no, rep["second"] = got
+            rep["second_missing"] = len(verify) - rep["second"]
+            for i, why in no.items():
+                rep["bad"][i] = "second check"
+                logger.info(f"Checked against the file ({feature}): the second check took a point out: {why}")
+    for why in rep["bad"].values():
+        reasons[why] += 1
+    rep["out"] = len(rep["bad"])
+    rep["reasons"] = dict(reasons)
+    logger.info(f"Checked against the file ({feature}): {len(points)} points, {rep['out']} out ({dict(reasons) or 'none'}), "
+                f"{rep['second']} read a second time, {rep['unchecked']} not checked by the AI")
+    return rep
+
+
+def _mat_say(rep, what="point"):
+    """What the person is told of the check against their own file, in one or two sentences."""
+    out = rep.get("out", 0)
+    gone = f"{out} that your file doesn\u2019t say {'was' if out == 1 else 'were'} taken out"
+    if rep.get("unchecked"):
+        return (f"Not every {what} could be checked against your file this time: their figures, dates and names were."
+                + (f" {gone}." if out else "") + " Check the rest against your file.")
+    twice = rep.get("second", 0) > 0 and not rep.get("second_missing")
+    return f"Every {what} was checked against your file" + (" twice" if twice else "") + (f" and {gone}." if out else ".")
+
+
+MAT_NOTHING = ("What RamzAI wrote didn\u2019t match your file, so none of it is shown. Please try again, or use a longer part "
+               "of your file.")
+
+
+def _mat_public(rep):
+    return {k: rep.get(k, 0) for k in ("checked", "out", "second", "second_missing", "unchecked")} | {"reasons": rep.get("reasons") or {}}
+
+
+def _mat_slides(material, slides, started, feature="summary"):
+    """A summary's content slides checked against the person's file (a point the file doesn't say goes; a chart whose
+    figures aren't the file's goes; a slide left with nothing goes). Returns (slides, report or None when there was no
+    file to check against: a few words of a topic)."""
+    if _g66.is_topic_only(material):
+        return slides, None
+    pts = _g66.slide_points(slides)
+    rep = _mat_check(material, [w for _k, w in pts], min(started + 120, time.time() + 80), feature)
+    drop = {pts[i][0] for i in rep["bad"]}
+    for si, sl in enumerate(slides or []):
+        if sl.get("chart") and not _g66.chart_ok(sl["chart"], material):
+            drop.add(("c", si))
+            rep["out"] += 1
+            rep["reasons"]["chart"] = rep["reasons"].get("chart", 0) + 1
+    return _g66.slides_without(slides, drop), rep
+
+
+def _mat_line_ok(line, material):
+    """A line RamzAI adds around the checked points (a deck's title, the line under it, a learning objective, a
+    discussion question) gives no figure, year or name the person's file doesn't (6.6, round 59)."""
+    t = str(line or "").strip()
+    if not t:
+        return True
+    # a title in Title Case capitalises every word: only its places are names there ("Preventing Malaria Through Nets"
+    # names nothing; "Malaria In Ghana" names Ghana)
+    w3 = re.findall(r"[A-Za-z][A-Za-z'’\-]{2,}", t)
+    titled = len(w3) >= 3 and sum(1 for w in w3 if w[:1].isupper()) >= 0.6 * len(w3)
+    if titled:
+        if not _v65.places_ok(t, material):
+            return False
+    elif not _g66.words_ok(re.sub(r"\d+(?:[.,]\d+)*", " ", t), material):
+        return False
+    if _QG_NUMBERISH.search(t):
+        return bool(_rs_figures_ok(t, material) and _v65.years_ok(t, material))
+    return True
+
+
+def _mat_extras(obj, material, rep):
+    """6.6, round 59: the summary deck's cover (title, the line under it), its learning objectives and its discussion
+    questions are RamzAI's words around the checked slides, and were never checked: "Malaria kills 600,000 a year" could
+    stand under the title, a discussion question could rest on a figure the file never gives. A line that gives a figure, a
+    year or a name the file doesn't goes (the deck then uses its first slide's heading, no line under the title, or the
+    usual objectives and question); counted with the points taken out."""
+    gone = 0
+    for k in ("title", "subtitle"):
+        if obj.get(k) and not _mat_line_ok(obj.get(k), material):
+            obj[k] = ""
+            gone += 1
+    for k in ("objectives", "discussion"):
+        if isinstance(obj.get(k), list):
+            keep = [x for x in obj[k] if _mat_line_ok(x, material)]
+            gone += len(obj[k]) - len(keep)
+            obj[k] = keep
+    if gone and rep is not None:
+        rep["out"] = rep.get("out", 0) + gone
+        rep.setdefault("reasons", {})["around"] = rep.get("reasons", {}).get("around", 0) + gone
+        logger.info(f"Checked against the file (summary): {gone} line(s) of the cover, objectives or discussion taken out")
+    return gone
+
+
+def _mat_refs(refs, material):
+    """The references a summary lists are the file's own (written there, word for word or nearly): one the file doesn't
+    hold goes (the writer is told never to add one; now it is checked)."""
+    low = re.sub(r"\s+", " ", str(material or "").lower())
+    words = set(re.findall(r"[a-z\u00e0-\u024f]{3,}", low))
+    out = []
+    for r in refs or []:
+        w = re.findall(r"[a-z\u00e0-\u024f]{3,}", str(r or "").lower())
+        years = re.findall(r"\b(?:1[5-9]|20)\d{2}\b", str(r or ""))
+        if w and sum(1 for x in w if x in words) >= 0.8 * len(w) and all(y in low for y in years):
+            out.append(r)
+    return out
+
+
 @app.route("/api/summarize", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 @_once
 def summarize_endpoint():
+    started = time.time()
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     if not text:
@@ -9039,11 +10760,23 @@ def summarize_endpoint():
             max_tokens=max_tokens + (900 if audience else 0),
         )
         if not audience:
-            return jsonify({"slides": _slides_without_citations(_parse_summary_json(result))})
+            slides, rep = _mat_slides(text, _slides_without_citations(_parse_summary_json(result)), started)
+            if not slides:
+                raise ConversionError(MAT_NOTHING)
+            return jsonify({"slides": slides, **({"checked": _mat_public(rep), "check_note": _mat_say(rep)} if rep else {})})
         obj = _json_object(result)
-        slides = _slides_without_citations(_parse_summary_json(json.dumps(obj.get("slides") or [])))
+        slides, rep = _mat_slides(text, _slides_without_citations(_parse_summary_json(json.dumps(obj.get("slides") or []))), started)
+        if not slides:
+            raise ConversionError(MAT_NOTHING)
+        if rep is not None:
+            obj["references"] = _mat_refs(obj.get("references"), text)     # 6.6: only references the file holds
+            try:
+                _mat_extras(obj, text, rep)                                 # 6.6, round 59: the cover and the rest too
+            except Exception as e:
+                logger.error(f"Summary: the cover's check failed ({_why(e)})")
         title, deck = _structure_summary(audience, obj, slides, presenters)
-        return jsonify({"slides": deck, "title": title, "audience": audience})
+        return jsonify({"slides": deck, "title": title, "audience": audience,
+                        **({"checked": _mat_public(rep), "check_note": _mat_say(rep)} if rep else {})})
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
         return jsonify({"error": str(e)}), 502
@@ -9097,7 +10830,7 @@ def _defence_reply(data, text):
         return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
     except Exception as e:
         _refund_sage_message(user, charged_from, POINTS_DECK)
-        logger.error(f"Defence slides failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Defence slides failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}), 502
     logger.info(f"Defence: {kind}, {len(deck)} slides, {suggested} suggested reason(s), {len(gaps)} thing(s) the work does not say, "
                 f"{len(asked)} question(s); {len(text)} characters read" + (" (cut)" if cut else ""))
@@ -9144,6 +10877,7 @@ def _notes_title(md, fallback):
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
 def study_notes_endpoint():
+    started = time.time()
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
     kind = data.get("kind") if data.get("kind") in NOTES_KINDS else "sheet"
@@ -9164,7 +10898,18 @@ def study_notes_endpoint():
         md = md.strip("`").split("\n", 1)[-1].strip()
     if not md:
         return jsonify({"error": "The notes came back empty. Try again."}), 502
-    return jsonify({"kind": kind, "name": name, "title": _notes_title(md, name), "notes": md[:30000]})
+    # 6.6: every point checked against the person's own file; what the file doesn't say goes
+    rep = None
+    if not _g66.is_topic_only(text):
+        pts = _g66.notes_points(md, kind)
+        if pts:
+            rep = _mat_check(text, [p[1] for p in pts], min(started + 120, time.time() + 80), "notes-" + kind)
+            if rep["bad"]:
+                md = _g66.notes_without(md, [pts[i][0] for i in rep["bad"]], kind)
+            if rep["out"] >= len(pts):
+                return jsonify({"error": MAT_NOTHING}), 502
+    return jsonify({"kind": kind, "name": name, "title": _notes_title(md, name), "notes": md[:30000],
+                    **({"checked": _mat_public(rep), "check_note": _mat_say(rep)} if rep else {})})
 
 
 @app.route("/api/summary-to-pptx", methods=["POST", "OPTIONS"])
@@ -9192,7 +10937,7 @@ def summary_to_pptx_endpoint():
         try:
             _colour_not_bold(result_path)
         except Exception as e:
-            logger.warning(f"Colour-not-bold pass skipped: {e}")
+            logger.warning(f"Colour-not-bold pass skipped: {_why(e)}")
         return send_file(
             result_path,
             mimetype=MIME_TYPES["pptx"],
@@ -9202,7 +10947,7 @@ def summary_to_pptx_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Summary-to-presentation failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Summary-to-presentation failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't build the presentation. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -9433,8 +11178,50 @@ def _quiz_harden(questions, difficulty, text, started):
     logger.info(f"Quiz check: {st['mc']} multiple-choice question(s), {st['examined']} answered by the examiner; found at fault: "
                 f"{st['code']} by code, {st['disagree']} with another answer than the key, {st['not_one']} with more than one "
                 f"defensible answer, {st['giveaway']} giving the answer away, {st['low']} easier than asked; {st['rewritten']} "
-                f"rewritten, {st['kept']} kept as written" + (" (a check didn't answer)" if st["failed"] else ""))
-    return out
+                f"rewritten ({st['confirmed']} confirmed by a second examiner, {st['not_confirmed']} not), {st['kept']} kept as "
+                f"written; {st.get('sa', 0)} short answer(s) checked, {st.get('sa_wrong', 0)} found wrong; {st['left_out']} left out "
+                f"(an answer in doubt)" + (" (a check didn't answer)" if st["failed"] else ""))
+    return out, st['left_out']
+
+
+# ---- 6.6, round 57 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a practice question's explanation says only
+# what the person's material (or the question itself: its case, its options) says. The examiner reads each question and
+# its key (round 48) and each short answer is held to the material (round 54); the explanation, the words that teach after
+# a mistake, was read by no one: a dose, a year, a figure or a name of its own stood there. Now a sentence of it that gives
+# a figure (in digits or in words), a year or a name the material and the question don't goes; what is left stays.
+_QG_NUMBERISH = re.compile(r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|"
+                           r"hundred|thousand|million|half|third|quarter|double|twice|triple|percent|per\s+cent)\b", re.I)
+
+
+def _quiz_ground(questions, material):
+    """The explanations held to the material: returns how many of their sentences went."""
+    if _g66.is_topic_only(material):
+        return 0                                # a few words of a topic: nothing to hold them to
+    cut = 0
+    for q in questions or []:
+        ex = str(q.get("explanation") or "").strip()
+        if not ex:
+            continue
+        own = " ".join(str(x or "") for x in [q.get("question"), q.get("case"), q.get("correct_answer")] + list(q.get("options") or []))
+        ground = str(material) + "\n" + own
+        keep, gone = [], 0
+        for s in re.split(r"(?<=[.!?])\s+(?=[\"“(]?[A-Z0-9À-ɏ])", ex):
+            s = s.strip()
+            if not s:
+                continue
+            ok = _g66.words_ok(re.sub(r"\d+(?:[.,]\d+)*", " ", s), ground)      # its names (figures below)
+            if ok and _QG_NUMBERISH.search(s):
+                ok = _rs_figures_ok(s, ground) and _v65.years_ok(s, ground)
+            if ok:
+                keep.append(s)
+            else:
+                gone += 1
+        if gone:
+            cut += gone
+            q["explanation"] = " ".join(keep).strip()
+    if cut:
+        logger.info(f"Quiz: {cut} explanation sentence(s) taken out: a figure, a year or a name the material doesn't give")
+    return cut
 
 
 @app.route("/api/quiz/generate", methods=["POST", "OPTIONS"])
@@ -9513,7 +11300,12 @@ def quiz_generate_endpoint():
             feature="quiz",
         )
         questions = _parse_quiz_json(result)
-        questions = _quiz_harden(questions, difficulty, text, started)
+        questions, left_out = _quiz_harden(questions, difficulty, text, started)
+        try:
+            ex_cut = _quiz_ground(questions, text)      # 6.6, round 57: what an explanation teaches is the material's
+        except Exception as e:
+            logger.error(f"Quiz: the explanations' check failed ({_why(e)})")
+            ex_cut = 0
         if title in ("", "Practice Quiz"):
             try:
                 made = json.loads(result[result.find("{"):result.rfind("}") + 1]) if "{" in result else {}
@@ -9523,7 +11315,18 @@ def quiz_generate_endpoint():
             named = _standalone(re.sub(r"\s+", " ", named))[:90]
             if named:
                 title = named if "quiz" in named.lower() else f"{named}: Practice Quiz"
-        return jsonify({"questions": questions, "title": title, "difficulty": difficulty, "audience": audience, "question_style": style})
+        out = {"questions": questions, "title": title, "difficulty": difficulty, "audience": audience, "question_style": style}
+        if left_out:                    # 6.6, round 48: questions whose answer two readings didn't agree on are left out
+            out["left_out"] = left_out
+            out["note"] = (f"{left_out} question{'s were' if left_out > 1 else ' was'} left out: a second, independent reading "
+                           f"didn’t agree on {'their answers' if left_out > 1 else 'its answer'}, so {'they' if left_out > 1 else 'it'} "
+                           f"could teach a wrong one.")
+        if ex_cut:
+            out["explanations_cut"] = ex_cut
+            out["note"] = (out.get("note", "") + " " if out.get("note") else "") + (
+                f"{ex_cut} sentence{'s' if ex_cut > 1 else ''} of the explanations {'were' if ex_cut > 1 else 'was'} taken out: "
+                f"{'they' if ex_cut > 1 else 'it'} gave a figure, a year or a name your material doesn’t.")
+        return jsonify(out)
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_REMY)
         return jsonify({"error": str(e)}), 502
@@ -9933,7 +11736,7 @@ def quiz_export_docx_endpoint():
             download_name=f"{safe_title}.docx",
         )
     except Exception as e:
-        logger.error(f"Quiz export failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Quiz export failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Couldn't build the quiz document. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -10192,7 +11995,7 @@ def _one_language(data, language=None, context=""):
         data, st = _onelang.fix_tree(data, language, context, ask)
         _lang_said(request.path if request else "-", st)
     except Exception as e:
-        logger.warning(f"One language skipped: {e.__class__.__name__}: {str(e)[:160]}")
+        logger.warning(f"One language skipped: {_why(e)}")
     return data
 
 
@@ -10216,7 +12019,7 @@ def _finish_ai_answers(resp):
             data = _one_language(data, asked.get("language") if isinstance(asked, dict) else None, _onelang.context_text(asked))
         resp.set_data(json.dumps(data, ensure_ascii=False))
     except Exception as e:
-        logger.warning(f"Finishing an AI answer skipped: {e}")
+        logger.warning(f"Finishing an AI answer skipped: {_why(e)}")
     return resp
 
 
@@ -10366,6 +12169,84 @@ def _write_more(text):
 # or agreed to: no citation, no figure that isn't theirs or worked out from theirs (proposal.guard_plan_text).
 PROPOSAL_REFS_MAX = 200
 PROPOSAL_POOL = {"short": 16, "standard": 20, "full": 24}       # papers one part may draw on
+# 6.5 (the owner, 20 Nov 2026: "Make it extremely valid"): every writer is told what its check holds it to
+WRITE_STRENGTH_RULE = (
+    "\n\nSAY EXACTLY AS MUCH AS EACH SOURCE SAYS (every sentence is checked against its sources' own sentences, and a "
+    "sentence that goes further than they do is taken out):\n"
+    "- A link, an association or a correlation is a link, never a cause: write \"was linked to\", not \"causes\" or "
+    "\"leads to\", unless the source itself reports a cause (a trial, an experiment, an effect).\n"
+    "- Keep the source's own caution: \"may\", \"suggests\" and \"was associated with\" stay as careful as the source is.\n"
+    "- A finding belongs to the people, the place and the years the source studied: what nurses in one city reported is "
+    "not shown for all health workers, for the whole country, or for the world; what secondary-school students showed is not "
+    "shown for university students, first-year students are not final-year students, rural is not urban.\n"
+    "- \"Studies show\" or \"research has found\" only with two or more citations; \"several\", \"many\" or \"most\" studies, \"a "
+    "growing body of research\" or \"it is well established\" only with three or more (two are \"two studies\").\n"
+    "- A figure, a year or a place only exactly as the source gives it; words in quotation marks only when they are the "
+    "source's own words, exactly.\n"
+    "- What a source says about earlier work or about its field (its background) is not its own finding: never write "
+    "\"Mensah (2021) found…\" for it.\n"
+    "- \"Is rising\", \"has increased\", \"increasingly\" or \"a growing problem\" only when the source shows a change over "
+    "time: a survey of one moment does not.\n"
+    "- How big or how wide a study was (\"nationally representative\", \"large-scale\", \"multicentre\") only as the source "
+    "says it; a share in words (\"one in three\", \"two-thirds\") only when it is the source's own figure.\n"
+    "- \"Worsens\", \"affects\", \"improves\", \"reduces\" and \"has an impact on\" are words of cause: only where the source "
+    "reports an effect; otherwise \"was linked to\".\n"
+    "- \"A recent study\" only for a source from the last five years; \"the first study to\" only where the source says so; "
+    "\"no link\" and \"a link\" exactly as the source found.\n"
+    # 6.6, round 4
+    "- \"Long-term\", \"lasting\" or \"sustained\" only where the source followed people for six months or more or says so.\n"
+    "- \"Doubled\", \"twice as likely\" or \"three times\" only where the source's own figures or ratio make it; \"by 10%\" "
+    "is not \"by 10 percentage points\" (from 20% to 30% is a rise of 10 percentage points, or of 50%): write the change the "
+    "way the source gives it.\n"
+    "- \"The more…, the more…\" or \"each additional hour\" only where the source shows a gradient, not where it compares two "
+    "groups.\n"
+    # 6.6, round 6
+    "- \"Developing countries\", \"low- and middle-income countries\" or \"the Global South\" only where the source studied "
+    "them: one country is that country.\n"
+    "- \"Studies agree\" or \"consistently\" only with two or more sources that do agree; \"studies disagree\" or \"the findings "
+    "are mixed\" only with sources that do differ (one found a link, another found none).\n"
+    "- \"Currently\", \"today\" or \"now\" with a figure only from a source of the last five years; otherwise give the year: "
+    "\"in 2012, 38% of…\".\n"
+    # 6.6, round 12
+    "- Keep each figure's measure: prevalence (who has it) is not incidence (new cases over a time); mortality (deaths in a "
+    "population) is not case fatality (deaths among those who have it); an odds ratio gives odds, not risk: \"twice the "
+    "odds\" or \"more likely\", never \"twice the risk\". A figure stays with its own measure: a paper's specificity is "
+    "not its sensitivity, its median not a mean or an average, its standard error not a standard deviation, its odds ratio "
+    "not a hazard ratio.\n"
+    # 6.6, round 19
+    "- A share keeps its people: \"38% of late users\" is not \"38% of students\".\n"
+    # 6.6, round 20
+    "- A figure keeps its period: a lifetime figure is not one for the past year, and the past month is not the past week.\n"
+    # 6.6, round 21
+    "- \"No study has…\", \"little is known\", \"few studies\" or \"a gap in the literature\" only where a source itself says so; "
+    "a paper that studied something says nothing about what others haven't; \"no study has\" only where the source says there is "
+    "none (\"little is known\" is not \"no study\").\n"
+    # 6.6, round 22
+    "- \"A strong\", \"moderate\" or \"weak\" correlation only as the source's own figure is (r = .23 is weak) or as it says; "
+    "\"a small\", \"medium\" or \"large\" effect only as its d or η² is (d = 0.25 is small).\n"
+    # 6.6, rounds 100 and 101
+    "- A sum of money in the source's own currency (US$50 is not GH₵50); a level as the source words it (knowledge the "
+    "source calls poor is not good, low uptake is not high); a share with its \"not\" (\"38% did not sleep enough\" is not "
+    "\"38% slept enough\"; \"unvaccinated\" is not \"vaccinated\").\n"
+    # 6.6, rounds 102 to 104
+    "- A comparison with its sides as the source has them (girls who slept more than boys, not boys more than girls; the "
+    "intervention group, not the control group); a link with its sign (\"positively\" is not \"negatively\", a risk factor "
+    "is not protective, an odds ratio below 1 is lower odds); \"the most common\" or \"the leading\" only for what the "
+    "source gives it to; a figure from one college, hospital, district or city is that place's (\"in a college in Kumasi, "
+    "38%…\"), never the whole country's (\"in Ghana, 38%…\"), unless the source is national; a share keeps the words that "
+    "narrow its people (38% of women is not 38% of pregnant women), its \"how often\" (daily is not weekly) and its time "
+    "(school nights are not weekends).\n"
+    # 6.6, round 23
+    "- A figure's year is the year its data are from, as the source gives it (\"in 2019, 38% of…\"), never the year the "
+    "source came out; \"not significant\" and \"significantly\" exactly as the source found; one country the source calls "
+    "\"a lower-middle-income country\" is that country, not \"developing countries\".\n"    # 6.6, round 60
+    "- How strong the evidence is (\"strong\", \"robust\" or \"compelling\" evidence, \"the evidence is clear\", \"firmly "
+    "established\", \"clearly shows\", \"definitely\") only as a source rates its own evidence, or with three or more sources; "
+    "\"it is known that\" needs three, as \"it is well established\" does.\n"
+    "- Paraphrase in your own words: don't put a source's words in quotation marks (a quotation needs a page number, which "
+    "an abstract doesn't give).")
+
+
 PROPOSAL_CITED_RULES = (
     # 5.4 (the owner, 12 Nov 2026: the research product must "be very healthy", not "scrambled"): one argument, built
     # paragraph by paragraph, never a list of study after study. Every sentence still carries its citation.
@@ -10390,7 +12271,7 @@ PROPOSAL_CITED_RULES = (
     " To make it read naturally, introduce a small group of studies in plain words, often naming where or who, as a "
     "narrative citation that carries its own key: 'In Ghana, Mensah (2021) found that…', 'Two studies from Nigeria point "
     "the same way…', 'Not every study agrees: …'. Vary how sentences begin and how long they are, and avoid stock phrases "
-    "('It is important to note that', 'plays a crucial role', 'delve', 'in today's world').")
+    "('It is important to note that', 'plays a crucial role', 'delve', 'in today's world').") + WRITE_STRENGTH_RULE
 
 
 def _prop_prev(previous_refs, cite_plan):
@@ -10431,6 +12312,7 @@ def _prop_sources(prev, found, style, cap, read_topic=None):
         if twin is not None:
             if not twin.get("abstract") and c.get("abstract"):
                 twin["abstract"] = c.get("abstract")       # the same paper found again: its key stays, its abstract backs the check
+                twin["abstract_full"], twin["abstract_lent"] = c.get("abstract_full"), c.get("abstract_lent")
                 twin["title"] = c.get("title") or twin["title"]
                 twin["venue"], twin["year"] = c.get("venue"), c.get("year")
                 live += 1
@@ -10458,7 +12340,7 @@ def _prop_find(find_raw, queries, n_each):
         try:
             return find_raw(queries[i][0], n_each, queries[i][1])
         except Exception as e:
-            logger.warning(f"Proposal: a paper search didn't run ({str(e)[:120]})")
+            logger.warning(f"Proposal: a paper search didn't run ({_why(e)})")
             return [], "failed"
     if len(queries) == 1:
         results[0] = run(0)
@@ -10500,6 +12382,17 @@ def _prop_plan_text(raw, plan, sample, keys, extra_text=""):
     return out
 
 
+def _prop_methods_kept(text, reference):
+    """6.6, round 75: an abstract's part without the sentences that name a method (a design, a sampling technique, a test,
+    software…) its proposal doesn't name (defence.METHOD_TERMS, against chapter three and THE PLAN): the abstract can't
+    say "simple random sampling" where chapter three says stratified. (text, how many went); a part that would be left
+    with nothing stays as written."""
+    ref = {i for i, rx in enumerate(_defence._METHOD_RX) if rx.search(str(reference or ""))}
+    sents = [x for x in re.split(r"(?<=[.!?])\s+", str(text or "").strip()) if x]
+    keep = [x for x in sents if all(i in ref for i, rx in enumerate(_defence._METHOD_RX) if rx.search(x))]
+    return (" ".join(keep), len(sents) - len(keep)) if keep else (text, 0)
+
+
 def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
     """One part of a research proposal (see proposal.parts). Returns the reply as a dict, restyled; raises
     ConversionError when the part can't be written honestly (no paper found for a cited chapter)."""
@@ -10537,7 +12430,7 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
                 for k, t in _prop_plan_text(more, plan, sample, lack, extra_text).items():
                     got.setdefault(k, t)
             except Exception as e:
-                logger.warning(f"Proposal: the missing sections of {feature} didn't come ({str(e)[:120]})")
+                logger.warning(f"Proposal: the missing sections of {feature} didn't come ({_why(e)})")
         return got
 
     if key == "ch1":
@@ -10582,7 +12475,7 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
                 try:
                     got[name] = job.result(timeout=130)
                 except Exception as e:
-                    logger.warning(f"Proposal: '{name}' of Chapter One didn't come ({str(e)[:140]})")
+                    logger.warning(f"Proposal: '{name}' of Chapter One didn't come ({_why(e)})")
                     got[name] = None
         if not got.get("cited"):
             raise ConversionError("RamzAI couldn’t write the background just now. Please try again; nothing was taken.")
@@ -10599,7 +12492,9 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
         sections += _prop.objectives_sections(plan)
         for k, num, head in (("significance", "1.3", "Significance of the Study"), ("scope", "1.4", "Scope of the Study"),
                              ("limitations", "1.5", "Limitations of the Study"), ("organisation", "1.6", "Organisation of the Study")):
-            sections.append({"number": num, "heading": head, "level": 2, "text": ps.get(k, ""), "kind": "plan"})
+            # 6.6, round 71: what the study itself will do is a plan here too, as in chapter three (round 13): no findings
+            # ("The findings revealed…": a proposal has none yet), its own steps in the future ("Data were collected" -> "will be")
+            sections.append({"number": num, "heading": head, "level": 2, "text": _prop.future_tense(ps.get(k, "")) or ps.get(k, ""), "kind": "plan"})
         raw_outline = (got.get("outline") or {}).get("themes") if isinstance(got.get("outline"), dict) else None
         outline2 = _prop.clean_outline(raw_outline, plan)
         if len(outline2) < 2:
@@ -10664,7 +12559,7 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
                 try:
                     got[name] = job.result(timeout=130)
                 except Exception as e:
-                    logger.warning(f"Proposal: '{name}' of the last part didn't come ({str(e)[:140]})")
+                    logger.warning(f"Proposal: '{name}' of the last part didn't come ({_why(e)})")
                     got[name] = None
         if not got.get("ch3"):
             raise ConversionError("RamzAI couldn’t write the methodology just now. Please try again; nothing was taken.")
@@ -10672,20 +12567,99 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
         ms = plan_part(got["ch3"], _prop.ch3_prompt(plan, sample), want3, "proposal-ch3")
         if not all(ms.get(k) for k in want3):
             raise ConversionError("RamzAI couldn’t finish the methodology just now. Please try again; nothing was taken.")
+        try:                                  # 6.6, round 116: no exclusion criterion that only turns an inclusion criterion round
+            ms["criteria"] = _prop.mirror_exclusions(ms.get("criteria", ""))
+        except Exception as e:
+            logger.error(f"Proposal: the exclusion criteria weren't checked ({_why(e)})")
+        # 6.6, round 70: the instrument answers every specific objective it should; one that didn't come, or was cut off at its
+        # room, or left an objective without a section is asked for once more (with more room) while the rest goes on
+        tool = _prop.clean_instrument(got.get("tool"), plan)
+        try:
+            tgaps = _prop.instrument_gaps(plan, tool) if tool else []
+        except Exception:
+            tgaps = []
+        tool_pool = tool_redo = None
+        if (tool is None or tgaps) and time.time() - started < 125:
+            tool_pool = _futures.ThreadPoolExecutor(max_workers=1)
+            tool_redo = tool_pool.submit(lambda: _brief_json(call_claude(system_prompt=_prop.instrument_prompt(plan), user_message=_prop.instrument_ask(tgaps),
+                                                                         max_tokens=2600, timeout=70, feature="proposal-instrument-again")))
+        # 6.6, round 63: an objective about a relationship or a difference has a test named for it in the analysis
+        try:
+            gaps = _prop.analysis_gaps(plan, ms.get("analysis", ""))
+        except Exception:
+            gaps = []
+        if gaps and time.time() - started < 120:
+            try:
+                again = _prop_plan_text(ask(_prop.ch3_prompt(plan, sample), _prop.analysis_ask(gaps), 900, "proposal-ch3-analysis", 45),
+                                        plan, sample, ["analysis"])
+                if again.get("analysis") and not _prop.analysis_gaps(plan, again["analysis"]):
+                    ms["analysis"] = again["analysis"]
+            except Exception as e:
+                logger.warning(f"Proposal: the analysis wasn't written again ({_why(e)})")
+            left = _prop.analysis_gaps(plan, ms.get("analysis", ""))
+            logger.info(f"Proposal: the analysis named no test for objective(s) {[n for n, _ in gaps]}; "
+                        + ("written again with them" if not left else f"still none for {[n for n, _ in left]}"))
+        # 6.6, round 64: children as participants: the ethics section says a parent's consent and the child's assent; round 70:
+        # and what every ethics committee looks for first (approval, voluntary, consent, withdrawal, confidentiality, keeping)
+        def _eth_gaps(t):
+            return _prop.ethics_gaps(plan, t), _prop.ethics_basics(t)
+        try:
+            egaps, bgaps = _eth_gaps(ms.get("ethics", ""))
+        except Exception:
+            egaps, bgaps = [], []
+        if (egaps or bgaps) and time.time() - started < 130:
+            try:
+                again = _prop_plan_text(ask(_prop.ch3_prompt(plan, sample), _prop.ethics_ask(egaps, bgaps), 900, "proposal-ch3-ethics", 45),
+                                        plan, sample, ["ethics"])
+                if again.get("ethics"):
+                    e2, b2 = _eth_gaps(again["ethics"])
+                    if len(e2) + len(b2) < len(egaps) + len(bgaps) and set(e2) <= set(egaps):
+                        ms["ethics"] = again["ethics"]
+            except Exception as e:
+                logger.warning(f"Proposal: the ethics section wasn't written again ({_why(e)})")
+            e2, b2 = _eth_gaps(ms.get("ethics", ""))
+            logger.info(f"Proposal: the ethics section lacked {egaps + bgaps}" + (" (children take part)" if egaps else "") + "; "
+                        + ("written again with them" if not (e2 or b2) else f"still without {e2 + b2}"))
         sections.append({"number": "", "heading": "CHAPTER THREE: METHODOLOGY", "level": 1, "text": "", "kind": "chapter"})
         for k, num, head in _prop.CH3_HEADS:
             if k == "sample":
                 sections.append({"number": num, "heading": head, "level": 2, "text": _prop.sample_text(sample), "kind": "sample"})
-            else:
-                sections.append({"number": num, "heading": head, "level": 2, "text": ms.get(k, ""), "kind": "plan"})
+            else:       # 6.6, round 13: the method is a plan ("will be collected"); the setting's history stays past
+                sections.append({"number": num, "heading": head, "level": 2, "text": ms.get(k, "") if k == "setting" else _prop.future_tense(ms.get(k, "")),
+                                 "kind": "plan"})
         ab = _prop_plan_text(got.get("abstract") or "", plan, sample, ("introduction", "aim", "methodology", "analysis", "keywords"), extra_text=digest)
         if ab.get("introduction") or ab.get("aim"):
             ab["introduction"] = keep_known_citations(ab.get("introduction", ""), [], style)[0]
+            for k in ("methodology", "analysis"):        # 6.6, round 13: the abstract's method is a plan too
+                if ab.get(k):
+                    ab[k] = _prop.future_tense(ab[k])
+            try:                                      # 6.6, round 75: and names only the methods chapter three names
+                ref3 = "\n".join(str(v) for v in ms.values()) + "\n" + _prop.plan_block(plan, sample) + "\n" + _prop.sample_text(sample)
+                for k in ("methodology", "analysis"):
+                    if ab.get(k):
+                        ab[k], gone = _prop_methods_kept(ab[k], ref3)
+                        if gone:
+                            logger.info(f"Proposal: {gone} sentence(s) of the abstract's {k} named a method chapter three doesn't, and went")
+            except Exception as e:
+                logger.warning(f"Proposal: the abstract's methods weren't checked ({_why(e)})")
             extras["abstract"] = {k: ab.get(k, "") for k in ("introduction", "aim", "methodology", "analysis", "keywords")}
-        tool = _prop.clean_instrument(got.get("tool"), plan)
+        if tool_redo is not None:
+            try:
+                again = _prop.clean_instrument(tool_redo.result(timeout=max(5, 200 - (time.time() - started))), plan)
+                if again and (tool is None or len(_prop.instrument_gaps(plan, again)) < len(tgaps)):
+                    tool = again
+            except Exception as e:
+                logger.warning(f"Proposal: the instrument wasn't drafted again ({_why(e)})")
+            finally:
+                tool_pool.shutdown(wait=False)
+            left = _prop.instrument_gaps(plan, tool) if tool else None
+            logger.info("Proposal: the instrument " + ("didn't come or was cut off" if not tgaps else f"had no section for objective(s) {[n for n, _ in tgaps]}")
+                        + "; " + ("still none" if tool is None else "drafted again with them" if not left else f"still none for {[n for n, _ in left]}"))
         if tool:
             extras["instrument"] = tool
         extras["sample"] = {k: sample.get(k) for k in ("method", "N", "e", "n", "z", "p", "exact", "formula", "steps", "text") if sample.get(k) is not None}
+        if _prop.minors(plan):
+            extras["children"] = True           # 6.6, round 64: the consent form asks a parent or guardian, and the child
         # (the consent form names the researchers and gives their contact: it is made with the Word file, from what is
         # sent then, so no name travels with the writing or is kept with its answer)
         b = _prop.budget(plan)
@@ -10719,15 +12693,17 @@ def _proposal_write(data, plan, style, cite_plan, CS, find_raw, note, started):
         if cite_plan and cite_plan["marks"]:
             for s in cited_secs:
                 s["text"] = _strip_invented(s["text"])
+        # 6.5: what was checked (this part's own papers: the earlier parts' were checked when they were written)
+        _v65_say(note, [sources[i] for i in sorted(cited) if i < len(sources) and not sources[i].get("_kept")])
     cited |= set(range(len(prev)))                         # the earlier parts still cite their papers
     nxt = all_parts[idx + 1] if idx + 1 < len(all_parts) else None
     result = {"type": "result", "sections": [{"number": s["number"], "heading": s["heading"], "level": s["level"], "text": s["text"], "kind": s["kind"]}
                                              for s in sections if s["kind"] == "chapter" or s["text"] or s["number"] == "1.2"],
               "references": build_references_list(sources, cited), "references_all": True, "references_title": CS["heading"],
-              "source_note": note["text"], "style": style, "title": title, "truncated": bool(nxt),
+              "source_note": note["text"], "style": style, "title": title, "truncated": bool(nxt), "evidence": note.get("evidence") or [],
               "proposal": {"part": key, "index": idx, "of": len(all_parts), "label": all_parts[idx]["label"], "next": nxt,
                            "outline2": outline2, "extras": extras or None, "parts": all_parts}}
-    return restyle_result(result, sources, cited, cite_plan, given, language=None)
+    return restyle_result(result, sources, cited, cite_plan, given, language=None, made_in=style)
 
 
 # 5.9 (the owner, 14 Nov 2026: "Is there a reason the research results (including … list of tables …) doesn't look
@@ -10891,7 +12867,7 @@ def write_endpoint():
     # 5.4: a research proposal (one part to a request): what it must hold is checked before anything is taken
     proposal_plan = None
     if isinstance(data.get("proposal"), dict):
-        proposal_plan = _prop.clean_plan(data["proposal"].get("plan"))
+        proposal_plan = _prop.fit_methods(_prop.clean_plan(data["proposal"].get("plan")))     # 6.6, round 15: methods that fit the design
         need = _prop.missing(proposal_plan)
         if need:
             return jsonify({"error": "RamzAI still needs something before it can write the proposal: " + need[0][1], "need": [k for k, _ in need]}), 400
@@ -10929,7 +12905,7 @@ def write_endpoint():
     except (TypeError, ValueError):
         recent_years = 0
     recent_years = recent_years if 1 <= recent_years <= 100 else 0       # 5.0: any number of years (4.9: 5 or 10 only)
-    note = {"text": ""}
+    note = {"text": "", "registry": {}}     # 6.5: what the papers' registries said, from every search of this request
     # 5.0: or the years the person chose themselves ("from 2010 to 2018"); and the length they asked for, which also
     # says how many papers the piece draws on (a long piece needs more than a short one)
     this_year = datetime.now(timezone.utc).year
@@ -10973,7 +12949,9 @@ def write_endpoint():
         got = []
         def one(q):
             try:
-                ps, _ = search_papers(q, max_results=6, since=since, kinds=kinds, **({"until": until} if until else {}))
+                st = {}
+                ps, _ = search_papers(q, max_results=6, since=since, kinds=kinds, stats=st, **({"until": until} if until else {}))
+                _v65_merge(note["registry"], st.get("registry"))
                 return [p for p in ps if (p.get("kind") or "article") in kinds]
             except Exception:
                 return []
@@ -10988,7 +12966,9 @@ def write_endpoint():
         """The same papers before they are given their citations (5.4: a proposal joins several searches into one list)."""
         n = n or n_sources
         look = paper_topic_search if topic else search_papers
-        papers, diag = look(text, max_results=n, since=since, kinds=kinds, **({"until": until} if until else {}))
+        st = {}
+        papers, diag = look(text, max_results=n, since=since, kinds=kinds, stats=st, **({"until": until} if until else {}))
+        _v65_merge(note["registry"], st.get("registry"))
         papers = [p for p in papers if (p.get("kind") or "article") in kinds]
         if figures and papers:
             try:
@@ -10996,7 +12976,9 @@ def write_endpoint():
             except Exception as e:
                 logger.info(f"Research writing: the search for figures didn't add papers ({e.__class__.__name__})")
         if (since or until) and len(papers) < 3 and diag != "not a topic":
-            older, _ = look(text, max_results=n, kinds=kinds)
+            st = {}
+            older, _ = look(text, max_results=n, kinds=kinds, stats=st)
+            _v65_merge(note["registry"], st.get("registry"))
             older = [p for p in older if (p.get("kind") or "article") in kinds]
             have = {p["url"] for p in papers}
             fresh = len(papers)
@@ -11031,6 +13013,7 @@ def write_endpoint():
     # 5.9: a table titled as the Word file and the app read it (the title right over the table, a note under it)
     extra += WRITE_TABLE_RULE
     extra += WRITE_NATURAL_RULE         # 6.2: organised, and natural to read (every statement still cited)
+    extra += WRITE_STRENGTH_RULE        # 6.5: no sentence says more than its sources do
     _focus = re.search(r"Focus on:\s*([^\n.]{2,80})", reqs or "")
     write_place = _focus.group(1).strip() if _focus else ""
     extra += write_figures_rule(write_place)          # 6.2: prevalence and figures, from the world to the place
@@ -11068,7 +13051,7 @@ def write_endpoint():
                 why = (why if why.endswith((".", "!", "?")) else why + ".") + " Nothing was taken for this part."
             return jsonify({"error": why}), 502
         except Exception as e:
-            logger.error(f"Proposal: a part failed unexpectedly: {e}", exc_info=True)
+            logger.error(f"Proposal: a part failed unexpectedly: {_why(e)}", exc_info=True)
             _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
             return jsonify({"error": "RamzAI couldn’t write this part just now. Please try again; nothing was taken."}), 502
     _call_claude = globals()["call_claude"]
@@ -11129,6 +13112,7 @@ def write_endpoint():
                     twin = next((p for p in prev if (c.get("doi") and c.get("doi") == p.get("doi")) or (c.get("url") and c.get("url") == p.get("url"))), None)
                     if twin is not None:
                         twin["abstract"] = c.get("abstract")         # the same paper: its key stays, its abstract helps the check
+                        twin["abstract_full"], twin["abstract_lent"] = c.get("abstract_full"), c.get("abstract_lent")
                         twin["title"] = c.get("title") or twin["title"]
                         continue
                     if (c.get("group") or _paper_group(c)) in groups:
@@ -11176,13 +13160,14 @@ def write_endpoint():
                 cont_cited = set(cont_cited) | set(range(len(prev)))     # the earlier part still cites its papers
             if cite_plan and cite_plan["marks"]:
                 cont_text = _strip_invented(cont_text)      # a number the model wrote itself is never one of ours
+            _v65_say(note, [cont_sources[i] for i in sorted(cont_cited) if i < len(cont_sources) and not cont_sources[i].get("_kept")])
             return jsonify(restyle_result({
                 "type": "result",
                 "text": cont_text,
                 "references": build_references_list(cont_sources, cont_cited), "references_all": bool(prev),
-                "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "references_title": CS["heading"], "source_note": note["text"], "style": style, "evidence": note.get("evidence") or [],
                 "truncated": cont_result["stop_reason"] == "max_tokens" or cont_more,
-            }, cont_sources, cont_cited, cite_plan, given, language=data.get("language")))
+            }, cont_sources, cont_cited, cite_plan, given, language=data.get("language"), made_in=style))
         except ConversionError as e:
             _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
             return jsonify({"error": str(e)}), 502
@@ -11253,6 +13238,8 @@ def write_endpoint():
             if cite_plan and cite_plan["marks"]:
                 for sec in outline:
                     sec["text"] = _strip_invented(sec["text"])
+            if sources:
+                _v65_say(note, [sources[i] for i in sorted(cited_all) if i < len(sources)])
             return jsonify(restyle_result({
                 "type": "result",
                 "sections": [
@@ -11260,9 +13247,10 @@ def write_endpoint():
                     for s in outline
                 ],
                 "references": build_references_list(sources, cited_all), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+                "evidence": note.get("evidence") or [],
                 "title": next((s["heading"] for s in outline if s.get("level", 1) <= 1 and s.get("heading")), None),
                 **({"free_part": {"rest": free_rest, "words": FREE_PART_WORDS}} if free_part else {}),
-            }, sources, cited_all, cite_plan, language=data.get("language")))
+            }, sources, cited_all, cite_plan, language=data.get("language"), made_in=style))
 
         # Chat mode (history present) and simple mode (first message, no history
         # yet) share the same citation and clarify-guardrail logic below — they
@@ -11397,15 +13385,18 @@ def write_endpoint():
         text, cited = _c34_write(text, sources, style, topic, note, started)
         if cite_plan and cite_plan["marks"]:
             text = _strip_invented(text)
+        if sources and cited:
+            _v65_say(note, [sources[i] for i in sorted(cited) if i < len(sources)])
         return jsonify(restyle_result({
             "type": "result",
             "text": text,
             "thinking": thinking,
             "references": build_references_list(sources, cited), "references_title": CS["heading"], "source_note": note["text"], "style": style,
+            "evidence": note.get("evidence") or [],
             "title": _topic_title(topic) if not attachment else None,
             "truncated": truncated, "noted": noted, **({"memory_full": True} if memory_full else {}),
             **({"free_part": {"rest": free_rest or [], "words": FREE_PART_WORDS}} if free_part else {}),
-        }, sources, cited, cite_plan, language=data.get("language")))
+        }, sources, cited, cite_plan, language=data.get("language"), made_in=style))
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_WRITE, research=True)
         return jsonify({"error": str(e)}), 502
@@ -11504,6 +13495,7 @@ def _c45_pick_papers(papers, known):
 def guide_statements():
     """About ten statements for one topic or subtopic, each grounded in one real, downloadable paper, with
     the in-text citation and the reference entry in the chosen style, and a paraphrase ready to insert."""
+    t0 = time.time()                 # (the app waits 150 s for this answer)
     data = request.get_json(silent=True) or {}
     topic = _guide_clip(data.get("topic"), 300)
     sub = _guide_clip(data.get("subtopic"), 200)
@@ -11560,8 +13552,9 @@ def guide_statements():
         return jsonify({"error": "The papers found for that are by authors already cited in your page. Try other words, or a wider topic.",
                         "no_papers": True}), 404
     sources = enrich_sources(picked, style)
-    if _special(request.current_user):        # 6.2: Half year and Year: the papers themselves
-        read_papers_for_writing(sources, sub or topic, seconds=14)
+    # (6.5: the statements are built from their papers' abstracts, as the app says beside them; 6.2 read the papers
+    # themselves here for Half year and Year, but neither the writing nor its check ever saw what was read: up to 14
+    # seconds of waiting for nothing, so it is no longer done)
     try:
         charged_from = _log_sage_message_and_consume(request.current_user, POINTS_RESEARCH, research=True)
     except ConversionError as e:
@@ -11580,11 +13573,17 @@ def guide_statements():
               + ", no citation inside the text (the app adds it). paraphrase says the "
               "same thing in clearly different words and sentence shape, the version that will go into the document. kind is one "
               "of: context, definition, finding, method, evidence, limitation, gap, implication. Use at least 6 different papers; "
-              "each paper at most twice. Use only the numbers given.")
+              "each paper at most twice. Use only the numbers given. "
+              # 6.5: what the check holds each statement to
+              "Say exactly as much as the paper says: a link or an association is never a cause; keep the paper's own caution "
+              "(\"may\", \"suggests\"); a finding belongs to the people, the place and the years that paper studied (not "
+              "everyone, not a whole region, not the world); never \"studies show\" (each statement rests on one paper); what a "
+              "paper says of earlier work or of its field is its background, never its finding.")
     lines = []
     for i, src in enumerate(sources, 1):
+        ab_s, _body = _v65_sents(src)            # 6.5: the whole abstract (it was its first 900 characters), as the check reads it
         lines.append(f"[{i}] {src['citation_key']} {src['title']} ({src.get('venue') or 'paper'}, {src.get('year') or 'n.d.'})"
-                     + (f"\n    Abstract: {src['abstract'][:900]}" if src.get("abstract") else ""))
+                     + (f"\n    Abstract: {_v65_join(ab_s, V65_WRITER_CHARS)}" if ab_s else ""))
     user = f"Heading: {heading}" + (f"\nMain topic: {topic}" if topic and sub else "") + "\n\nPapers:\n" + "\n".join(lines)
     try:
         strong = _special(request.current_user)    # 6.2: Half year and Year: RamzAI's strongest model
@@ -11611,12 +13610,12 @@ def guide_statements():
         if len(para.split()) < 6 or para.lower() == text.lower():
             para = text
         src = sources[n - 1]
-        ab = (src.get("title") or "") + " " + (src.get("abstract") or "")
+        ab = (src.get("title") or "") + " " + " ".join(sum(_v65_sents(src), []))
         nums = _c45_numbers(text) + _c45_numbers(para)
         if nums and not _c45_numbers_in(nums, ab):
             continue                                  # a figure the abstract doesn't give
-        if _c45_copied(para, src.get("abstract") or ""):
-            continue                                  # the words that would go in are the abstract's own: not a paraphrase
+        if _c45_copied(para, ab):
+            continue                                  # the words that would go in are the paper's own: not a paraphrase
         out.append({"id": f"{len(out) + 1}", "paper": n, "text": text, "paraphrase": para,
                     "kind": x.get("kind") if x.get("kind") in kinds else "finding",
                     "cite": src["citation_key"],
@@ -11625,16 +13624,36 @@ def guide_statements():
                             "group": src.get("group") or "", "after": src.get("ref_after") or ""}})
         if len(out) >= GUIDE_STATEMENTS:
             break
-    # each statement is checked against the papers by a second pass: it stays only when its own paper supports it
+    # each statement is checked against the papers by a second pass: it stays only when its own paper supports it.
+    # 6.5: by that paper's own sentences that state it (labelled, and every label verified), the whole of it: every figure
+    # in those sentences, and nothing said that the paper doesn't say (server/valid65.py). A statement no check could look
+    # at is never offered: the person is asked to try again, and nothing is taken.
     checked = False
     if out:
-        ev = [f"[P{i}] {s.get('title', '')} \u2014 {str(s.get('abstract') or '')[:900]}" for i, s in enumerate(sources, 1)]
-        dec = _c34_check("guide", heading, ev, [o["paraphrase"] for o in out], "", time.time() + 40)   # the words that go in
-        if dec and not dec["skip"]:
-            checked = True
-            out = [o for i, o in enumerate(out) if f"P{o['paper']}" in (dec["cite"].get(i) or [])]
-            for i, o in enumerate(out):
-                o["id"] = f"{i + 1}"
+        gp = _v65_papers(sources)
+        gby = {p["n"]: p for p in gp}
+        grams = _v65_grams(" ".join(" ".join(p["sents"]) for p in gp))
+        dec = _v65_check("guide", heading, gp, [o["paraphrase"] for o in out], "", min(time.time() + 50, t0 + 128))   # the words that go in
+        if dec is None:
+            _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
+            return jsonify({"error": "RamzAI couldn\u2019t check these statements against their papers just now. Please try again; "
+                                     "nothing was taken."}), 502
+        checked = True
+        kept, verify = [], []
+        for i, o in enumerate(out):
+            own = [c for c in dec["cite"].get(i, []) if c[0] == o["paper"]]
+            if own and _v65_keep(o["paraphrase"], own, dec["doubt"].get(i, False), gby, grams, alone=True)[0]:
+                kept.append(o)
+                verify.append((len(kept) - 1, o["paraphrase"], _v65_quotes(own, gby)))
+        # 6.5, further: a second, independent check of each statement against its paper's sentences named for it
+        got = _v65_verify(verify, min(time.time() + 40, t0 + 142), "guide") if verify else None
+        if got is not None:
+            for k, why in got[0].items():
+                logger.info(f"Manual research writing: the second check took a statement out: {why}")
+            kept = [o for k, o in enumerate(kept) if k not in got[0]]
+        out = kept
+        for i, o in enumerate(out):
+            o["id"] = f"{i + 1}"
     if len(out) < 3:
         _refund_sage_message(request.current_user, charged_from, POINTS_RESEARCH, research=True)
         return jsonify({"error": "RamzAI couldn't build statements those papers fully support. Try again, or say the topic in other words."}), 502
@@ -11838,6 +13857,92 @@ _RS_COUNTS_PAPERS = re.compile(r"(?<![\w.,\-])(?!(?:1[5-9]|20)\d\d\b)(?:\d[\d,]*
                                r"(?:stud(?:y|ies)|papers?|trials?|reviews?|articles?|reports?|sources?)\b", re.I)
 
 
+def _rs_unratio(sentence):
+    """The sentence with its shares in words ("one in three", "1 in 5", "two-thirds of") taken out: valid65.ratio_ok judges
+    them, against the paper's own share (6.6, round 25)."""
+    return _v65._RATIO.sub(lambda m: " a share " if (m.group("a") or m.group("fa")) else m.group(0), str(sentence or ""))
+
+
+def _rs_pp_mask(sentence, quoted):
+    """The sentence without a change in percentage points that is worked out from the paper's own two percentages ("fell
+    from 80% to 65%": "fell by 15 percentage points"), which is the paper's figure (6.6, round 26); "by 15%" is not
+    (valid65.points_ok holds that)."""
+    q_pc = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s?(?:%|percent\b|per\s+cent\b)", str(quoted or ""))]
+    if len(q_pc) < 2:
+        return sentence
+    diffs = {round(abs(a - b), 2) for i, a in enumerate(q_pc) for b in q_pc[i + 1:]}
+
+    def _pp(m):
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            return m.group(0)
+        return " a change of points " if any(abs(v - d) <= 0.051 for d in diffs) else m.group(0)
+    return re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(?:percentage[\s-]+points?|pp)\b", _pp, str(sentence or ""), flags=re.I)
+
+
+_RS_SCALE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(million|billion|thousand)\b", re.I)
+
+
+def _rs_scaled(text):
+    """ "1.2 million" -> "1200000" (6.6, round 25: the same figure as 1,200,000)."""
+    f = {"thousand": 1000, "million": 1000000, "billion": 1000000000}
+    t = _RS_SCALE.sub(lambda m: str(int(round(float(m.group(1)) * f[m.group(2).lower()]))), str(text or ""))
+    return re.sub(r"\bmm\s*(?:of\s+)?Hg\b", "mmHg", t)          # 6.6, round 100: one unit written two ways ("128 mm Hg", "128 mmHg")
+
+
+def _rs_round_half_up(x, dec):
+    """x rounded as people round it (half up) to dec decimals: 38.45 -> 38.5, 39.6 -> 40."""
+    from decimal import Decimal, ROUND_HALF_UP
+    try:
+        return float(Decimal(repr(float(x))).quantize(Decimal(1).scaleb(-dec), rounding=ROUND_HALF_UP))
+    except Exception:
+        return None
+
+
+def _rs_dec(raw):
+    raw = str(raw).replace(",", "")
+    return len(raw.split(".", 1)[1]) if "." in raw else 0
+
+
+_RS_P_BEFORE = re.compile(r"\bp\s*(?:=|<|>|≤|≥|<=|>=)\s*$", re.I)
+
+
+def _rs_unp(text):
+    """The text with its p-values said as words: _rs_values_ok has judged them already (round 29)."""
+    return re.sub(r"\bp\s*(?:<=|>=|=|<|>|≤|≥)\s*(?:0?\.\d+|1(?:\.0+)?)\b", " a p-value ", str(text or ""), flags=re.I)
+
+
+def _rs_values_ok(s, q):
+    """6.6, round 29: every number of the sentence s is one of the quote q's, or that number rounded as people round it to
+    fewer decimals (38% for 38.4%, 40% for 39.6%, 2.1 for 2.14); never a p-value, whose rounding can change what it says
+    (p = .05 for p = .046)."""
+    qv = [(round(float(m.group(1).replace(",", "")), 6), _rs_dec(m.group(1))) for m in _RS_DIGITS.finditer(q)]
+    have = {v for v, _d in qv}
+    for m in _RS_DIGITS.finditer(s):
+        raw = m.group(1).replace(",", "")
+        try:
+            v = round(float(raw), 6)
+        except ValueError:
+            continue
+        if v in have:
+            continue
+        pb = _RS_P_BEFORE.search(s[max(0, m.start() - 8):m.start()])
+        if pb:
+            # "p < .05" where the paper gives p = .046 or p < .001 is true; any other p not in the quote is not the paper's
+            op = re.sub(r"\s+", "", pb.group(0))[-2:].lstrip("p").replace("≤", "<=").replace("≥", ">=")
+            qp = [(o.replace("≤", "<=").replace("≥", ">="), float(x)) for o, x in re.findall(r"\bp\s*(<=|>=|<|=|≤|>|≥)\s*(0?\.\d+|1(?:\.0+)?)\b", q, re.I)]
+            if op.startswith("<") and any(o in ("=", "<", "<=") and (x < v or (op == "<=" and x <= v)) for o, x in qp):
+                continue
+            if op.startswith(">") and any(o in ("=", ">", ">=") and (x > v or (op == ">=" and x >= v)) for o, x in qp):
+                continue
+            return False
+        d = _rs_dec(raw)
+        if not any(dq > d and _rs_round_half_up(x, d) == v for x, dq in qv):
+            return False
+    return True
+
+
 def _rs_values(text):
     """The numbers in a text (".45" and "0.45" are one value; 1,200 and 1200 too)."""
     out = set()
@@ -11849,28 +13954,121 @@ def _rs_values(text):
     return out
 
 
+# 6.6, round 100 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a sum of money keeps its currency. "Households
+# spent GH₵50 a month" passed the figure check where the paper says US$50 (50 is there): a sum the paper gives only in
+# another currency is not the paper's. The same sum with no currency there, "$" against "US$", GHS against GH₵ stand.
+_RS_CUR_BEFORE = [
+    (r"US\s?\$|U\.S\.\s?\$|USD\s?", "usd"), (r"A\$|AU\$|AUD\s?", "aud"), (r"C\$|CA\$|CAD\s?", "cad"), (r"NZ\$|NZD\s?", "nzd"),
+    (r"GH\s?[₵¢]|GHS\s?|GHC\s?|₵", "ghs"), (r"₦|NGN\s?", "ngn"), (r"KSh\.?\s?|Ksh\.?\s?|KES\s?", "kes"), (r"USh\.?\s?|UGX\s?", "ugx"),
+    (r"TSh\.?\s?|TZS\s?", "tzs"), (r"£|GBP\s?", "gbp"), (r"€|EUR\s?", "eur"), (r"₹|INR\s?|Rs\.?\s?", "inr"), (r"ZAR\s?", "zar"),
+    (r"(?:F\s?)?CFA\s?|XOF\s?|XAF\s?", "xof"), (r"ETB\s?|Br\s?", "etb"), (r"RWF\s?|FRw\s?", "rwf"), (r"ZMW\s?|MWK\s?", "kwacha"),
+    (r"¥|JPY\s?", "jpy"), (r"RMB\s?|CNY\s?", "cny"), (r"\$", "dollar")]
+_RS_CUR_AFTER = [
+    (r"US\s+dollars?|USD\b", "usd"), (r"(?:Australian)\s+dollars?|AUD\b", "aud"), (r"(?:Canadian)\s+dollars?|CAD\b", "cad"),
+    (r"dollars?", "dollar"), (r"(?:Ghana(?:ian)?\s+)?cedis?|GHS\b|GH[₵¢]", "ghs"), (r"(?:Nigerian\s+)?naira|NGN\b", "ngn"),
+    (r"Kenyan\s+shillings?|KES\b", "kes"), (r"Ugandan\s+shillings?|UGX\b", "ugx"), (r"Tanzanian\s+shillings?|TZS\b", "tzs"),
+    (r"pounds?\s+sterling|GBP\b", "gbp"), (r"euros?|EUR\b", "eur"), (r"(?:Indian\s+)?rupees?|INR\b", "inr"),
+    (r"(?:South\s+African\s+)?rand|ZAR\b", "zar"), (r"(?:CFA\s+)?francs?\s+CFA|CFA\s+francs?|FCFA\b|XOF\b|XAF\b", "xof"),
+    (r"(?:Ethiopian\s+)?birr|ETB\b", "etb"), (r"Rwandan\s+francs?|RWF\b", "rwf"), (r"kwacha|ZMW\b|MWK\b", "kwacha"),
+    (r"yen|JPY\b", "jpy"), (r"yuan|renminbi|RMB\b|CNY\b", "cny")]
+_RS_MONEY_NUM = r"(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:\s?(million|billion|thousand|m|bn|k)\b)?"
+_RS_MONEY = re.compile(r"(?<![\w.])(?:" + "|".join(f"(?P<b{i}>{p})" for i, (p, _c) in enumerate(_RS_CUR_BEFORE)) + r")\s?" + _RS_MONEY_NUM.replace("(", "(?P<v1>", 1).replace("(million", "(?P<m1>million", 1)
+                       + r"|(?<![\w.$₵¢£€₦¥₹])" + _RS_MONEY_NUM.replace("(", "(?P<v2>", 1).replace("(million", "(?P<m2>million", 1) + r"\s?(?:"
+                       + "|".join(f"(?P<a{i}>{p})" for i, (p, _c) in enumerate(_RS_CUR_AFTER)) + r")(?![\w])")
+_RS_MULT = {"million": 1e6, "m": 1e6, "billion": 1e9, "bn": 1e9, "thousand": 1e3, "k": 1e3}
+_RS_DOLLARS = {"usd", "aud", "cad", "nzd", "dollar"}
+
+
+def _rs_money(text):
+    """[(value, currency code, (start, end))] for each sum of money the text gives ("GH₵50", "US$1.2 million", "500 naira")."""
+    out = []
+    for m in _RS_MONEY.finditer(str(text or "")):
+        g = m.groupdict()
+        code = next((c for i, (_p, c) in enumerate(_RS_CUR_BEFORE) if g.get(f"b{i}")), None) or \
+            next((c for i, (_p, c) in enumerate(_RS_CUR_AFTER) if g.get(f"a{i}")), None)
+        v, mult = (g.get("v1"), g.get("m1")) if g.get("v1") else (g.get("v2"), g.get("m2"))
+        if not code or not v:
+            continue
+        try:
+            val = float(v.replace(",", "")) * _RS_MULT.get((mult or "").lower(), 1)
+        except ValueError:
+            continue
+        out.append((val, code, m.span()))
+    return out
+
+
+def _rs_same_cur(a, b):
+    return a == b or (a == "dollar" and b in _RS_DOLLARS) or (b == "dollar" and a in _RS_DOLLARS)
+
+
+def _rs_money_ok(sentence, quoted):
+    """Every sum of money the sentence gives keeps its currency where the quoted sentences give the same sum: one they give
+    only in another currency ("GH₵50" for the paper's US$50) is not the paper's. The same sum with no currency there, or
+    "$" against "US$", stands."""
+    said = _rs_money(sentence)
+    if not said:
+        return True
+    q = str(quoted or "")
+    theirs = _rs_money(q)
+    spans = [sp for _v, _c, sp in theirs]
+    bare = []
+    for m in re.finditer(r"(?<![\w.])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?:\s?(million|billion|thousand)\b)?", q):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        try:
+            bare.append(float(m.group(1).replace(",", "")) * _RS_MULT.get((m.group(2) or "").lower(), 1))
+        except ValueError:
+            pass
+    for v, c, _sp in said:
+        same = [c2 for v2, c2, _s in theirs if abs(v2 - v) < 1e-6 * max(1.0, v)]
+        if not same or any(_rs_same_cur(c, c2) for c2 in same):
+            continue
+        if any(abs(b - v) < 1e-6 * max(1.0, v) for b in bare):
+            continue
+        return False
+    return True
+
+
 def _rs_figures_ok(sentence, quoted, n_cited=None, n_read=None):
     """Every figure the report's sentence states (in digits or in words) is in the quoted sentences, as the same value
     and counting the same thing; percentage points are never a percentage; a fraction ("half", "a third") is the same
     fraction or its percentage there. A count of the papers themselves ("two studies found…") is the writer's own,
     unless the quotes count papers too — then it is checked like any figure; when n_cited is given, it can't be more
     than the papers the sentence cites (or, counting all the papers, "of the five studies", than the papers read)."""
-    q = _rs_digits(quoted, False)
+    # 6.6, round 25: a share in words ("one in three", "four in ten", "nearly one in five") is the paper's own share when
+    # valid65 finds it so (its words, its percentage within a few points, its count of its total): its numbers are not
+    # figures to find in the quote; and "1.2 million" is 1,200,000
+    if _v65._RATIO.search(_v65.bare(sentence)):
+        if not _v65.ratio_ok(sentence, quoted):
+            return False
+        sentence = _rs_unratio(sentence)
+    q = _rs_digits(_rs_scaled(quoted), False)
     own = not _RS_COUNTS_PAPERS.search(str(quoted or ""))
     counts = []
-    s = _rs_digits(sentence, True, papers_ok=own, counts=counts)
+    s = _rs_digits(_rs_scaled(sentence), True, papers_ok=own, counts=counts)
+    s = _rs_pp_mask(s, q)
     if n_cited is not None and any(not v or v > (max(n_cited, n_read or 0) if of_all else n_cited) for v, of_all in counts):
         return False
-    if not _rs_values(s) <= _rs_values(q):
+    if not _rs_values_ok(s, q):
         return False
     q_vals = _rs_values(q)
+    q_pcts = [float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s?(?:%|percent\b|per\s+cent\b)", str(quoted or ""))]
     for rx, name, pcts in _RS_FRACS:
-        if rx.search(sentence) and not rx.search(quoted) and not any(v in q_vals for v in pcts):
+        for m in rx.finditer(sentence):
+            if rx.search(quoted) or any(v in q_vals for v in pcts):
+                break
+            # "fewer than half", "more than a third", "nearly half": a bound, not the fraction itself (6.6, round 25)
+            qual = re.search(r"\b(nearly|almost|just\s+under|close\s+to|over|more\s+than|just\s+over|at\s+least|less\s+than|under|"
+                             r"fewer\s+than|up\s+to)\s+(?:a\s+|one\s+)?$", sentence[max(0, m.start() - 22):m.start()], re.I)
+            if qual and pcts and any(_v65._share_fits(qual.group(1), pcts[0], v) for v in q_pcts):
+                continue
             return False
     if re.search(r"percentage[- ]points?|\bpp\b", s, re.I) and not re.search(r"percentage[- ]points?|\bpoints?\b|\bpp\b", q, re.I):
         return False
-    nums = _c45_numbers(s)
-    return not nums or _c45_numbers_in(nums, q)
+    nums = _c45_numbers(_rs_unp(s))
+    if nums and not _c45_numbers_in(nums, q):
+        return False
+    return _rs_money_ok(sentence, quoted)          # 6.6, round 100: a sum of money keeps its currency
 
 
 # ---- design and who it studied, from the abstract's sentences about the study itself
@@ -11932,6 +14130,42 @@ def _rs_self(sents):
         if own and _RS_SELF.search(own) and not _RS_NOT_SELF.search(own):
             out.append(own)
     return out
+
+
+RS_DESIGN_WORDS = {   # (one, more) — in the order of what a design can show, the strongest first
+    "Meta-analysis": ("meta-analysis", "meta-analyses"), "Systematic review": ("systematic review", "systematic reviews"),
+    "Scoping review": ("scoping review", "scoping reviews"), "Review": ("review", "reviews"),
+    "Randomised trial": ("randomised trial", "randomised trials"), "Quasi-experimental": ("quasi-experimental study", "quasi-experimental studies"),
+    "Experiment": ("experiment", "experiments"), "Longitudinal study": ("longitudinal study", "longitudinal studies"),
+    "Mixed methods": ("mixed-methods study", "mixed-methods studies"), "Cross-sectional study": ("cross-sectional study", "cross-sectional studies"),
+    "Survey": ("survey", "surveys"), "Case study": ("case study", "case studies"), "Qualitative": ("qualitative study", "qualitative studies")}
+RS_OBSERVED = {"Longitudinal study", "Cross-sectional study", "Survey", "Case study", "Qualitative"}
+
+
+def _rs_designs_line(out_papers):
+    """6.6, round 9: what kinds of study the answer rests on (the papers it cites; all those read when it cites none), and,
+    when none of them is a trial, an experiment or a review of studies, that together they show links, not causes."""
+    base = [p for p in out_papers if p.get("cited")] or [p for p in out_papers if p.get("kind") != "mine"]
+    if not base:
+        return ""
+    c = Counter(p.get("design") for p in base)
+    parts = [f"{c[d]} {RS_DESIGN_WORDS[d][0 if c[d] == 1 else 1]}" for d in RS_DESIGN_WORDS if c.get(d)]
+    if not parts:
+        return ""
+    words = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    unknown = c.get(None, 0)
+    line = ("The answer rests on " if any(p.get("cited") for p in out_papers) else "Among them: ") + words + (
+        f" ({unknown} whose abstract doesn’t say how it was done)" if unknown == 1 else f" ({unknown} whose abstracts don’t say how they were done)" if unknown else "") + "."
+    known = {d for d in c if d}
+    if unknown:
+        return line                           # (a paper whose design isn't known may be a trial: nothing more is said)
+    if known == {"Qualitative"}:
+        line += (" A qualitative study shows what people experience and think, not how common it is or what causes it." if len(base) == 1
+                 else " Qualitative studies show what people experience and think, not how common it is or what causes it.")
+    elif known and known <= RS_OBSERVED:
+        line += (" It is not a trial or an experiment, so it shows a link, not a cause." if len(base) == 1
+                 else " None of them is a trial or an experiment, so together they show links, not causes.")
+    return line
 
 
 def _rs_design(sents, kind=None):
@@ -12129,11 +14363,15 @@ _RS_PLAN = re.compile(r"\b(?:we|they|it|this|these|that|which|who|pupils|student
                       r"evaluate|measure|determine|use|follow|recruit|assign|enrol|enroll|conduct|collect)\b|\b(?:is|are)\s+planned\b", re.I)
 
 
-def _rs_pick(found, library, question, kinds, since, until=None):
+def _rs_pick(found, library, question, kinds, since, until=None, counts=None):
     """The papers the research reads: from the library first (when they're about the question and fit the years and
     kinds; a saved paper the search also found comes with the search's fuller record), then the search's best, up to
-    RS_MAX_PAPERS; each with whole sentences of its own abstract to stand on (never an abstract lent by another version)."""
+    RS_MAX_PAPERS; each with whole sentences of its own abstract to stand on (never an abstract lent by another version).
+    6.6: counts (a dict), when given, is told why each paper the search found was not kept (for the search record)."""
     terms = _paper_terms(question)
+    counts = counts if counts is not None else {}
+    for k in ("kinds", "years", "no_abstract", "same", "more"):
+        counts.setdefault(k, 0)
 
     def text_of(p):
         return p.get("abstract_full") or p.get("abstract") or ""
@@ -12164,19 +14402,26 @@ def _rs_pick(found, library, question, kinds, since, until=None):
             if twin:
                 p = dict(twin, kind=twin.get("kind") or p["kind"], lib="saved")
         picked.append(p)
-    for p in found:
+    for i, p in enumerate(found):
         if len(picked) >= RS_MAX_PAPERS:
+            counts["more"] += len(found) - i          # enough papers: the rest were ranked lower for the question
             break
         kind = p.get("kind") or ("preprint" if p.get("preprint") else "article")
         if kind not in kinds or kind == "other":
+            counts["kinds"] += 1
             continue
         if not usable(p):
+            plan = _RS_PROTOCOL.search(p.get("title") or "") or _RS_PROTOCOL_TEXT.search(text_of(p)[:400])
+            counts["plan" if plan else "no_abstract"] = counts.get("plan" if plan else "no_abstract", 0) + 1
             continue
         if since and p.get("year") and p["year"] < since:
+            counts["years"] += 1
             continue
         if until and p.get("year") and p["year"] > until:
+            counts["years"] += 1
             continue
         if any(_same_work(p, q) for q in picked):
+            counts["same"] += 1
             continue
         picked.append(dict(p, kind=kind))
     out = []
@@ -12184,6 +14429,8 @@ def _rs_pick(found, library, question, kinds, since, until=None):
         sents = [x for x in _rs_split(text_of(p)) if not _RS_PLAN.search(x)]
         if sents:
             out.append(dict(p, n=len(out) + 1, sents=sents))
+        elif not (p.get("lib") or p.get("kind") == "mine"):
+            counts["no_abstract"] += 1
     return out
 
 
@@ -12980,7 +15227,7 @@ def _rs_read_papers(papers, question, until):
                     why[str(e) or "error"] += 1
                     continue
                 except Exception as e:
-                    logger.warning(f"Research: a paper couldn't be read ({e.__class__.__name__}: {str(e)[:120]})")
+                    logger.warning(f"Research: a paper couldn't be read ({_why(e)})")
                     why["error"] += 1
                     continue
                 body = [(s, c) for s, c in got["body"] if c in _RS_WHERE]
@@ -13014,7 +15261,9 @@ def _rs_papers_text(papers, labelled=False, cap=2600):
         n_abs = p.get("abs_n", len(p["sents"]))
         own = n_abs < len(p["sents"])
         if labelled:
-            lines = [f"  P{p['n']}-S{i}: {s}" for i, s in enumerate(p["sents"])]
+            bg = _rs_bg(p)
+            lines = [f"  P{p['n']}-S{i}" + (" (background: what the paper says of earlier work or of its field, not its own finding)"
+                                            if i in bg else "") + f": {s}" for i, s in enumerate(p["sents"])]
             if own:
                 lines = ["  Its abstract:"] + lines[:n_abs] + ["  The paper itself (its methods, results, discussion and conclusion):"] + lines[n_abs:]
             body = "\n".join(lines)
@@ -13025,6 +15274,13 @@ def _rs_papers_text(papers, labelled=False, cap=2600):
             body = "  " + " ".join(p["sents"])[:cap]
         out.append(head + "\n" + body)
     return "\n\n".join(out)
+
+
+def _rs_bg(p):
+    """6.5: the sentences of a paper's abstract that set out its background (_v65_background); none for the person's own PDF."""
+    if p.get("bg") is None:
+        p["bg"] = set() if p.get("kind") == "mine" else _v65_background(p["sents"][:p.get("abs_n", len(p["sents"]))])
+    return p["bg"]
 
 
 def _rs_idx(raw, pn, n_sents):
@@ -13059,6 +15315,10 @@ def _rs_write(question, papers, deadline, context="", language=""):
         "from the numbered PAPERS only (each paper's abstract and, where the paper itself was read, sentences from its "
         "methods, results, discussion and conclusion; or the first pages of the person's own PDF). Rules:\n"
         "- Say only what the papers state. No outside knowledge, no background of your own, no advice, no guesses.\n"
+        "- Say exactly as much as each paper says (6.5): a link or an association is never a cause; keep a paper's own caution "
+        "(\"may\", \"suggests\"); a finding belongs to the people, the place and the years that paper studied (not everyone, "
+        "not a whole region, not the world); \"studies show\" only for two papers or more; what a paper says of earlier work "
+        "or of its field (its background) is never what it found.\n"
         "- Every sentence ends with the numbers of the papers that state what it says, in square brackets before the full "
         "stop, like [2] or [1, 4]. Cite a paper only for what its own text states. Give each figure exactly as the paper does. "
         "When you count the papers themselves, use words (\"two studies\").\n"
@@ -13084,7 +15344,7 @@ def _rs_write(question, papers, deadline, context="", language=""):
             obj = _rs_json(raw)
             break
         except Exception as e:
-            logger.warning(f"Research: the writing didn't run (try {attempt}): {e.__class__.__name__}: {str(e)[:120]}")
+            logger.warning(f"Research: the writing didn't run (try {attempt}): {_why(e)}")
             if attempt == 2 or deadline - time.time() < 95:
                 raise
             time.sleep(5)
@@ -13128,7 +15388,8 @@ def _rs_check(question, papers, sentences, deadline):
         "Keep a summary sentence only when the papers you give together state all of it (at least one \"full\", or \"part\" "
         "ones that together cover every part). Otherwise mark it drop. Any paper may back any sentence. At most 3 papers per "
         "sentence and at most 2 sentences per paper. Never pair a summary sentence with a paper sentence that doesn't state "
-        "it. Reply with JSON only, like {\"sentences\": [{\"n\": 1, \"cite\": [{\"p\": 3, \"s\": [\"P3-S2\"], \"v\": \"full\"}]}, "
+        "it. A paper sentence marked (background) is what that paper says of earlier work or of its field: it may back a general "
+        "statement, never a sentence saying that a study found, showed or reported it. " + _v65.STRENGTH_RULES + " Reply with JSON only, like {\"sentences\": [{\"n\": 1, \"cite\": [{\"p\": 3, \"s\": [\"P3-S2\"], \"v\": \"full\"}]}, "
         "{\"n\": 2, \"drop\": true}]}.\n\nPAPERS:\n" + _rs_papers_text(papers, labelled=True))
     user = ("QUESTION: " + question + "\n\nSENTENCES:\n" + "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences)))
     obj = None
@@ -13139,7 +15400,7 @@ def _rs_check(question, papers, sentences, deadline):
             obj = _rs_json(raw)
             break
         except Exception as e:
-            logger.warning(f"Research: the sentence check didn't run ({str(e)[:100]})")
+            logger.warning(f"Research: the sentence check didn't run ({_why(e)})")
             if attempt == 2 or deadline - time.time() < 40:
                 return None
     by_n = {p["n"]: p for p in papers}
@@ -13182,20 +15443,56 @@ def _rs_check(question, papers, sentences, deadline):
     return out, doubt, drop
 
 
-def _rs_keep(sentence, cites, doubtful, by_n, all_text):
+def _rs_keep(sentence, cites, doubtful, by_n, all_text, why=None):
     """Whether a checked sentence may stay: backed fully (one "full"; or "part" from at least two papers when nothing the
-    AI gave was wrong), every figure in its quoted sentences, and in its own words (no run of ten words from any paper)."""
-    if not cites:
+    AI gave was wrong), every figure in its quoted sentences, and in its own words (no run of ten words from any paper).
+    6.5: and nothing said that its papers don't say (server/valid65.py: a year, a place, the world, "studies show", words
+    in quotation marks, a cause, a group of people), never a paper's background as what it found. why (a list) gets the
+    reason when it may not."""
+    def no(reason):
+        if why is not None:
+            why.append(reason)
         return False
+    if not cites:
+        return no("unbacked")
     full = any(v == "full" for _, _, v in cites)
     if not full and (doubtful or len(cites) < 2):
-        return False
+        return no("part")
     quoted = " ".join(by_n[pn]["sents"][k] for pn, ks, _ in cites for k in ks)
-    if not _rs_figures_ok(sentence, quoted, n_cited=len({pn for pn, _, _ in cites}), n_read=len(by_n)):
-        return False
+    cited = [by_n[pn] for pn in sorted({pn for pn, _, _ in cites})]
+    n_cited = _v65_n_studies(cited)              # 6.6, round 18: studies, not records
+    if not _rs_figures_ok(sentence, quoted, n_cited=n_cited, n_read=len(by_n)):
+        return no("figure")
+    nums = _c45_numbers(_rs_unp(_rs_pp_mask(_rs_scaled(_rs_unratio(sentence)), _rs_digits(_rs_scaled(quoted), False))))
+    if nums and not _c45_numbers_in(nums, _rs_digits(_rs_scaled(quoted), False)):
+        return no("figure")             # 6.5, further: a figure counts the same thing as in the paper's sentence
+    bad = _v65.claim_problems(sentence, quoted, _v65_own_text(cited, _rs_bg), n_cited, [p.get("year") for p in cited],
+                              all_text=" ".join(str(p.get("title") or "") + ". " + " ".join(p["sents"]) for p in cited))
+    if bad:
+        return no(bad[0])
+    if _V65_FOUND.search(sentence) and not _v65_found_ok(sentence, cites, by_n, _rs_bg, n_cited):
+        return no("background")
     if _c45_copied(sentence, all_text, run=10):
-        return False
+        return no("copied")
     return True
+
+
+_RS_NULL = re.compile(r"\b(?:no|not|nor|neither|none|without|never|failed\s+to|did\s+not|does\s+not|do\s+not|was\s+not|were\s+not|"
+                      r"is\s+not|are\s+not|non-?significant\w*|insignificant\w*|null|unrelated|n['\u2019]t|little|negligible|similar|"
+                      r"comparable|unchanged|remained\s+(?:the\s+same|stable|steady|unchanged|similar))\b", re.I)
+
+
+def _rs_answer_ok(a, quote):
+    """6.6, round 2: a paper's answer to the question as its own words allow: "no" only where its sentences say no, not or
+    none (a finding of no link); "yes" never where its words only say there was none (each link word only after "no",
+    "not"); otherwise RamzAI's reading is unsure, and it says so ("unclear")."""
+    if a == "no" and not _RS_NULL.search(quote or ""):
+        return "unclear"
+    if a in ("yes", "partly"):
+        pol = _v65._polarity(quote or "")
+        if pol and all(neg for _stem, neg in pol):
+            return "unclear"
+    return a
 
 
 def _rs_evidence(question, papers, deadline):
@@ -13217,7 +15514,7 @@ def _rs_evidence(question, papers, deadline):
             obj = _rs_json(raw)
             break
         except Exception as e:
-            logger.warning(f"Research: the evidence table's reading didn't run ({str(e)[:100]})")
+            logger.warning(f"Research: the evidence table's reading didn't run ({_why(e)})")
             if attempt == 2 or deadline - time.time() < 70:
                 return {}
     by_n = {p["n"]: p for p in papers}
@@ -13232,11 +15529,68 @@ def _rs_evidence(question, papers, deadline):
             if not p or pn in out:
                 continue
             nums = _rs_idx(it.get("s"), pn, len(p["sents"])) or []
+            # 6.6, round 2: what a paper says of earlier work (its background) is never what it found
+            bg = _rs_bg(p)
+            nums = [k for k in nums if k not in bg]
             a = it.get("a") if yesno and nums and it.get("a") in ("yes", "partly", "no", "unclear") else None
+            a = _rs_answer_ok(a, " ".join(p["sents"][k] for k in nums))
             out[pn] = (nums, a)
         except Exception:
             continue
     return out
+
+
+def _rs_search_record(stats, papers, result, kinds, since, until, this_year):
+    """6.6, round 2 (the owner, 21 Nov 2026: "Do as much as a research tool can be"): how the papers were found, so the
+    research can be checked and done again: when and where it searched, for what words, what was asked for, how many
+    papers were found, what was left out and why, how many were read and how many are cited."""
+    st = stats or {}
+    reg = st.get("registry") or {}
+    months = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
+    now = datetime.now(timezone.utc)
+    where = [n for n in ("OpenAlex", "Semantic Scholar", "Europe PMC") if (st.get("by_source") or {}).get(n) is not None] or list(st.get("from") or [])
+    plural = lambda n, one, many: f"{n} {one if n == 1 else many}"
+    kind_words = [RS_KIND_WORDS[k][1] for k in ("article", "review", "book", "conference", "thesis", "report", "preprint") if k in (kinds or [])]
+    kinds_said = (", ".join(kind_words[:-1]) + " and " + kind_words[-1]) if len(kind_words) > 1 else "".join(kind_words)
+    years_said = (f"{since} to {until or this_year}" if since else (f"up to {until}" if until else "any year"))
+    pick = st.get("pick") or {}
+    n = lambda d, k: int((d or {}).get(k) or 0)
+    same = n(pick, "same") + n(reg, "same_work")      # two versions of one work (a preprint and its article): one paper
+    found, dup = max(0, n(st, "found") - same), n(st, "duplicates") + same
+    mine = [p for p in papers if p.get("kind") == "mine" or p.get("lib")]
+    searched = [p for p in papers if p not in mine]
+    out_fit = n(st, "out_years") + n(st, "out_kinds") + n(pick, "years") + n(pick, "kinds")
+    no_copy = n(st, "no_copy")
+    no_abs, plan = n(pick, "no_abstract"), n(pick, "plan")
+    retracted, concern = n(reg, "retracted"), n(reg, "concern")
+    unconfirmed = sum(n(reg, k) for k in ("wrong_doi", "unknown_doi", "unidentified", "future"))
+    rest = max(0, found - out_fit - no_copy - no_abs - plan - retracted - concern - unconfirmed - len(searched))
+    read = st.get("read") or {}
+    in_full = int(read.get("paper") or 0) + int(read.get("part") or 0)
+    cited = sum(1 for p in (result.get("papers") or []) if p.get("cited"))
+    left = [x for x in ((plural(out_fit, "outside the years or kinds asked for", "outside the years or kinds asked for") if out_fit else ""),
+                        (plural(no_copy, "whose free copy couldn\u2019t be opened", "whose free copy couldn\u2019t be opened") if no_copy else ""),
+                        (f"{retracted} retracted" if retracted else ""),
+                        (f"{concern} under an expression of concern" if concern else ""),
+                        (f"{no_abs} with no abstract to read" if no_abs else ""),
+                        (f"{plan} {'a study’s plan' if plan == 1 else 'studies’ plans'}, with no findings yet" if plan else ""),
+                        (f"{unconfirmed} whose details couldn\u2019t be confirmed" if unconfirmed else ""),
+                        (f"{rest} less relevant to the question" if rest else "")) if x]
+    lines = [f"Searched on {now.day} {months[now.month - 1]} {now.year}" + (f" in {', '.join(where[:-1]) + ' and ' + where[-1] if len(where) > 1 else ''.join(where)}" if where else "")
+             + (f" for: \u201c{st.get('query')}\u201d." if st.get("query") else "."),
+             "Asked for: " + (kinds_said + ", " if kinds_said else "") + years_said + ".",
+             f"Found {plural(found, 'different paper', 'different papers')}" + (f" ({dup} more {'was the same paper' if dup == 1 else 'were the same papers'} found twice)." if dup else ".")]
+    if left:
+        lines.append("Left out: " + "; ".join(left) + ".")
+    pub = sum(1 for p in papers if p.get("preprint_doi"))
+    paren = [x for x in ((f"{in_full} of them in full" if in_full else ""),
+                         (f"{pub} found as {'a preprint' if pub == 1 else 'preprints'} and read as the published {'paper' if pub == 1 else 'papers'}" if pub else "")) if x]
+    lines.append(f"Read: {plural(len(papers), 'paper', 'papers')}" + (f" ({'; '.join(paren)})" if paren else "")
+                 + (f", {len(mine)} of them from your library" if mine else "") + f". Cited in the report: {cited}.")
+    return {"lines": lines, "date": now.date().isoformat(), "where": where, "query": st.get("query") or "", "found": found,
+            "duplicates": dup, "left_out": {"years_or_kinds": out_fit, "no_copy": no_copy, "no_abstract": no_abs, "plan": plan,
+                                            "retracted": retracted, "concern": concern, "unconfirmed": unconfirmed, "less_relevant": rest},
+            "read": len(papers), "in_full": in_full, "cited": cited}
 
 
 def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="apa", full=True):
@@ -13251,7 +15605,7 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
             cited.update(c["p"] for c in s["c"])
         if keep:
             sections.append({"h": head, "s": keep})
-    strip = lambda p: {k: v for k, v in p.items() if k not in ("sents", "abstract_full", "where", "abs_n", "read", "own_link", "pmcid")}
+    strip = lambda p: {k: v for k, v in p.items() if k not in ("sents", "abstract_full", "where", "abs_n", "read", "own_link", "pmcid", "bg")}
     # 5.1: of the sentences read from a paper itself, the app is sent only those a citation or the evidence table
     # quotes (after its abstract's, which all go as before); the numbers that point at them are moved to match
     used = {}
@@ -13325,9 +15679,14 @@ def _rs_result(question, years, kinds, papers, parts, evidence, stats, style="ap
         how += (" " if how else "") + ("RamzAI read the first pages of your PDF." if n_mine == 1 else "RamzAI read the first pages of your PDFs.")
     if any(p.get("read") == "part" for p in papers):
         how += f" Of a long work it read the first {RS_PAGES_MAX} pages."
+    # 6.5, further: said only when the second, independent check read every sentence that stayed
+    twice = " Every sentence was checked twice against its papers’ own words." if stats.get("second") and not stats.get("second_missing") else ""
+    designs = _rs_designs_line(out_papers)               # 6.6, round 9: the kinds of study the answer rests on
     limits = (f"{len(papers)} paper{'' if len(papers) == 1 else 's'}" + (f" from {min(yrs)} to {max(yrs)}" if yrs and min(yrs) != max(yrs) else f" from {yrs[0]}" if yrs else "")
-              + (f": {kinds_words}" if kinds_words else "") + ". " + how
-              + " Every quote is a paper’s own sentence, word for word. Read a paper before you rely on it.")
+              + (f": {kinds_words}" if kinds_words else "") + ". " + (designs + " " if designs else "") + how + twice
+              + " Every quote is a paper’s own sentence, word for word. "
+              + ((_v65_reg_words(stats.get("registry"), papers) + " ") if _v65_reg_words(stats.get("registry"), papers) else "")
+              + "Read a paper before you rely on it.")
     if not full:
         # an app from before 5.1 (the endpoint read abstracts alone for it): the words and the shape of 5.0, so that what
         # it shows as "the abstract" is the abstract and nothing else
@@ -13416,6 +15775,37 @@ def _brief_options(v, avoid=()):
     return out[:6]
 
 
+# 6.6, round 58 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): no paper is read to suggest a topic, so its
+# reason says why it suits the person, never what the world or research is like ("little research exists on this",
+# "cases are rising", "affects 40% of nurses", "the first study", "globally"): a student copies such a line into a problem
+# statement as if it were found. The claim rules of research (server/valid65.py), held to no evidence at all.
+BRIEF_REASON_RULE = ("A reason states no fact about the world or about research, since no paper has been read yet: no figure, "
+                     "no trend (\"rising\", \"growing\"), nothing about what research has or hasn't done (\"little is known\", "
+                     "\"a gap\", \"the first\"), no \"the most\", nothing \"global\".")
+
+
+def _brief_reason_problem(why):
+    """What a topic's reason claims with no paper read for it ("" when nothing): a figure, a trend, a gap in research, "the
+    most", "the first", the world, "significant", "proven"."""
+    w = str(why or "").strip()
+    if not w:
+        return ""
+    try:
+        if not _rs_figures_ok(w, ""):
+            return "a figure"
+    except Exception:
+        pass
+    for name, ok in (("what research hasn't done", _v65.absence_ok), ("a trend", _v65.trend_ok), ("the world", _v65.world_ok),
+                     ("the most", _v65.superlative_ok), ("the first", _v65.first_ok), ("significant", _v65.significance_ok),
+                     ("certain", _v65.certainty_ok)):
+        try:
+            if not ok(w, ""):
+                return name
+        except Exception:
+            continue
+    return ""
+
+
 @app.route("/api/brief/topics", methods=["POST", "OPTIONS"])
 @limiter.limit(BRIEF_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -13436,14 +15826,15 @@ def brief_topics():
         "assignment; an organisation needs a question it can act on), and worded plainly (at most 18 words)"
         + (", as a question that papers can answer" if kind == "question" else "") + ". Range widely: different angles, "
         "groups, places, methods or sides of the subject, not five wordings of one idea. Never invent facts. Give each one "
-        "short reason (at most 14 words) why it is a good choice. Never repeat a topic in ALREADY SHOWN. Reply with JSON "
-        "only: {\"topics\": [{\"t\": \"the topic\", \"why\": \"the reason\"}]}.")
+        "short reason (at most 14 words) why it suits them: what makes it doable, useful or right for their level. " + BRIEF_REASON_RULE
+        + " Never repeat a topic in ALREADY SHOWN. Reply with JSON only: {\"topics\": [{\"t\": \"the topic\", \"why\": "
+        "\"the reason\"}]}.")
     user = ("WHAT THEY STUDY, WORK ON OR CARE ABOUT: " + interest + ("\nABOUT THE PERSON: " + about if about else "")
             + ("\nALREADY SHOWN:\n- " + "\n- ".join(avoid) if avoid else ""))
     try:
         obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=700, timeout=45, feature="brief-topics"))
     except Exception as e:
-        logger.warning(f"Brief: topic ideas didn't run: {str(e)[:120]}")
+        logger.warning(f"Brief: topic ideas didn't run: {_why(e)}")
         return jsonify({"error": "RamzAI couldn’t suggest topics just now. Please try again, or type a topic of your own."}), 502
     out, seen = [], {re.sub(r"\W+", "", a.lower()) for a in avoid}
     for x in (obj.get("topics") or [])[:8]:
@@ -13452,6 +15843,25 @@ def brief_topics():
         if t and k not in seen:
             seen.add(k)
             out.append({"t": _finish_text(t, "words"), "why": _finish_text(_brief_line(x.get("why"), 160), "words")})
+    # 6.6, round 58: a reason is about the person and the work, never a fact of the world or of research that no paper
+    # was read for ("little is known", "rising", "40% of nurses"): once more for those, then the topic goes without one
+    bad = {i: why for i, o in enumerate(out[:5]) for why in [_brief_reason_problem(o["why"])] if why}
+    if bad:
+        try:
+            again = _brief_json(call_claude(system_prompt=system, user_message=(
+                "For each of these topics, write the reason again: " + BRIEF_REASON_RULE + " Reply with JSON only: {\"topics\": "
+                "[{\"t\": \"the topic, as given\", \"why\": \"the reason\"}]}.\n" + "\n".join(f"- {out[i]['t']} (it said: {out[i]['why']})" for i in bad)),
+                max_tokens=400, timeout=30, feature="brief-topics"))
+            new_why = {re.sub(r"\W+", "", str(x.get("t") or "").lower()): _finish_text(_brief_line(x.get("why"), 160), "words")
+                       for x in (again.get("topics") or []) if isinstance(x, dict)}
+        except Exception as e:
+            logger.warning(f"Brief: topic reasons weren't written again: {_why(e)}")
+            new_why = {}
+        for i in bad:
+            w = new_why.get(re.sub(r"\W+", "", out[i]["t"].lower()), "")
+            out[i]["why"] = w if w and not _brief_reason_problem(w) else ""
+        logger.info(f"Brief: {len(bad)} topic reason(s) stated a fact no paper was read for; "
+                    f"{sum(1 for i in bad if out[i]['why'])} written again, {sum(1 for i in bad if not out[i]['why'])} left without one")
     if len(out) < 2:
         return jsonify({"error": "RamzAI couldn’t suggest topics just now. Please try again, or type a topic of your own."}), 502
     return jsonify({"topics": out[:5]})
@@ -13509,7 +15919,7 @@ def brief_check():
     try:
         obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=320, timeout=12, feature="brief-check"))
     except Exception as e:
-        logger.warning(f"Brief: the clarity check didn't run: {str(e)[:120]}")
+        logger.warning(f"Brief: the clarity check didn't run: {_why(e)}")
         if other:
             return jsonify({"error": "RamzAI couldn’t think of other answers just now. You can say it in your own words."}), 502
         return jsonify({"clear": True, "unchecked": True})
@@ -13590,7 +16000,7 @@ def brief_review():
     try:
         obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=700, timeout=18, feature="brief-review"))
     except Exception as e:
-        logger.warning(f"Brief: the review didn't run: {str(e)[:120]}")
+        logger.warning(f"Brief: the review didn't run: {_why(e)}")
         return jsonify({"questions": [], "unchecked": True})
     out, seen = [], {re.sub(r"\W+", "", q.lower()) for q, _ in answered}
     for x in (obj.get("questions") if isinstance(obj.get("questions"), list) else [])[:most + 2]:
@@ -13686,7 +16096,7 @@ def brief_plan():
     try:
         obj = _brief_json(call_claude(system_prompt=system, user_message=user, max_tokens=1100, timeout=40, feature="brief-plan"))
     except Exception as e:
-        logger.warning(f"Brief: the study plan didn't come: {str(e)[:120]}")
+        logger.warning(f"Brief: the study plan didn't come: {_why(e)}")
         return jsonify({"error": "RamzAI couldn’t suggest a plan just now. Please try again, or type your objectives yourself."}), 502
     got = _prop.clean_plan({"title": obj.get("title"), "general": obj.get("general"), "specific": obj.get("specific"),
                             "questions": obj.get("questions"), "gap": obj.get("gap"), "design": _plan_pick(obj.get("design"), _prop.DESIGNS),
@@ -13694,6 +16104,10 @@ def brief_plan():
                             "analysis": _plan_pick(obj.get("analysis"), _prop.ANALYSES), "keywords": obj.get("keywords"),
                             "country": obj.get("country"), "region": obj.get("region"), "continent": obj.get("continent")})
     fin = lambda t: _finish_text(t, "words") if t else t
+    # 6.6, round 83: RamzAI's own objectives start with "To" and one measurable verb (never the person's: they stand as stated)
+    _qual = (stated["design"] or got["design"]) in _prop.QUALITATIVE
+    got["general"] = _prop.measurable(got["general"], _qual)
+    got["specific"] = [_prop.measurable(o, _qual) for o in got["specific"]]
     # what the person stated stands; RamzAI's suggestion fills only what they left open
     out = {"title": stated["title"] or fin(got["title"]) or topic,
            "general": stated["general"] or fin(got["general"]),
@@ -13710,6 +16124,11 @@ def brief_plan():
     # a question for each objective: RamzAI's when they came one for one, else a plain rewording of the objective
     qs = [fin(q) for q in got["questions"]] if (not stated["specific"] or len(got["questions"]) == len(out["specific"])) else []
     out["questions"] = qs if len(qs) == len(out["specific"]) and all(q.endswith("?") for q in qs) else [_prop.question_for(o) for o in out["specific"]]
+    try:                                       # 6.6, round 105: each question asks what its own objective sets out to find
+        out["questions"] = _prop.fit_questions(out["specific"], out["questions"], {"population": stated.get("population") or got.get("population"),
+                                                                                    "setting": place or got.get("setting")})
+    except Exception as e:
+        logger.error(f"Brief: the questions weren't matched to their objectives ({_why(e)})")
     # a design must have its own kind of sampling, instrument and analysis (a qualitative study has no statistics)
     if out["design"] in _prop.QUALITATIVE:
         out["sampling"] = out["sampling"] if out["sampling"] in ("purposive", "snowball", "convenience") else "purposive"
@@ -13771,7 +16190,7 @@ def brief_template():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Brief: a template couldn't be read: {e}", exc_info=True)
+        logger.error(f"Brief: a template couldn't be read: {_why(e)}", exc_info=True)
         return jsonify({"error": "Academic-Home couldn’t read that file. Try a Word file, a PDF or plain text."}), 422
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -13864,7 +16283,7 @@ def research_endpoint():
             found, diag = fs.result()
             yield line({"step": "search", "state": "done", "found": stats.get("found", len(found)), "from": stats.get("from", [])})
             yield line({"step": "keep", "state": "now"})
-            papers = _rs_pick(found, library, question, kinds, since, until)
+            papers = _rs_pick(found, library, question, kinds, since, until, counts=stats.setdefault("pick", {}))
             if len(papers) < RS_MIN_PAPERS:
                 if not found and diag and _RS_DOWN.search(diag):
                     msg = "The paper search services aren’t answering right now. Please try again in a few minutes."
@@ -13885,7 +16304,7 @@ def research_endpoint():
                 try:
                     read = fr.result()
                 except Exception as e:           # reading is an extra: whatever happens to it, the research goes on from the abstracts
-                    logger.warning(f"Research: the papers couldn't be read ({e.__class__.__name__}: {str(e)[:120]})")
+                    logger.warning(f"Research: the papers couldn't be read ({_why(e)})")
                     for p in papers:
                         p["sents"] = p["sents"][:p.get("abs_n", len(p["sents"]))]
                         p["abs_n"], p["where"], p["read"] = len(p["sents"]), ["a"] * len(p["sents"]), ("mine" if p.get("kind") == "mine" else "abstract")
@@ -13914,7 +16333,7 @@ def research_endpoint():
                         try:
                             parts = f.result()      # may raise: the research stops, and the point is given back
                         except Exception as e:
-                            logger.warning(f"Research failed at the writing: {e.__class__.__name__}: {str(e)[:160]}")
+                            logger.warning(f"Research failed at the writing: {_why(e)}")
                             settle(False)
                             # 4.9.1: say what happened when the AI itself said it (busy, slow, not available)
                             why = str(e) if isinstance(e, ConversionError) and str(e) in (AI_MSG_BUSY, AI_MSG_SLOW, AI_MSG_UNAVAILABLE) \
@@ -13942,7 +16361,7 @@ def research_endpoint():
                                     x["t"], x["h"] = t, new_heads.get(x["h"], x["h"])
                                 _lang_said("research", st)
                             except Exception as e:
-                                logger.warning(f"One language skipped in research: {e.__class__.__name__}: {str(e)[:160]}")
+                                logger.warning(f"One language skipped in research: {_why(e)}")
                             return _rs_check(question, papers, [x["t"] for x in flat], deadline)
                         fc = pool.submit(one_language_then_check)
                         pending.add(fc)
@@ -13951,12 +16370,36 @@ def research_endpoint():
                         if chk is None:
                             raise ConversionError("the check didn't run")
                         cites, doubt, drop = chk
+                        gone = Counter()
                         for i, x in enumerate(flat):
                             c = cites.get(i)
-                            if i in drop or not c or not _rs_keep(x["t"], c, doubt.get(i, False), by_n, all_text):
+                            why = []
+                            if i in drop or not c or not _rs_keep(x["t"], c, doubt.get(i, False), by_n, all_text, why):
                                 x["c"] = None
+                                gone[(why or ["unbacked"])[0]] += 1
                                 continue
                             x["c"] = [{"p": pn, "q": ks, "v": v} for pn, ks, v in c]
+                        # 6.5, further: a second, independent check of each kept sentence against the papers' sentences
+                        # named for it (it sees nothing else)
+                        vitems = [(i, x["t"], _v65_quotes([(c["p"], c["q"], c["v"]) for c in x["c"]], by_n))
+                                  for i, x in enumerate(flat) if x.get("c")]
+                        vgot = None
+                        if vitems and deadline - time.time() > 30:
+                            fv = pool.submit(_v65_verify, vitems, min(deadline - 15, time.time() + 45), "research")
+                            yield from waiting({fv})
+                            try:
+                                vgot = fv.result()
+                            except Exception:
+                                vgot = None
+                            for i, why in ((vgot or ({}, 0))[0]).items():
+                                flat[i]["c"] = None
+                                gone["second check"] += 1
+                                logger.info(f"Research: the second check took a sentence out: {why}")
+                        # (what this rests on says "checked twice" only when the second check read every kept sentence)
+                        stats["second"] = (vgot or ({}, 0))[1]
+                        stats["second_missing"] = len(vitems) - stats["second"]
+                        if gone:
+                            logger.info("Research: sentences taken out: " + ", ".join(f"{k} {v}" for k, v in gone.most_common()))
                         kept = sum(1 for x in flat if x.get("c"))
                         yield line({"step": "check", "state": "done", "checked": len(flat), "removed": len(flat) - kept})
             kept = [x for x in flat if x.get("c")]
@@ -13969,6 +16412,10 @@ def research_endpoint():
             result = _rs_result(question, years, kinds, papers, parts_out, evidence or {}, stats, full=full)
             if year_from or until:           # 5.0: the years the person chose themselves
                 result["asked"].update({k: v for k, v in (("year_from", year_from), ("year_to", until)) if v})
+            try:                             # 6.6, round 2: how the papers were found
+                result["search"] = _rs_search_record(stats, papers, result, kinds, since, until, this_year)
+            except Exception as e:
+                logger.warning(f"Research: the search record couldn't be made ({_why(e)})")
             if language and language.lower() not in ("english", "en"):      # 5.0: the language it is written in
                 result["asked"]["language"] = language
                 heads = RS_SECTIONS_LANG.get(language.lower())
@@ -13983,7 +16430,7 @@ def research_endpoint():
             settle(False)
             raise
         except Exception as e:
-            logger.warning(f"Research failed: {e.__class__.__name__}: {str(e)[:160]}")
+            logger.warning(f"Research failed: {_why(e)}")
             settle(False)
             yield line({"error": "RamzAI couldn’t finish this research. Please try again. This didn’t use any points."})
         finally:
@@ -14115,7 +16562,7 @@ def write_export_docx_endpoint():
         if isinstance(data.get("proposal"), dict):
             # 5.4: a research proposal: its own Word file (cover, contents, abstract, chapters, references, appendices)
             spec = data["proposal"]
-            plan = _prop.clean_plan(spec.get("plan"))
+            plan = _prop.fit_methods(_prop.clean_plan(spec.get("plan")))
             extras = dict(spec.get("extras")) if isinstance(spec.get("extras"), dict) else {}
             extras.pop("consent", None)
             if spec.get("complete"):
@@ -14156,7 +16603,7 @@ def write_export_docx_endpoint():
     except ConversionError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Document export failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Document export failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "Export failed. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -14200,7 +16647,7 @@ def slides_import_endpoint():
         try:
             original = parse_pptx_original(path, work_dir, to_pdf=lambda src_path, out: _soffice_convert(src_path, "pdf", out))
         except Exception as e:
-            logger.warning(f"Keeping the deck's own design failed: {e}")
+            logger.warning(f"Keeping the deck's own design failed: {_why(e)}")
         out = {"deck": deck, "original": original}
         if made and original:
             with open(path, "rb") as fh:
@@ -14209,7 +16656,7 @@ def slides_import_endpoint():
     except StudioError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Slide import failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Slide import failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "That file couldn't be read. Please try another."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -14244,7 +16691,7 @@ def slides_build_endpoint():
     except StudioError as e:
         return jsonify({"error": str(e)}), 422
     except Exception as e:
-        logger.error(f"Slide build failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Slide build failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "The slides couldn't be built. Please try again."}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -14328,6 +16775,59 @@ _ALL_ASSIST = {
 _ALL_LANGS = WORD_AI_LANGS
 
 
+# ---- 6.6, round 56 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): RamzAI in Slide Studio keeps the slides'
+# facts, as it does in the Word editor (round 50, _wf_rewrite_problems). Shorter points, simpler words and fixed spelling
+# keep every figure and year of the slide and add none; points written from a title and speaker notes add none; none says
+# more than the slide ("may reduce" made "reduces", a link made a cause, "significant", "the most"); a spelling fix adds or
+# takes away no "not" and turns no word into its opposite; a translation keeps every number. A slide whose new version
+# does is asked for once more, told what changed; then, if it still does, it stays as it was (and the person is told).
+_SL_RULE = {"tighten": "improve", "simplify": "simpler", "spelling": "fix", "expand": "longer", "notes": "explain",
+            "translate": "translate"}
+
+
+def _sl_text(title, points, notes=""):
+    """A slide's words as one text: its title, each point on its own line, its speaker notes."""
+    rows = [str(title or "").strip()] + [str(p.get("text") if isinstance(p, dict) else p).strip() for p in points or []]
+    if notes:
+        rows.append(str(notes).strip())
+    return "\n".join(r for r in rows if r)
+
+
+def _sl_problems(action, before, after):
+    """What RamzAI's version of a slide changed of its facts (empty when nothing). before, after: (title, points, notes).
+    A fault in the check itself finds nothing (it never stops the person's work)."""
+    try:
+        return _sl_problems_(action, before, after)
+    except Exception as e:
+        logger.error(f"Slide Studio ({action}): the facts check failed ({_why(e)})")
+        return []
+
+
+def _sl_problems_(action, before, after):
+    rule = _SL_RULE.get(action)
+    if not rule:
+        return []
+    bt, bp, bn = before
+    at, ap, an = after
+    if action == "notes":
+        a_text, b_text = str(an or ""), _sl_text(bt, bp)
+    elif action == "translate":
+        a_text, b_text = _sl_text(at or bt, ap or bp, (an or bn) if bn else ""), _sl_text(bt, bp, bn)
+    else:
+        a_text, b_text = _sl_text(at or bt, ap if ap else bp), _sl_text(bt, bp)
+    probs = list(_wf_rewrite_problems(rule, b_text, a_text))
+    if action == "spelling":
+        why = _wf_issue_problem(b_text, a_text, "spelling")
+        if why and why != "a figure":
+            probs.append(why + " changed")
+    return probs[:4]
+
+
+def _sl_retry_note(problems):
+    return ("Your last version changed facts of the slide: " + "; ".join(problems) + ". Write it again, keeping every figure, "
+            "year and claim exactly as the slide gives them and adding none.")
+
+
 def _all_points(raw, limit=12):
     out = []
     for b in (raw or [])[:40]:
@@ -14353,6 +16853,7 @@ def _all_points(raw, limit=12):
 def slides_assist_all_endpoint():
     if request.method == "OPTIONS":
         return "", 204
+    started = time.time()
     data = request.get_json(silent=True) or {}
     action = str(data.get("action") or "")
     if action not in _ALL_ASSIST:
@@ -14411,32 +16912,77 @@ def slides_assist_all_endpoint():
         _refund_sage_message(request.current_user, charged)
         msg = str(e) if isinstance(e, ConversionError) else "RamzAI couldn't finish that — please try again."
         return jsonify({"error": msg + AI_MSG_NOT_COUNTED}), 502
-    asked = {i for i, *_ in slides}
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
+    asked = {i: (title, pts, notes) for i, title, pts, notes in slides}
+
+    def read(items):
+        got = {}
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            try:
+                i = int(it.get("i"))
+            except (TypeError, ValueError):
+                continue
+            if i not in asked:
+                continue
+            o = {"i": i}
+            if action in ("spelling", "translate") and isinstance(it.get("title"), str) and it["title"].strip():
+                o["title"] = it["title"].strip()[:200]
+            if action in ("tighten", "spelling", "translate"):
+                pts = _all_points(it.get("bullets"), 12)
+                if pts:
+                    o["bullets"] = pts
+            if action in ("notes", "translate") and isinstance(it.get("notes"), str) and it["notes"].strip():
+                o["notes"] = it["notes"].strip()[:2000]
+            if len(o) > 1:
+                got[i] = o
+        return got
+
+    def faults(got):
+        return {i: pr for i, o in got.items()
+                for pr in [_sl_problems(action, asked[i], (o.get("title"), o.get("bullets"), o.get("notes")))] if pr}
+
+    got = read(items)
+    bad = faults(got)
+    if bad and time.time() - started < 100:
+        # 6.6, round 56: once more for the slides whose new version changed their facts, told what changed
+        again = ["Last time, these slides came back with their facts changed. " + " ".join(
+            f"SLIDE {i}: {_sl_retry_note(pr)}" for i, pr in bad.items())]
+        for i, title, pts, notes in slides:
+            if i in bad:
+                again.append(f"\nSLIDE {i}\nTitle: {title or '(none)'}")
+                if pts:
+                    again.append("Points:\n" + "\n".join(("  " * p["level"]) + "- " + p["text"] for p in pts))
+                if notes and action == "translate":
+                    again.append("Notes: " + notes)
         try:
-            i = int(it.get("i"))
-        except (TypeError, ValueError):
-            continue
-        if i not in asked:
-            continue
-        o = {"i": i}
-        if action in ("spelling", "translate") and isinstance(it.get("title"), str) and it["title"].strip():
-            o["title"] = it["title"].strip()[:200]
-        if action in ("tighten", "spelling", "translate"):
-            pts = _all_points(it.get("bullets"), 12)
-            if pts:
-                o["bullets"] = pts
-        if action in ("notes", "translate") and isinstance(it.get("notes"), str) and it["notes"].strip():
-            o["notes"] = it["notes"].strip()[:2000]
-        if len(o) > 1:
-            out.append(o)
+            raw2 = call_claude(system, "\n".join(again) + "\n", max_tokens=max_tokens, feature="slides-all-" + action,
+                               timeout=max(20, min(80, 170 - (time.time() - started))))
+            m2 = re.search(r"\{.*\}", (raw2 or "").strip(), re.S)
+            got2 = read((json.loads(m2.group(0)) if m2 else {}).get("slides"))
+            for i in list(bad):
+                if i in got2 and not faults({i: got2[i]}):
+                    got[i] = got2[i]
+                    del bad[i]
+        except Exception as e:
+            logger.warning(f"Slide Studio ({action}): the second try didn't run ({_why(e)})")
+    for i, pr in bad.items():
+        got.pop(i, None)
+        logger.info(f"Slide Studio ({action}): slide {i} left as it was: {'; '.join(pr)[:200]}")
+    out = [got[i] for i in sorted(got)]
     if not out:
         _refund_sage_message(request.current_user, charged)
+        if bad:
+            return jsonify({"error": "RamzAI\u2019s version changed facts of your slides (" + "; ".join(next(iter(bad.values())))[:160]
+                            + "), so nothing was changed. Please try again." + AI_MSG_NOT_COUNTED, "kept": sorted(bad)}), 502
         return jsonify({"error": "RamzAI couldn't finish that — please try again." + AI_MSG_NOT_COUNTED}), 502
-    return jsonify({"slides": out})
+    reply = {"slides": out}
+    if bad:
+        n = len(bad)
+        reply["kept"] = sorted(bad)
+        reply["kept_note"] = (f"{n} slide{'s' if n != 1 else ''} stayed as {'they were' if n != 1 else 'it was'}: RamzAI\u2019s "
+                              f"version changed {'their' if n != 1 else 'its'} facts (a figure, a year or a claim).")
+    return jsonify(reply)
 
 
 @app.route("/api/slides/assist", methods=["POST", "OPTIONS"])
@@ -14471,11 +17017,23 @@ def slides_assist_endpoint():
     )
     try:
         raw = call_claude(_ASSIST_SYSTEM, user_message, max_tokens=max_tokens)
-        return jsonify(_parse_assist_json(raw, action))
+        got = _parse_assist_json(raw, action)
+        # 6.6, round 56: the slide's facts stay its own; once more when they changed, then not shown
+        before = (title, [{"text": re.sub(r"^\s*- ", "", p)} for p in points], "")
+        pr = _sl_problems(action, before, (None, got.get("bullets"), got.get("notes")))
+        if pr:
+            raw = call_claude(_ASSIST_SYSTEM, user_message + "\n\n" + _sl_retry_note(pr), max_tokens=max_tokens)
+            got = _parse_assist_json(raw, action)
+            pr = _sl_problems(action, before, (None, got.get("bullets"), got.get("notes")))
+            if pr:
+                logger.info(f"Slide Studio ({action}): not shown: {'; '.join(pr)[:200]}")
+                return jsonify({"error": "RamzAI\u2019s version changed a fact of this slide (" + "; ".join(pr)[:160]
+                                + "), so it isn\u2019t shown. Please try again."}), 502
+        return jsonify(got)
     except ConversionError as e:
         return jsonify({"error": str(e)}), 502
     except Exception as e:
-        logger.error(f"Slide assist failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Slide assist failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": "RamzAI couldn't reach the AI just now — please try again."}), 502
 
 
@@ -14900,10 +17458,15 @@ def _c45_deck_verify(slides, sources, style, topic, deadline):
         return True
     if time.time() > deadline - 12:
         return False
-    lines, mark = _c34_write_parts(sources)
+    _lines, mark = _c34_write_parts(sources)
+    # 6.5: checked like research writing: by the papers' own sentences (labelled and verified), every figure in them,
+    # nothing said that they don't say
+    papers = _v65_papers(sources)
+    by_n = {p["n"]: p for p in papers}
+    grams = _v65_grams(" ".join(" ".join(p["sents"]) for p in papers))
 
     def own(t):
-        return {f"S{i + 1}" for i in keep_known_citations(t, sources, style)[1]}
+        return {i + 1 for i in keep_known_citations(t, sources, style)[1]}
 
     def bare(t):
         out = re.sub(r"[ \t]*\(([^()]{2,400})\)", lambda m: "" if keep_known_citations("(" + m.group(1) + ")", sources, style)[1] else m.group(0), t)
@@ -14917,46 +17480,55 @@ def _c45_deck_verify(slides, sources, style, topic, deadline):
     chunks = [list(range(i, min(i + C34_CHUNK, len(todo)))) for i in range(0, len(todo), C34_CHUNK)][:C34_MAX_CHUNKS]
     results = [None] * len(chunks)
     with _futures.ThreadPoolExecutor(max_workers=3) as pool:
-        jobs = {pool.submit(_c34_check, "deck", topic, lines, [shown[i] for i in ch], context, deadline): ci for ci, ch in enumerate(chunks)}
+        jobs = {pool.submit(_v65_check, "deck", topic, papers, [shown[i] for i in ch], context, deadline): ci for ci, ch in enumerate(chunks)}
         for job, ci in jobs.items():
             try:
                 results[ci] = job.result(timeout=max(2, deadline - time.time() + 3))
             except Exception:
                 results[ci] = None
     dropped = moved = given = 0
+    final, verify = {}, []          # 6.5, further: what each kept point will say, then a second check of it
     for ci, ch in enumerate(chunks):
         r = results[ci]
-        if not r or r["skip"]:
+        if not r:
             continue
         for j, k in enumerate(ch):
             b = todo[k]
             if j in r["keep"] and not own(b["text"]):
                 continue
-            new = set(r["cite"].get(j, []))
+            cites = r["cite"].get(j)
             old = own(b["text"])
-            if not new:
-                b["text"] = ""; dropped += 1
+            if j in r["drop"] or not cites or not _v65_keep(shown[k], cites, r["doubt"].get(j, False), by_n, grams)[0]:
+                final[k] = ""; dropped += 1
+                continue
+            new = {pn for pn, _, _ in cites}
+            if old and not (old & new) and any(_NARRATIVE.finditer(b["text"])):
+                final[k] = ""; dropped += 1          # "Mensah (2021) found…", but what Mensah says doesn't state it
                 continue
             keep = (old & new) or new
-            ev = " ".join(sources[int(x[1:]) - 1].get("abstract") or "" for x in keep if x[1:].isdigit() and 1 <= int(x[1:]) <= len(sources))
-            if _c45_copied(bare(b["text"]), ev, run=10):
-                b["text"] = ""; dropped += 1
-                continue
             if keep == old:
+                verify.append((k, b["text"], _v65_quotes([c for c in cites if c[0] in keep] or cites, by_n)))
                 continue
-            m = mark(sorted(keep))
+            m = mark([f"S{n}" for n in sorted(keep)])
             if m:
-                b["text"] = _c34_put(bare(b["text"]), m)
+                final[k] = _c34_put(bare(b["text"]), m)
                 moved += 1 if old else 0
                 given += 0 if old else 1
+                verify.append((k, final[k], _v65_quotes([c for c in cites if c[0] in keep] or cites, by_n)))
             else:
-                b["text"] = ""; dropped += 1
+                final[k] = ""; dropped += 1
+    got = _v65_verify(verify, deadline, "deck") if verify else None       # (the app waits 170 s for a deck)
+    for k, why in ((got or ({}, 0))[0]).items():
+        final[k] = ""; dropped += 1
+        logger.info(f"Citations (deck): the second check took a point out: {why}")
+    for k, t in final.items():
+        todo[k]["text"] = t
     for sl in slides:
         for name in ("bullets", "left", "right"):
             if sl.get(name):
                 sl[name] = [b for b in sl[name] if str(b.get("text") or "").strip()]
     logger.info(f"Citations (deck): {len(todo)} points checked → {given} given a source, {moved} given the right one, {dropped} taken out")
-    return all(r and not r["skip"] for r in results) and len(todo) <= C34_CHUNK * C34_MAX_CHUNKS
+    return all(results) and len(todo) <= C34_CHUNK * C34_MAX_CHUNKS
 
 
 def _parse_full_deck(raw, group, sources, style="apa", deck_max=None, topic="", deadline=None):
@@ -15095,7 +17667,7 @@ def slides_draft_endpoint():
     try:
         papers, _ = paper_topic_search(topic, max_results=6)
     except Exception as e:
-        logger.warning(f"Deck paper search failed: {e}")
+        logger.warning(f"Deck paper search failed: {_why(e)}")
         papers = []
     sources = enrich_sources(papers, "apa") if papers else []
     system = _DECK_SYSTEM.format(
@@ -15134,7 +17706,7 @@ def slides_draft_endpoint():
         return jsonify({"error": str(e) + AI_MSG_NOT_COUNTED}), 502
     except Exception as e:
         _refund_sage_message(request.current_user, charged_from, POINTS_DECK)
-        logger.error(f"Slide draft failed unexpectedly: {e}", exc_info=True)
+        logger.error(f"Slide draft failed unexpectedly: {_why(e)}", exc_info=True)
         return jsonify({"error": AI_MSG_FAILED + AI_MSG_NOT_COUNTED}), 502
 
 
@@ -15439,7 +18011,7 @@ def delete_account_endpoint():
         conn.commit()
     except Exception as e:
         conn.rollback()
-        logger.error(f"Account deletion failed for user {user['id']}: {e}", exc_info=True)
+        logger.error(f"Account deletion failed for user {user['id']}: {_why(e)}", exc_info=True)
         return jsonify({"error": "Your account couldn't be deleted just now — please try again."}), 500
     finally:
         conn.close()
@@ -15624,7 +18196,7 @@ def _lk_call(method, body, room=None, timeout=8):
         r = requests.post(f"{LIVEKIT_HTTP}/twirp/livekit.RoomService/{method}", json=body, timeout=timeout,
                           headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
     except requests.exceptions.RequestException as e:
-        logger.warning(f"Meet: couldn't reach LiveKit ({method}): {e}")
+        logger.warning(f"Meet: couldn't reach LiveKit ({method}): {_why(e)}")
         raise MeetError(MEET_MSG_DOWN, 503)
     if r.status_code == 404:
         return {}
@@ -16493,6 +19065,81 @@ def meet_attendance(cur, code):
     return resp
 
 
+# ---------------- 6.6, round 55 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a meeting's notes held to the
+# meeting. Every point names where it came from ("[Ama 10:42]", "[Slide 3]"); now that moment must exist and hold the
+# point (server/meetnotes66.py), and an independent check reads each point with only those lines. What the meeting
+# doesn't bear out goes; a point that named the wrong moment names the one that holds it.
+MEET_VERIFY_SYSTEM = (
+    "You are an independent checker of meeting notes. Each numbered ITEM is one POINT of the notes, with the section it "
+    "is under, and the QUOTES it rests on: lines of what was said in the meeting (live captions: speech turned into text, "
+    "so small mistakes of hearing are expected) or written in its chat, each after the person and the time, or the title "
+    "of a slide that was shown. Answer \"ok\" only when the quotes, taken together, state everything the point says: who "
+    "said, asked, decided or will do what, and every figure, date, deadline, name and place. A question is not a "
+    "decision; a suggestion, a wish or one person's view is not a decision of the group; \"may\" or \"could\" is not "
+    "\"will\"; a point under Decisions must be something the quotes show was agreed or decided; a point under Next steps "
+    "must be something the quotes show someone will do, with a time it is due only if the quotes give one; a point under "
+    "Questions asked gives an answer only if the quotes hold that answer. Words that only organise (\"The meeting "
+    "covered…\") need the quotes to show that the subject came up. Otherwise answer \"no\" and say in a few words what "
+    "the quotes don't state. Judge only by the quotes, never by what you know. Reply with JSON only, like {\"items\": "
+    "[{\"n\": 1, \"v\": \"ok\"}, {\"n\": 2, \"v\": \"no\", \"why\": \"Kofi asked this; nobody decided it\"}]}.")
+MEET_NOTHING = ("What RamzAI wrote didn’t match what was said in the meeting, so none of it is shown. Please try "
+                "again.")
+
+
+def _mn_rules(body, quoted):
+    """What a point of the notes says that the lines it names don't hold: a figure (in digits or in words), a year,
+    words in quotation marks."""
+    bad = []
+    if not _rs_figures_ok(body, quoted):
+        bad.append("figure")
+    if not _v65.years_ok(body, quoted):
+        bad.append("year")
+    if not _v65.quotes_ok(body, quoted):
+        bad.append("quote")
+    return bad
+
+
+def _mn_check(notes, said, chat, slides, material, title, deadline):
+    """The notes held to the meeting (said, chat: [(time, name, text)]; slides: the titles, by number). Returns
+    {"notes", "points", "out", "repointed", "second", "second_missing", "reasons"}; notes is "" when nothing is left."""
+    lines = _mn66.make_lines(said, chat)
+    p = _mn66.plan(notes, lines, slides, _mn_rules, material, title)
+    drop = dict(p["drop"])
+    rep = {"points": p["points"], "repointed": p["repointed"], "second": 0, "second_missing": 0}
+    if p["verify"]:
+        got = _v65_verify(p["verify"], deadline, "meet-notes", system=MEET_VERIFY_SYSTEM)
+        if got is None:
+            rep["second_missing"] = len(p["verify"])
+        else:
+            no, rep["second"] = got
+            rep["second_missing"] = len(p["verify"]) - rep["second"]
+            for ln, why in no.items():
+                drop[ln] = "second check"
+                logger.info(f"Meet notes: the independent check took a point out: {why}")
+    rep["out"] = len(drop)
+    rep["reasons"] = dict(Counter(drop.values()))
+    rep["notes"] = _mn66.rebuild(notes, {k: v for k, v in p["fix"].items() if k not in drop}, drop) \
+        if any(True for _ in _mn66.points(notes)) else notes
+    if p["points"] and rep["out"] >= p["points"]:
+        rep["notes"] = ""
+    logger.info(f"Meet notes: {p['points']} points, {rep['out']} out ({rep['reasons'] or 'none'}), {p['repointed']} pointed "
+                f"to the moment that holds them, {rep['second']} read a second time")
+    return rep
+
+
+def _mn_say(rep):
+    """What the host is told of the check (beside the notes, never in them: they are emailed to everyone who came)."""
+    out, fixed = rep.get("out", 0), rep.get("repointed", 0)
+    s = ("Every point was checked against what was said, written and shown in the meeting." if not rep.get("second_missing")
+         else "Each point’s moment, figures, dates and names were checked against the meeting; check the rest against "
+              "what was said.")
+    if out:
+        s += f" {out} that the meeting doesn’t bear out {'was' if out == 1 else 'were'} taken out."
+    if fixed:
+        s += f" {fixed} named the wrong moment and now {'names' if fixed == 1 else 'name'} the one where it was said."
+    return s
+
+
 @app.route("/api/meet/<code>/notes", methods=["POST", "OPTIONS"])
 @limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
 @auth_required
@@ -16500,6 +19147,7 @@ def meet_attendance(cur, code):
 @_meet_reply
 def meet_notes(cur, code):
     """RamzAI's notes of a meeting, from its chat, questions and slide titles — each point says where it came from."""
+    started = time.time()
     data = _json_body()
     m = _meet_get(cur, code)
     if request.current_user["id"] != m["host_id"]:
@@ -16508,15 +19156,18 @@ def meet_notes(cur, code):
         # 4.5: an end-to-end encrypted meeting's chat and words stay between the people in it — never sent to us or the AI
         raise MeetError("RamzAI’s notes aren’t available in an end-to-end encrypted meeting: its chat and words stay "
                         "between the people in it.", 400)
-    lines = []
+    lines, chat_t = [], []
     for it in (data.get("chat") or [])[:400]:
         if isinstance(it, dict) and _text(it.get("text")).strip():
-            lines.append(f"[{_text(it.get('time'))[:5]} {_meet_clean_name(it.get('name'))}] {_text(it.get('text'))[:600]}")
-    slides = [f"Slide {i + 1}: {_text(s)[:200]}" for i, s in enumerate((data.get("slides") or [])[:200]) if _text(s).strip()]
-    said = []
+            chat_t.append((_text(it.get('time'))[:5], _meet_clean_name(it.get('name')), _text(it.get('text'))[:600]))
+            lines.append(f"[{chat_t[-1][0]} {chat_t[-1][1]}] {chat_t[-1][2]}")
+    titles = [_text(s)[:200] for s in (data.get("slides") or [])[:200]]
+    slides = [f"Slide {i + 1}: {s}" for i, s in enumerate(titles) if s.strip()]
+    said, said_t = [], []
     for it in (data.get("said") or [])[:1200]:      # 3.9: the live captions the host's device saw
         if isinstance(it, dict) and _text(it.get("text")).strip():
-            said.append(f"[{_text(it.get('time'))[:5]} {_meet_clean_name(it.get('name'))}] {_text(it.get('text'))[:400]}")
+            said_t.append((_text(it.get('time'))[:5], _meet_clean_name(it.get('name')), _text(it.get('text'))[:400]))
+            said.append(f"[{said_t[-1][0]} {said_t[-1][1]}] {said_t[-1][2]}")
     if not lines and not slides and not said:
         raise MeetError("There’s nothing to make notes from yet — no chat, captions or slides.", 400)
     material = (("WHAT WAS SAID (live captions):\n" + "\n".join(said)[:40000] + "\n\n") if said else "") + \
@@ -16537,7 +19188,19 @@ def meet_notes(cur, code):
     except ConversionError as e:
         _refund_sage_message(request.current_user, charged)
         raise MeetError(str(e) + AI_MSG_NOT_COUNTED, 502)
-    return jsonify({"notes": (notes or "").strip()})
+    notes = (notes or "").strip()
+    # 6.6, round 55: every point held to the moment it names; what the meeting doesn't bear out goes
+    try:
+        rep = _mn_check(notes, said_t, chat_t, titles, material + "\n" + "\n".join(titles), m["title"],
+                        min(started + 100, time.time() + 45))
+    except Exception as e:                      # (a fault in the check never costs the person the notes)
+        logger.error(f"Meet notes: the check failed ({_why(e)}); the notes go as written", exc_info=True)
+        return jsonify({"notes": notes})
+    if not rep["notes"]:
+        _refund_sage_message(request.current_user, charged)
+        raise MeetError(MEET_NOTHING + AI_MSG_NOT_COUNTED, 502)
+    return jsonify({"notes": rep["notes"], "check_note": _mn_say(rep),
+                    "checked": {k: rep[k] for k in ("points", "out", "repointed", "second", "second_missing")} | {"reasons": rep["reasons"]}})
 
 
 @app.route("/api/meet/webhook", methods=["POST"])
@@ -16651,7 +19314,7 @@ def _meet_reap_loop():
         try:
             _meet_reap_once()
         except Exception as e:
-            logger.warning(f"Meet: tidy-up pass failed: {e}")
+            logger.warning(f"Meet: tidy-up pass failed: {_why(e)}")
         time.sleep(60)
 
 
@@ -16677,8 +19340,654 @@ def _once_tidy_loop():
         try:
             _once_tidy()
         except Exception as e:
-            logger.warning(f"once: tidy-up failed: {e}")
+            logger.warning(f"once: tidy-up failed: {_why(e)}")
         time.sleep(300)
+
+
+# ======================= 6.6, round 5: Check my citations =======================
+# The owner, 21 Nov 2026 00:47: "Raise the app's validity. Do as much as a research tool can be." The person pastes their
+# own writing with its reference list. Each entry is found in its publisher's registry (Crossref: by its DOI, or by the
+# entry itself, which Crossref matches to a paper); what differs from the record is said, and what couldn't be found or
+# was retracted. Every in-text citation is matched to its entry. Each cited sentence is checked against its paper's
+# abstract the way research writing is (the paper's sentences named, the rules of valid65, a second check), and the
+# person is told plainly that only abstracts were read. 1 point, a research use (as Research a question). Nothing of the
+# writing is kept; only the entries go to Crossref (server/citecheck66.py; the privacy notice says so).
+import citecheck66 as _cc66
+import stats66 as _st66
+
+CC_SECONDS = 150                 # the app waits 175
+CC_CHUNK = 10
+CC_CHECK_SYSTEM = (
+    "You check a person's own academic writing against the papers it cites. Each numbered ITEM is one SENTENCE of their "
+    "writing and the PAPERS it cites, each paper's abstract in sentences labelled like R3-S2 (reference 3, sentence 2). "
+    "For each item, name the abstract sentences that state what the SENTENCE says about those papers, and say whether "
+    "together they state all of it (\"full\") or only part (\"part\"); if none does, give \"none\". A sentence states it "
+    "fully only with the same strength and scope: every figure, year, place, group of people and kind of study; a link is "
+    "not a cause; \"may\" is not \"does\"; one study is not \"studies\"; what one place or group showed is not shown for "
+    "another or for everyone. What an abstract says of earlier work or of its field (its background) is not its finding. "
+    "Words that only join or organise the writing need nothing. Judge only by the given sentences, never by what you "
+    "know. Reply with JSON only, like {\"items\": [{\"n\": 1, \"s\": [\"R3-S2\"], \"v\": \"full\"}, {\"n\": 2, \"s\": [], "
+    "\"v\": \"none\"}]}.")
+CC_WHY = {"figure": "a figure the abstract doesn’t give", "year": "a year the abstract doesn’t give (a paper’s own year is not the year of its data)",
+          "place": "a place the abstract doesn’t name",
+          "world": "the world, where the paper studied one place", "many": "“studies” from one paper", "quote": "words in quotation marks the abstract doesn’t have",
+          "cause": "a cause, where the paper found a link", "group": "people the paper didn’t study", "design": "a kind of study the paper isn’t",
+          "significance": "“significant” or “not significant”, which the abstract doesn’t say", "certainty": "“proves” or “always”, which the abstract doesn’t say",
+          "superlative": "“the most” or “the best”, which the abstract doesn’t say", "share": "a share the abstract’s figures don’t give",
+          "direction": "the opposite of what the paper found", "trend": "a change over time the paper doesn’t show", "scale": "a study bigger or wider than it was",
+          "hedge": "drops the paper’s “may”", "recent": "“recent”, for a paper more than five years old", "first": "“the first”, which the abstract doesn’t say",
+          "all": "“all” or “none”, which the abstract doesn’t say", "long": "a lasting effect the paper doesn’t show", "times": "a ratio the paper’s figures don’t make",
+          "points": "percent where the paper gives percentage points (or the other way round)", "dose": "a gradient the paper doesn’t show",
+          "region": "a group of countries the paper didn’t study", "agree": "agreement or disagreement among studies that the papers don’t show",
+          "current": "“currently”, from a paper more than five years old", "stats": "figures that don’t agree with each other",
+          "measure": "a different measure from the paper’s (prevalence or incidence, mortality or case fatality, odds or risk, a mean or a median, sensitivity or specificity)",
+          "whom": "a share of other people than the paper’s (38% of late users is not 38% of students)",
+          "period": "another period than the paper’s (lifetime, the past year, the past month, the past week)",
+          "absence": "what research hasn’t done (“no study”, “little is known”), which the abstract doesn’t say",
+          "strength": "a stronger or weaker correlation than the paper’s figure or its own word for it",
+          "evidence": "stronger evidence (“strong evidence”, “clearly shows”) than the abstract claims for itself",
+          "whose": "“the most common”, “the leading” or “the main” said of something the paper doesn’t say it of",
+          "often": "another “how often” than the paper’s (daily, weekly, monthly, ever)",
+          "when": "another time than the paper’s (school nights or weekends, the dry or the rainy season, a day or a night shift)"}
+
+
+def _cc_rec(msg):
+    """What a registry record says of a paper, for comparing with an entry."""
+    if not isinstance(msg, dict):
+        return None
+    auth = [a for a in (msg.get("author") or []) if isinstance(a, dict)]
+    pg = _v65._cr_pages(msg)
+    doi = _norm_doi(msg.get("DOI"))
+    return {"title": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", " ".join(str(x) for x in (msg.get("title") or [])[:1]))).strip()[:400],
+            "year": _v65._cr_year(msg), "journal": " ".join(str(x) for x in (msg.get("container-title") or [])[:1]).strip()[:200],
+            "type": str(msg.get("type") or ""), "volume": str(msg.get("volume") or "").strip()[:20], "first_page": pg.get("first_page", ""),
+            "last_page": pg.get("last_page", ""), "first_surname": str((auth[0].get("family") or auth[0].get("name") or "") if auth else "").strip()[:80],
+            "doi": doi, "url": f"https://doi.org/{doi}" if doi else "", "gone": _v65._cr_withdrawn(msg), "abstract": str(msg.get("abstract") or ""),
+            # (for the entry as the record has it, written in the person's own style)
+            "authors": [((a.get("given") or "") + " " + (a.get("family") or "")).strip() or str(a.get("name") or "") for a in auth][:60],
+            "issue": str(msg.get("issue") or "").strip()[:20], "article": bool(pg.get("article")),
+            "online_year": _cc_date_year(msg, "published-online"),       # 6.6, round 44: the year it came out online
+            # 6.6, round 61: a book's publisher, a chapter's editors (its book is "journal": the record's container title)
+            "publisher": re.sub(r"\s+", " ", str(msg.get("publisher") or "")).strip()[:160], "editors": _v65._cr_authors(msg, "editor")[:12],
+            "journal_abbrev": _v65.journal_abbrev(msg),                     # 6.6, round 67
+            "corrected": _v65._cr_corrected(msg)}                           # 6.6, round 94: a published correction to it
+
+
+def _cc_date_year(msg, key):
+    try:
+        y = int(((msg.get(key) or {}).get("date-parts") or [[None]])[0][0])
+        return y if 1500 <= y <= 2100 else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+CC_STYLE_NAMES = {"apa": "APA 7", "harvard": "Harvard", "mla": "MLA 9", "chicago": "Chicago", "vancouver": "Vancouver", "ieee": "IEEE"}
+
+
+def _cc_style(refs):
+    """The style the person's reference list is written in (most of its entries), or "apa"."""
+    votes = _cc_style_votes(refs)
+    return votes.most_common(1)[0][0] if votes else "apa"
+
+
+def _cc_style_sure(refs, style):
+    """6.6, round 68: whether the list shows that style itself (a third of its entries or more, at least one), not by the
+    default alone: a note that only one style asks for (the comma before the year) is said only then."""
+    return _cc_style_votes(refs).get(style, 0) >= max(1, (len(refs) + 2) // 3)
+
+
+def _cc_comma_notes(cites, style, sure):
+    """6.6, round 68: how the person's citations in brackets separate the name from the year, as the list's style asks.
+    ({citation: note}, None) for one or two of them; for three or more ({}, one line naming them), so the same note isn't
+    said again and again. Nothing when the list doesn't show its style."""
+    if not sure:
+        return {}, None
+    fixes = {}
+    for c in cites:
+        if c.get("ref") and c["text"] not in fixes:
+            f = _cc66.comma_fix(c, style)
+            if f:
+                fixes[c["text"]] = f
+    if len(fixes) < 3:
+        return {t: f"{_cc66.COMMA_RULE[style]}: {f}." for t, f in fixes.items()}, None
+    return {}, _cc66.comma_many(list(fixes), style, next(iter(fixes.values())))
+
+
+def _cc_etal_notes(cites):
+    """6.6, round 72: the person's citations whose "et al." isn't written as every style writes it ("et. al.", "et al").
+    As _cc_comma_notes: ({citation: note}, None) for one or two of them, ({}, one line) for three or more."""
+    fixes = {}
+    for c in cites:
+        if c.get("ref") and c["text"] not in fixes:
+            f = _cc66.etal_punct_fix(c)
+            if f:
+                fixes[c["text"]] = f
+    if len(fixes) < 3:
+        return {t: f"{_cc66.ETAL_RULE}: {f}." for t, f in fixes.items()}, None
+    texts = list(fixes)
+    more = len(texts) - 3
+    shown = ", ".join(t if len(t) <= 60 else t[:57].rstrip() + "…)" for t in texts[:3])
+    return {}, {"cite": (shown + (f" and {more} more" if more > 0 else ""))[:200], "note": f"{_cc66.ETAL_RULE}, as in {fixes[texts[0]]}."}
+
+
+def _cc_style_votes(refs):
+    """How many of the list's entries are written in each style (6.6, round 68: shared by _cc_style and _cc_style_sure)."""
+    votes = Counter()
+    numbered = _cc66.is_numbered(refs)
+    for r in refs:
+        t = r["text"]
+        if numbered:
+            votes["ieee" if re.search(r"[“\"][^”\"]{3,},[”\"]", t) or re.search(r"\bvol\.\s*\d", t) else "vancouver"] += 1
+        elif re.search(r"\((?:19|20)\d{2}[a-z]?\)\s+[‘']", t) or "Available at:" in t:
+            votes["harvard"] += 1
+        elif re.search(r"\((?:19|20)\d{2}[a-z]?(?:,[^)]*)?\)\.\s", t):
+            votes["apa"] += 1
+        elif re.search(r"\.\s(?:19|20)\d{2}[a-z]?\.\s+[“\"]", t):
+            votes["chicago"] += 1
+        elif re.search(r"[“\"][^”\"]{3,}\.[”\"]", t) and re.search(r"\bvol\.\s*\d|\bpp?\.\s*\d", t):
+            votes["mla"] += 1
+    return votes
+
+
+def _cc_as_record(rec, style, evidence=""):
+    """The entry as the publisher's record has it, in the person's style ("" when the record is too thin to write one).
+    evidence: the paper's abstract and the person's writing, for its title's sentence case (6.6, round 51)."""
+    if not rec or not rec.get("title") or not rec.get("authors"):
+        return ""
+    src = {"title": rec["title"], "authors": rec["authors"], "year": rec.get("year"), "venue": rec.get("journal") or None, "doi": rec.get("doi"),
+           "abstract": str(evidence or "")[:20000],
+           "url": rec.get("url") or "", "biblio": {k: v for k, v in (("volume", rec.get("volume")), ("issue", rec.get("issue")),
+                                                                  ("first_page", rec.get("first_page")), ("last_page", rec.get("last_page")),
+                                                                  ("article", rec.get("article"))) if v},
+           "kind": "conference" if rec.get("type") == "proceedings-article" else "book" if rec.get("type") in _v65._CR_BOOKISH else "article",
+           "preprint": rec.get("type") == "posted-content",
+           # 6.6, round 61: a chapter written as a chapter (its book, editors and publisher), a book with its publisher
+           "chapter": rec.get("type") in _v65._CR_CHAPTER, "publisher": rec.get("publisher") or "", "editors": rec.get("editors") or [],
+           "journal_abbrev": rec.get("journal_abbrev") or ""}
+    try:
+        if style in NUM_STYLES:
+            return numbered_ref(src, style)
+        e = enrich_sources([src], style)[0]
+        return " ".join(x for x in (e["ref_text"], e.get("url") or "", e.get("ref_after") or "") if x).replace("*", "")
+    except Exception:
+        return ""
+
+
+_CC_OWN = re.compile(r"\b(?:our|we|us|this\s+(?:study|research|survey|thesis|project|work)|the\s+(?:present|current)\s+(?:study|research|survey|"
+                     r"findings?|results?)|in\s+this\s+(?:study|research|survey|sample)|the\s+(?:findings|results)\s+of\s+this)\b", re.I)
+
+
+def _cc_figures_ok(sentence, abstract):
+    """6.6, round 34: every figure a person's cited sentence gives is in its papers' abstracts (written there in digits
+    or in words, the same share in words, rounded as people round it), counting the same thing; the checks research
+    writing uses (_rs_figures_ok, then each figure's noun). A sentence's statistics are worked out again elsewhere
+    (stats66): here only whether the abstract gives its figures."""
+    if _CC_OWN.search(str(sentence or "")):
+        return True              # (6.6, round 42: "Our 38% is higher than the 30% Mensah (2021) found": its own figure isn't the paper's)
+    plain = re.sub(r"(?<![\w.,\-/])(?:1[89]\d{2}|20\d{2})(?![\w%])", " ", _v65.bare(sentence))      # (a year is years_ok's)
+    if not re.search(r"\d|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|sixty|seventy|"
+                     r"eighty|ninety|hundred|half|third|quarter|twice|thrice|double|triple)\w*\b", plain, re.I):
+        return True
+    if not _rs_figures_ok(plain, abstract):
+        return False
+    qd = _rs_digits(_rs_scaled(abstract), False)
+    nums = _c45_numbers(_rs_unp(_rs_pp_mask(_rs_scaled(_rs_unratio(plain)), qd)))
+    return not nums or _c45_numbers_in(nums, qd)
+
+
+def _cc_find(ref):
+    """The entry's paper in the registry: (status, record). status: "found", "doi_unknown", "doi_other", "doi_mismatch",
+    "not_found" or "unreached"."""
+    entry = ref["text"]
+    if ref.get("doi"):
+        try:
+            st, js = _v65_get("https://api.crossref.org/works/" + ref["doi"], None)
+        except Exception:
+            return "unreached", None
+        if st == 200 and isinstance(js, dict) and isinstance(js.get("message"), dict):
+            rec = _cc_rec(js["message"])
+            if rec["title"] and not _cc66.title_in(entry, rec["title"]):
+                return "doi_mismatch", rec
+            return "found", rec
+        if st == 404:
+            try:
+                s2, h = _v65_get("https://doi.org/api/handles/" + ref["doi"], None)
+            except Exception:
+                return "unreached", None
+            if s2 == 200 and isinstance(h, dict) and h.get("responseCode") == 1:
+                return "doi_other", None
+            found = _cc_query(ref)
+            return "doi_unknown", found
+        return "unreached", None
+    found = _cc_query(ref)
+    if found is False:
+        return "unreached", None
+    if not found and _cc66.looks_book(entry):
+        book = _cc_book(ref)                    # 6.6, round 17: a book Crossref doesn't have, at Open Library
+        if book:
+            return "book", book
+    return ("found", found) if found else ("not_found", None)
+
+
+def _cc_book(ref):
+    """6.6, round 17: the entry's book at Open Library (its title and first author only are sent), or None."""
+    from urllib.parse import urlencode
+    title = _cc66.book_title(ref["text"])
+    if len(title) < 4:
+        return None
+    q = {"title": title[:200], "limit": 5, "fields": "title,author_name,first_publish_year,publish_year,publisher,key"}
+    if ref.get("surname"):
+        q["author"] = str(ref["surname"])[:80]
+    try:
+        st, js = _v65_get("https://openlibrary.org/search.json?" + urlencode(q), None)
+    except Exception:
+        return None
+    if st != 200 or not isinstance(js, dict):
+        return None
+    return _cc66.book_match(ref["text"], ref.get("surname"), js.get("docs"))
+
+
+def _cc_query(ref):
+    """Crossref's match for an entry with no DOI (its bibliographic search), checked: the record's title is the entry's,
+    its year within a year of the entry's, its first author in the entry. None when nothing fits; False when unreachable."""
+    from urllib.parse import urlencode
+    q = re.sub(r"https?://\S+", " ", ref["text"])[:600]
+    try:
+        st, js = _v65_get("https://api.crossref.org/works?" + urlencode({"query.bibliographic": q, "rows": 3}), None)
+    except Exception:
+        return False
+    if st != 200 or not isinstance(js, dict):
+        return False
+    for it in ((js.get("message") or {}).get("items") or [])[:3]:
+        rec = _cc_rec(it)
+        if not rec or not rec["title"] or not _cc66.title_in(ref["text"], rec["title"]):
+            continue
+        if rec["year"] and ref.get("year") and abs(rec["year"] - ref["year"]) > 1:
+            continue
+        if rec["first_surname"] and _cc66.norm_name(rec["first_surname"]) not in _cc66.norm_name(ref["text"]):
+            continue
+        return rec
+    return None
+
+
+def _cc_abstracts(dois):
+    """{doi: (abstract, retracted)} from OpenAlex, one request for every DOI."""
+    out = {}
+    if not dois:
+        return out
+    try:
+        st, js = _v65_get("https://api.openalex.org/works", {"filter": "doi:" + "|".join("https://doi.org/" + d for d in dois[:50]),
+                                                             "select": "doi,is_retracted,abstract_inverted_index", "per-page": 50})
+    except Exception:
+        return out
+    if st == 200 and isinstance(js, dict):
+        for w in js.get("results") or []:
+            d = _norm_doi((w or {}).get("doi"))
+            if d:
+                out[d] = (_cc_text(None, w), w.get("is_retracted") is True)
+    return out
+
+
+def _cc_text(jats, work=None):
+    """An abstract as plain words: the registry's (JATS), else OpenAlex's index of its words; "" when shorter than a
+    couple of sentences."""
+    a = ""
+    if jats:
+        a = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(jats)))).strip()
+        a = re.sub(r"^(?:abstract|summary)\b[\s:.\-–]*", "", a, flags=re.I).strip()
+    inv = (work or {}).get("abstract_inverted_index") if isinstance(work, dict) else None
+    if not a and isinstance(inv, dict):
+        pos = {}
+        for word, idx in inv.items():
+            for i in (idx or []):
+                if isinstance(i, int) and 0 <= i < 6000:
+                    pos[i] = str(word)
+        a = " ".join(pos[i] for i in sorted(pos))
+    return a if len(a) >= 60 else ""
+
+
+def _cc_check(items, deadline):
+    """items: [(i, sentence, {ref n: [abstract sentences]})]. Returns {i: ("full" | "part" | "none", [(ref n, k)])}."""
+    out = {}
+    chunks = [items[k:k + CC_CHUNK] for k in range(0, len(items), CC_CHUNK)]
+
+    def run(chunk):
+        user = "ITEMS:\n" + "\n\n".join(
+            f"{n}. SENTENCE: {s}\n   PAPERS:\n" + "\n".join(f"   R{rn}-S{k}: {t}" for rn, sents in papers.items() for k, t in enumerate(sents))
+            for n, (_i, s, papers) in enumerate(chunk, 1))
+        try:
+            raw = str(call_claude(system_prompt=CC_CHECK_SYSTEM, user_message=user[:60000], max_tokens=min(2400, 60 * len(chunk) + 300),
+                                  timeout=max(5, min(70, deadline - time.time())), feature="cite-check") or "")
+            obj = _rs_json(raw)
+        except Exception as e:
+            logger.warning(f"Check my citations: the check didn't run ({_why(e)})")
+            return {}
+        got = {}
+        for it in obj.get("items") or []:
+            try:
+                n = int(str(it.get("n"))) if re.fullmatch(r"\d{1,3}", str(it.get("n") or "")) else None
+                if not n or not 1 <= n <= len(chunk):
+                    continue
+                i, _s, papers = chunk[n - 1]
+                v = str(it.get("v") or "").strip().lower()
+                labels = []
+                ok = True
+                for lab in (it.get("s") or [])[:4]:
+                    m = re.fullmatch(r"\s*R(\d{1,3})\s*-\s*S(\d{1,3})\s*", str(lab or ""), re.I)
+                    if not m or int(m.group(1)) not in papers or not 0 <= int(m.group(2)) < len(papers[int(m.group(1))]):
+                        ok = False                 # a label this server didn't give: the claim is void
+                        break
+                    labels.append((int(m.group(1)), int(m.group(2))))
+                if v not in ("full", "part", "none") or not ok or (v != "none" and not labels):
+                    continue
+                got[i] = (v, labels)
+            except Exception:
+                continue
+        return got
+
+    with _futures.ThreadPoolExecutor(max_workers=3) as pool:
+        for got in pool.map(run, chunks):
+            out.update(got or {})
+    return out
+
+
+def _cc_stats_line(notes, n_tests, n_sizes=0):
+    """What the statistics check found, in one line. n_sizes (6.6, round 69): sample sizes worked out again from their
+    formula."""
+    tests = f"{n_tests} test{'' if n_tests == 1 else 's'} worked out again from {'its' if n_tests == 1 else 'their'} own figures" if n_tests else ""
+    sizes = f"{n_sizes} sample size{'' if n_sizes == 1 else 's'} worked out again from {'its' if n_sizes == 1 else 'their'} formula" if n_sizes else ""
+    if not notes:
+        if n_sizes:
+            return ("Your statistics: " + (tests + ", and each p-value is what its statistic gives; " if n_tests else "") + sizes
+                    + (", as written." if n_sizes == 1 else ", each as written."))
+        return "Your statistics: " + (tests + ", and each p-value is what its statistic gives." if n_tests else "nothing found that doesn’t add up.")
+    k = len(notes)
+    extra = "; ".join(x for x in (tests, sizes) if x)
+    hyp = sum(1 for n in notes if isinstance(n, dict) and n.get("kind") == "hypothesis")      # 6.6, round 97
+    what = ("on figures that don’t add up" if not hyp else "on how a hypothesis is stated" if hyp == k
+            else "on figures that don’t add up and how a hypothesis is stated")
+    return f"Your statistics: {k} note{'' if k == 1 else 's'} {what}" + (f" ({extra})." if extra else ".")
+
+
+@app.route("/api/cite-check", methods=["POST", "OPTIONS"])
+@limiter.limit(AI_LIMIT, key_func=_account_or_ip_key)
+@auth_required
+@_once
+def cite_check_endpoint():
+    started = time.time()
+    deadline = started + CC_SECONDS
+    data = request.get_json(silent=True) or {}
+    text = str(data.get("text") or "")
+    if len(text.strip()) < 40:
+        return jsonify({"error": "Paste your writing with its reference list."}), 400
+    if len(text) > _cc66.TEXT_MAX:
+        return jsonify({"error": f"That is too long to check at once ({_cc66.TEXT_MAX:,} characters at most). Check it in parts."}), 400
+    body, entries = _cc66.split_writing(text)
+    st_notes, n_tests = _st66.check(body)            # 6.6, round 8: the statistics it reports, worked out again
+    try:                                              # 6.6, round 69: a sample size worked out again from its formula
+        sz_notes, n_sizes = _st66.sample_check(body)
+    except Exception as e:                            # (a fault here never stops the check)
+        logger.error(f"Check my citations: the sample size check failed ({_why(e)})")
+        sz_notes, n_sizes = [], 0
+    st_notes = st_notes + sz_notes
+    if not entries:
+        if st_notes or n_tests or n_sizes:
+            return jsonify({"refs": [], "sentences": [], "orphans": [], "cite_notes": [], "list_notes": [], "stats": st_notes, "n_tests": n_tests,
+                            "n_sizes": n_sizes, "summary": [_cc_stats_line(st_notes, n_tests, n_sizes)], "numbered": False, "style": "", "style_name": "", "second": False,
+                            "stats_only": True, "note": "No reference list was found, so only your statistics were checked. This didn’t use any points."})
+        return jsonify({"error": "Your reference list wasn’t found. Put it after your writing, under a heading such as References.",
+                        "no_refs": True}), 400
+    user = request.current_user
+    gate = _scholar_gate(user, "Check my citations", research=True)
+    if gate:
+        return gate
+    try:
+        charged = _log_sage_message_and_consume(user, POINTS_ASK_RESEARCH, research=True)
+    except ConversionError as e:
+        return _points_reply(e)
+    try:
+        this_year = datetime.now(timezone.utc).year
+        refs = _cc66.fill_repeated_authors([_cc66.read_reference(e, i) for i, e in enumerate(entries)])     # 6.6, round 28: "---."
+        numbered = _cc66.is_numbered(refs)
+        style = _cc_style(refs)
+        mla_names = {_cc66.norm_name(r.get("surname")) for r in refs if r.get("surname")} if style == "mla" else None   # 6.6, round 10
+        cites = _cc66.match(_cc66.find_citations(body, numbered, mla_names), refs, style)
+        # 1. each entry's paper, in its registry
+        found = {}
+        with _futures.ThreadPoolExecutor(max_workers=2) as pool:
+            for r, res in zip(refs, pool.map(_cc_find, refs)):
+                found[r["n"]] = res
+        dois = sorted({rec["doi"] for st, rec in found.values() if rec and rec.get("doi") and st in ("found",)})
+        oa = _cc_abstracts(dois)
+        unreached = sum(1 for st, _r in found.values() if st == "unreached")
+        # 2. what the person is told of each entry
+        uses = Counter(c["ref"] for c in cites if c.get("ref"))
+        out_refs = []
+        for r in refs:
+            st, rec = found.get(r["n"], ("unreached", None))
+            if st == "book":                            # 6.6, round 17: a book, found at Open Library
+                note = _cc66.book_years_note(r.get("year"), rec.get("years"))
+                out_refs.append({"n": r["n"], "text": r["text"], "surname": r.get("surname") or "", "year": r.get("year"), "status": "book",
+                                 "diffs": [note] if note else [], "add": "", "fixed": "", "uses": uses.get(r["n"], 0), "style_notes": _cc66.style_notes(r["text"], style, body),
+                                 "record": {"title": rec["title"], "year": rec.get("first_year"), "journal": "", "doi": None, "url": rec["url"], "source": "openlibrary",
+                                            "authors": rec["authors"][:3], "publisher": rec["publisher"]}, "_abstract": ""})
+                continue
+            ab, retracted = oa.get((rec or {}).get("doi") or "", ("", False))
+            gone = (rec or {}).get("gone") or ("retracted" if retracted else "")
+            if st == "found" and gone:
+                st = gone
+            diffs = _cc66.compare(r, rec) if (st == "found" and rec) else []
+            if st == "found" and diffs:
+                st = "differs"
+            if st == "not_found" and r.get("undated") == "press":      # 6.6, round 24
+                diffs = ["It is in press: a work not yet published is often not in the registry yet. Check it again once it is "
+                         "out, and give its year in the text and the list then."]
+            src_note = _cc66.source_note(r["text"])                 # 6.6, round 31: Wikipedia, a copy on a sharing site
+            if src_note:
+                diffs = list(diffs) + [src_note]
+            cy = (rec or {}).get("corrected") if st in ("found", "differs") else None     # 6.6, round 94: a published correction
+            if cy is not None:
+                diffs = list(diffs) + [f"Its journal has published a correction to it{f' ({cy})' if cy else ''}: check what you cite "
+                                       f"from it against the correction."]
+            fut = _cc66.future_note(r, this_year) if st not in ("found", "differs") else ""     # 6.6, round 80: a year still to come
+            if fut:
+                diffs = [fut] + list(diffs)
+            add = _cc66.offer_doi(r, rec) if st in ("found", "differs") else ""
+            abstract = ab or (_cc_text(rec.get("abstract")) if rec else "")
+            # 6.6, round 9: the entry as APA 7 itself writes one; round 51: a title capitalised the other way, in every style
+            sty = _cc66.style_notes(r["text"], style, body + " " + abstract)
+            fixed = _cc_as_record(rec, style, abstract + " " + body) if st == "differs" or (st == "found" and (add or sty)) else ""
+            out_refs.append({"n": r["n"], "text": r["text"], "surname": r.get("surname") or "", "year": r.get("year"), "status": st, "diffs": diffs,
+                             "add": add, "fixed": fixed, "uses": uses.get(r["n"], 0), "style_notes": sty,
+                             "record": {k: (rec or {}).get(k) for k in ("title", "year", "journal", "doi", "url")} if rec else None,
+                             "_abstract": abstract if st in ("found", "differs") else ""})
+        by_n = {x["n"]: x for x in out_refs}
+        # 3. each cited sentence, against its papers' abstracts
+        sents = _g66.split_material(body)
+        checked = []
+        items = []
+        for t in sents:
+            here = [c for c in _cc66.match(_cc66.find_citations(t, numbered, mla_names), refs, style) if c.get("ref")]
+            if not here:
+                continue
+            ns = sorted({c["ref"] for c in here})
+            papers = {}
+            for n in ns:
+                abs_ = by_n[n]["_abstract"]
+                if abs_:
+                    papers[n] = [x for x in _rs_split(abs_)][:40]
+            entry = {"s": t[:600], "refs": ns, "verdict": "unread", "quotes": [], "notes": [],
+                     "why": "book" if all(by_n[n]["status"] == "book" for n in ns) else ""}      # (a book has no abstract to check it against)
+            for n in ns:                                 # 6.6, round 35: a retracted paper backs nothing
+                st_n = by_n[n]["status"]
+                if st_n in ("retracted", "concern"):
+                    who = (by_n[n].get("surname") or "").strip() + (f" ({by_n[n]['year']})" if by_n[n].get("year") else "")
+                    entry["notes"].append(f"It cites a retracted paper, {who}: a retracted paper can’t back a sentence, so find other "
+                                          f"evidence for it." if st_n == "retracted" else
+                                          f"It cites {who}, a paper under an expression of concern: its findings are in doubt, so "
+                                          f"check them or find other evidence.")
+            if _cc66.quote_needs_page(t, here):         # 6.6, round 7: a direct quotation needs its page
+                c0 = str(here[0]["text"])
+                eg = (c0[:-1] + ", p. 4)") if c0.endswith(")") else c0
+                entry["notes"].append(f"A direct quotation needs its page number, for example {eg}.")
+            if papers:                                   # 6.6, round 8: the abstract's own words, without quotation marks
+                run = _cc66.copied_run(t, " ".join(" ".join(v) for v in papers.values()))
+                if run:
+                    entry["notes"].append(_cc66.copied_note(run))
+            checked.append(entry)
+            if papers and len(items) < _cc66.SENTS_MAX:
+                items.append((len(checked) - 1, t[:600], papers))
+        got = _cc_check(items, deadline - 25) if items else {}
+        verify = []
+        for i, s_, papers in items:
+            v, labels = got.get(i, (None, []))
+            if v is None:
+                checked[i]["verdict"] = "unchecked"
+                continue
+            quoted = " ".join(papers[rn][k] for rn, k in labels)
+            checked[i]["quotes"] = [{"ref": rn, "t": papers[rn][k]} for rn, k in labels][:4]
+            if v == "none":
+                checked[i]["verdict"] = "none"
+                continue
+            all_text = " ".join(" ".join(x) for x in papers.values())
+            years = [by_n[rn]["record"]["year"] for rn in papers if by_n[rn].get("record") and by_n[rn]["record"].get("year")]
+            why = [w for w in _v65.claim_problems(s_, quoted, all_text, len(papers), years, this_year=this_year) if w != "stats"]
+            if not _cc_figures_ok(s_, all_text):         # 6.6, round 34: every figure of the sentence is in its abstract
+                why = ["figure"] + why
+            if why:                      # (the writing's statistics have their own section)
+                checked[i]["verdict"] = "further"
+                checked[i]["why"] = "; ".join(CC_WHY.get(w, w) for w in why[:3])
+                continue
+            checked[i]["verdict"] = v
+            if v == "full":
+                verify.append((i, s_, " ".join(f"({by_n[rn]['text'][:60]}) {papers[rn][k]}" for rn, k in labels)))
+        second = _v65_verify(verify, deadline, feature="cite-check") if verify else None
+        if second:
+            bad, _answered = second
+            for i, why in bad.items():
+                checked[i]["verdict"] = "part"
+                checked[i]["why"] = str(why or "")[:160]
+        orphans = []
+        for c in cites:
+            if c.get("ref"):
+                continue
+            if (c.get("mla") and not c.get("short_title")) or (not c.get("year") and not c.get("num") and not c.get("undated") and not c.get("short_title")):
+                continue                 # (a parenthesis that only looks like a citation; "(… in press)" and "(… n.d.)" are citations)
+            if c["text"] not in [o["cite"] for o in orphans]:
+                orphans.append({"cite": c["text"][:120], "hint": _cc66.near_miss(c, refs)})
+        # 6.6, round 7: how each citation names its authors, as the list's style asks ("et al.")
+        cite_notes, seen_notes = [], set()
+        try:                                            # 6.6, round 68: the comma between the name and the year
+            comma_one, comma_all = _cc_comma_notes(cites, style, _cc_style_sure(refs, style))
+        except Exception as e:                          # (a fault here never stops the check)
+            logger.error(f"Check my citations: the comma check failed ({_why(e)})")
+            comma_one, comma_all = {}, None
+        try:                                            # 6.6, round 72: "et al." with one full stop, after "al"
+            etal_one, etal_all = _cc_etal_notes(cites)
+        except Exception as e:
+            logger.error(f"Check my citations: the et al. check failed ({_why(e)})")
+            etal_one, etal_all = {}, None
+        for c in cites:
+            if not c.get("ref") or c["text"] in seen_notes:
+                continue
+            x = by_n.get(c["ref"]) or {}
+            rec_authors = len(found.get(c["ref"], (None, None))[1].get("authors") or []) if (found.get(c["ref"], (None, None))[1] and
+                                                                                       x.get("status") in ("found", "differs")) else 0
+            n_auth = rec_authors or _cc66.entry_authors(x.get("text"))
+            note = _cc66.etal_note(c, n_auth if n_auth < 100 else 0, style)
+            rec_c = found.get(c["ref"], (None, None))[1] if x.get("status") in ("found", "differs") else None
+            pnote = _cc66.page_note(c, rec_c)               # 6.6, round 13: a page the paper doesn't have
+            anote = _cc66.amp_note(c, n_auth, style)        # 6.6, round 30: "&" or "and"
+            bnote = _cc66.ambiguity_note(c, refs, style)    # 6.6, round 45: two works that would both be "Osei et al., 2023"
+            cnote = comma_one.get(c["text"], "")            # 6.6, round 68: "(Mensah, 2021)" or "(Mensah 2021)"
+            enote = etal_one.get(c["text"], "")             # 6.6, round 72: "et al." with one full stop
+            note = " ".join(n for n in (note, pnote, anote, bnote, enote, cnote) if n)
+            if note:
+                seen_notes.add(c["text"])
+                cite_notes.append({"cite": c["text"][:120], "note": note})
+        for one_line in (etal_all, comma_all):
+            if one_line:
+                cite_notes.append(one_line)
+        if style == "apa" and not numbered:             # 6.6, round 92: a secondary citation's original isn't listed too
+            try:
+                cite_notes += [n for n in _cc66.secondary_notes(cites, refs) if n["cite"] not in seen_notes][:4]
+            except Exception as e:
+                logger.error(f"Check my citations: the secondary-citation check failed ({_why(e)})")
+        if style == "apa" and not numbered:             # 6.6, round 91: a group's first citation gives its full name
+            try:
+                cite_notes += [n for n in _cc66.group_abbr_notes(cites, refs) if n["cite"] not in seen_notes][:4]
+            except Exception as e:
+                logger.error(f"Check my citations: the group-name check failed ({_why(e)})")
+        if style == "apa" and not numbered:             # 6.6, round 90: several works in one bracket, in the list's order
+            try:
+                cite_notes += [n for n in _cc66.order_notes(body, cites) if n["cite"] not in seen_notes][:4]
+            except Exception as e:
+                logger.error(f"Check my citations: the order check failed ({_why(e)})")
+        if style == "apa":                              # 6.6, round 89: a quotation of 40 words or more
+            try:
+                for q in _cc66.long_quotes(body)[:3]:
+                    cite_notes.append({"cite": "“" + q + " …”", "note": "A quotation of 40 words or more is set as a block in APA 7: on its own "
+                                       "lines, indented, without quotation marks, with its citation after the final full stop."})
+            except Exception as e:
+                logger.error(f"Check my citations: the long-quotation check failed ({_why(e)})")
+        try:                                            # 6.6, round 140: a claim with no source in its paragraph
+            cite_notes += _cc66.uncited_claims(body, cites)[:4]
+        except Exception as e:
+            logger.error(f"Check my citations: the uncited-claims check failed ({_why(e)})")
+        for x in out_refs:
+            x.pop("_abstract", None)
+        list_notes = _cc66.list_notes(refs, cites, numbered, CC_STYLE_NAMES.get(style, "APA 7"))     # 6.6, round 8: the list itself
+        try:                                            # 6.6, round 88: two works of one author and year, with no letters
+            sy = _cc66.same_year_note(refs, style) if not numbered else ""
+        except Exception as e:
+            logger.error(f"Check my citations: the same-year check failed ({_why(e)})")
+            sy = ""
+        if sy:
+            list_notes.append(sy)
+        n_refs = len(out_refs)
+        cnt = Counter(x["status"] for x in out_refs)
+        vc = Counter(x["verdict"] for x in checked)
+        summary = []
+        bits = [f"{cnt['found']} found as written" if cnt["found"] else "",
+                f"{cnt['book']} book{'' if cnt['book'] == 1 else 's'} found at Open Library" if cnt["book"] else "", f"{cnt['differs']} with details that differ from the publisher’s record" if cnt["differs"] else "",
+                f"{cnt['not_found'] + cnt['doi_unknown'] + cnt['doi_mismatch']} that couldn’t be confirmed" if cnt["not_found"] + cnt["doi_unknown"] + cnt["doi_mismatch"] else "",
+                f"{cnt['retracted']} retracted" if cnt["retracted"] else "", f"{cnt['concern']} under an expression of concern" if cnt["concern"] else "",
+                f"{cnt['doi_other']} with a DOI registered elsewhere" if cnt["doi_other"] else "", f"{cnt['unreached']} not looked up this time" if cnt["unreached"] else ""]
+        summary.append(f"{n_refs} reference{'' if n_refs == 1 else 's'}: " + ", ".join(b for b in bits if b) + ".")
+        if checked:
+            vb = [f"{vc['full']} backed by their paper’s abstract" if vc["full"] else "", f"{vc['part']} partly backed" if vc["part"] else "",
+                  f"{vc['further']} saying more than the abstract" if vc["further"] else "", f"{vc['none']} not found in the abstract" if vc["none"] else "",
+                  f"{vc['unread'] + vc['unchecked']} not checked (no abstract to read)" if vc["unread"] + vc["unchecked"] else ""]
+            summary.append(f"{len(checked)} cited sentence{'' if len(checked) == 1 else 's'}: " + ", ".join(b for b in vb if b) + ".")
+        never = [x["n"] for x in out_refs if not x["uses"]]
+        n_notes = len(cite_notes) + sum(len(x.get("notes") or []) for x in checked)
+        if n_notes:
+            summary.append(f"{n_notes} note{'' if n_notes == 1 else 's'} on how citations are written ({CC_STYLE_NAMES.get(style, 'APA 7')}).")
+        if orphans or never:
+            summary.append(" ".join(b for b in (f"{len(orphans)} citation{'' if len(orphans) == 1 else 's'} with no entry in your list." if orphans else "",
+                                                 f"{len(never)} entr{'y' if len(never) == 1 else 'ies'} never cited in the text." if never else "") if b))
+        n_list = len(list_notes) + sum(len(x.get("style_notes") or []) for x in out_refs)
+        if n_list:
+            summary.append(f"{n_list} note{'' if n_list == 1 else 's'} on your reference list itself.")
+        if st_notes or n_tests or n_sizes:
+            summary.append(_cc_stats_line(st_notes, n_tests, n_sizes))
+        # 6.6, round 10: how recent the sources are (a literature review is usually asked for recent work; said, not judged)
+        yrs = [((x.get("record") or {}).get("year") if x["status"] in ("found", "differs") else None) or x.get("year") for x in out_refs]
+        yrs = [y for y in yrs if isinstance(y, int) and 1500 < y <= this_year]
+        if len(yrs) >= 3:
+            old = sum(1 for y in yrs if this_year - y > 10)
+            summary.append(f"Your sources’ years: {min(yrs)}–{max(yrs)}" + (f"; {old} of {len(yrs)} are more than ten years old." if old else "; none is more than ten years old."))
+        logger.info(f"Check my citations: {n_refs} references ({dict(cnt)}), {len(cites)} citations, {len(checked)} sentences ({dict(vc)}), "
+                     f"{unreached} not reached, {time.time() - started:.0f}s")
+        return jsonify({"refs": out_refs, "sentences": checked, "orphans": orphans, "cite_notes": cite_notes, "list_notes": list_notes,
+                        "stats": st_notes, "n_tests": n_tests, "n_sizes": n_sizes, "summary": summary, "numbered": numbered,
+                        "style": style, "style_name": CC_STYLE_NAMES.get(style, "APA 7"),
+                        "second": bool(second), "note": "RamzAI read each paper’s abstract, not the whole paper: a sentence not found there may "
+                                                         "still be in the paper itself, so check it there."})
+    except Exception as e:
+        logger.warning(f"Check my citations failed: {_why(e)}")
+        _refund_sage_message(user, charged, POINTS_ASK_RESEARCH, research=True)
+        return jsonify({"error": "RamzAI couldn’t finish checking your citations. Please try again. This didn’t use any points."}), 502
 
 
 if "fake" not in os.environ.get("DATABASE_URL", "fake"):

@@ -194,12 +194,41 @@ def _numbers(text):
     return out
 
 
+# 6.6, round 73 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a choice on a defence slide names only the methods
+# the work itself names. Its quoted source was checked, and its figures, but not the method it names: a slide could say
+# "Simple random sampling" beside the work's own sentence about stratified sampling, and the person would defend a method
+# they didn't use. Each kind below, named in a choice, must be named somewhere in the work (in any of its usual spellings).
+METHOD_TERMS = (
+    r"cross[\s-]*sectional", r"case[\s-]*control", r"\bcohorts?\b", r"longitudinal", r"quasi[\s-]*experiment\w*",
+    r"randomi[sz]ed\s+control(?:led)?\s+trials?|\bRCTs?\b", r"phenomenolog\w*", r"grounded\s+theory", r"ethnograph\w*",
+    r"case[\s-]*stud(?:y|ies)", r"mixed[\s-]*methods?", r"correlational", r"simple\s+random", r"stratifi\w*",
+    r"systematic\s+(?:random\s+)?sampl\w*", r"cluster\s+(?:random\s+)?sampl\w*", r"multi[\s-]*stage", r"convenien(?:ce|t)",
+    r"purposi(?:ve|vely)|purposeful(?:ly)?", r"snowball\w*|chain[\s-]*referral", r"quota\s+sampl\w*",
+    r"\bcensus\b|total\s+population\s+sampl\w*", r"chi[\s-]*squ?are|\u03c7\s*(?:\u00b2|2)", r"\bt[\s-]*tests?\b",
+    r"\banova\b|analysis\s+of\s+variance", r"mann[\s-]*whitney", r"kruskal", r"wilcoxon", r"logistic\s+regression",
+    r"linear\s+regression", r"\bpearson", r"\bspearman", r"thematic\w*|\bthemes?\b", r"content\s+analysis", r"factor\s+analysis",
+    r"fisher['\u2019]?s?\s+exact", r"focus[\s-]*groups?|\bFGDs?\b", r"\bspss\b|statistical\s+package\s+for\s+(?:the\s+)?social\s+sciences?",
+    r"\bstata\b", r"\bn\s?vivo\b", r"atlas\.?\s?ti\b", r"\bepi\s?info\b", r"\bexcel\b", r"\blikert\b")
+_METHOD_RX = [re.compile(x, re.I) for x in METHOD_TERMS]
+_CONTRAST = re.compile(r"\b(?:rather\s+than|instead\s+of|over|unlike|not|than|compared\s+(?:with|to)|as\s+opposed\s+to|such\s+as|like|"
+                       r"alternatives?\s+(?:such\s+as|like|to|of)|other\s+(?:designs|methods|options)\s+(?:such\s+as|like)|whereas|while)"
+                       r"\s+(?:a\s+|an\s+|the\s+|using\s+|use\s+of\s+)?(?:[\w-]+\s+){0,2}$", re.I)
+_STAGED = {i for i, x in enumerate(METHOD_TERMS) if x.startswith(("stratifi", "cluster", "multi"))}
+_INNER = {i for i, x in enumerate(METHOD_TERMS) if x.startswith(("simple", "systematic"))}
+_INNER_WORDS = re.compile(r"\bstrat(?:um|a)\b|\bstages?\b|\bclusters?\b|\beach\s+(?:year|group|level|class|school|ward)\b", re.I)
+
+
 class Work:
     """The work, ready to be checked against."""
     def __init__(self, text):
         self.text = str(text or "")
         self.norm = " " + _norm(self.text) + " "
         self.numbers = _numbers(self.text)
+        self.methods = {i for i, rx in enumerate(_METHOD_RX) if rx.search(self.text)}
+
+    def methods_ok(self, text):
+        """Every method the text names is one the work names (6.6, round 73)."""
+        return all(i in self.methods for i, rx in enumerate(_METHOD_RX) if rx.search(str(text or "")))
 
     def has(self, quote):
         """Are these the work's own words? Exactly; or, for a copy with a slip in it, most of its runs of four words."""
@@ -213,6 +242,20 @@ class Work:
         hit = sum(1 for r in runs if " " + r + " " in self.norm)
         return len(words) >= 6 and hit >= max(2, int(len(runs) * 0.6 + 0.999))
 
+    def methods_said_ok(self, text):
+        """6.6, round 107: what is said or answered names only the methods the work names, unless it sets one against another
+        ("stratified rather than simple random sampling", "instead of a cohort", "not purposive"): the person would defend a
+        method they didn't use (the choice itself is held to methods_ok, with no such room)."""
+        t = str(text or "")
+        staged = bool(self.methods & _STAGED) and _INNER_WORDS.search(t)     # (simple random within each stratum is still stratified)
+        for i, rx in enumerate(_METHOD_RX):
+            if i in self.methods or (staged and i in _INNER):
+                continue
+            for m in rx.finditer(t):
+                if not _CONTRAST.search(t[max(0, m.start() - 48):m.start()]):
+                    return False
+        return True
+
     def figures_ok(self, text):
         """Every figure in the text is in the work. (A single digit is a count of points more often than a figure.)"""
         return all(n in self.numbers for n in _numbers(text) if len(n.replace(".", "")) > 1 or "." in n)
@@ -223,8 +266,8 @@ def _words(v, cap, clean):
 
 
 def _sentences_ok(text, work):
-    """A text without the sentences that carry a figure the work does not have."""
-    keep = [s for s in re.split(r"(?<=[.!?])\s+", str(text or "").strip()) if s and work.figures_ok(s)]
+    """A text without the sentences that carry a figure the work does not have, or name a method it doesn't (round 107)."""
+    keep = [s for s in re.split(r"(?<=[.!?])\s+", str(text or "").strip()) if s and work.figures_ok(s) and work.methods_said_ok(s)]   # (round 107)
     return " ".join(keep).strip()
 
 
@@ -239,7 +282,7 @@ def read_item(key, raw, work, clean, strip=_same):
         return None
     cap = 6 if key in LISTS else 3
     what = [w for w in (strip(_words(x, 260, clean)) for x in (raw.get("what") if isinstance(raw.get("what"), list) else [raw.get("what")])) if w][:cap]
-    what = [w for w in what if work.figures_ok(w)]
+    what = [w for w in what if work.figures_ok(w) and work.methods_ok(w)]        # (6.6, round 73: and its methods)
     if not what or not work.has(raw.get("src")):
         return None
     why = []
@@ -249,7 +292,7 @@ def read_item(key, raw, work, clean, strip=_same):
         if not isinstance(r, dict):
             continue
         t = strip(_words(r.get("t"), 240, clean))
-        if not t or not work.figures_ok(t):
+        if not t or not work.figures_ok(t) or not work.methods_said_ok(t):         # (6.6, round 107: and its methods)
             continue
         why.append({"t": t, "own": bool(r.get("src")) and work.has(r.get("src"))})
     why = (sorted(why, key=lambda r: not r["own"]))[:4]
@@ -276,7 +319,7 @@ def read_literature(raw, work, clean, strip=_same):
         if not isinstance(t, dict) or not work.has(t.get("src")):
             continue
         h = _words(t.get("h"), 90, clean)
-        pts = [p for p in (strip(_words(x, 260, clean)) for x in (t.get("points") or [])) if p and work.figures_ok(p)][:3]
+        pts = [p for p in (strip(_words(x, 260, clean)) for x in (t.get("points") or [])) if p and work.figures_ok(p) and work.methods_ok(p)][:3]
         if h and pts:
             themes.append({"h": h, "points": pts})
     if not themes:

@@ -51,6 +51,37 @@ import pypdf
 import pdfplumber
 
 
+def _why_c(e):
+    """6.6, round 128: an exception as the server's log may say it, its kind and where it happened in our files, never its
+    message (a message can quote a line of the person's file; the privacy notice says the logs never hold that)."""
+    try:
+        where, tb = "", getattr(e, "__traceback__", None)
+        while tb is not None:
+            name = tb.tb_frame.f_code.co_filename
+            if os.path.dirname(os.path.abspath(name)) == os.path.dirname(os.path.abspath(__file__)):
+                where = f" at {os.path.basename(name)} line {tb.tb_lineno}"
+            tb = tb.tb_next
+        return type(e).__name__ + where
+    except Exception:
+        return type(e).__name__
+
+
+def _stderr_safe(err, keep=14):
+    """6.6, round 128: a helper process's error output as the log may keep it: where it failed (file, line, function) and
+    the kind of each exception, never a message."""
+    text = err.decode("utf-8", "replace") if isinstance(err, (bytes, bytearray)) else str(err or "")
+    out = []
+    for line in text.splitlines():
+        m = re.match(r'^\s*File "([^"]+)", line (\d+)(?:, in ([\w<>.]+))?', line)
+        if m:
+            out.append(f"  {os.path.basename(m.group(1))} line {m.group(2)}" + (f" in {m.group(3)}" if m.group(3) else ""))
+            continue
+        m = re.match(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt))\b", line)
+        if m:
+            out.append(m.group(1).rsplit(".", 1)[-1])
+    return "\n".join(out[-keep:]) or "(no traceback)"
+
+
 class ConversionError(Exception):
     pass
 
@@ -5404,7 +5435,7 @@ def _p2w_run(src_path, out_dir, slides=False, notes=None, used=0.0):
     if not isinstance(res, dict) or not res.get("ok") or not os.path.exists(res["ok"]):
         import logging as _logging
         _logging.getLogger(__name__).error("PDF to %s failed (exit %s): %s", "slides" if slides else "Word", proc.returncode,
-                                           (err or b"").decode("utf-8", "replace")[-1500:])
+                                           _stderr_safe(err))
         raise ConversionError(P2W_FAILED if not slides else P2W_FAILED.replace("a Word file", "slides"))
     return res["ok"], (res.get("info") or {})
 
@@ -12998,7 +13029,7 @@ def _essay_docx(payload, out_dir, out_path):
                                     [(bm, label, f"{n} {cap}") for bm, label, n, cap in caps])
         except Exception as e:
             import logging as _logging
-            _logging.getLogger("academic-home").warning(f"Contents page numbers not worked out: {e}")
+            _logging.getLogger("academic-home").warning(f"Contents page numbers not worked out: {_why_c(e)}")
         # 5.5: a contents page only where the writing is long. (Until 5.5 any piece with three headings or one table
         # opened on a page that held its title, "Contents" and "List of Tables" and nothing else: a one-page answer
         # became two pages, the first almost empty.)
@@ -13027,7 +13058,7 @@ def _essay_docx(payload, out_dir, out_path):
             _review_notes(doc, len(payload.get("references") or []), str(payload.get("kind") or ""))
         except Exception as e:
             import logging as _logging
-            _logging.getLogger("academic-home").warning(f"Review notes not added: {e}")
+            _logging.getLogger("academic-home").warning(f"Review notes not added: {_why_c(e)}")
     _finish_docx(doc, getattr(doc, "_ah_title", None) or payload.get("title") or "", _DOC_SUBJECTS.get(str(payload.get("kind") or ""), ""), front.get("author") or "")
     doc.save(out_path)
     return out_path
@@ -13076,7 +13107,7 @@ def proposal_to_docx(payload, out_dir):
             pages = _laid_out_pages(first, probe, heads, [])
         except Exception as e:
             import logging as _logging
-            _logging.getLogger("academic-home").warning(f"Proposal: the contents' page numbers were not worked out: {e}")
+            _logging.getLogger("academic-home").warning(f"Proposal: the contents' page numbers were not worked out: {_why_c(e)}")
         doc, heads = _build_proposal(payload, pages)
         if any(bm not in pages for bm, _ in heads):
             _ask_word_to_update(doc)
@@ -13085,7 +13116,7 @@ def proposal_to_docx(payload, out_dir):
                 _review_notes(doc, len(payload.get("references") or []), "proposal")
             except Exception as e:
                 import logging as _logging
-                _logging.getLogger("academic-home").warning(f"Proposal: review notes not added: {e}")
+                _logging.getLogger("academic-home").warning(f"Proposal: review notes not added: {_why_c(e)}")
         doc.save(out_path)
         return out_path
     finally:
@@ -13558,9 +13589,12 @@ def _build_proposal(payload, pages):
         # the two signature lines, kept on one page with the words of consent above them
         doc.paragraphs[-1].paragraph_format.keep_with_next = True
         cw = [text_w * 0.42, text_w * 0.33, text_w * 0.25]
-        t = _prop_table(doc, cw, 4, grid=False, header=False, centre=True)
-        for k, who in enumerate(("participant", "researcher")):
-            for ci, label in enumerate((f"Name of {who}", "Signature", "Date")):
+        # 6.6, round 64: for children, the parent or guardian's consent, the child's assent and the researcher (three lines)
+        whos = (("parent or guardian", "child", "researcher") if any(c.get("h") == "Assent of the child" for c in consent)
+                else ("participant", "researcher"))
+        t = _prop_table(doc, cw, 2 * len(whos), grid=False, header=False, centre=True)
+        for k, who in enumerate(whos):
+            for ci, label in enumerate((f"Name of {who}", "Signature" if who != "child" else "Signature or mark", "Date")):
                 top = _prop_cell(t.cell(2 * k, ci), "", width=cw[ci])
                 top.paragraph_format.space_before = DocxPt(18)
                 _prop_cell(t.cell(2 * k + 1, ci), label, width=cw[ci], size=10.5)

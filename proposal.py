@@ -184,7 +184,10 @@ def clean_plan(raw):
             total = None
         p["budget"].append({"item": _line(b.get("item"), 80), "qty": _line(b.get("qty"), 12), "unit": _line(b.get("unit"), 16), "total": total})
     if len(p["questions"]) != len(p["specific"]):
-        p["questions"] = [question_for(o) for o in p["specific"]]
+        # one question for each objective: the person's own, in their order, as far as they go; then one in the words of
+        # each objective left (6.6, round 33: before, a person's questions were all set aside when there were fewer)
+        given = p["questions"][:len(p["specific"])]
+        p["questions"] = given + [question_for(o) for o in p["specific"][len(given):]]
     return p
 
 
@@ -268,9 +271,42 @@ def _q_plural(phrase):
     while len(words) > 1 and words[-1].endswith(("ed", "ing")):       # "the coping strategies used by…": the noun is before "used"
         words.pop()
     head = words[-1] if words else ""
-    if not head.endswith("s") or head in _Q_ONE or head.endswith(("ness", "ics", "ss", "us", "is")):
-        return False
-    return True
+    plural = lambda w: w.endswith("s") and w not in _Q_ONE and not w.endswith(("ness", "ics", "ss", "us", "is")) and "'" not in w and "’" not in w
+    # 6.6, round 105: "the coping strategies nurses use…", "the challenges nurses face…": the noun comes first
+    first = [w.lower().strip(",;:") for w in phrase.split()[:2]]
+    if first and first[0] in ("the", "a", "an"):
+        first = [w.lower().strip(",;:") for w in phrase.split()[1:3]]
+    if any(plural(w) for w in first) and not any(w in ("of", "for", "in", "on", "to", "towards", "among", "about") for w in first[:1]):
+        return True
+    return plural(head)
+
+
+# 6.6, round 83 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): an objective RamzAI suggests starts with "To" and
+# one measurable verb. "To know", "to understand", "to find out", "to look at" can't be measured or answered by a design: a
+# supervisor's first correction. The person's own objectives are never touched (only RamzAI's suggestions pass here).
+MEASURABLE = ("determine", "assess", "examine", "identify", "describe", "compare", "explore", "establish", "evaluate", "investigate",
+              "measure", "ascertain", "estimate", "analyse", "analyze", "document")
+_VAGUE = (("get to know", "determine"), ("find out", "determine"), ("look into", "examine"), ("look at", "examine"),
+          ("learn about", "describe"), ("know about", "determine"), ("know", "determine"), ("see", "determine"), ("study", "examine"),
+          ("check", "assess"), ("discover", "identify"), ("understand", None), ("appreciate", "describe"), ("be aware of", "assess"))
+
+
+def measurable(objective, qualitative=False):
+    """The objective with a measurable verb ("To know the level of…" -> "To determine the level of…"; "to understand" becomes
+    "to explore" in a qualitative study, "to assess" otherwise); "Assess the…" gets its "To". Anything else stays as it is."""
+    t = str(objective or "").strip()
+    m = re.match(r"^(to\s+)?(.*)$", t, re.I | re.S)
+    has_to, rest = bool(m.group(1)), m.group(2)
+    low = rest.lower()
+    if any(low.startswith(v + " ") for v in MEASURABLE):
+        return t if has_to else "To " + rest[:1].lower() + rest[1:]
+    if not has_to:
+        return t
+    for vague, good in _VAGUE:
+        if low.startswith(vague + " "):
+            good = good or ("explore" if qualitative else "assess")
+            return "To " + good + rest[len(vague):]
+    return t
 
 
 def question_for(objective):
@@ -302,6 +338,36 @@ def question_for(objective):
         return "What %s the %s?" % ("are" if _q_plural(m.group(1)) else "is", m.group(1))
     return "What can be said about %s?" % re.sub(r"^to \w+ ", "", low)
 
+
+
+# 6.6, round 105 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): each research question asks what its own
+# objective sets out to find. RamzAI's suggested questions were taken whenever they came one for each objective, so a question
+# about another objective (or none) could stand under it, and a supervisor checks that line first. A question that shares
+# too little of what tells its objective apart from the others is written again from the objective (question_for); the
+# person's own questions stay as they wrote them.
+def question_fits(objective, question, objectives, plan=None):
+    """True when the question asks about what tells its objective apart from the other objectives (half of those words, at
+    least one), the study's shared topic, people and place aside."""
+    objs = [str(o) for o in (objectives or []) if str(o).strip()]
+    shared = set.intersection(*[_obj_words(o) for o in objs]) if len(objs) > 1 else set()
+    plan = plan or {}
+    shared |= _obj_words(plan.get("population")) | _obj_words(plan.get("setting"))
+    own = _obj_words(objective) - shared
+    if not own:
+        return True
+    hit = own & _obj_words(question)
+    return bool(hit) and len(hit) * 2 >= min(len(own), 4)
+
+
+def fit_questions(objectives, questions, plan=None):
+    """The questions, one for each objective, each asking what its objective sets out to find: one that doesn't is written
+    again from its objective. (questions as RamzAI suggested them; the person's own are never passed here.)"""
+    objs = [str(o) for o in (objectives or [])]
+    out = []
+    for i, o in enumerate(objs):
+        q = str(questions[i]) if i < len(questions or []) else ""
+        out.append(q if q and question_fits(o, q, objs, plan) else question_for(o))
+    return out
 
 # ---------------------------------------------------------------- the parts a proposal is written in
 ORDINALS = ("ONE", "TWO", "THREE", "FOUR", "FIVE")
@@ -501,9 +567,51 @@ def budget(plan):
 
 
 # ---------------------------------------------------------------- informed consent
+# 6.6, round 64 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a study whose participants are children (under 18)
+# asks a parent or guardian for consent and the child for assent. The consent form spoke only to the participant ("I agree
+# to take part"), whoever they were, and chapter three's ethics section was not held to it: a proposal for pupils went out
+# without parental consent, which every ethics committee asks for first.
+_MINOR = re.compile(r"\b(?:pupils?|school\s*children|children|child|kids|adolescents?|teen(?:ager)?s|minors?|juveniles?|infants?|toddlers?|"
+                    r"under[\s-]*(?:fives?|5s?|18s?|eighteens?)|kindergarten\w*|"
+                    r"(?:junior|senior)\s+high\s+(?:school\s+)?(?:students?|pupils?|learners?)|"
+                    r"(?:secondary|high|primary|basic|elementary|middle|junior|senior)\s+school\s+(?:students?|pupils?|learners?)|"
+                    r"(?:jhs|shs)\s*\d?\s+(?:students?|pupils?|learners?)|aged\s+(?:[5-9]|1[0-7])\s*(?:-|\u2013|to)\s*(?:[5-9]|1[0-9])\b)", re.I)
+_ADULT_OF = re.compile(r"\b(?:mothers?|fathers?|parents?|caregivers?|care-givers?|guardians?|teachers?|nurses?|midwives|health\s+workers?|"
+                       r"staff|head\s*teachers?|principals?|carers?|families|households?)\b\s+(?:of|for|with|caring\s+for|who\s+(?:have|care\s+for)|attending)\b",
+                       re.I)
+
+
+def minors(plan):
+    """Do the participants include children (under 18)? From who will be studied (or, when that isn't given, the title):
+    pupils, children, adolescents, secondary-school students; not the adults around them ("mothers of children under
+    five", "teachers of pupils")."""
+    pop = str(plan.get("population") or plan.get("title") or "")
+    return bool(_MINOR.search(pop)) and not _ADULT_OF.search(pop)
+
+
+def ethics_gaps(plan, ethics):
+    """What chapter three's ethics section leaves out for children: ["parent", "assent"] (empty when nothing)."""
+    if not minors(plan):
+        return []
+    t = str(ethics or "")
+    out = []
+    if not re.search(r"\b(?:parents?|guardians?)\b", t, re.I):
+        out.append("parent")
+    if not re.search(r"\bassent\b", t, re.I):
+        out.append("assent")
+    return out
+
+
+ETHICS_MINORS_ASK = ("Write ONLY the ⟦ethics⟧ section again, after its marker. The participants include children (under 18): say "
+                     "that written informed consent will be obtained from each child's parent or guardian, that each child's assent "
+                     "will be sought in words they understand, that a child who does not want to take part will not be included even "
+                     "when a parent has agreed, and that permission will be obtained from the setting; keep the rest of the section.")
+
+
 def consent(plan):
     """The informed consent form: [(heading or "", paragraph)]. Standard wording, filled with what the person gave; a
-    line they didn't give (a contact) is left as a line to write on, never made up."""
+    line they didn't give (a contact) is left as a line to write on, never made up. For children (6.6, round 64): the
+    form speaks to a parent or guardian, and the child gives assent."""
     who = "we" if how_many(plan) > 1 else "I"
     Who = who.capitalize()
     are = "are" if who == "we" else "am"
@@ -519,6 +627,24 @@ def consent(plan):
     task = ("take part in an interview" if plan.get("instrument") in ("interview", "focus_group") else
             "complete a questionnaire and, if you agree, take part in a short interview" if plan.get("instrument") == "questionnaire_interview" else
             "complete %s" % instrument)
+    if minors(plan):
+        return [
+            ("", "Dear parent or guardian. %s. %s %s inviting your child to take part in a research study titled “%s”." % (lead, Who, are, plan.get("title") or "")),
+            ("Purpose of the study", (plan.get("general") or "").replace("To ", "The study aims to ", 1) if plan.get("general") else "The purpose of the study will be explained to you by the researcher."),
+            ("Voluntary participation", "Your child’s taking part is entirely voluntary. You or your child may refuse, your child may decline to answer any question, and you or your "
+                                        "child may withdraw from the study at any time without giving a reason and without any penalty."),
+            ("What your child will be asked to do", "Your child will be asked to %s. This will take about %s, at a time that does not disturb lessons or care." % (task, minutes)),
+            ("Confidentiality", "Your child’s answers will be kept confidential. No name, index number or other detail that could identify your child will appear in any "
+                                "report of the study. The information will be stored securely, will be seen only by the research team, and will be used for academic purposes only."),
+            ("Risks and benefits", "There are no known risks in taking part beyond those of everyday life. Your child will receive no payment or direct benefit, "
+                                   "but the answers will help to improve understanding of the subject of the study."),
+            ("Your child’s agreement", "The study will also be explained to your child in words they understand, and your child will be asked to agree. A child who does not "
+                                       "want to take part will not be included, even when a parent or guardian has agreed. A participant aged 18 or over signs for themselves."),
+            ("Questions", "If you have any question about the study, please contact the researcher%s at %s.%s" % ("s" if who == "we" else "", contact, sup)),
+            ("Consent of the parent or guardian", "I am the parent or guardian of the child named below. I have read and understood the information above, my questions "
+                                                  "have been answered, and I agree that my child may take part in this study."),
+            ("Assent of the child", "The study has been explained to me. I know that I can stop at any time, and I agree to take part."),
+        ]
     return [
         ("", "%s. %s %s inviting you to take part in a research study titled “%s”." % (lead, Who, are, plan.get("title") or "")),
         ("Purpose of the study", (plan.get("general") or "").replace("To ", "The study aims to ", 1) if plan.get("general") else "The purpose of the study will be explained to you by the researcher."),
@@ -647,6 +773,32 @@ def guard_plan_text(text, allowed):
 
 
 # ---------------------------------------------------------------- the words given to the AI
+def fit_methods(plan):
+    """6.6, round 15: a design has its own kinds of sampling, instrument and analysis, whatever was sent (the app keeps the
+    same rule, src/app-54.js _p54Fitting; so does /api/brief/plan): a qualitative study has no random sample, no
+    questionnaire and no statistics; a mixed-methods study has both kinds of instrument and analysis; a quantitative study
+    has statistics. The plan is changed in place and returned."""
+    d = plan.get("design")
+    if d in QUALITATIVE:
+        if plan.get("sampling") not in ("purposive", "snowball", "convenience"):
+            plan["sampling"] = "purposive"
+        if plan.get("instrument") not in ("interview", "focus_group", "observation"):
+            plan["instrument"] = "interview"
+        plan["analysis"] = "thematic"
+    elif d == "mixed":
+        plan["sampling"] = plan.get("sampling") or "stratified"
+        if not plan.get("instrument") or plan.get("instrument") in ("interview", "focus_group"):
+            plan["instrument"] = "questionnaire_interview"
+        plan["analysis"] = "both"
+    elif d:
+        if not plan.get("sampling") or plan.get("sampling") == "snowball":
+            plan["sampling"] = "simple_random"
+        if not plan.get("instrument") or plan.get("instrument") in ("interview", "focus_group", "questionnaire_interview"):
+            plan["instrument"] = "questionnaire"
+        plan["analysis"] = "statistics"
+    return plan
+
+
 def plan_block(plan, sample=None):
     """The person's plan, as lines the AI writes from (and nothing else)."""
     d = plan.get("design")
@@ -730,7 +882,10 @@ def ch3_prompt(plan, sample):
             "recalculate it, and add no allowance (for non-response or anything else) that THE PLAN doesn't give.\n"
             "⟦criteria⟧ Inclusion and Exclusion Criteria: the line 'Inclusion criteria' then three or four bullet points "
             "(each starting '- '), then the line 'Exclusion criteria' then three or four bullet points; each follows from "
-            "THE PLAN's population and setting (who belongs to it, is present during data collection, gives informed consent).\n"
+            "THE PLAN's population and setting (who belongs to it, is present during data collection, gives informed consent). "
+            "An exclusion criterion is a reason to leave out someone who meets every inclusion criterion (for example too ill to "
+            "take part, away during data collection, took part in the pre-test), never an inclusion criterion turned round "
+            "('students who do not consent' only repeats 'students who consent').\n"
             "⟦instrument⟧ Research Instrument (two paragraphs, 150 to 200 words): the instrument in THE PLAN; its sections "
             "(the participants' background, then one section for each specific objective) and how each will be answered"
             + ("" if qual else " (for example a four- or five-point scale of agreement or frequency)") + "; "
@@ -813,6 +968,13 @@ def clean_instrument(raw, plan):
             if not isinstance(s, dict):
                 continue
             qs = [_line(q, 260) for q in (s.get("questions") if isinstance(s.get("questions"), list) else [])[:7] if _line(q, 260)]
+            fair = [q for q in qs if not _leading(q)]          # 6.6, round 65: no question that leads to its answer
+            if len(fair) >= 2:
+                qs = fair
+            title = _line(s.get("title"), 120)
+            if not re.search(r"\bbackground\b|\bdemograph|\bpersonal\s+(?:information|details|data)\b|\bbio-?data\b", title or "", re.I):
+                qs = [x for q in qs for x in split_question(q)][:8]       # 6.6, round 99: one thing in each question
+                qs = [q if _leading(q) else open_question(q) for q in qs]  # 6.6, round 98: open, not yes or no (one kept as drafted stays)
             if qs:
                 secs.append({"title": _line(s.get("title"), 120) or "Section %s" % chr(65 + len(secs)), "questions": qs})
         return {"kind": "guide", "intro": intro, "sections": secs} if len(secs) >= 2 else None
@@ -821,15 +983,442 @@ def clean_instrument(raw, plan):
         if isinstance(b, dict) and _line(b.get("q"), 120):
             opts = [_line(o, 50) for o in (b.get("options") if isinstance(b.get("options"), list) else [])[:6] if _line(o, 50)]
             bg.append({"q": _line(b.get("q"), 120).rstrip(":"), "options": opts})
-    secs = []
+    bg = [dict(b, options=fix_ranges(b["options"])) for b in bg]          # 6.6, round 9: answers that don't overlap or leave a gap
+    secs, seen = [], set()
     for s in (raw.get("sections") if isinstance(raw.get("sections"), list) else [])[:7]:
         if not isinstance(s, dict):
             continue
         items = [re.sub(r"^\d{1,2}[.)]\s*", "", _line(i, 220)) for i in (s.get("items") if isinstance(s.get("items"), list) else [])[:9] if _line(i, 220)]
+        # 6.6, round 9: a statement once in the whole questionnaire; a question ("Do you…?") can't be agreed with or rated
+        # for how often, so it goes when the section keeps three statements without it
+        items = [i for k, i in enumerate(items) if _item_key(i) not in {_item_key(x) for x in items[:k]} and _item_key(i) not in seen]
+        rated = [i for i in items if not i.rstrip().endswith("?")]
+        if len(rated) >= 3:
+            items = rated
+        fair = [i for i in items if not _leading(i)]            # 6.6, round 65: no statement that leads to its answer
+        if len(fair) >= 3:
+            items = fair
+        one = [x for i in items for x in split_statement(i)]     # 6.6, round 99: one thing in each statement
+        if len([x for x in one if x]) >= 3:
+            items = [x for k, x in enumerate(one) if _item_key(x) not in {_item_key(y) for y in one[:k]} and _item_key(x) not in seen][:9]
+        if s.get("scale") == "frequency":
+            items = _fit_frequency(items)
+        seen |= {_item_key(i) for i in items}
         if len(items) >= 3:
             secs.append({"title": _line(s.get("title"), 120) or "Section %s" % chr(66 + len(secs)),
                          "scale": "frequency" if s.get("scale") == "frequency" else "agreement", "items": items})
     return {"kind": "questionnaire", "intro": intro, "background": bg, "sections": secs} if secs else None
+
+
+# 6.6, round 70 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): the instrument answers every specific objective it
+# should (its content validity): a questionnaire one section for each objective a respondent can answer (an objective about a
+# relationship or a difference is answered from the others, the participants' background from its own questions), an
+# interview guide one for each objective. The draft was used as it came: a section left out meant an objective no data would
+# answer, and a draft cut off at its room meant no instrument at all.
+_OBJ_BG = re.compile(r"\b(?:socio[\s-]*demographic|demographic|background\s+(?:characteristics|information|of)|personal\s+characteristics|"
+                     r"characteristics\s+of\s+(?:the\s+)?(?:respondents|participants))", re.I)
+_OBJ_STOP = set("assess determine identify describe examine explore establish investigate document find evaluate measure ascertain analyse "
+                "analyze understand test estimate among amongst towards toward between within level levels extent their there this these those "
+                "about into with from that which what section respondents participants study".split())
+
+
+def _obj_words(t):
+    return {w[:6] for w in re.findall(r"[a-z][a-z’'-]{3,}", str(t or "").lower()) if w not in _OBJ_STOP}
+
+
+def instrument_gaps(plan, tool):
+    """The specific objectives the instrument should answer and has no section for: [(n, objective)] (empty when each has
+    one). Sections are matched to objectives by the words that tell the objectives apart (not the topic, the people or the
+    place, which they share), then in order; only objectives beyond the sections there are can be left without one."""
+    objs = [str(o) for o in (plan.get("specific") or []) if str(o).strip()]
+    if not tool or not objs:
+        return []
+    guide = tool.get("kind") == "guide"
+    need = [(i + 1, o) for i, o in enumerate(objs) if not _OBJ_BG.search(o) and (guide or not (_OBJ_REL.search(o) or _OBJ_DIFF.search(o)))]
+    secs = [str(x.get("title") or "") for x in (tool.get("sections") or []) if isinstance(x, dict)]
+    if guide:
+        secs = [t for t in secs if not re.search(r"\bbackground\b|\bdemograph", t, re.I)]
+    if len(secs) >= len(need):
+        return []
+    shared = set.intersection(*[_obj_words(o) for o in objs]) if len(objs) > 1 else set()
+    shared |= _obj_words(plan.get("population")) | _obj_words(plan.get("setting"))
+    ow = {n: _obj_words(o) - shared for n, o in need}
+    sw = [_obj_words(t) - shared for t in secs]
+    pairs = sorted(((len(ow[n] & sw[k]), n, k) for n, _ in need for k in range(len(secs)) if ow[n] & sw[k]), reverse=True)
+    done_o, done_s = set(), set()
+    for score, n, k in pairs:
+        if n not in done_o and k not in done_s:
+            done_o.add(n)
+            done_s.add(k)
+    left_o = [(n, o) for n, o in need if n not in done_o]
+    left_s = [k for k in range(len(secs)) if k not in done_s]
+    return left_o[len(left_s):]
+
+
+def instrument_ask(gaps):
+    """What the instrument is asked for again, naming the objectives it left without a section."""
+    if not gaps:
+        return "Draft it."
+    return ("Draft it. Your last draft had no section for " + ("this specific objective" if len(gaps) == 1 else "these specific objectives")
+            + ", which the instrument must answer: " + "; ".join("%d. %s" % (n, o.rstrip(".")) for n, o in gaps)
+            + ". Give ONE section for EACH specific objective it should answer, in order, and keep the reply short enough to finish.")
+
+
+# 6.6, round 70: the ethics section says what every ethics committee looks for first: approval, voluntary participation,
+# informed consent, the right to withdraw, confidentiality or anonymity, and how the data will be kept. Chapter three is told
+# to (ch3_prompt); a section that leaves one out is asked for once more, as round 64 does for children.
+ETHICS_BASICS = (
+    ("approval", re.compile(r"\b(?:approv\w*|clearance|ethic\w*\s+(?:review\s+)?(?:committee|board)|review\s+(?:committee|board)|IRB|ERC)\b", re.I),
+     "that ethical approval will be obtained from the relevant ethics review committee (or the body THE PLAN names)"),
+    ("voluntary", re.compile(r"\bvoluntar\w*|\bfree(?:ly)?\s+to\s+(?:take\s+part|participate|decline|refuse)|\bnot\s+(?:be\s+)?(?:forced|coerced|compelled)|"
+                             r"\bwithout\s+(?:any\s+)?(?:coercion|pressure)", re.I), "that taking part is voluntary"),
+    ("consent", re.compile(r"\bconsent\w*", re.I), "that informed consent will be obtained before anyone takes part"),
+    ("withdraw", re.compile(r"\bwithdr[ae]w\w*|\bpull\s+out\b|\bleave\s+the\s+study|\bstop\s+(?:taking\s+part|participating)|\bdiscontinue", re.I),
+     "that participants may withdraw at any time without any penalty"),
+    ("confidentiality", re.compile(r"\bconfidential\w*|\banonym\w*|\bprivacy\b|\bno\s+names?\b|\bcodes?\b", re.I),
+     "how confidentiality and anonymity will be kept (no names on the instrument, codes instead)"),
+    ("keeping", re.compile(r"(?:^|(?<=[.!?;]))(?=[^.!?;]*\b(?:data|questionnaires?|records?|information|recordings?|transcripts?|forms?|responses|"
+                           r"files?|notes)\b)(?=[^.!?;]*\b(?:kept|keep\w*|stor\w*|lock\w*|password\w*|secur\w*|safe\w*|destroy\w*|delet\w*|dispos\w*|"
+                           r"access\w*|encrypt\w*)\b)", re.I),
+     "how the data will be kept safe and who may see it"),       # (in one sentence with what is kept: "Confidentiality will be kept" isn't it)
+)
+
+
+def ethics_basics(ethics):
+    """What the ethics section leaves out of the basics: ["approval", "voluntary", …] (empty when nothing)."""
+    t = str(ethics or "")
+    return [k for k, rx, _ in ETHICS_BASICS if not rx.search(t)]
+
+
+def ethics_ask(minor_gaps, basic_gaps):
+    """The ethics section asked for again: round 64's words for children, and the basics it left out."""
+    words = {k: w for k, _, w in ETHICS_BASICS}
+    more = [words[k] for k in basic_gaps if k in words]
+    if minor_gaps and not more:
+        return ETHICS_MINORS_ASK
+    tail = ("It must also say " + "; ".join(more) + "; keep the rest of the section.") if more else ""
+    if minor_gaps:
+        return ETHICS_MINORS_ASK[:-len("; keep the rest of the section.")] + ". " + tail
+    return "Write ONLY the ⟦ethics⟧ section again, after its marker. " + tail
+
+
+# 6.6, round 63 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a quantitative proposal's analysis names, for an
+# objective that asks about a relationship or a difference, a test that can answer it. Chapter three is told to (ch3_prompt),
+# and nothing checked it: "frequencies and percentages" alone can't answer "to determine the relationship between sleep and
+# grades", and a supervisor marks the method as unable to meet its objective.
+_OBJ_DIFF = re.compile(r"\b(?:differen\w*|differ|compar\w*|vary|varies|between\s+(?:male|female|men|women|boys|girls|rural|urban|"
+                       r"public|private)\b)", re.I)
+_OBJ_REL = re.compile(r"\b(?:relationships?|relat(?:e|es|ed|ing)\s+to|associat\w*|correlat\w*|influenc\w*|effects?\s+of|impacts?\s+of|"
+                      r"predict\w*|determinants?|factors?\s+(?:that\s+)?(?:associated|influencing|affecting|contributing|related|"
+                      r"influence|affect|contribute)|link(?:ed|s)?\s+(?:to|with|between))\b", re.I)
+_TEST_REL = re.compile(r"chi[\s-]*squ?are|\u03c7\s*2|\u03c7\u00b2|correlation|pearson|spearman|kendall|regression|odds\s+ratio|fisher\W?s\s+exact|"
+                       r"test\s+of\s+(?:association|independence|relationship)", re.I)
+_TEST_DIFF = re.compile(r"\bt[\s-]*tests?\b|anova|analysis\s+of\s+variance|mann[\s-]*whitney|kruskal|wilcoxon|chi[\s-]*squ?are|"
+                        r"\u03c7\s*2|\u03c7\u00b2|test\s+of\s+difference|independent[\s-]+samples", re.I)
+
+
+def analysis_gaps(plan, analysis):
+    """The specific objectives of a quantitative (or mixed) plan whose kind of question the analysis names no test for:
+    [(their number, "relationship" or "difference")]. A qualitative plan answers with themes: none."""
+    if plan.get("design") in QUALITATIVE or plan.get("analysis") == "thematic" or re.search(
+            r"qualitative|phenomenolog|ethnograph|grounded\s+theory|narrative\s+inquiry", str(plan.get("design_other") or ""), re.I):
+        return []
+    t = str(analysis or "")
+    out = []
+    for i, ob in enumerate(plan.get("specific") or [], 1):
+        if _OBJ_DIFF.search(ob) and not _TEST_DIFF.search(t):
+            out.append((i, "difference"))
+        elif _OBJ_REL.search(ob) and not _TEST_REL.search(t):
+            out.append((i, "relationship"))
+    return out
+
+
+def analysis_ask(gaps):
+    """What chapter three's analysis is asked to add, in words for the AI."""
+    return ("Write ONLY the ⟦analysis⟧ section again, after its marker. It must name, for EACH specific objective, the analysis "
+            "that answers it. " + " ".join(
+                f"Specific objective {n} asks about a {kind}: name the test of {kind} that answers it "
+                + ("(for example the chi-square test of independence for categories, or a correlation for scores)" if kind == "relationship"
+                   else "(for example an independent-samples t-test or ANOVA for scores, or the chi-square test for categories)")
+                + ", at the 0.05 level of significance." for n, kind in gaps))
+
+
+def _item_key(t):
+    return re.sub(r"[^a-z0-9]+", " ", str(t or "").lower()).strip()
+
+
+# 6.6, round 65: a question or statement that leads to its answer is no fair measure: "Don't you think…?", "Wouldn't you
+# agree…?", "Isn't it true that…?", "Do you agree that…?" (in an interview), "How bad is…?" (the answer assumed), "Obviously",
+# "Surely", "Everyone knows that…". It goes while its section keeps enough (two questions, three statements); otherwise it
+# stays as drafted for the person to read.
+_LEADING = re.compile(r"^\s*(?:don['\u2019]?t|doesn['\u2019]?t|didn['\u2019]?t|wouldn['\u2019]?t|shouldn['\u2019]?t|isn['\u2019]?t|aren['\u2019]?t|"
+                      r"wasn['\u2019]?t|weren['\u2019]?t|won['\u2019]?t|can['\u2019]?t|couldn['\u2019]?t)\s+(?:you|it|they|this|that|there|we|people|"
+                      r"students|nurses|patients)\b"
+                      r"|^\s*(?:do|would|wouldn['\u2019]?t)\s+you\s+(?:not\s+)?agree\b|\bisn['\u2019]?t\s+it\s+(?:true|obvious|clear)\b"
+                      r"|\b(?:obviously|surely|undoubtedly|of\s+course)\b|\beveryone\s+knows\b|\bit\s+is\s+(?:obvious|clear)\s+that\b"
+                      r"|^\s*how\s+(?:bad|terrible|harmful|dangerous|awful|good|great|helpful|wonderful|useful)\s+(?:is|are|was|were)\b", re.I)
+
+
+def _leading(t):
+    return bool(_LEADING.search(str(t or "")))
+
+
+# 6.6, round 116 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): an exclusion criterion is a reason to leave out
+# someone who meets every inclusion criterion (too ill to take part, away during data collection, took part in the pre-test);
+# "students who do not give consent" only repeats "students who give informed consent" the other way round, a point
+# supervisors mark. Such a mirror goes while another exclusion criterion stays (chapter three is told so too).
+_CRIT_NEG = re.compile(r"\b(?:not|no|non|never|unwilling(?:ness)?|refus\w*|declin\w*|fail\w*\s+to|without|absent|unable|n['’]t)\b|n['’]t\b", re.I)
+_CRIT_STOP = set("a an the who whom whose which that are is was were be been being will would to of in on at for and or with by as do does did "
+                 "have has had their they them those these students participants respondents nurses persons people individuals "
+                 "willing unwilling refuse refused refusing decline declined declining consent consented consenting give gives given "
+                 "provide provides provided informed written verbal agree agreed agreeing".split())
+
+
+def _crit_words(t):
+    return {w[:6] for w in re.findall(r"[a-z][a-z’'-]{2,}", str(t or "").lower()) if w not in _CRIT_STOP and not _CRIT_NEG.fullmatch(w)}
+
+
+def _crit_consent(t):
+    return bool(re.search(r"\b(?:consent\w*|agree\w*|willing\w*|unwilling\w*|refus\w*|declin\w*)\b", str(t or ""), re.I))
+
+
+def mirror_exclusions(text):
+    """Chapter three's 3.6 without the exclusion criteria that only turn an inclusion criterion round, as long as another
+    exclusion criterion stays."""
+    t = str(text or "")
+    m = re.search(r"(?im)^\s*exclusion\s+criteria\s*:?\s*$", t)
+    if not m:
+        return t
+    inc_part, exc_part = t[:m.start()], t[m.end():]
+    incs = [x.strip() for x in re.findall(r"(?m)^\s*[-•*]\s+(.+)$", inc_part)]
+    lines = exc_part.split("\n")
+    bullets = [(k, re.sub(r"^\s*[-•*]\s+", "", ln).strip()) for k, ln in enumerate(lines) if re.match(r"^\s*[-•*]\s+", ln)]
+    if not incs or len(bullets) < 2:
+        return t
+    mirrors = set()
+    for k, e in bullets:
+        if not _CRIT_NEG.search(e):
+            continue
+        ew = _crit_words(e)
+        for i in incs:
+            iw = _crit_words(i)
+            if _CRIT_NEG.search(i):
+                continue
+            both_consent = _crit_consent(e) and _crit_consent(i)
+            if both_consent or (iw and ew and (ew <= iw or len(iw & ew) * 2 >= len(iw | ew))):
+                mirrors.add(k)
+                break
+    if not mirrors or len(mirrors) >= len(bullets):
+        return t
+    kept = [ln for k, ln in enumerate(lines) if k not in mirrors]
+    return t[:m.end()] + "\n".join(kept)
+
+
+# 6.6, round 98: an interview guide's questions are open. A question that can be answered "yes" or "no" ("Do you use your phone
+# at night?") gives the interviewer a word, not an account. One about an objective with no open probe after it is given one,
+# "(Please tell me more.)", which keeps the question and asks for the account. "Can you describe…", "Could you tell me…",
+# "Is there anything else…?" and the background section are left as they are.
+_CLOSED_Q = re.compile(r"^\s*(?:do|does|did|is|are|was|were|have|has|had|will|would|should|could|can|may|must|shall)\b"
+                       r"(?!\s+(?:you|u)\s+(?:please\s+)?(?:describe|tell|explain|share|talk|walk|give|say\s+(?:more|something)|elaborate|narrate|"
+                       r"expand|recall|list|mention|outline|discuss|comment|think\s+(?:of|about)\s+(?:a|an|any|some)\b))", re.I)
+_ANYTHING_ELSE = re.compile(r"\banything\s+else\b|\bany\s+other\s+(?:thing|comment|issue|point|idea)s?\b|\bwould\s+you\s+like\s+to\s+add\b", re.I)
+_OPEN_PROBE = re.compile(r"\((?=[^)]*\b(?:how|what|why|when|where|who|which|explain|describe|tell|examples?|elaborate|more|probe)\b)[^)]*\)\s*\.?\s*$", re.I)
+OPEN_PROBE = "(Please tell me more.)"
+
+
+def open_question(q):
+    """A question of an interview guide's objective section, open: a yes-or-no question with no open probe gets one."""
+    q = str(q or "").strip()
+    if not q or not _CLOSED_Q.match(q) or _ANYTHING_ELSE.search(q) or _OPEN_PROBE.search(q):
+        return q
+    return q + " " + OPEN_PROBE
+
+
+# 6.6, round 99: one thing at a time. A statement that rates two things ("I use my phone in bed and I sleep late") can't be
+# answered for either: it becomes two statements when it is two simple ones (each "I …", three words or more), else it goes
+# while its section keeps three. An interview question that asks two things ("What do you use your phone for at night, and
+# how does it affect your sleep?", or two questions in one line) becomes two questions; a probe in brackets stays whole.
+_TWO_I = re.compile(r"^(?P<a>I\s+[^,;()]+?)(?:,\s*|\s+)(?:and|or|but)\s+(?P<b>I\s+[^;()]+?)[.!]?$")
+_TWO_Q = re.compile(r"^(?P<a>[^()?]+?),?\s+and\s+(?P<b>(?:how|what|why|when|where|who|which|in\s+what\s+ways?)\b[^()?]+\?)(?P<probe>\s*\([^)]*\))?\s*$", re.I)
+
+
+def _words(t):
+    return len(re.findall(r"[A-Za-z’']+", str(t or "")))
+
+
+def split_statement(i):
+    """[i] as it is, [two statements] for one that is two simple ones, or [] for one that rates two things otherwise."""
+    t = str(i or "").strip()
+    two = [m for m in re.finditer(r"(?:,\s*|\s)(?:and|or)\s+I\s+\w", t)
+           if not re.search(r"\b(?:my|our|the|his|her|their|your)\s+[\w’'-]+(?:\s+[\w’'-]+)?$", t[:m.start()], re.I)]   # ("my friends and I")
+    if not two:
+        return [t]
+    m = _TWO_I.match(t)
+    if m and len(two) == 1 and _words(m.group("a")) >= 4 and _words(m.group("b")) >= 4:
+        return [m.group("a").strip() + ".", m.group("b").strip().rstrip(".") + "."]
+    return []
+
+
+def split_question(q):
+    """[q] as it is, or the two questions it asks."""
+    t = str(q or "").strip()
+    probe = ""
+    pm = re.search(r"\s*\([^)]*\)\s*\.?\s*$", t)
+    core = t[:pm.start()].strip() if pm else t
+    probe = t[pm.start():].strip() if pm else ""
+    parts = [x.strip() for x in re.split(r"(?<=\?)\s+(?=[A-Z])", core) if x.strip()]
+    if len(parts) == 2 and all(_words(x) >= 3 and x.endswith("?") for x in parts):
+        return [parts[0], (parts[1] + (" " + probe if probe else "")).strip()]
+    m = _TWO_Q.match(core + (" " + probe if probe else ""))
+    if m and _words(m.group("a")) >= 6 and _words(m.group("b")) >= 4:
+        b = m.group("b").strip()
+        return [m.group("a").strip().rstrip(",") + "?", (b[:1].upper() + b[1:] + (m.group("probe") or "")).strip()]
+    return [t]
+
+
+# 6.6, round 62 (the owner, 21 Nov 2026 00:47: "Raise the app's validity."): a statement rated for how often (Never to Always)
+# that says its own frequency ("I always check my phone after midnight") can't be answered: "Sometimes" to "always" means
+# nothing. A word that only says how often goes ("I check my phone after midnight"); a statement that says "never",
+# "rarely" or "seldom" turns round without it ("I never skip breakfast" is not "I skip breakfast"), so it goes, as long as
+# its section keeps three statements (then it stays as it was: the person reads the draft).
+_FREQ_POS = re.compile(r"\s*\b(?:always|often|usually|sometimes|frequently|regularly|occasionally|constantly|generally|normally|"
+                       r"typically|habitually|at\s+times|all\s+the\s+time|most\s+of\s+the\s+time|every\s+(?:single\s+)?(?:day|night|"
+                       r"week|time|morning|evening)|most\s+(?:days|nights|weeks|mornings|evenings))\b", re.I)
+_FREQ_NEG = re.compile(r"\b(?:never|rarely|seldom|hardly\s+ever|almost\s+never|not\s+often)\b", re.I)
+
+
+def _fit_frequency(items):
+    out = []
+    for it in items:
+        if _FREQ_NEG.search(it):
+            continue
+        t = re.sub(r"\s{2,}", " ", _FREQ_POS.sub("", it)).strip()
+        t = re.sub(r"\s+([,.;:])", r"\1", t).strip(" ,")
+        out.append(t[:1].upper() + t[1:] if t else it)
+    if len(out) >= 3:
+        return [i for k, i in enumerate(out) if _item_key(i) not in {_item_key(x) for x in out[:k]}]
+    return [re.sub(r"\s{2,}", " ", _FREQ_POS.sub("", it)).strip() or it for it in items]
+
+
+# ---------------------------------------------------------------- 6.6, round 13: a proposal tells what WILL be done
+# A proposal's method is a plan: "Data were collected", "Participants were recruited" or "The results showed" claim work
+# that hasn't been done. In chapter three (its setting apart: a place's history is past) and the abstract's methodology and
+# analysis, a sentence about the study's own steps is put in the future ("will be collected"); a sentence that reports
+# results the study can't have yet is left out. A sentence with a year in it, or about earlier work, is left as it is.
+_PROC_NOUN = re.compile(r"\b(?:data|participants?|respondents?|questionnaires?|interviews?|sample|samples|consent|approval|permission|"
+                        r"instruments?|pre-?test(?:ing)?|pilot|analysis|responses|information|students|nurses|patients|the\s+study|"
+                        r"the\s+researchers?|focus\s+groups?|records?|scores?|items?|variables?|confidentiality|anonymity)\b", re.I)
+_PAST_PASSIVE = re.compile(r"\b(?:was|were)\s+((?:\w+ly\s+)?(?:collected|conducted|analy[sz]ed|recruited|selected|sampled|interviewed|"
+                           r"administered|obtained|sought|distributed|coded|entered|cleaned|checked|pre-?tested|piloted|used|employed|"
+                           r"adopted|applied|computed|calculated|determined|estimated|summari[sz]ed|presented|described|compared|tested|"
+                           r"assessed|measured|explained|informed|assured|given|asked|invited|approached|included|excluded|stored|kept|"
+                           r"transcribed|translated|recorded|gathered|retrieved|reviewed|approved|granted|performed|carried\s+out|done|"
+                           r"guaranteed|maintained|protected|ensured|trained|visited|contacted|allocated|assigned|randomi[sz]ed|weighted))\b", re.I)
+_PAST_ACTIVE = {"collected": "collect", "administered": "administer", "obtained": "obtain", "recruited": "recruit", "selected": "select",
+                "used": "use", "analysed": "analyse", "analyzed": "analyze", "employed": "employ", "adopted": "adopt", "conducted": "conduct",
+                "sought": "seek", "interviewed": "interview", "distributed": "distribute", "visited": "visit", "explained": "explain",
+                "ensured": "ensure", "assured": "assure", "recorded": "record", "transcribed": "transcribe", "coded": "code", "entered": "enter"}
+_ACTIVE_RX = re.compile(r"\b((?:the|a|each)\s+(?:researchers?|research\s+assistants?|study\s+team|investigators?|study))\s+(" + "|".join(_PAST_ACTIVE) + r")\b", re.I)
+_RESULTS_SAID = re.compile(r"\b(?:the\s+)?(?:results?|findings?)\s+(?:of\s+(?:the|this)\s+study\s+)?(?:showed|revealed|indicated|demonstrated|"
+                           r"found|suggested|confirmed)\b|\bit\s+was\s+found\s+that\b|\bthe\s+study\s+found\b", re.I)
+_EARLIER = re.compile(r"\b(?:19|20)\d{2}\b|\b(?:previous|previously|earlier|prior|past|other)\s+(?:stud|research|work|surveys?|researchers?)|\bwas\s+established\b", re.I)
+
+
+def future_tense(text):
+    """A proposal's method in the future ("Data were collected" -> "Data will be collected"; "The researcher administered"
+    -> "The researcher will administer"); a sentence reporting results the study can't have yet is taken out. Only sentences
+    about the study's own steps change; one with a year or about earlier work stays as it is."""
+    out = []
+    for para in str(text or "").split("\n"):
+        sents = re.split(r"(?<=[.!?])\s+(?=[A-Z(“\"])", para) if para.strip() else [para]
+        kept = []
+        for snt in sents:
+            if _EARLIER.search(snt):
+                kept.append(snt)
+                continue
+            if _RESULTS_SAID.search(snt):
+                continue                                   # (a plan has no results yet)
+            if _PROC_NOUN.search(snt):
+                snt = _PAST_PASSIVE.sub(lambda m: "will be " + m.group(1), snt)
+                snt = _ACTIVE_RX.sub(lambda m: m.group(1) + " will " + _PAST_ACTIVE[m.group(2).lower()], snt)
+            kept.append(snt)
+        out.append(" ".join(k for k in kept if k is not None))
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- 6.6, round 9: number ranges a respondent can answer
+_N = r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?"            # 500, 1,000, 2.5
+_OPT_RANGE = re.compile(r"^(?P<pre>\D*?)(?P<a>" + _N + r")(?P<sep>\s*(?:-|–|—|to)\s*)(?P<cur>[^\d\s]{0,4})(?P<b>" + _N + r")(?P<post>\D*)$", re.I)
+_OPT_BELOW = re.compile(r"^\s*(?:below|under|less\s+than|fewer\s+than|younger\s+than|<)\s*(?P<cur>[^\d\s]{0,4})(?P<a>" + _N + r")(?P<post>\D*)$", re.I)
+_OPT_ATLEAST = re.compile(r"^\s*(?P<cur>[^\d\s]{0,4})(?P<a>" + _N + r")(?P<mid>\s*\+|\D*?\b(?:and|or)\s+(?:above|over|more|older|longer)\b)(?P<post>.*)$", re.I)
+_OPT_ABOVE = re.compile(r"^\s*(?:above|over|more\s+than|greater\s+than|older\s+than|>)\s*(?P<cur>[^\d\s]{0,4})(?P<a>" + _N + r")(?P<post>\D*)$", re.I)
+
+
+def _num_fmt(x, dec, commas=False):
+    return (f"{x:,.{dec}f}" if commas else f"{x:.{dec}f}") if dec else (f"{int(round(x)):,}" if commas else str(int(round(x))))
+
+
+def fix_ranges(options):
+    """The answer options of a background question whose answers are numbers ("18-24", "25–29 years", "Below 18",
+    "30 and above", "Above 30", "GH₵500–1,000"), made to neither overlap nor leave a gap ("20-25", "25-30" -> "20-24",
+    "25-30"; "18-20", "22-25" -> "18-21", "22-25"; "25-29", "Above 30" -> "25-30", "Above 30"; "Below 18", "19-24" ->
+    "Below 18", "18-24"). Options that aren't all numbers, or aren't in rising order, are left as they are."""
+    parsed = []
+    for o in options:
+        t = str(o or "")
+        for kind, rx in (("range", _OPT_RANGE), ("below", _OPT_BELOW), ("atleast", _OPT_ATLEAST), ("above", _OPT_ABOVE)):
+            m = rx.match(t)
+            if m:
+                parsed.append((kind, m))
+                break
+        else:
+            return list(options)
+    if len(parsed) < 2:
+        return list(options)
+    nums = [m.group(g) for _k, m in parsed for g in ("a", "b") if g in m.groupdict() and m.group(g)]
+    dec = max((len(x.split(".")[1]) for x in nums if "." in x), default=0)
+    commas = any("," in x for x in nums)
+    step = 10 ** -dec
+    lo_hi = []
+    for kind, m in parsed:
+        a = float(m.group("a").replace(",", ""))
+        if kind == "range":
+            b = float(m.group("b").replace(",", ""))
+            if b < a:
+                return list(options)
+            lo_hi.append((a, b))
+        elif kind == "below":
+            lo_hi.append((float("-inf"), a - step))
+        elif kind == "atleast":
+            lo_hi.append((a, float("inf")))
+        else:
+            lo_hi.append((a + step, float("inf")))
+    if any(lo_hi[k + 1][0] < lo_hi[k][0] for k in range(len(lo_hi) - 1)) or any(h == float("inf") for _l, h in lo_hi[:-1]):
+        return list(options)                  # (not in rising order, or an open top before the end)
+    out = [str(o) for o in options]
+    eps = step / 10
+    for k in range(len(parsed) - 1):
+        (kind, m), (nkind, nm) = parsed[k], parsed[k + 1]
+        hi, nlo = lo_hi[k][1], lo_hi[k + 1][0]
+        if abs(nlo - (hi + step)) < eps:
+            continue                          # (they meet exactly)
+        if kind == "range" and nlo - step > lo_hi[k][0] + eps:
+            nb = nlo - step                   # the earlier range ends where the next begins
+            out[k] = out[k][:m.start("b")] + _num_fmt(nb, dec, commas) + out[k][m.end("b"):]
+            lo_hi[k] = (lo_hi[k][0], nb)
+        elif kind == "range" and nkind == "range" and hi + step < lo_hi[k + 1][1] - eps:
+            na = hi + step                    # ("1-2", "2-4": "1-1" is no range) the next one begins after it: "1-2", "3-4"
+            out[k + 1] = out[k + 1][:nm.start("a")] + _num_fmt(na, dec, commas) + out[k + 1][nm.end("a"):]
+            lo_hi[k + 1] = (na, lo_hi[k + 1][1])
+        elif nkind == "range" and kind == "below":
+            na = hi + step                    # "Below 18", "19-24" -> "18-24"
+            out[k + 1] = out[k + 1][:nm.start("a")] + _num_fmt(na, dec, commas) + out[k + 1][nm.end("a"):]
+            lo_hi[k + 1] = (na, lo_hi[k + 1][1])
+        elif nkind == "above" and nlo > hi + step + eps:
+            # "25-29", "Above 30": 30 is nobody's answer -> "30 and above"
+            out[k + 1] = (nm.group("cur") or "") + _num_fmt(hi + step, dec, commas) + (nm.group("post") or "") + " and above"
+            lo_hi[k + 1] = (hi + step, float("inf"))
+    return [re.sub(r"\s{2,}", " ", o).strip() for o in out]
 
 
 SCALES = {"agreement": (("SD", "Strongly disagree"), ("D", "Disagree"), ("A", "Agree"), ("SA", "Strongly agree")),

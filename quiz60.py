@@ -12,7 +12,15 @@ today") or of another kind than the right one. So here:
    the material, and says whether only one option can be defended, whether the wording gives the answer away, and how
    demanding the question really is;
 4. a question that code or the examiner finds fault with is rewritten in one request; the rewrite is taken only when its
-   key is one of its options and code finds nothing in it; otherwise the question stays as it was. Nothing is dropped.
+   key is one of its options and code finds nothing in it; otherwise the question stays as it was;
+5. (6.6, round 48: the owner, 21 Nov 2026: "Raise the app's validity") a rewrite is answered again by an examiner who is
+   not told its key: it is taken when that examiner chooses its key and finds one best answer. A question whose answer an
+   examiner disputed (another option chosen, or more than one defensible) and that has no rewrite so confirmed is LEFT
+   OUT: a practice question must not teach a wrong answer. Unless the examiner disputed more than half of the questions
+   (then the examination itself is in doubt, and nothing is left out for it). A rewrite that only fixed the wording and
+   is not confirmed gives way to the question as it was. No time for the second reading: the rewrite is taken as before;
+6. (round 54) a short-answer question's model answer is checked against the material (KEYCHECK, told the answer); one it
+   finds wrong is left out with its question, unless it finds most of them wrong.
 Nothing here logs a word of anyone's material or questions: the caller logs counts only."""
 import json
 import random
@@ -178,99 +186,206 @@ def _want(level):
     return {"medium": {"foundation"}, "hard": {"foundation"}}.get(level, set())
 
 
+# 6.6, round 54: a short-answer question's model answer, checked against the material (it was never read at all). The
+# checker IS told the answer (a short answer can be right in many words, so an answer written blind can't be compared by
+# code); it says whether that answer is right. A model answer it finds wrong is left out with its question, unless it
+# finds most of them wrong (then the check itself is in doubt).
+KEYCHECK = (
+    "You check the answer key of short-answer practice questions before they are printed. Each QUESTION comes with its "
+    "MODEL ANSWER. Using the MATERIAL below as the facts to go by (and the subject's established knowledge where the material "
+    "says nothing), judge each model answer: \"ok\" when it is right (it may be brief), \"wrong\" when it states something "
+    "false or answers another question, \"unsure\" when you can't tell. Answer with JSON only: [{\"i\": 0, \"v\": \"ok\"}, "
+    "{\"i\": 1, \"v\": \"wrong\", \"why\": \"a few words\"}], one item for each question.")
+
+
+def is_sa(q):
+    return q.get("type") == "short_answer" and bool(str(q.get("correct_answer") or "").strip()) and bool(str(q.get("question") or "").strip())
+
+
+def _check_keys(questions, sa, mat, ask, deadline, now):
+    """The short-answer questions whose model answer the checker finds wrong ([] when none; None when it couldn't run)."""
+    wrong, answered = [], 0
+    for k in range(0, min(len(sa), 60), 20):
+        batch = sa[k:k + 20]
+        items = [dict({"i": i, "question": questions[i].get("question"), "model answer": questions[i].get("correct_answer")},
+                      **({"case": questions[i]["case"]} if questions[i].get("case_study") and questions[i].get("case") else {})) for i in batch]
+        user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS:\n" + json.dumps(items, ensure_ascii=False)
+        got = _json_list(ask(KEYCHECK, user, 120 + 40 * len(batch), max(15, min(60, int(deadline - now() - 30)))))
+        for x in got:
+            if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in batch:
+                answered += 1
+                if str(x.get("v") or "").strip().lower() == "wrong":
+                    wrong.append(x["i"])
+    return wrong if answered else None
+
+
 def harden(questions, difficulty, material, ask, deadline, now=time.time, standalone=lambda s: s):
     """questions as the quiz endpoint parsed them (options already in their final order). ask(system, user, max_tokens,
     timeout) -> the AI's text (it may raise). Returns (questions, stats). Never raises."""
     stats = {"mc": 0, "code": 0, "disagree": 0, "not_one": 0, "giveaway": 0, "low": 0, "asked": 0, "rewritten": 0, "kept": 0,
-             "examined": 0, "failed": False}
+             "examined": 0, "failed": False, "confirmed": 0, "not_confirmed": 0, "left_out": 0, "sa": 0, "sa_wrong": 0}
     try:
-        mc = [i for i, q in enumerate(questions) if is_mc(q)]
-        stats["mc"] = len(mc)
-        if not mc:
-            return questions, stats
-        faults = {i: flags(questions[i]) for i in mc}
-        stats["code"] = sum(1 for i in mc if faults[i])
         mat = _material(material)
-        # ---- the examiner, in batches at once
-        verdict = {}
-        left = deadline - now()
-        if left > 25:
-            batches = [mc[k:k + 25] for k in range(0, len(mc), 25)][:8]
-
-            def examine(batch):
-                items = [_as_item(questions[i], i) for i in batch]
-                user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS:\n" + json.dumps(items, ensure_ascii=False)
-                return _json_list(ask(EXAMINER, user, 200 + 60 * len(batch), max(15, min(70, int(deadline - now() - 40)))))
-            with _futures.ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
-                for f in [pool.submit(examine, b) for b in batches]:
-                    try:
-                        for x in f.result():
-                            if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in faults:
-                                verdict[x["i"]] = x
-                    except Exception:
-                        stats["failed"] = True
-        stats["examined"] = len(verdict)
-        want_up = _want(difficulty)
-        for i, v in verdict.items():
-            q = questions[i]
-            letter = str(v.get("answer") or "").strip().upper()[:1]
-            k = key_index(q)
-            if letter and letter in _letters(len(q["options"])) and _letters(len(q["options"])).index(letter) != k:
-                faults[i].append(f"an examiner who was not told the key chose {letter}, not {_letters(len(q['options']))[k]}")
-                stats["disagree"] += 1
-            if v.get("only_one") is False:
-                faults[i].append("more than one option can be defended as best, or none is right")
-                stats["not_one"] += 1
-            if v.get("giveaway") is True and not is_tf(q):
-                faults[i].append("the wording gives the answer away")
-                stats["giveaway"] += 1
-            if str(v.get("level") or "").lower() in want_up:
-                faults[i].append(f"it is easier than asked (asked: {'specialist' if difficulty == 'hard' else 'exam'} standard)")
-                stats["low"] += 1
-        todo = [i for i in mc if faults[i]]
-        stats["asked"] = len(todo)
-        if not todo or deadline - now() < 30:
-            stats["kept"] = len(todo)
-            return questions, stats
-        # ---- the rewrite, in batches at once
-        level_word = {"easy": "foundation", "medium": "exam standard", "hard": "specialist (licensing-exam) standard"}.get(difficulty, "")
-
-        def rewrite(batch):
-            items = []
-            for i in batch:
-                q = questions[i]
-                it = _as_item(q, i)
-                it["key"] = _letters(len(q["options"]))[key_index(q)]
-                it["explanation"] = q.get("explanation") or ""
-                it["level asked"] = level_word or {"easy": "foundation", "medium": "exam standard", "hard": "specialist"}.get(q.get("difficulty") or "", "exam standard")
-                it["faults"] = faults[i]
-                if is_tf(q):
-                    it["form"] = "true or false: the options stay exactly [\"True\", \"False\"] and the question is a statement"
-                items.append(it)
-            user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS TO REWRITE:\n" + json.dumps(items, ensure_ascii=False)
-            return _json_list(ask(REWRITER, user, 300 + 420 * len(batch), max(15, min(80, int(deadline - now() - 10)))))
-        batches = [todo[k:k + 10] for k in range(0, len(todo), 10)][:6]
-        got = {}
-        with _futures.ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
-            for f in [pool.submit(rewrite, b) for b in batches]:
-                try:
-                    for x in f.result():
-                        if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in faults:
-                            got[x["i"]] = x
-                except Exception:
-                    stats["failed"] = True
-        for i in todo:
-            x, q = got.get(i), questions[i]
-            new = _taken(q, x, standalone)
-            if new:
-                questions[i] = new
-                stats["rewritten"] += 1
-            else:
-                stats["kept"] += 1
-        return questions, stats
+        sa = [i for i, q in enumerate(questions) if is_sa(q)]
+        stats["sa"] = len(sa)
+        pool = _futures.ThreadPoolExecutor(max_workers=1)
+        sa_job = pool.submit(_check_keys, questions, sa, mat, ask, deadline, now) if sa and deadline - now() > 25 else None
+        drop = _harden_mc(questions, difficulty, mat, ask, deadline, now, standalone, stats)
+        if sa_job is not None:
+            try:
+                wrong = sa_job.result(timeout=max(1, deadline - now() + 5))
+            except Exception:
+                wrong = None
+                stats["failed"] = True
+            if wrong:
+                stats["sa_wrong"] = len(wrong)
+                if len(wrong) <= max(1, len(sa) // 2):
+                    drop = list(drop) + list(wrong)
+        pool.shutdown(wait=False)
+        return _left_out(questions, drop, stats), stats
     except Exception:
         stats["failed"] = True
         return questions, stats
+
+
+def _harden_mc(questions, difficulty, mat, ask, deadline, now, standalone, stats):
+    """The multiple-choice questions' checks (see the top of this file): rewrites put in place; returns the questions to
+    leave out (round 48)."""
+    mc = [i for i, q in enumerate(questions) if is_mc(q)]
+    stats["mc"] = len(mc)
+    if not mc:
+        return []
+    faults = {i: flags(questions[i]) for i in mc}
+    stats["code"] = sum(1 for i in mc if faults[i])
+    # ---- the examiner, in batches at once
+    verdict = {}
+    left = deadline - now()
+    if left > 25:
+        batches = [mc[k:k + 25] for k in range(0, len(mc), 25)][:8]
+
+        def examine(batch):
+            items = [_as_item(questions[i], i) for i in batch]
+            user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS:\n" + json.dumps(items, ensure_ascii=False)
+            return _json_list(ask(EXAMINER, user, 200 + 60 * len(batch), max(15, min(70, int(deadline - now() - 40)))))
+        with _futures.ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+            for f in [pool.submit(examine, b) for b in batches]:
+                try:
+                    for x in f.result():
+                        if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in faults:
+                            verdict[x["i"]] = x
+                except Exception:
+                    stats["failed"] = True
+    stats["examined"] = len(verdict)
+    want_up = _want(difficulty)
+    disputed = set()                                 # (round 48: the examiner chose another answer, or found no one best)
+    for i, v in verdict.items():
+        q = questions[i]
+        letter = str(v.get("answer") or "").strip().upper()[:1]
+        k = key_index(q)
+        if letter and letter in _letters(len(q["options"])) and _letters(len(q["options"])).index(letter) != k:
+            faults[i].append(f"an examiner who was not told the key chose {letter}, not {_letters(len(q['options']))[k]}")
+            stats["disagree"] += 1
+            disputed.add(i)
+        if v.get("only_one") is False:
+            faults[i].append("more than one option can be defended as best, or none is right")
+            stats["not_one"] += 1
+            disputed.add(i)
+        if v.get("giveaway") is True and not is_tf(q):
+            faults[i].append("the wording gives the answer away")
+            stats["giveaway"] += 1
+        if str(v.get("level") or "").lower() in want_up:
+            faults[i].append(f"it is easier than asked (asked: {'specialist' if difficulty == 'hard' else 'exam'} standard)")
+            stats["low"] += 1
+    todo = [i for i in mc if faults[i]]
+    stats["asked"] = len(todo)
+    # the examination is trusted to leave questions out only when it disputed at most half of what it read
+    trusted = bool(verdict) and len(disputed) <= max(1, len(verdict) // 2)
+    if not todo or deadline - now() < 30:
+        drop = [i for i in todo if i in disputed] if trusted else []
+        stats["kept"] = len(todo) - len(drop)
+        return drop
+    # ---- the rewrite, in batches at once
+    level_word = {"easy": "foundation", "medium": "exam standard", "hard": "specialist (licensing-exam) standard"}.get(difficulty, "")
+
+    def rewrite(batch):
+        items = []
+        for i in batch:
+            q = questions[i]
+            it = _as_item(q, i)
+            it["key"] = _letters(len(q["options"]))[key_index(q)]
+            it["explanation"] = q.get("explanation") or ""
+            it["level asked"] = level_word or {"easy": "foundation", "medium": "exam standard", "hard": "specialist"}.get(q.get("difficulty") or "", "exam standard")
+            it["faults"] = faults[i]
+            if is_tf(q):
+                it["form"] = "true or false: the options stay exactly [\"True\", \"False\"] and the question is a statement"
+            items.append(it)
+        user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS TO REWRITE:\n" + json.dumps(items, ensure_ascii=False)
+        return _json_list(ask(REWRITER, user, 300 + 420 * len(batch), max(15, min(80, int(deadline - now() - 10)))))
+    batches = [todo[k:k + 10] for k in range(0, len(todo), 10)][:6]
+    got = {}
+    with _futures.ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+        for f in [pool.submit(rewrite, b) for b in batches]:
+            try:
+                for x in f.result():
+                    if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in faults:
+                        got[x["i"]] = x
+            except Exception:
+                stats["failed"] = True
+    cand = {}
+    for i in todo:
+        new = _taken(questions[i], got.get(i), standalone)
+        if new:
+            cand[i] = new
+    # ---- round 48: every rewrite answered again by an examiner who isn't told its key
+    confirm = {}
+    if cand and deadline - now() > 20:
+        order = list(cand)
+        batches2 = [order[k:k + 25] for k in range(0, len(order), 25)][:4]
+
+        def reexamine(batch):
+            items = [_as_item(cand[i], i) for i in batch]
+            user = "MATERIAL:\n<<<\n" + mat + "\n>>>\n\nQUESTIONS:\n" + json.dumps(items, ensure_ascii=False)
+            return _json_list(ask(EXAMINER, user, 200 + 60 * len(batch), max(10, min(45, int(deadline - now() - 5)))))
+        with _futures.ThreadPoolExecutor(max_workers=min(4, len(batches2))) as pool:
+            for f in [pool.submit(reexamine, b) for b in batches2]:
+                try:
+                    for x in f.result():
+                        if isinstance(x, dict) and isinstance(x.get("i"), int) and x["i"] in cand:
+                            q2 = cand[x["i"]]
+                            letter = str(x.get("answer") or "").strip().upper()[:1]
+                            ok = (letter in _letters(len(q2["options"])) and _letters(len(q2["options"])).index(letter) == key_index(q2)
+                                  and x.get("only_one") is not False)
+                            confirm[x["i"]] = ok
+                except Exception:
+                    stats["failed"] = True
+    drop = []
+    for i in todo:
+        new, ok = cand.get(i), confirm.get(i)
+        if new is not None and ok is not False:      # confirmed, or no second reading in time (as before)
+            questions[i] = new
+            stats["rewritten"] += 1
+            if ok:
+                stats["confirmed"] += 1
+            continue
+        if new is not None:
+            stats["not_confirmed"] += 1
+        if i in disputed and trusted:
+            drop.append(i)                            # its answer stays in doubt: left out
+        elif i in disputed and new is not None:
+            questions[i] = new                        # (an examiner in doubt about most questions: as before)
+            stats["rewritten"] += 1
+        else:
+            stats["kept"] += 1                        # only its wording was at fault: the question as it was
+    return drop
+
+
+def _left_out(questions, drop, stats):
+    """The quiz without the questions whose answer stays in doubt (round 48), counted in stats["left_out"]."""
+    if not drop:
+        return questions
+    stats["left_out"] += len(drop)
+    gone = set(drop)
+    return [q for j, q in enumerate(questions) if j not in gone]
 
 
 def _taken(q, x, standalone):
